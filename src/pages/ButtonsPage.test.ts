@@ -33,17 +33,6 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       lastError: null,
     })),
     saveButtonMappings: vi.fn(async (mappings: unknown) => mappings),
-    exportButtonMappingConfiguration: vi.fn(async () => true),
-    importButtonMappingConfiguration: vi.fn(async () => ({
-      enabled: false,
-      actions: {
-        power: {
-          single: { type: "shortcut", chord: { keys: ["escape"] } },
-          double: { type: "disabled" },
-          long: { type: "disabled" },
-        },
-      },
-    })),
     resetButtonMappings: vi.fn(async () => ({ enabled: true, actions: {} })),
     testButtonMapping: vi.fn(async () => ({
       available: true,
@@ -63,9 +52,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 });
 
 import {
-  exportButtonMappingConfiguration,
   getButtonMappings,
-  importButtonMappingConfiguration,
   subscribeButtonEdges,
   subscribeButtonGestures,
   saveButtonMappings,
@@ -152,8 +139,6 @@ beforeEach(() => {
   vi.mocked(subscribeButtonEdges).mockClear();
   vi.mocked(subscribeButtonGestures).mockClear();
   vi.mocked(saveButtonMappings).mockClear();
-  vi.mocked(exportButtonMappingConfiguration).mockClear();
-  vi.mocked(importButtonMappingConfiguration).mockClear();
 });
 
 describe("buttons mapping page", () => {
@@ -209,7 +194,7 @@ describe("buttons mapping page", () => {
     intervalSpy.mockRestore();
   });
 
-  it("saves, exports and imports a versioned mapping configuration from the footer", async () => {
+  it("keeps global mapping save while v2 transfer is preview-confirmed in the template panel", async () => {
     const wrapper = await mountPage();
     const button = (label: string) =>
       wrapper.findAll(".mapping-footer button").find((item) => item.text() === label)!;
@@ -218,17 +203,37 @@ describe("buttons mapping page", () => {
     await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
     expect(wrapper.text()).toContain("配置已保存并生效");
 
-    await button("导出配置…").trigger("click");
-    await vi.waitFor(() => expect(exportButtonMappingConfiguration).toHaveBeenCalledOnce());
-    expect(wrapper.text()).toContain("按键映射配置已导出");
-
-    await button("导入配置…").trigger("click");
-    await vi.waitFor(() => expect(importButtonMappingConfiguration).toHaveBeenCalledOnce());
-    expect(wrapper.text()).toContain("按键映射配置已导入并生效");
-    const powerCard = wrapper
+    expect(wrapper.text()).toContain("配置导入与导出");
+    expect(wrapper.text()).toContain("选择导入文件");
+    const powerCell = wrapper
       .findAll(".mapping-card")
-      .find((card) => card.text().includes("电源"))!;
-    expect(powerCard.text()).toContain("Esc");
+      .find((card) => card.text().includes("电源"))!
+      .findAll(".mapping-cell")[0]!;
+    expect((powerCell.element as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("switches templates into the first-page section without discarding global editing state", async () => {
+    const wrapper = await mountPage();
+    const powerCell = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!
+      .findAll(".mapping-cell")[0]!;
+    await powerCell.trigger("click");
+    expect(wrapper.find(".mapping-editor").exists()).toBe(true);
+
+    const templateTab = wrapper.get("#template-mapping-tab");
+    await templateTab.trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(templateTab.attributes("aria-selected")).toBe("true");
+    expect(wrapper.get("#template-mapping-panel").isVisible()).toBe(true);
+    expect(wrapper.get("#global-mapping-panel").isVisible()).toBe(false);
+    expect(wrapper.text()).toContain("模板与应用绑定");
+
+    await wrapper.get("#global-mapping-tab").trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get("#global-mapping-tab").attributes("aria-selected")).toBe("true");
+    expect(wrapper.get("#global-mapping-panel").attributes("style") ?? "").not.toContain("display: none");
+    expect(wrapper.find(".mapping-editor").exists()).toBe(true);
   });
 
   it("marks configured cells and opens the editor with the correct target", async () => {
@@ -411,7 +416,7 @@ describe("buttons mapping page", () => {
     expect(wrapper.find(".mapping-editor").text()).not.toContain("原生按键动作");
   });
 
-  it("返回/音量±全型号禁用（2026-09-07 用户决策：RC001 同样不开放）", async () => {
+  it("返回/音量±可配置；RC003 的实际增强执行能力不由编辑器声称", async () => {
     for (const model of ["rc003", "rc001", "unknown"] as const) {
       const wrapper = await mountPage(model);
       const backCell = wrapper
@@ -421,7 +426,7 @@ describe("buttons mapping page", () => {
       expect(
         (backCell.element as HTMLButtonElement).disabled,
         `${model} 返回格子应禁用`,
-      ).toBe(true);
+      ).toBe(false);
       const volumeCell = wrapper
         .findAll(".mapping-card")
         .find((c) => c.text().includes("音量"))!
@@ -429,9 +434,9 @@ describe("buttons mapping page", () => {
       expect(
         (volumeCell.element as HTMLButtonElement).disabled,
         `${model} 音量格子应禁用`,
-      ).toBe(true);
+      ).toBe(false);
       await backCell.trigger("click");
-      expect(wrapper.find(".mapping-editor").exists()).toBe(false);
+      expect(wrapper.find(".mapping-editor").exists()).toBe(true);
     }
   });
 });

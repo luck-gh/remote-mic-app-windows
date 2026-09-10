@@ -48,7 +48,7 @@ thread_local! {
 #[derive(Debug)]
 pub struct RawInputRuntime {
     snapshot: Arc<Mutex<RawInputSnapshot>>,
-    engine: Mutex<Option<Sender<EngineMessage>>>,
+    engine: Sender<EngineMessage>,
     control: Mutex<Option<ListenerControl>>,
 }
 
@@ -58,7 +58,7 @@ impl RawInputRuntime {
         // 直接投递（见 docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md）。
         Self {
             snapshot,
-            engine: Mutex::new(Some(engine)),
+            engine,
             control: Mutex::new(None),
         }
     }
@@ -94,12 +94,9 @@ impl RawInputRuntime {
         let snapshot = Arc::clone(&self.snapshot);
         let thread_stop = Arc::clone(&stop_requested);
         let thread_hwnd = Arc::clone(&hwnd);
-        let engine = self
-            .engine
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or_else(|| mpsc::channel().0);
+        // Each listener lifetime gets a clone; stopping must not consume the
+        // runtime's only sender and disconnect all subsequent starts.
+        let engine = self.engine.clone();
         let join = thread::Builder::new()
             .name("sayall-raw-input".to_owned())
             .spawn(move || {

@@ -1,6 +1,6 @@
-export type PageId = "buttons" | "connection" | "permissions" | "about";
+export type PageId = "drivers" | "buttons" | "connection" | "permissions" | "about";
 
-export type NavIcon = "keyboard" | "link" | "shield" | "info";
+export type NavIcon = "driver" | "keyboard" | "link" | "shield" | "info";
 
 export interface NavigationItem {
   id: PageId;
@@ -10,6 +10,7 @@ export interface NavigationItem {
 }
 
 export const navigationItems: NavigationItem[] = [
+  { id: "drivers", label: "驱动", icon: "driver" },
   { id: "buttons", label: "按键", icon: "keyboard" },
   { id: "connection", label: "连接与语音", icon: "link" },
   { id: "permissions", label: "权限", icon: "shield" },

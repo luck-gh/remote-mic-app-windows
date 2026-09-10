@@ -37,7 +37,9 @@ use crate::key_gate;
 use crate::raw_input::{
     ButtonEdge, ButtonStateMerger, RawInputSnapshot, RawKeyboardEvent, RemoteButton,
 };
-use crate::send_input::{native_key, ButtonAction, ButtonMappings, ButtonTrigger, KeyChord};
+use crate::send_input::{
+    native_key, ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, KeyCode,
+};
 use crate::UsageCounters;
 
 /// 引擎消息（监听器/门控/宿主 → 引擎线程）。
@@ -54,7 +56,12 @@ pub enum EngineMessage {
     /// 匹配的遥控器 HID 设备被移除（断连/睡眠）：释放全部按住状态。
     DeviceRemoved,
     /// 按键映射已更新：重建手势配置。
-    MappingsChanged,
+    MappingsChanged {
+        execution: ButtonMappings,
+        recognition: ButtonMappings,
+    },
+    #[cfg(test)]
+    Flush(Sender<()>),
     Shutdown,
 }
 
@@ -92,6 +99,22 @@ impl MappingInjector for SendInputInjector {
 
 pub type ButtonEdgeCallback = Arc<dyn Fn(ButtonEdge) + Send + Sync>;
 pub type ButtonGestureCallback = Arc<dyn Fn(FiredGesture) + Send + Sync>;
+pub type GestureHandler = Arc<dyn Fn(RoutedGesture) -> GestureDisposition + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureDisposition {
+    Handled,
+    PassThrough,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedGesture {
+    pub gesture: FiredGesture,
+    /// The remote's native key already reached Windows before source attribution.
+    /// Semantic routing must not add a second action in this case.
+    pub native_delivered: bool,
+}
 
 /// 一次触发的手势（用于 UI 反馈与事件推送）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -135,13 +158,99 @@ pub(crate) fn persistent_suppress_mask(mapped_mask: u64) -> u64 {
 
 /// 按键映射引擎运行时。持有句柄即运行；线程在 `Shutdown` 或通道关闭时退出。
 pub struct ButtonMappingRuntime {
-    mappings: Arc<RwLock<ButtonMappings>>,
+    configuration: Mutex<InputConfiguration>,
     sender: Sender<EngineMessage>,
     receiver: Mutex<Option<Receiver<EngineMessage>>>,
     state: Arc<Mutex<EngineState>>,
     edge_callbacks: Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     gesture_callbacks: Arc<RwLock<Vec<ButtonGestureCallback>>>,
+    gesture_handler: Arc<RwLock<Option<GestureHandler>>>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct InputConfiguration {
+    mappings: ButtonMappings,
+    scene_mappings: ButtonMappings,
+    model: crate::RemoteModel,
+    connected: bool,
+}
+
+impl InputConfiguration {
+    fn apply_input_capabilities(&self, mut mappings: ButtonMappings) -> ButtonMappings {
+        mappings.enabled &= self.connected;
+        if !self.connected || self.model != crate::RemoteModel::Rc001 {
+            for button in [
+                RemoteButton::Back,
+                RemoteButton::VolumeUp,
+                RemoteButton::VolumeDown,
+            ] {
+                mappings.actions.remove(&button);
+            }
+        }
+        mappings
+    }
+
+    fn effective_mappings(&self) -> (ButtonMappings, ButtonMappings) {
+        let execution = self.apply_input_capabilities(self.mappings.clone());
+        let scene = self.apply_input_capabilities(self.scene_mappings.clone());
+        let recognition = merge_recognition_mappings(&execution, &scene);
+        (execution, recognition)
+    }
+}
+
+fn merge_recognition_mappings(
+    execution: &ButtonMappings,
+    scene: &ButtonMappings,
+) -> ButtonMappings {
+    let mut merged = execution.clone();
+    merged.enabled = execution.enabled || scene.enabled;
+    for (button, scene_actions) in &scene.actions {
+        let actions = merged.actions.entry(*button).or_default();
+        merge_recognition_action(&mut actions.single, &scene_actions.single);
+        merge_recognition_action(&mut actions.double, &scene_actions.double);
+        merge_recognition_action(&mut actions.long, &scene_actions.long);
+    }
+    merged
+}
+
+fn merge_recognition_action(target: &mut ButtonAction, source: &ButtonAction) {
+    if *target == ButtonAction::Disabled && *source != ButtonAction::Disabled {
+        *target = ButtonAction::Shortcut {
+            chord: KeyChord {
+                keys: vec![KeyCode::Escape],
+            },
+        };
+    }
+}
+
+/// A cancelled physical hold cannot become a new gesture after reconfiguration.
+/// Releases with no accepted press must not manufacture a single/double click.
+#[derive(Default)]
+struct GestureInputState {
+    blocked: BTreeSet<RemoteButton>,
+    accepted: BTreeSet<RemoteButton>,
+}
+
+impl GestureInputState {
+    fn cancel(&mut self, active: BTreeSet<RemoteButton>) {
+        self.blocked.extend(active);
+        self.accepted.clear();
+    }
+
+    fn accept(&mut self, edge: ButtonEdge) -> bool {
+        if self.blocked.contains(&edge.button) {
+            if !edge.is_pressed {
+                self.blocked.remove(&edge.button);
+            }
+            return false;
+        }
+        if edge.is_pressed {
+            self.accepted.insert(edge.button)
+        } else {
+            self.accepted.remove(&edge.button)
+        }
+    }
 }
 
 impl ButtonMappingRuntime {
@@ -162,14 +271,16 @@ impl ButtonMappingRuntime {
         let state = Arc::new(Mutex::new(EngineState::default()));
         let edge_callbacks = Arc::new(RwLock::new(Vec::new()));
         let gesture_callbacks = Arc::new(RwLock::new(Vec::new()));
+        let gesture_handler = Arc::new(RwLock::new(None));
 
         let runtime = Self {
-            mappings: Arc::clone(&mappings),
+            configuration: Mutex::new(InputConfiguration::default()),
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Arc::clone(&state),
             edge_callbacks: Arc::clone(&edge_callbacks),
             gesture_callbacks: Arc::clone(&gesture_callbacks),
+            gesture_handler: Arc::clone(&gesture_handler),
             worker: None,
         };
 
@@ -190,11 +301,13 @@ impl ButtonMappingRuntime {
                 move || {
                     engine_worker(
                         receiver,
-                        mappings,
+                        Arc::clone(&mappings),
+                        Arc::new(RwLock::new(ButtonMappings::default())),
                         state,
                         snapshot,
                         edge_callbacks,
                         gesture_callbacks,
+                        gesture_handler,
                         injector,
                         usage,
                     )
@@ -213,27 +326,64 @@ impl ButtonMappingRuntime {
 
     /// 更新按键映射：热加载到引擎 + 同步门控吞键配置。
     pub fn set_mappings(&self, mappings: ButtonMappings) {
-        // 策略性不支持的按键（返回/音量±）统一
-        // 剥离：normalized() 已在持久化层剥离，此处兜底直连调用路径。
-        let mappings = mappings.without_unsupported_buttons();
-        *self
-            .mappings
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mappings.clone();
-        let mapped_mask = mappings.mapped_mask();
-        key_gate::configure(mappings.enabled, mapped_mask);
-        key_gate::set_persistent_mask(persistent_suppress_mask(mapped_mask));
-        let _ = self.sender.send(EngineMessage::MappingsChanged);
+        let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
+        configuration.mappings = mappings;
+        let (execution, recognition) = configuration.effective_mappings();
+        let _ = self.sender.send(EngineMessage::MappingsChanged {
+            execution,
+            recognition,
+        });
+    }
+
+    /// Adds semantic gesture shapes to recognition without replacing the
+    /// generic mappings used when the scene router passes through.
+    pub fn set_scene_mappings(&self, mappings: ButtonMappings) {
+        let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
+        configuration.scene_mappings = mappings;
+        let (execution, recognition) = configuration.effective_mappings();
+        let _ = self.sender.send(EngineMessage::MappingsChanged {
+            execution,
+            recognition,
+        });
+    }
+
+    /// Call only with the current, identified connection; reconnecting is unavailable.
+    /// The basic channel supports the three vendor keys on RC001 only.
+    pub fn set_input_context(&self, model: crate::RemoteModel, connected: bool) {
+        let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
+        if configuration.model == model && configuration.connected == connected {
+            return;
+        }
+        configuration.model = model;
+        configuration.connected = connected;
+        crate::ble::gatt_note(format!(
+            "map_input_context model={model:?} connected={connected} vendor_keys_available={}",
+            connected && model == crate::RemoteModel::Rc001
+        ));
+        let (execution, recognition) = configuration.effective_mappings();
+        let _ = self.sender.send(EngineMessage::MappingsChanged {
+            execution,
+            recognition,
+        });
     }
 
     pub fn mappings(&self) -> ButtonMappings {
-        read_lock(&self.mappings).clone()
+        self.configuration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mappings
+            .clone()
     }
 
     pub fn snapshot(&self) -> ButtonMappingSnapshot {
         let state = lock_state(&self.state);
         ButtonMappingSnapshot {
-            enabled: read_lock(&self.mappings).enabled,
+            enabled: self
+                .configuration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mappings
+                .enabled,
             gate_active: key_gate::is_gate_thread_alive(),
             listener_active: key_gate::listener_active(),
             swallowed_edges: key_gate::swallowed_edge_count(),
@@ -259,6 +409,13 @@ impl ButtonMappingRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(callback);
     }
+
+    pub fn set_gesture_handler(&self, handler: Option<GestureHandler>) {
+        *self
+            .gesture_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handler;
+    }
 }
 
 impl Drop for ButtonMappingRuntime {
@@ -274,21 +431,24 @@ impl Drop for ButtonMappingRuntime {
 fn engine_worker(
     receiver: Receiver<EngineMessage>,
     mappings: Arc<RwLock<ButtonMappings>>,
+    recognition_mappings: Arc<RwLock<ButtonMappings>>,
     state: Arc<Mutex<EngineState>>,
     snapshot: Arc<Mutex<RawInputSnapshot>>,
     edge_callbacks: Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     gesture_callbacks: Arc<RwLock<Vec<ButtonGestureCallback>>>,
+    gesture_handler: Arc<RwLock<Option<GestureHandler>>>,
     injector: Arc<dyn MappingInjector>,
     usage: Arc<UsageCounters>,
 ) {
     let mut merger = ButtonStateMerger::default();
     let mut recognizer = GestureRecognizer::new();
-    recognizer.configure(&read_lock(&mappings).clone());
+    recognizer.configure(&read_lock(&recognition_mappings).clone());
     // 泄漏对冲标记：本次按住的原始键已泄漏进 OS（原生动作已交付）的按键。
     // 由 [`EngineMessage::Keyboard`]（泄漏路径）的按压边沿置位，Single 同键
     // 映射触发时消费并跳过注入；门控吞下的按压（[`EngineMessage::GateEdge`]）
     // 置位前清除。见模块文档"泄漏对冲"。
     let mut native_pending: BTreeSet<RemoteButton> = BTreeSet::new();
+    let mut gesture_input = GestureInputState::default();
 
     loop {
         let timeout = recognizer
@@ -304,8 +464,10 @@ fn engine_worker(
                             button,
                             trigger,
                             &mappings,
+                            &recognition_mappings,
                             &state,
                             &gesture_callbacks,
+                            &gesture_handler,
                             &injector,
                             &mut native_pending,
                         );
@@ -321,6 +483,10 @@ fn engine_worker(
         };
 
         match message {
+            #[cfg(test)]
+            EngineMessage::Flush(reply) => {
+                let _ = reply.send(());
+            }
             EngineMessage::Keyboard(event) => {
                 let now = Instant::now();
                 let edges = merger.update_keyboard(event);
@@ -336,16 +502,32 @@ fn engine_worker(
                     &mut merger,
                     &mut recognizer,
                     &mappings,
+                    &recognition_mappings,
                     &state,
                     &snapshot,
                     &edge_callbacks,
                     &gesture_callbacks,
+                    &gesture_handler,
                     &injector,
                     &usage,
                     &mut native_pending,
+                    &mut gesture_input,
                 );
             }
             EngineMessage::HidUsages(usages) => {
+                // A complete, decoded keyboard report with no usages is direct
+                // all-up evidence, including a release missed while disconnected.
+                if usages.is_empty() && !gesture_input.blocked.is_empty() {
+                    recognizer.release_all();
+                    merger.release_all();
+                    gesture_input = GestureInputState::default();
+                    native_pending.clear();
+                    lock_snapshot(&snapshot).active_buttons.clear();
+                    crate::ble::gatt_note(
+                        "map_resync evidence=hid_all_up waiting_for_release=false".to_owned(),
+                    );
+                    continue;
+                }
                 let now = Instant::now();
                 let edges = merger.update_hid_usages(usages);
                 handle_edges(
@@ -354,13 +536,16 @@ fn engine_worker(
                     &mut merger,
                     &mut recognizer,
                     &mappings,
+                    &recognition_mappings,
                     &state,
                     &snapshot,
                     &edge_callbacks,
                     &gesture_callbacks,
+                    &gesture_handler,
                     &injector,
                     &usage,
                     &mut native_pending,
+                    &mut gesture_input,
                 );
             }
             EngineMessage::GateEdge(edge) => {
@@ -376,13 +561,16 @@ fn engine_worker(
                     &mut merger,
                     &mut recognizer,
                     &mappings,
+                    &recognition_mappings,
                     &state,
                     &snapshot,
                     &edge_callbacks,
                     &gesture_callbacks,
+                    &gesture_handler,
                     &injector,
                     &usage,
                     &mut native_pending,
+                    &mut gesture_input,
                 );
             }
             EngineMessage::ListenerStopped | EngineMessage::DeviceRemoved => {
@@ -395,27 +583,25 @@ fn engine_worker(
                 ));
                 // 释放全部按住状态：取消所有手势计时，不触发动作。
                 recognizer.release_all();
-                let edges = merger.release_all();
+                cancel_gesture_input(&merger, &mut gesture_input, &snapshot, &edge_callbacks);
                 native_pending.clear();
-                let now = Instant::now();
-                handle_edges(
-                    edges,
-                    now,
-                    &mut merger,
-                    &mut recognizer,
-                    &mappings,
-                    &state,
-                    &snapshot,
-                    &edge_callbacks,
-                    &gesture_callbacks,
-                    &injector,
-                    &usage,
-                    &mut native_pending,
-                );
+                key_gate::cancel_pending_holds();
             }
-            EngineMessage::MappingsChanged => {
-                let mappings = read_lock(&mappings).clone();
-                recognizer.configure(&mappings);
+            EngineMessage::MappingsChanged {
+                execution,
+                recognition,
+            } => {
+                cancel_gesture_input(&merger, &mut gesture_input, &snapshot, &edge_callbacks);
+                recognizer.configure(&recognition);
+                let mapped_mask = recognition.mapped_mask();
+                key_gate::cancel_pending_holds();
+                key_gate::configure(recognition.enabled, mapped_mask);
+                key_gate::set_persistent_mask(persistent_suppress_mask(mapped_mask));
+                *mappings.write().unwrap_or_else(|p| p.into_inner()) = execution;
+                *recognition_mappings
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = recognition;
+                let mappings = read_lock(&recognition_mappings).clone();
                 // 配置变化重置全部手势状态：挂起的泄漏对冲标记一并失效。
                 native_pending.clear();
                 let configured = crate::raw_input::ALL_BUTTONS
@@ -430,9 +616,40 @@ fn engine_worker(
                     mappings.enabled, configured
                 ));
             }
-            EngineMessage::Shutdown => break,
+            EngineMessage::Shutdown => {
+                recognizer.release_all();
+                cancel_gesture_input(&merger, &mut gesture_input, &snapshot, &edge_callbacks);
+                key_gate::cancel_pending_holds();
+                key_gate::configure(false, 0);
+                break;
+            }
         }
     }
+}
+
+fn cancel_gesture_input(
+    merger: &ButtonStateMerger,
+    input: &mut GestureInputState,
+    snapshot: &Arc<Mutex<RawInputSnapshot>>,
+    callbacks: &Arc<RwLock<Vec<ButtonEdgeCallback>>>,
+) {
+    let active = merger.active_button_set();
+    input.cancel(active.clone());
+    lock_snapshot(snapshot).active_buttons.clear();
+    for callback in read_callbacks(callbacks).iter() {
+        for button in &active {
+            callback(ButtonEdge {
+                button: *button,
+                is_pressed: false,
+            });
+        }
+    }
+    crate::ble::gatt_note(format!(
+        "map_cancel held_keys={} waiting_release={} waiting_for_release={}",
+        active.len(),
+        input.blocked.len(),
+        !input.blocked.is_empty()
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,13 +659,16 @@ fn handle_edges(
     merger: &mut ButtonStateMerger,
     recognizer: &mut GestureRecognizer,
     mappings: &Arc<RwLock<ButtonMappings>>,
+    recognition_mappings: &Arc<RwLock<ButtonMappings>>,
     state: &Arc<Mutex<EngineState>>,
     snapshot: &Arc<Mutex<RawInputSnapshot>>,
     edge_callbacks: &Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     gesture_callbacks: &Arc<RwLock<Vec<ButtonGestureCallback>>>,
+    gesture_handler: &Arc<RwLock<Option<GestureHandler>>>,
     injector: &Arc<dyn MappingInjector>,
     usage: &Arc<UsageCounters>,
     native_pending: &mut BTreeSet<RemoteButton>,
+    gesture_input: &mut GestureInputState,
 ) {
     if edges.is_empty() {
         return;
@@ -471,7 +691,11 @@ fn handle_edges(
         snapshot.semantic_edge_count = snapshot
             .semantic_edge_count
             .saturating_add(edges.len() as u64);
-        snapshot.active_buttons = merger.active_button_set().into_iter().collect();
+        snapshot.active_buttons = merger
+            .active_button_set()
+            .difference(&gesture_input.blocked)
+            .copied()
+            .collect();
         if let Some(last) = edges.last() {
             snapshot.last_button = Some(last.button);
             snapshot.last_is_pressed = Some(last.is_pressed);
@@ -484,6 +708,10 @@ fn handle_edges(
     }
 
     for edge in edges {
+        if !gesture_input.accept(edge) {
+            native_pending.remove(&edge.button);
+            continue;
+        }
         let fired = if edge.is_pressed {
             recognizer.press(edge.button, now)
         } else {
@@ -494,8 +722,10 @@ fn handle_edges(
                 edge.button,
                 trigger,
                 mappings,
+                recognition_mappings,
                 state,
                 gesture_callbacks,
+                gesture_handler,
                 injector,
                 native_pending,
             );
@@ -508,8 +738,10 @@ fn fire_gesture(
     button: RemoteButton,
     trigger: ButtonTrigger,
     mappings: &Arc<RwLock<ButtonMappings>>,
+    recognition_mappings: &Arc<RwLock<ButtonMappings>>,
     state: &Arc<Mutex<EngineState>>,
     gesture_callbacks: &Arc<RwLock<Vec<ButtonGestureCallback>>>,
+    gesture_handler: &Arc<RwLock<Option<GestureHandler>>>,
     injector: &Arc<dyn MappingInjector>,
     native_pending: &mut BTreeSet<RemoteButton>,
 ) {
@@ -523,18 +755,36 @@ fn fire_gesture(
         callback(fired);
     }
 
-    let mappings = read_lock(mappings).clone();
+    let recognition = read_lock(recognition_mappings).clone();
     // 门控未运行时不注入：原始键未被吞（或无法归因），注入会造成双输入。
-    if !mappings.enabled || !key_gate::is_gate_thread_alive() {
-        if mappings.enabled {
+    if !recognition.enabled || !key_gate::is_gate_thread_alive() {
+        if recognition.enabled {
             crate::ble::gatt_note(format!(
                 "map_skip_inject reason=gate_not_alive enabled={} gate_alive=false button={:?} trigger={:?}",
-                mappings.enabled, button, trigger
+                recognition.enabled, button, trigger
             ));
             let mut state = lock_state(state);
             state.last_error =
                 Some("按键映射门控未运行，已保持观察模式（不注入，避免双输入）".to_owned());
         }
+        return;
+    }
+    let native_delivered = native_pending.remove(&button);
+    let handler = read_lock(gesture_handler).clone();
+    if let Some(handler) = handler {
+        let disposition = handler(RoutedGesture {
+            gesture: fired,
+            native_delivered,
+        });
+        crate::ble::gatt_note(format!(
+            "map_route button={button:?} trigger={trigger:?} disposition={disposition:?} native_delivered={native_delivered}"
+        ));
+        if disposition != GestureDisposition::PassThrough {
+            return;
+        }
+    }
+    let mappings = read_lock(mappings).clone();
+    if !mappings.enabled {
         return;
     }
     let action = mappings.action_for(button, trigger);
@@ -549,7 +799,7 @@ fn fire_gesture(
     // 动作与原生动作相同（右→右 等）时跳过注入（原生已交付，注入即双响应）；
     // 其余触发（Long/Double/连发/不同动作）始终注入——原生无法交付组合
     // 语义与连发。标记在此消费，对冲只作用于本次按住的首个 Single。
-    if native_pending.remove(&button) {
+    if native_delivered {
         if trigger == ButtonTrigger::Single {
             let native_covers = matches!(&action, ButtonAction::Shortcut { chord }
                 if chord.keys.len() == 1
@@ -644,6 +894,186 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
+    fn flush(runtime: &ButtonMappingRuntime) {
+        let (sender, receiver) = mpsc::channel();
+        runtime.sender().send(EngineMessage::Flush(sender)).unwrap();
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn input_context_gates_vendor_keys_without_erasing_configuration() {
+        let mut configuration = InputConfiguration::default();
+        for button in [
+            RemoteButton::Back,
+            RemoteButton::VolumeUp,
+            RemoteButton::VolumeDown,
+        ] {
+            configuration.mappings.actions.insert(
+                button,
+                ButtonActions {
+                    single: ButtonAction::Shortcut {
+                        chord: KeyChord {
+                            keys: vec![KeyCode::Escape],
+                        },
+                    },
+                    ..ButtonActions::default()
+                },
+            );
+        }
+        let saved = configuration.mappings.clone();
+        for (model, connected, available) in [
+            (crate::RemoteModel::Unknown, true, false),
+            (crate::RemoteModel::Rc003, true, false),
+            (crate::RemoteModel::Rc001, false, false),
+            (crate::RemoteModel::Rc001, true, true),
+        ] {
+            configuration.model = model;
+            configuration.connected = connected;
+            let effective = configuration.effective_mappings();
+            for button in [
+                RemoteButton::Back,
+                RemoteButton::VolumeUp,
+                RemoteButton::VolumeDown,
+            ] {
+                assert_eq!(
+                    effective.0.action_for(button, ButtonTrigger::Single) != ButtonAction::Disabled,
+                    available
+                );
+            }
+            assert_eq!(configuration.mappings, saved);
+            assert_eq!(effective.0.enabled, connected && saved.enabled);
+        }
+    }
+
+    #[test]
+    fn cancelled_input_holds_do_not_transfer_or_fabricate_clicks() {
+        for cancellation in ["disable", "disconnect", "listener_restart", "model_switch"] {
+            let runtime = ButtonMappingRuntime::new(
+                Arc::new(RecordingInjector::default()),
+                Arc::new(UsageCounters::default()),
+                Arc::new(StdMutex::new(RawInputSnapshot::default())),
+            );
+            runtime.set_input_context(crate::RemoteModel::Rc001, true);
+            let mut mappings = mappings_with_single(RemoteButton::Ok, KeyCode::Enter);
+            mappings.actions.get_mut(&RemoteButton::Ok).unwrap().long = ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Escape],
+                },
+            };
+            runtime.set_mappings(mappings.clone());
+            let sender = runtime.sender();
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            flush(&runtime);
+            match cancellation {
+                "disable" => {
+                    let mut disabled = mappings.clone();
+                    disabled.enabled = false;
+                    runtime.set_mappings(disabled);
+                }
+                "disconnect" => runtime.set_input_context(crate::RemoteModel::Rc001, false),
+                "listener_restart" => {
+                    sender.send(EngineMessage::ListenerStopped).unwrap();
+                }
+                _ => runtime.set_input_context(crate::RemoteModel::Rc003, true),
+            }
+            runtime.set_input_context(crate::RemoteModel::Rc001, true);
+            runtime.set_mappings(mappings);
+            // A repeat from the old physical hold and its eventual UP cannot click.
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: false,
+                }))
+                .unwrap();
+            flush(&runtime);
+            assert_eq!(runtime.snapshot().fired_gestures, 0, "{cancellation}");
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: false,
+                }))
+                .unwrap();
+            flush(&runtime);
+            assert_eq!(
+                runtime.snapshot().fired_gestures,
+                1,
+                "{cancellation}: next press"
+            );
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            sender.send(EngineMessage::ListenerStopped).unwrap();
+            // A verified full all-up report recovers a release missed offline.
+            sender
+                .send(EngineMessage::HidUsages(BTreeSet::new()))
+                .unwrap();
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            sender
+                .send(EngineMessage::GateEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: false,
+                }))
+                .unwrap();
+            flush(&runtime);
+            assert_eq!(
+                runtime.snapshot().fired_gestures,
+                2,
+                "{cancellation}: all-up resync"
+            );
+        }
+        let mut restarted = GestureInputState::default();
+        assert!(!restarted.accept(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: false
+        }));
+        assert!(restarted.accept(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: true
+        }));
+        restarted.cancel(BTreeSet::from([RemoteButton::Ok]));
+        assert!(restarted.accept(ButtonEdge {
+            button: RemoteButton::Up,
+            is_pressed: true
+        }));
+        assert!(!restarted.accept(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: false
+        }));
+        assert!(restarted.accept(ButtonEdge {
+            button: RemoteButton::Up,
+            is_pressed: false
+        }));
+        assert!(restarted.accept(ButtonEdge {
+            button: RemoteButton::Up,
+            is_pressed: true
+        }));
+    }
+
     /// 测试注入器：记录 tap 的和弦与打开应用的目标。
     #[derive(Debug, Default)]
     struct RecordingInjector {
@@ -735,6 +1165,7 @@ mod tests {
             Arc::new(UsageCounters::default()),
             Arc::new(StdMutex::new(RawInputSnapshot::default())),
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         let single = |key: KeyCode| ButtonAction::Shortcut {
             chord: KeyChord { keys: vec![key] },
         };
@@ -887,6 +1318,7 @@ mod tests {
             Arc::new(UsageCounters::default()),
             Arc::clone(&snapshot),
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         // 注意：单元测试环境没有真实 key_gate 线程（is_gate_thread_alive=false），
         // 引擎按设计保持观察模式（不注入）。此处先验证边沿→手势→回调链路。
         runtime.set_mappings(mappings_with_single(RemoteButton::Ok, KeyCode::Enter));
@@ -939,6 +1371,7 @@ mod tests {
             Arc::new(UsageCounters::default()),
             snapshot,
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         let mut mappings = ButtonMappings::default();
         mappings.actions.insert(
             RemoteButton::Ok,
@@ -981,6 +1414,7 @@ mod tests {
             Arc::new(UsageCounters::default()),
             snapshot,
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         runtime.set_mappings(mappings_with_single(RemoteButton::Ok, KeyCode::Enter));
 
         let edges = Arc::new(StdMutex::new(Vec::new()));
@@ -1040,6 +1474,7 @@ mod tests {
             Arc::new(UsageCounters::default()),
             Arc::clone(&snapshot),
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         // 双击配置：释放后进入双击窗口（悬而未决），监听器停止必须取消它。
         let mut mappings = ButtonMappings::default();
         mappings.actions.insert(
@@ -1093,6 +1528,7 @@ mod tests {
             Arc::clone(&usage),
             snapshot,
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         let sender = runtime.sender();
         // 双源同一次按下：语义按下只计一次。
         sender
@@ -1129,13 +1565,13 @@ mod tests {
     }
 
     #[test]
-    fn set_mappings_strips_unsupported_buttons_and_sets_persistent_mask() {
-        // 返回/音量±仍被策略剥离；左键映射必须保留并进入普通逐键武装机制。
+    fn set_mappings_preserves_unavailable_buttons() {
         let runtime = ButtonMappingRuntime::new(
             Arc::new(RecordingInjector::default()) as Arc<dyn MappingInjector>,
             Arc::new(UsageCounters::default()),
             Arc::new(StdMutex::new(RawInputSnapshot::default())),
         );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
         let mut mappings = ButtonMappings::default();
         mappings.actions.insert(
             RemoteButton::Left,
@@ -1176,16 +1612,7 @@ mod tests {
             effective.actions.contains_key(&RemoteButton::Left),
             "左键自定义必须保留"
         );
-        for button in [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-        ] {
-            assert!(
-                !effective.actions.contains_key(&button),
-                "{button:?} 自定义必须被策略剥离"
-            );
-        }
+        assert!(effective.actions.contains_key(&RemoteButton::Back));
         assert_eq!(
             effective
                 .actions
@@ -1205,8 +1632,7 @@ mod tests {
                 },
             },
         );
-        // 引擎侧被剥离按键的动作查询为 Disabled（双保险：配置剥离 + 查询兜底）。
-        assert_eq!(
+        assert_ne!(
             effective.action_for(RemoteButton::Back, ButtonTrigger::Single),
             ButtonAction::Disabled,
         );

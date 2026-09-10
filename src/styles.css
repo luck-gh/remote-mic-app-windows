@@ -66,6 +66,8 @@
   --pressed-ring: rgba(239, 148, 32, 0.55);
 }
 
+:root.scene-overlay-document, :root.scene-overlay-document body, :root.scene-overlay-document #app { background: transparent; }
+
 html[data-theme="dark"] {
   color-scheme: dark;
   --accent: #8f92ff;
@@ -344,6 +346,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 /* ---- 按键映射页（Mac RemoteMappingCanvas 对标） ---- */
 /* 头部对齐 Mac mappingPage：标题 + 启用开关居左同行，遥控器状态最右。 */
 .mapping-title-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.mapping-section-tabs { display: flex; gap: 6px; margin: 0 0 14px; padding: 4px; width: fit-content; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle); }
+.mapping-section-tab { min-height: 32px; padding: 5px 13px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; }
+.mapping-section-tab:hover { background: var(--surface-hover); color: var(--text-primary); }
+.mapping-section-tab.active { background: var(--accent-surface); color: var(--accent-text); box-shadow: inset 0 0 0 1px var(--accent-border); }
 .buttons-page .page-header h1 { font-size: 24px; margin: 0; }
 .mapping-header-controls { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
 .device-chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-raised); font-size: 13px; white-space: nowrap; }

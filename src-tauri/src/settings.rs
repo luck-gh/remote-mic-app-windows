@@ -1,17 +1,42 @@
 use sayall_core::{AppSettings, ThemePreference, UsageStatistics};
-use sayall_windows::send_input::{ButtonMappings, KeyChord};
+use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord};
+use sayall_windows::templates::{
+    new_template_id, ApplicationBinding, ImportedTemplatePreview, MappingConfiguration,
+    MappingConfigurationImportPreview, MappingTemplate, TemplateImportPreview,
+    TemplateImportRequest,
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
     path: PathBuf,
     access: Arc<Mutex<()>>,
+    revision: Arc<AtomicU64>,
+    pending_imports: Arc<Mutex<HashMap<String, PendingImport>>>,
+    import_sources: Arc<Mutex<HashMap<String, ImportSource>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingImport {
+    revision: u64,
+    configuration: MappingConfiguration,
+    source_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ImportSource {
+    revision: u64,
+    configuration: MappingConfiguration,
+    new_template_ids: BTreeMap<String, String>,
 }
 
 const BUTTON_MAPPING_EXPORT_VERSION: u32 = 1;
+const MAPPING_CONFIGURATION_EXPORT_VERSION: u32 = 2;
 const MAX_BUTTON_MAPPING_IMPORT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -21,11 +46,44 @@ struct ButtonMappingConfiguration {
     button_mappings: ButtonMappings,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MappingConfigurationExport {
+    format_version: u32,
+    common_mappings: ButtonMappings,
+    template_control_enabled: bool,
+    templates: Vec<MappingTemplate>,
+    application_bindings: Vec<sayall_windows::templates::ExportApplicationBinding>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum ImportedMappingConfiguration {
+    V2(MappingConfigurationExportImport),
+    V1(ButtonMappingConfiguration),
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MappingConfigurationExportImport {
+    format_version: u32,
+    common_mappings: ButtonMappings,
+    #[serde(default)]
+    template_control_enabled: bool,
+    #[serde(default)]
+    templates: Vec<MappingTemplate>,
+    #[serde(default)]
+    application_bindings: Vec<sayall_windows::templates::ExportApplicationBinding>,
+}
+
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
             access: Arc::new(Mutex::new(())),
+            revision: Arc::new(AtomicU64::new(0)),
+            pending_imports: Arc::new(Mutex::new(HashMap::new())),
+            import_sources: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -100,74 +158,371 @@ impl SettingsStore {
 
     pub fn load_button_mappings(&self) -> Result<ButtonMappings, String> {
         let _guard = lock(&self.access);
+        Ok(self.load_mapping_configuration_unlocked()?.common_mappings)
+    }
+
+    pub fn load_mapping_configuration(&self) -> Result<MappingConfiguration, String> {
+        let _guard = lock(&self.access);
+        self.load_mapping_configuration_unlocked()
+    }
+
+    pub fn apply_current_mapping_configuration(
+        &self,
+        apply: impl FnOnce(&MappingConfiguration),
+    ) -> Result<(), String> {
+        let _guard = lock(&self.access);
+        let configuration = self.load_mapping_configuration_unlocked()?;
+        apply(&configuration);
+        Ok(())
+    }
+
+    fn load_mapping_configuration_unlocked(&self) -> Result<MappingConfiguration, String> {
         let path = self.button_mappings_path();
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(ButtonMappings::default())
+                return Ok(MappingConfiguration::default())
             }
             Err(error) => return Err(format!("读取按键映射失败：{error}")),
         };
-        serde_json::from_str::<ButtonMappings>(&contents)
-            .map_err(|error| format!("解析按键映射失败：{error}"))?
+        let value: serde_json::Value = serde_json::from_str(&contents)
+            .map_err(|error| format!("解析按键映射失败：{error}"))?;
+        let configuration = if value.get("commonMappings").is_some() {
+            serde_json::from_value::<MappingConfiguration>(value)
+        } else if value.get("enabled").is_some() && value.get("actions").is_some() {
+            serde_json::from_value::<ButtonMappings>(value).map(|common_mappings| {
+                MappingConfiguration {
+                    common_mappings,
+                    ..Default::default()
+                }
+            })
+        } else {
+            return Err("按键映射格式缺少通用映射字段".to_owned());
+        }
+        .map_err(|error| format!("解析按键映射失败：{error}"))?;
+        configuration
             .normalized()
             .map_err(|error| format!("按键映射无效：{error}"))
     }
 
     pub fn save_button_mappings(&self, mappings: ButtonMappings) -> Result<ButtonMappings, String> {
+        self.save_button_mappings_with(mappings, |_| {})
+    }
+
+    pub fn save_button_mappings_with(
+        &self,
+        mappings: ButtonMappings,
+        apply: impl FnOnce(&MappingConfiguration),
+    ) -> Result<ButtonMappings, String> {
+        let (configuration, ()) = self.update_mapping_configuration(
+            |configuration| {
+                configuration.common_mappings = mappings;
+                Ok(())
+            },
+            apply,
+        )?;
+        Ok(configuration.common_mappings)
+    }
+
+    pub fn save_mapping_configuration(
+        &self,
+        configuration: MappingConfiguration,
+    ) -> Result<MappingConfiguration, String> {
+        self.save_mapping_configuration_with(configuration, |_| {})
+    }
+
+    pub fn save_mapping_configuration_with(
+        &self,
+        configuration: MappingConfiguration,
+        apply: impl FnOnce(&MappingConfiguration),
+    ) -> Result<MappingConfiguration, String> {
         let _guard = lock(&self.access);
-        let mappings = mappings
+        let saved = self.save_mapping_configuration_unlocked(configuration)?;
+        apply(&saved);
+        Ok(saved)
+    }
+
+    pub fn update_mapping_configuration<R>(
+        &self,
+        update: impl FnOnce(&mut MappingConfiguration) -> Result<R, String>,
+        apply: impl FnOnce(&MappingConfiguration),
+    ) -> Result<(MappingConfiguration, R), String> {
+        let _guard = lock(&self.access);
+        let mut configuration = self.load_mapping_configuration_unlocked()?;
+        let result = update(&mut configuration)?;
+        let saved = self.save_mapping_configuration_unlocked(configuration)?;
+        apply(&saved);
+        Ok((saved, result))
+    }
+
+    fn save_mapping_configuration_unlocked(
+        &self,
+        configuration: MappingConfiguration,
+    ) -> Result<MappingConfiguration, String> {
+        let configuration = configuration
             .normalized()
             .map_err(|error| format!("按键映射无效：{error}"))?;
         let path = self.button_mappings_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
         }
-        let contents = serde_json::to_vec_pretty(&mappings)
+        let contents = serde_json::to_vec_pretty(&configuration)
             .map_err(|error| format!("序列化按键映射失败：{error}"))?;
-        fs::write(path, contents).map_err(|error| format!("保存按键映射失败：{error}"))?;
-        Ok(mappings)
+        atomic_write(&path, &contents).map_err(|error| format!("保存按键映射失败：{error}"))?;
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        sayall_windows::gatt_note(
+            "template_configuration phase=persisted terminal_result=passed".to_owned(),
+        );
+        Ok(configuration)
     }
 
-    pub fn export_button_mappings(
+    pub fn export_mapping_configuration(
         &self,
         path: &Path,
-        mappings: ButtonMappings,
+        configuration: MappingConfiguration,
+        template_ids: Option<&[String]>,
     ) -> Result<(), String> {
-        let mappings = mappings
+        let mut configuration = configuration
             .normalized()
             .map_err(|error| format!("按键映射无效：{error}"))?;
-        let configuration = ButtonMappingConfiguration {
-            format_version: BUTTON_MAPPING_EXPORT_VERSION,
-            button_mappings: mappings,
+        if let Some(template_ids) = template_ids {
+            if template_ids.is_empty() {
+                return Err("至少选择一个模板".to_owned());
+            }
+            let selected: std::collections::HashSet<_> = template_ids.iter().collect();
+            if selected.len() != template_ids.len()
+                || template_ids.iter().any(|id| {
+                    !configuration
+                        .templates
+                        .iter()
+                        .any(|template| &template.id == id)
+                })
+            {
+                return Err("所选模板不存在或重复".to_owned());
+            }
+            configuration
+                .templates
+                .retain(|template| selected.contains(&template.id));
+            configuration
+                .application_bindings
+                .retain(|binding| selected.contains(&binding.template_id));
+        }
+        let exported = MappingConfigurationExport {
+            format_version: MAPPING_CONFIGURATION_EXPORT_VERSION,
+            common_mappings: portable_common_mappings(&configuration)?,
+            template_control_enabled: configuration.template_control_enabled,
+            templates: configuration.templates,
+            application_bindings: configuration
+                .application_bindings
+                .iter()
+                .map(Into::into)
+                .collect(),
         };
-        // serde_json::Value 的对象键按序输出，使同一配置便于比对和版本管理。
-        let value = serde_json::to_value(configuration)
-            .map_err(|error| format!("序列化按键映射配置失败：{error}"))?;
-        let contents = serde_json::to_vec_pretty(&value)
-            .map_err(|error| format!("序列化按键映射配置失败：{error}"))?;
-        fs::write(path, contents).map_err(|error| format!("写入按键映射配置失败：{error}"))
+        let contents = serde_json::to_vec_pretty(&exported)
+            .map_err(|error| format!("序列化模板配置失败：{error}"))?;
+        atomic_write(path, &contents).map_err(|error| format!("写入模板配置失败：{error}"))
     }
 
-    pub fn import_button_mappings(&self, path: &Path) -> Result<ButtonMappings, String> {
-        let metadata =
-            fs::metadata(path).map_err(|error| format!("读取按键映射配置失败：{error}"))?;
-        if metadata.len() > MAX_BUTTON_MAPPING_IMPORT_BYTES {
-            return Err("按键映射配置文件过大".to_owned());
-        }
-        let contents = fs::read(path).map_err(|error| format!("读取按键映射配置失败：{error}"))?;
-        let configuration: ButtonMappingConfiguration = serde_json::from_slice(&contents)
-            .map_err(|error| format!("解析按键映射配置失败：{error}"))?;
-        if configuration.format_version != BUTTON_MAPPING_EXPORT_VERSION {
-            return Err(format!(
-                "不支持的按键映射配置版本：{}",
-                configuration.format_version
-            ));
-        }
-        // 完整解析并规范化通过后才触碰应用配置，实现失败不改变现状。
-        self.save_button_mappings(configuration.button_mappings)
+    pub fn apply_mapping_configuration_import(
+        &self,
+        token: &str,
+    ) -> Result<MappingConfiguration, String> {
+        self.apply_mapping_configuration_import_with(token, |_| {})
     }
 
+    pub fn apply_mapping_configuration_import_with(
+        &self,
+        token: &str,
+        apply: impl FnOnce(&MappingConfiguration),
+    ) -> Result<MappingConfiguration, String> {
+        let _guard = lock(&self.access);
+        let pending = lock(&self.pending_imports)
+            .remove(token)
+            .ok_or_else(|| "导入预览已失效，请重新预览".to_owned())?;
+        if pending.revision != self.revision.load(Ordering::Acquire) {
+            sayall_windows::gatt_note(
+                "template_import phase=rejected reason=stale_preview".to_owned(),
+            );
+            return Err("导入预览已过期，请重新预览".to_owned());
+        }
+        let saved = self.save_mapping_configuration_unlocked(pending.configuration)?;
+        apply(&saved);
+        Ok(saved)
+    }
+
+    pub fn preview_mapping_configuration_import(
+        &self,
+        path: &Path,
+    ) -> Result<MappingConfigurationImportPreview, String> {
+        let parsed = read_mapping_import(path)?;
+        let _guard = lock(&self.access);
+        let current = self.load_mapping_configuration_unlocked()?;
+        let (format_version, configuration) = resolve_mapping_import(parsed, &current)?;
+        let revision = self.revision.load(Ordering::Acquire);
+        let source_token = (format_version == 2).then(|| format!("source-{}", new_template_id()));
+        // Choosing another file ends the previous preview session; no arbitrary
+        // template quota or long-lived collection of file snapshots is needed.
+        lock(&self.pending_imports).clear();
+        lock(&self.import_sources).clear();
+        if let Some(source_token) = &source_token {
+            lock(&self.import_sources).insert(
+                source_token.clone(),
+                ImportSource {
+                    revision,
+                    new_template_ids: configuration
+                        .templates
+                        .iter()
+                        .map(|template| (template.id.clone(), new_template_id()))
+                        .collect(),
+                    configuration: configuration.clone(),
+                },
+            );
+        }
+        let token = format!("apply-{}", new_template_id());
+        lock(&self.pending_imports).insert(
+            token.clone(),
+            PendingImport {
+                revision,
+                configuration: configuration.clone(),
+                source_token: source_token.clone(),
+            },
+        );
+        let template_name_conflicts = configuration
+            .templates
+            .iter()
+            .filter(|template| {
+                current
+                    .templates
+                    .iter()
+                    .any(|local| local.name == template.name)
+            })
+            .map(|template| template.name.clone())
+            .collect();
+        let unresolved_application_ids = unresolved_configuration(&configuration);
+        let mut preview_configuration = configuration;
+        preview_configuration.common_mappings = portable_common_mappings(&preview_configuration)?;
+        for binding in &mut preview_configuration.application_bindings {
+            binding.launch_target = None;
+        }
+        sayall_windows::gatt_note(format!(
+            "template_import phase=previewed format_version={format_version} template_count={}",
+            preview_configuration.templates.len()
+        ));
+        Ok(MappingConfigurationImportPreview {
+            token,
+            source_token,
+            format_version,
+            configuration: preview_configuration,
+            template_name_conflicts,
+            unresolved_application_ids,
+        })
+    }
+
+    pub fn preview_template_import(
+        &self,
+        source_token: &str,
+        request: TemplateImportRequest,
+    ) -> Result<TemplateImportPreview, String> {
+        let _guard = lock(&self.access);
+        let source = lock(&self.import_sources)
+            .get(source_token)
+            .cloned()
+            .ok_or_else(|| "模板来源预览已失效，请重新选择文件".to_owned())?;
+        if source.revision != self.revision.load(Ordering::Acquire) {
+            return Err("模板来源预览已过期，请重新选择文件".to_owned());
+        }
+        // A changed selection invalidates prior final previews, even if its new
+        // name validation fails. The source token itself can never be applied.
+        lock(&self.pending_imports)
+            .retain(|_, pending| pending.source_token.as_deref() != Some(source_token));
+        let selected: HashSet<_> = request.template_ids.iter().collect();
+        if selected.is_empty()
+            || selected.len() != request.template_ids.len()
+            || selected
+                .iter()
+                .any(|id| !source.new_template_ids.contains_key(*id))
+        {
+            return Err("所选模板不存在、重复或为空".to_owned());
+        }
+        if request
+            .resolved_names
+            .keys()
+            .any(|id| !selected.contains(id))
+        {
+            return Err("拟用名称包含未选择的模板".to_owned());
+        }
+        let current = self.load_mapping_configuration_unlocked()?;
+        let mut next = current.clone();
+        let mut templates = Vec::new();
+        for original in &source.configuration.templates {
+            if !selected.contains(&original.id) {
+                continue;
+            }
+            let mut imported = original.clone();
+            imported.id = source.new_template_ids[&original.id].clone();
+            imported.name = request
+                .resolved_names
+                .get(&original.id)
+                .unwrap_or(&original.name)
+                .trim()
+                .to_owned();
+            templates.push(ImportedTemplatePreview {
+                source_template_id: original.id.clone(),
+                template: imported.clone(),
+            });
+            next.templates.push(imported);
+        }
+        let mut added_application_bindings = Vec::new();
+        let mut replaced_application_ids = Vec::new();
+        let mut skipped_application_ids = Vec::new();
+        let mut changed_bindings = Vec::new();
+        for imported in &source.configuration.application_bindings {
+            if !selected.contains(&imported.template_id) {
+                continue;
+            }
+            let existing = current
+                .application_bindings
+                .iter()
+                .find(|binding| binding.application_id == imported.application_id);
+            if existing.is_some() && !request.replace_application_bindings {
+                skipped_application_ids.push(imported.application_id.clone());
+                continue;
+            }
+            let binding = ApplicationBinding {
+                application_id: imported.application_id.clone(),
+                template_id: source.new_template_ids[&imported.template_id].clone(),
+                menu_order: imported.menu_order,
+                launch_target: local_launch_target(existing),
+            };
+            if existing.is_some() {
+                replaced_application_ids.push(binding.application_id.clone());
+                next.application_bindings
+                    .retain(|old| old.application_id != binding.application_id);
+            }
+            added_application_bindings.push((&binding).into());
+            changed_bindings.push(binding.clone());
+            next.application_bindings.push(binding);
+        }
+        let next = next.normalized()?;
+        let token = format!("apply-{}", new_template_id());
+        lock(&self.pending_imports).insert(
+            token.clone(),
+            PendingImport {
+                revision: source.revision,
+                configuration: next,
+                source_token: Some(source_token.to_owned()),
+            },
+        );
+        sayall_windows::gatt_note(format!("template_import phase=selected_previewed templates={} bindings_added={} bindings_replaced={} bindings_skipped={}", templates.len(), added_application_bindings.len(), replaced_application_ids.len(), skipped_application_ids.len()));
+        Ok(TemplateImportPreview {
+            token,
+            templates,
+            added_application_bindings,
+            replaced_application_ids,
+            skipped_application_ids,
+            unresolved_application_ids: unresolved_applications(&changed_bindings),
+        })
+    }
     pub fn load_voice_hold_hotkey(&self) -> Result<Option<KeyChord>, String> {
         let _guard = lock(&self.access);
         self.load_voice_hold_hotkey_unlocked()
@@ -238,6 +593,193 @@ impl SettingsStore {
     }
 }
 
+fn read_mapping_import(path: &Path) -> Result<ImportedMappingConfiguration, String> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|error| format!("读取模板配置失败：{error}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BUTTON_MAPPING_IMPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取模板配置失败：{error}"))?;
+    if bytes.len() as u64 > MAX_BUTTON_MAPPING_IMPORT_BYTES {
+        return Err("模板配置文件过大".to_owned());
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("解析模板配置失败：{error}"))
+}
+
+fn local_launch_target(binding: Option<&ApplicationBinding>) -> Option<String> {
+    binding
+        .and_then(|binding| binding.launch_target.as_ref())
+        .filter(|target| Path::new(target).is_absolute() && Path::new(target).is_file())
+        .cloned()
+}
+
+fn unresolved_applications(bindings: &[ApplicationBinding]) -> Vec<String> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.launch_target.is_none()
+                && sayall_windows::app_launcher::preset_app(&binding.application_id).is_none()
+        })
+        .map(|binding| binding.application_id.clone())
+        .collect()
+}
+
+fn logical_application_id(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, ':' | '/' | '\\'))
+}
+
+fn portable_common_mappings(
+    configuration: &MappingConfiguration,
+) -> Result<ButtonMappings, String> {
+    if configuration
+        .application_bindings
+        .iter()
+        .any(|binding| !logical_application_id(&binding.application_id))
+    {
+        return Err("应用 ID 必须为逻辑引用，不能包含路径或协议".to_owned());
+    }
+    let mut mappings = configuration.common_mappings.clone();
+    let mut references = HashMap::<String, String>::new();
+    let mut reserved: HashSet<String> = configuration
+        .application_bindings
+        .iter()
+        .map(|binding| binding.application_id.clone())
+        .collect();
+    for actions in mappings.actions.values() {
+        for action in [&actions.single, &actions.double, &actions.long] {
+            if let ButtonAction::OpenApp { target } = action {
+                if logical_application_id(target) {
+                    reserved.insert(target.clone());
+                }
+            }
+        }
+    }
+    let mut sequence = 0;
+    for actions in mappings.actions.values_mut() {
+        for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
+            if let ButtonAction::OpenApp { target } = action {
+                if logical_application_id(target) {
+                    continue;
+                }
+                let reference = references.entry(target.clone()).or_insert_with(|| {
+                    if let Some(binding) = configuration
+                        .application_bindings
+                        .iter()
+                        .find(|binding| binding.launch_target.as_deref() == Some(target.as_str()))
+                    {
+                        return binding.application_id.clone();
+                    }
+                    loop {
+                        sequence += 1;
+                        let candidate = format!("custom-app-{sequence}");
+                        if reserved.insert(candidate.clone()) {
+                            return candidate;
+                        }
+                    }
+                });
+                *target = reference.clone();
+            }
+        }
+    }
+    Ok(mappings)
+}
+
+fn unresolved_configuration(configuration: &MappingConfiguration) -> Vec<String> {
+    let mut unresolved: std::collections::BTreeSet<_> =
+        unresolved_applications(&configuration.application_bindings)
+            .into_iter()
+            .collect();
+    for actions in configuration.common_mappings.actions.values() {
+        for action in [&actions.single, &actions.double, &actions.long] {
+            if let ButtonAction::OpenApp { target } = action {
+                if logical_application_id(target)
+                    && sayall_windows::app_launcher::preset_app(target).is_none()
+                {
+                    unresolved.insert(target.clone());
+                }
+            }
+        }
+    }
+    unresolved.into_iter().collect()
+}
+
+fn resolve_mapping_import(
+    parsed: ImportedMappingConfiguration,
+    current: &MappingConfiguration,
+) -> Result<(u32, MappingConfiguration), String> {
+    let (version, mut configuration) = match parsed {
+        ImportedMappingConfiguration::V1(v) if v.format_version == 1 => (
+            1,
+            MappingConfiguration {
+                common_mappings: v.button_mappings,
+                ..current.clone()
+            },
+        ),
+        ImportedMappingConfiguration::V2(v) if v.format_version == 2 => (
+            2,
+            MappingConfiguration {
+                common_mappings: v.common_mappings,
+                template_control_enabled: v.template_control_enabled,
+                templates: v.templates,
+                application_bindings: v
+                    .application_bindings
+                    .into_iter()
+                    .map(|binding| {
+                        let local = current
+                            .application_bindings
+                            .iter()
+                            .find(|local| local.application_id == binding.application_id);
+                        ApplicationBinding {
+                            launch_target: local_launch_target(local),
+                            application_id: binding.application_id,
+                            template_id: binding.template_id,
+                            menu_order: binding.menu_order,
+                        }
+                    })
+                    .collect(),
+            },
+        ),
+        ImportedMappingConfiguration::V1(v) => {
+            return Err(format!("不支持的按键映射配置版本：{}", v.format_version))
+        }
+        ImportedMappingConfiguration::V2(v) => {
+            return Err(format!("不支持的模板配置版本：{}", v.format_version))
+        }
+    };
+    if version == 2 {
+        if configuration
+            .application_bindings
+            .iter()
+            .any(|binding| !logical_application_id(&binding.application_id))
+        {
+            return Err("导入应用 ID 必须为逻辑引用".to_owned());
+        }
+        for actions in configuration.common_mappings.actions.values_mut() {
+            for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
+                if let ButtonAction::OpenApp { target } = action {
+                    if !logical_application_id(target) {
+                        return Err("v2 导入不接受启动路径或协议，请使用逻辑应用引用".to_owned());
+                    }
+                    if sayall_windows::app_launcher::preset_app(target).is_none() {
+                        if let Some(local) = local_launch_target(
+                            current
+                                .application_bindings
+                                .iter()
+                                .find(|binding| binding.application_id == *target),
+                        ) {
+                            *target = local;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((version, configuration.normalized()?))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -254,9 +796,441 @@ fn serialize_settings(settings: &AppSettings) -> Result<Vec<u8>, String> {
     serde_json::to_vec_pretty(settings).map_err(|error| format!("序列化应用设置失败：{error}"))
 }
 
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "配置文件缺少父目录")
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "配置文件名无效"))?;
+    let temp = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let write_result = (|| {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::core::PCWSTR;
+            use windows::Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(source.as_ptr()),
+                    PCWSTR(destination.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            fs::rename(&temp, path)
+        }
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn template_test_store() -> SettingsStore {
+        let directory =
+            std::env::temp_dir().join(format!("sayall-template-test-{}", new_template_id()));
+        fs::create_dir_all(&directory).unwrap();
+        SettingsStore::new(directory.join("settings.json"))
+    }
+
+    fn source_configuration() -> MappingConfiguration {
+        let mut configuration = MappingConfiguration::default();
+        let first = configuration.create_template("阅读".to_owned()).unwrap();
+        let second = configuration.create_template("演示".to_owned()).unwrap();
+        for (application_id, template_id) in [("edge", first.id), ("custom-reader", second.id)] {
+            configuration.application_bindings.push(ApplicationBinding {
+                application_id: application_id.to_owned(),
+                template_id,
+                menu_order: 0,
+                launch_target: None,
+            });
+        }
+        configuration
+    }
+
+    fn source_file(store: &SettingsStore, configuration: MappingConfiguration) -> PathBuf {
+        let path = store
+            .path
+            .with_file_name(format!("source-{}.json", new_template_id()));
+        store
+            .export_mapping_configuration(&path, configuration, None)
+            .unwrap();
+        path
+    }
+
+    fn selected_request(ids: Vec<String>) -> TemplateImportRequest {
+        TemplateImportRequest {
+            template_ids: ids,
+            resolved_names: BTreeMap::new(),
+            replace_application_bindings: false,
+        }
+    }
+
+    #[test]
+    fn template_legacy_enabled_actions_is_not_silently_read_as_defaults() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::{ButtonActions, KeyCode};
+        let store = template_test_store();
+        let mut mappings = ButtonMappings::default();
+        mappings.enabled = false;
+        mappings.actions.insert(
+            RemoteButton::Back,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Escape],
+                    },
+                },
+                ..Default::default()
+            },
+        );
+        fs::write(
+            store.button_mappings_path(),
+            serde_json::to_vec(&mappings).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.load_mapping_configuration().unwrap();
+        assert_eq!(loaded.common_mappings, mappings);
+        assert!(!loaded.template_control_enabled);
+        assert!(loaded.templates.is_empty());
+        store.save_mapping_configuration(loaded.clone()).unwrap();
+        assert_eq!(store.load_mapping_configuration().unwrap(), loaded);
+        fs::write(store.button_mappings_path(), b"{}").unwrap();
+        assert!(store.load_mapping_configuration().is_err());
+    }
+
+    #[test]
+    fn template_v1_import_changes_only_common_and_applies_once() {
+        let store = template_test_store();
+        let original = source_configuration();
+        store.save_mapping_configuration(original.clone()).unwrap();
+        store.save_theme_preference(ThemePreference::Dark).unwrap();
+        let unrelated_settings = fs::read(&store.path).unwrap();
+        let mut mappings = ButtonMappings::default();
+        mappings.enabled = false;
+        let path = store.path.with_file_name("v1.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&ButtonMappingConfiguration {
+                format_version: 1,
+                button_mappings: mappings.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let preview = store.preview_mapping_configuration_import(&path).unwrap();
+        assert_eq!(preview.source_token, None);
+        let mut runtime = original.clone();
+        let saved = store
+            .apply_mapping_configuration_import_with(&preview.token, |configuration| {
+                runtime = configuration.clone()
+            })
+            .unwrap();
+        assert_eq!(saved.common_mappings, mappings);
+        assert_eq!(saved.templates, original.templates);
+        assert_eq!(saved.application_bindings, original.application_bindings);
+        assert_eq!(runtime, saved);
+        assert_eq!(fs::read(&store.path).unwrap(), unrelated_settings);
+        assert!(store
+            .apply_mapping_configuration_import(&preview.token)
+            .is_err());
+    }
+
+    #[test]
+    fn template_selected_import_resolves_names_preserves_global_and_skips_bindings() {
+        let store = template_test_store();
+        let original = source_configuration();
+        store.save_mapping_configuration(original.clone()).unwrap();
+        let source = source_configuration();
+        let path = source_file(&store, source.clone());
+        let initial = store.preview_mapping_configuration_import(&path).unwrap();
+        let source_token = initial.source_token.as_ref().unwrap();
+        assert!(store
+            .apply_mapping_configuration_import(source_token)
+            .is_err());
+        let first_id = source.templates[0].id.clone();
+        let mut request = selected_request(vec![first_id.clone()]);
+        let before = fs::read(store.button_mappings_path()).unwrap();
+        assert!(store
+            .preview_template_import(source_token, request.clone())
+            .is_err());
+        assert_eq!(fs::read(store.button_mappings_path()).unwrap(), before);
+        request
+            .resolved_names
+            .insert(first_id.clone(), "阅读副本".to_owned());
+        let first = store
+            .preview_template_import(source_token, request.clone())
+            .unwrap();
+        let second = store
+            .preview_template_import(source_token, request)
+            .unwrap();
+        assert_eq!(first.templates, second.templates);
+        assert_ne!(first.token, second.token);
+        assert_ne!(second.templates[0].template.id, first_id);
+        assert_eq!(second.skipped_application_ids, vec!["edge"]);
+        assert!(second.added_application_bindings.is_empty());
+        assert!(store
+            .apply_mapping_configuration_import(&initial.token)
+            .is_err());
+        assert!(store
+            .apply_mapping_configuration_import(&first.token)
+            .is_err());
+        let saved = store
+            .apply_mapping_configuration_import(&second.token)
+            .unwrap();
+        assert_eq!(saved.common_mappings, original.common_mappings);
+        assert_eq!(saved.application_bindings, original.application_bindings);
+        assert_eq!(
+            &saved.templates[..original.templates.len()],
+            original.templates.as_slice()
+        );
+        assert_eq!(saved.templates.len(), original.templates.len() + 1);
+    }
+
+    #[test]
+    fn template_selected_binding_replacement_is_explicit_and_keeps_valid_local_target() {
+        let store = template_test_store();
+        let mut current = source_configuration();
+        let local_target = store.path.with_file_name("local-reader.exe");
+        fs::write(&local_target, b"test fixture, never executed").unwrap();
+        current.application_bindings[0].launch_target =
+            Some(local_target.to_string_lossy().into_owned());
+        store.save_mapping_configuration(current.clone()).unwrap();
+        let source = source_configuration();
+        let path = source_file(&store, source.clone());
+        let initial = store.preview_mapping_configuration_import(&path).unwrap();
+        assert!(initial
+            .configuration
+            .application_bindings
+            .iter()
+            .all(|binding| binding.launch_target.is_none()));
+        let mut request = selected_request(
+            source
+                .templates
+                .iter()
+                .map(|template| template.id.clone())
+                .collect(),
+        );
+        request.replace_application_bindings = true;
+        for template in &source.templates {
+            request
+                .resolved_names
+                .insert(template.id.clone(), format!("{}副本", template.name));
+        }
+        let preview = store
+            .preview_template_import(initial.source_token.as_ref().unwrap(), request)
+            .unwrap();
+        assert_eq!(preview.replaced_application_ids.len(), 2);
+        let saved = store
+            .apply_mapping_configuration_import(&preview.token)
+            .unwrap();
+        assert_eq!(
+            saved.application_bindings[0].launch_target,
+            current.application_bindings[0].launch_target
+        );
+        assert_ne!(
+            saved.application_bindings[0].template_id,
+            current.application_bindings[0].template_id
+        );
+    }
+
+    #[test]
+    fn template_tokens_are_unique_one_use_and_reject_stale_revision() {
+        let store = template_test_store();
+        let source = source_configuration();
+        let path = source_file(&store, source);
+        let first = store.preview_mapping_configuration_import(&path).unwrap();
+        let second = store.preview_mapping_configuration_import(&path).unwrap();
+        assert_ne!(first.token, second.token);
+        assert!(store
+            .apply_mapping_configuration_import(&first.token)
+            .is_err());
+        let current = store
+            .save_mapping_configuration(MappingConfiguration::default())
+            .unwrap();
+        assert!(store
+            .apply_mapping_configuration_import(&second.token)
+            .unwrap_err()
+            .contains("过期"));
+        assert_eq!(store.load_mapping_configuration().unwrap(), current);
+        assert!(store
+            .apply_mapping_configuration_import(&second.token)
+            .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn template_atomic_replace_failure_keeps_file_runtime_and_revision() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let store = template_test_store();
+        let original = source_configuration();
+        store.save_mapping_configuration(original.clone()).unwrap();
+        let before = fs::read(store.button_mappings_path()).unwrap();
+        let revision = store.revision.load(Ordering::Acquire);
+        let imported_path = source_file(&store, MappingConfiguration::default());
+        let preview = store
+            .preview_mapping_configuration_import(&imported_path)
+            .unwrap();
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(store.button_mappings_path())
+            .unwrap();
+        let mut runtime = original.clone();
+        let mut candidate = original.clone();
+        candidate.template_control_enabled = true;
+        assert!(store
+            .save_mapping_configuration_with(candidate, |saved| runtime = saved.clone())
+            .is_err());
+        assert_eq!(runtime, original);
+        assert_eq!(fs::read(store.button_mappings_path()).unwrap(), before);
+        assert_eq!(store.revision.load(Ordering::Acquire), revision);
+        assert!(store
+            .apply_mapping_configuration_import_with(&preview.token, |saved| runtime =
+                saved.clone())
+            .is_err());
+        assert_eq!(runtime, original);
+        assert!(store
+            .apply_mapping_configuration_import(&preview.token)
+            .is_err());
+        drop(guard);
+        let mut invalid = original.clone();
+        invalid.templates[1].name = invalid.templates[0].name.clone();
+        assert!(store
+            .save_mapping_configuration_with(invalid, |saved| runtime = saved.clone())
+            .is_err());
+        assert_eq!(runtime, original);
+        assert_eq!(fs::read(store.button_mappings_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn template_v2_exports_logical_targets_and_rejects_incoming_paths_and_schemes() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::ButtonActions;
+        let store = template_test_store();
+        for target in [
+            r"C:\private\reader.exe",
+            r"\\host\share\reader.exe",
+            "https://host/reader.exe",
+            "shell:AppsFolder",
+        ] {
+            let mut configuration = MappingConfiguration::default();
+            configuration.common_mappings.actions.insert(
+                RemoteButton::Home,
+                ButtonActions {
+                    single: ButtonAction::OpenApp {
+                        target: target.to_owned(),
+                    },
+                    ..Default::default()
+                },
+            );
+            let path = source_file(&store, configuration);
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(!text.contains(target));
+            assert!(text.contains("custom-app-1"));
+            let preview = store.preview_mapping_configuration_import(&path).unwrap();
+            assert_eq!(preview.unresolved_application_ids, vec!["custom-app-1"]);
+            let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            value["commonMappings"]["actions"]["home"]["single"]["target"] = target.into();
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(store.preview_mapping_configuration_import(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn template_selected_import_validates_selection_and_new_binding_preview() {
+        let store = template_test_store();
+        let source = source_configuration();
+        let path = source_file(&store, source.clone());
+        let initial = store.preview_mapping_configuration_import(&path).unwrap();
+        let token = initial.source_token.unwrap();
+        for ids in [
+            vec![],
+            vec!["missing".to_owned()],
+            vec![source.templates[0].id.clone(); 2],
+        ] {
+            assert!(store
+                .preview_template_import(&token, selected_request(ids))
+                .is_err());
+        }
+        let preview = store
+            .preview_template_import(
+                &token,
+                selected_request(vec![source.templates[1].id.clone()]),
+            )
+            .unwrap();
+        assert_eq!(preview.added_application_bindings.len(), 1);
+        assert_eq!(preview.unresolved_application_ids, vec!["custom-reader"]);
+        assert!(preview.skipped_application_ids.is_empty());
+        let saved = store
+            .apply_mapping_configuration_import(&preview.token)
+            .unwrap();
+        assert_eq!(saved.templates.len(), 1);
+        assert_eq!(
+            saved.application_bindings[0].template_id,
+            saved.templates[0].id
+        );
+    }
+
+    #[test]
+    fn template_transactions_serialize_crud_and_runtime_application() {
+        let store = template_test_store();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let workers: Vec<_> = ["A", "B"]
+            .into_iter()
+            .map(|name| {
+                let store = store.clone();
+                let observed = Arc::clone(&observed);
+                std::thread::spawn(move || {
+                    store
+                        .update_mapping_configuration(
+                            |configuration| configuration.create_template(name.to_owned()),
+                            |configuration| lock(&observed).push(configuration.clone()),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let observed = lock(&observed);
+        assert_eq!(
+            observed
+                .iter()
+                .map(|configuration| configuration.templates.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(store.load_mapping_configuration().unwrap(), observed[1]);
+    }
 
     #[test]
     fn settings_round_trip_preserves_stable_endpoint_identity() {
@@ -373,61 +1347,6 @@ mod tests {
     }
 
     #[test]
-    fn exported_button_mapping_configuration_is_stable_versioned_and_rejects_before_mutation() {
-        use sayall_windows::raw_input::RemoteButton;
-        use sayall_windows::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
-
-        let base = std::env::temp_dir().join(format!(
-            "sayall-test-button-mapping-config-{}",
-            std::process::id()
-        ));
-        let settings_path = base.join("settings.json");
-        let export_path = base.join("mapping.json");
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let store = SettingsStore::new(settings_path);
-        let mut mappings = ButtonMappings::default();
-        mappings.actions.insert(
-            RemoteButton::Power,
-            ButtonActions {
-                single: ButtonAction::Shortcut {
-                    chord: KeyChord {
-                        keys: vec![KeyCode::Escape],
-                    },
-                },
-                double: ButtonAction::Disabled,
-                long: ButtonAction::Disabled,
-            },
-        );
-
-        store
-            .export_button_mappings(&export_path, mappings.clone())
-            .unwrap();
-        let exported: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&export_path).unwrap()).unwrap();
-        assert_eq!(exported["formatVersion"], 1);
-        assert!(exported.get("buttonMappings").is_some());
-        let first_export = std::fs::read(&export_path).unwrap();
-        store
-            .export_button_mappings(&export_path, mappings.clone())
-            .unwrap();
-        assert_eq!(std::fs::read(&export_path).unwrap(), first_export);
-        assert_eq!(
-            store.import_button_mappings(&export_path).unwrap(),
-            mappings
-        );
-
-        std::fs::write(
-            &export_path,
-            br#"{"formatVersion":99,"buttonMappings":{"enabled":false,"actions":{}}}"#,
-        )
-        .unwrap();
-        assert!(store.import_button_mappings(&export_path).is_err());
-        assert_eq!(store.load_button_mappings().unwrap(), mappings);
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
     fn voice_hold_hotkey_round_trips_and_validates_chord() {
         let store = SettingsStore::new(std::env::temp_dir().join(format!(
             "sayall-test-voice-hold-{}.json",
@@ -463,5 +1382,32 @@ mod tests {
         assert!(store.save_voice_hold_hotkey(Some(invalid)).is_err());
 
         let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
+    }
+
+    #[test]
+    fn selected_template_export_excludes_unselected_templates_and_launch_targets() {
+        let base =
+            std::env::temp_dir().join(format!("sayall-template-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(base.join("settings.json"));
+        let mut configuration = MappingConfiguration::default();
+        let first = configuration.create_template("阅读".to_owned()).unwrap();
+        let second = configuration.create_template("演示".to_owned()).unwrap();
+        configuration.application_bindings.push(ApplicationBinding {
+            application_id: "edge".to_owned(),
+            template_id: first.id.clone(),
+            menu_order: 0,
+            launch_target: Some("C:\\private\\edge.exe".to_owned()),
+        });
+        let output = base.join("selected.json");
+        store
+            .export_mapping_configuration(&output, configuration, Some(&[first.id.clone()]))
+            .unwrap();
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(text.contains(&first.id));
+        assert!(!text.contains(&second.id));
+        assert!(!text.contains("private"));
+        let _ = std::fs::remove_dir_all(base);
     }
 }

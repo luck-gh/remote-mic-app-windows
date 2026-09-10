@@ -1019,6 +1019,10 @@ fn handle_control(
             session_id,
             generation,
         } => {
+            // ATVV CONTROL 0x04 is the existing, device-attributed voice DOWN
+            // boundary. Notify the scene before any hotkey/audio work so a
+            // visible menu closes without adding latency to the voice path.
+            crate::scene_control::notify_voice_activity(true);
             // 语音会话纪元 +1：本轮 wetype_check 阶梯以此为 armed 纪元，
             // 后续新会话会使旧阶梯的核对失效（防跨会话误伤）。
             let epoch = voice_session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1259,6 +1263,9 @@ fn abort_voice_session(
 /// 释放失败会记录在 SendInput 快照的 last_error 中，由诊断摘要呈现。
 /// 同时解除语音键 F5 抑制器的会话武装（覆盖停止/中止/断连/退出全部路径）。
 fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+    // This helper is the existing common cleanup boundary for normal stop,
+    // abort, disconnect, sleep and shutdown. The notification is idempotent.
+    crate::scene_control::notify_voice_activity(false);
     crate::key_suppressor::set_session_active(false);
     if let Some(chord) = held_hotkey.take() {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。

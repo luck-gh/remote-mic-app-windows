@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 dist/
 target/
 src-tauri/target/
@@ -22,3 +23,5 @@ coverage/
 .idea/
 .vscode/
 pnpm-debug.log*
+/artifacts/windows-preview/SHA256SUMS.txt
+/artifacts/windows-preview/build-metadata.json

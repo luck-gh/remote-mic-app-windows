@@ -8,6 +8,7 @@ import type { PageId } from "./navigation";
 import AboutPage from "./pages/AboutPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
+import DriverGuidePage from "./pages/DriverGuidePage.vue";
 import PermissionsPage from "./pages/PermissionsPage.vue";
 
 const activePage = ref<PageId>("buttons");
@@ -19,6 +20,7 @@ let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
 let initialRuntimeReported = false;
 
 const activeComponent = computed(() => ({
+  drivers: DriverGuidePage,
   buttons: ButtonsPage,
   connection: ConnectionPage,
   permissions: PermissionsPage,

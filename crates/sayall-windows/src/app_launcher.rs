@@ -36,6 +36,11 @@ pub const PRESET_APPS: &[PresetApp] = &[
         exe_names: &["sayall-windows-app.exe"],
     },
     PresetApp {
+        id: "codex",
+        name: "Codex",
+        exe_names: &["Codex.exe"],
+    },
+    PresetApp {
         id: "wechat",
         name: "微信",
         exe_names: &["WeChat.exe", "Weixin.exe"],
@@ -71,6 +76,22 @@ pub const PRESET_APPS: &[PresetApp] = &[
         exe_names: &["cloudmusic.exe"],
     },
 ];
+
+/// Windows 蓝牙设置的固定公开协议入口。
+///
+/// 此值不接受前端参数，避免把宿主命令扩大为任意 URI/文件启动器。
+pub const BLUETOOTH_SETTINGS_URI: &str = "ms-settings:bluetooth";
+
+/// 打开 Windows 的“蓝牙和设备”设置页。
+#[cfg(windows)]
+pub fn open_bluetooth_settings() -> Result<(), String> {
+    launch_explicit(BLUETOOTH_SETTINGS_URI, None, None)
+}
+
+#[cfg(not(windows))]
+pub fn open_bluetooth_settings() -> Result<(), String> {
+    Err("打开 Windows 蓝牙设置仅在 Windows 上可用".to_owned())
+}
 
 pub fn preset_app(id: &str) -> Option<&'static PresetApp> {
     PRESET_APPS.iter().find(|app| app.id == id)
@@ -343,8 +364,7 @@ mod win_impl {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow,
-        SW_RESTORE,
+        GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
 
     pub(super) struct EnumContext<'a> {
@@ -712,6 +732,11 @@ mod tests {
             .expect("无线麦自身应在预设表首位");
         assert!(sayall.installed, "无线麦自身恒为已安装");
         assert_eq!(apps[0].id, "sayall", "对齐 Mac：自身排首位");
+    }
+
+    #[test]
+    fn bluetooth_settings_uses_only_the_fixed_windows_uri() {
+        assert_eq!(BLUETOOTH_SETTINGS_URI, "ms-settings:bluetooth");
     }
 
     /// COM 文件对话框管线（创建+标题+过滤器+选项）可用性探针；

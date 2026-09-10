@@ -1,15 +1,14 @@
-use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::send_input::{
     ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, SendInputSnapshot,
 };
 use sayall_windows::{
-    AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformSnapshot,
-    WindowsPlatform,
+    AudioEndpoint, AudioSnapshot, ConnectionPhase, ConnectionSnapshot, PairedRemote,
+    PlatformSnapshot, WindowsPlatform,
 };
 use serde::{Deserialize, Serialize};
 use settings::SettingsStore;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 mod diagnostics;
@@ -38,6 +37,14 @@ struct AppState {
     /// check_app_update 暂存的待安装更新（install_app_update 取走）。
     /// tauri_plugin_updater::Update 未实现 Debug，用手写 impl 只呈现存在性。
     pending_update: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+}
+
+fn synchronize_input_context(platform: &dyn PlatformRuntime, snapshot: &ConnectionSnapshot) {
+    let connected = matches!(
+        snapshot.phase,
+        ConnectionPhase::Ready | ConnectionPhase::Streaming | ConnectionPhase::Draining
+    );
+    platform.set_input_context(snapshot.remote_model, connected);
 }
 
 impl std::fmt::Debug for AppState {
@@ -122,9 +129,11 @@ async fn connect_remote(
     let settings = state.settings.clone();
     tauri::async_runtime::spawn_blocking(move || {
         settings.save_selected_remote_id(device_id.clone())?;
-        platform
+        let snapshot = platform
             .connect_remote(device_id)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        synchronize_input_context(platform.as_ref(), &snapshot);
+        Ok(snapshot)
     })
     .await
     .map_err(|error| format!("连接任务失败：{error}"))?
@@ -135,10 +144,35 @@ async fn disconnect_remote(
     state: tauri::State<'_, AppState>,
 ) -> Result<ConnectionSnapshot, String> {
     let platform = Arc::clone(&state.platform);
-    tauri::async_runtime::spawn_blocking(move || platform.disconnect_remote())
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = platform
+            .disconnect_remote()
+            .map_err(|error| error.to_string())?;
+        synchronize_input_context(platform.as_ref(), &snapshot);
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| format!("断开任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn open_bluetooth_settings(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    sayall_windows::gatt_note(
+        "bluetooth_settings action=open phase=started target=fixed_public_uri".to_owned(),
+    );
+    let platform = Arc::clone(&state.platform);
+    let result = tauri::async_runtime::spawn_blocking(move || platform.open_bluetooth_settings())
         .await
-        .map_err(|error| format!("断开任务失败：{error}"))?
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("打开 Windows 蓝牙设置任务失败：{error}"))?
+        .map_err(|error| error.to_string());
+    sayall_windows::gatt_note(match &result {
+        Ok(()) => {
+            "bluetooth_settings action=open phase=completed terminal_result=passed target=fixed_public_uri"
+                .to_owned()
+        }
+        Err(_) => "bluetooth_settings action=open phase=completed terminal_result=failed error_domain=platform error_code=shell_open_failed reason=windows_settings_unavailable retryable=true".to_owned(),
+    });
+    result
 }
 
 #[tauri::command]
@@ -218,6 +252,324 @@ fn get_button_mappings(state: tauri::State<'_, AppState>) -> ButtonMappings {
 }
 
 #[tauri::command]
+fn get_mapping_configuration(
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    state.settings.load_mapping_configuration()
+}
+
+fn apply_mapping_configuration(
+    platform: &dyn platform::PlatformRuntime,
+    configuration: &sayall_windows::templates::MappingConfiguration,
+) {
+    platform.set_mapping_configuration(configuration.clone());
+}
+
+#[tauri::command]
+async fn preview_mapping_configuration_import(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<sayall_windows::templates::MappingConfigurationImportPreview>, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = sayall_windows::file_dialog::pick_button_mapping_import_path()? else {
+            return Ok(None);
+        };
+        settings
+            .preview_mapping_configuration_import(&path)
+            .map(Some)
+    })
+    .await
+    .map_err(|error| format!("预览模板导入任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn apply_mapping_configuration_import(
+    token: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        settings.apply_mapping_configuration_import_with(&token, |saved| {
+            apply_mapping_configuration(platform.as_ref(), saved);
+        })
+    })
+    .await
+    .map_err(|error| format!("应用模板导入任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn export_mapping_configuration(
+    template_ids: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = sayall_windows::file_dialog::pick_button_mapping_export_path()? else {
+            return Ok(false);
+        };
+        let configuration = settings.load_mapping_configuration()?;
+        settings.export_mapping_configuration(&path, configuration, template_ids.as_deref())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| format!("导出模板配置任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn save_mapping_configuration(
+    configuration: sayall_windows::templates::MappingConfiguration,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        settings.save_mapping_configuration_with(configuration, |saved| {
+            apply_mapping_configuration(platform.as_ref(), saved);
+        })
+    })
+    .await
+    .map_err(|error| format!("保存模板配置任务失败：{error}"))?
+}
+
+#[tauri::command]
+fn get_mapping_template_presets() -> Vec<sayall_windows::templates::MappingTemplate> {
+    sayall_windows::templates::MappingConfiguration::recommended_templates()
+}
+
+#[tauri::command]
+fn get_scene_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Option<sayall_windows::scene_control::SceneSnapshot> {
+    state.platform.scene_snapshot()
+}
+
+#[tauri::command]
+fn get_component_status() -> Vec<sayall_windows::component_support::ComponentStatus> {
+    sayall_windows::component_support::inspect_components()
+}
+
+#[tauri::command]
+async fn perform_component_action(
+    component: sayall_windows::component_support::ComponentKind,
+    action: sayall_windows::component_support::ComponentAction,
+) -> Result<sayall_windows::component_support::ComponentOperation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sayall_windows::component_support::perform_component_action(component, action)
+    })
+    .await
+    .map_err(|error| format!("组件操作工作线程失败：{error}"))
+}
+
+#[tauri::command]
+async fn apply_mapping_template_preset(
+    preset_id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingTemplate, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, template) = settings.update_mapping_configuration(
+            |configuration| configuration.apply_template_preset(&preset_id, name),
+            |saved| apply_mapping_configuration(platform.as_ref(), saved),
+        )?;
+        Ok(template)
+    })
+    .await
+    .map_err(|error| format!("应用推荐模板任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn preview_template_import(
+    source_token: String,
+    request: sayall_windows::templates::TemplateImportRequest,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::TemplateImportPreview, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        settings.preview_template_import(&source_token, request)
+    })
+    .await
+    .map_err(|error| format!("预览选中模板任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn create_mapping_template(
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingTemplate, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, template) = settings.update_mapping_configuration(
+            |configuration| configuration.create_template(name),
+            |saved| apply_mapping_configuration(platform.as_ref(), saved),
+        )?;
+        Ok(template)
+    })
+    .await
+    .map_err(|error| format!("新建模板任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn duplicate_mapping_template(
+    template_id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingTemplate, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, template) = settings.update_mapping_configuration(
+            |configuration| configuration.duplicate_template(&template_id, name),
+            |saved| apply_mapping_configuration(platform.as_ref(), saved),
+        )?;
+        Ok(template)
+    })
+    .await
+    .map_err(|error| format!("复制模板任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn rename_mapping_template(
+    template_id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .update_mapping_configuration(
+                |configuration| {
+                    let template = configuration
+                        .templates
+                        .iter_mut()
+                        .find(|template| template.id == template_id)
+                        .ok_or_else(|| "模板不存在".to_owned())?;
+                    template.name = name;
+                    Ok(())
+                },
+                |saved| apply_mapping_configuration(platform.as_ref(), saved),
+            )
+            .map(|(saved, ())| saved)
+    })
+    .await
+    .map_err(|error| format!("重命名模板任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn delete_mapping_template(
+    template_id: String,
+    replacement_template_id: Option<String>,
+    unbind_applications: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .update_mapping_configuration(
+                |configuration| {
+                    if !configuration
+                        .templates
+                        .iter()
+                        .any(|template| template.id == template_id)
+                    {
+                        return Err("模板不存在".to_owned());
+                    }
+                    let bound = configuration
+                        .application_bindings
+                        .iter()
+                        .any(|binding| binding.template_id == template_id);
+                    if unbind_applications.unwrap_or(false) {
+                        if replacement_template_id.is_some() {
+                            return Err("重新绑定与解除绑定只能选择一项".to_owned());
+                        }
+                        configuration
+                            .application_bindings
+                            .retain(|binding| binding.template_id != template_id);
+                    } else if bound {
+                        let replacement = replacement_template_id.ok_or_else(|| {
+                            "模板仍有应用绑定，须重新绑定或明确解除绑定".to_owned()
+                        })?;
+                        if replacement == template_id
+                            || !configuration
+                                .templates
+                                .iter()
+                                .any(|template| template.id == replacement)
+                        {
+                            return Err("替换模板不存在".to_owned());
+                        }
+                        for binding in &mut configuration.application_bindings {
+                            if binding.template_id == template_id {
+                                binding.template_id = replacement.clone();
+                            }
+                        }
+                    }
+                    configuration
+                        .templates
+                        .retain(|template| template.id != template_id);
+                    Ok(())
+                },
+                |saved| apply_mapping_configuration(platform.as_ref(), saved),
+            )
+            .map(|(saved, ())| saved)
+    })
+    .await
+    .map_err(|error| format!("删除模板任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn upsert_application_binding(
+    binding: sayall_windows::templates::ApplicationBinding,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .update_mapping_configuration(
+                |configuration| {
+                    configuration
+                        .application_bindings
+                        .retain(|item| item.application_id != binding.application_id);
+                    configuration.application_bindings.push(binding);
+                    Ok(())
+                },
+                |saved| apply_mapping_configuration(platform.as_ref(), saved),
+            )
+            .map(|(saved, ())| saved)
+    })
+    .await
+    .map_err(|error| format!("保存应用绑定任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn remove_application_binding(
+    application_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .update_mapping_configuration(
+                |configuration| {
+                    configuration
+                        .application_bindings
+                        .retain(|binding| binding.application_id != application_id);
+                    Ok(())
+                },
+                |saved| apply_mapping_configuration(platform.as_ref(), saved),
+            )
+            .map(|(saved, ())| saved)
+    })
+    .await
+    .map_err(|error| format!("解除应用绑定任务失败：{error}"))?
+}
+#[tauri::command]
 async fn save_button_mappings(
     mappings: ButtonMappings,
     state: tauri::State<'_, AppState>,
@@ -231,10 +583,9 @@ async fn save_button_mappings(
     let platform = Arc::clone(&state.platform);
     let result =
         match tauri::async_runtime::spawn_blocking(move || -> Result<ButtonMappings, String> {
-            let saved = settings.save_button_mappings(mappings)?;
-            // 持久化成功后热加载到引擎与门控（保存即生效）。
-            platform.set_button_mappings(saved.clone());
-            Ok(saved)
+            settings.save_button_mappings_with(mappings, |saved| {
+                apply_mapping_configuration(platform.as_ref(), saved);
+            })
         })
         .await
         {
@@ -267,9 +618,9 @@ async fn reset_button_mappings(
     let platform = Arc::clone(&state.platform);
     let result =
         match tauri::async_runtime::spawn_blocking(move || -> Result<ButtonMappings, String> {
-            let saved = settings.save_button_mappings(ButtonMappings::default())?;
-            platform.set_button_mappings(saved.clone());
-            Ok(saved)
+            settings.save_button_mappings_with(ButtonMappings::default(), |saved| {
+                apply_mapping_configuration(platform.as_ref(), saved);
+            })
         })
         .await
         {
@@ -284,89 +635,6 @@ async fn reset_button_mappings(
         ),
         Err(_) => format!(
             "shortcut_settings feature=button_mapping action=reset phase=completed terminal_result=failed error_domain=settings error_code=save_failed reason=defaults_persistence_failed retryable=true elapsed_ms={}",
-            started.elapsed().as_millis()
-        ),
-    });
-    result
-}
-
-#[tauri::command]
-async fn export_button_mapping_configuration(
-    state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
-    let started = std::time::Instant::now();
-    sayall_windows::gatt_note(
-        "shortcut_settings feature=button_mapping action=export phase=requested".to_owned(),
-    );
-    let settings = state.settings.clone();
-    let mappings = state.platform.button_mappings();
-    let result = match tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
-        let Some(path) = sayall_windows::file_dialog::pick_button_mapping_export_path()? else {
-            return Ok(false);
-        };
-        settings.export_button_mappings(&path, mappings)?;
-        Ok(true)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(format!("导出按键映射配置任务失败：{error}")),
-    };
-    sayall_windows::gatt_note(match &result {
-        Ok(true) => format!(
-            "shortcut_settings feature=button_mapping action=export phase=completed terminal_result=passed elapsed_ms={}",
-            started.elapsed().as_millis()
-        ),
-        Ok(false) => format!(
-            "shortcut_settings feature=button_mapping action=export phase=completed terminal_result=cancelled elapsed_ms={}",
-            started.elapsed().as_millis()
-        ),
-        Err(_) => format!(
-            "shortcut_settings feature=button_mapping action=export phase=completed terminal_result=failed error_domain=settings error_code=export_failed reason=dialog_or_write_failed retryable=true elapsed_ms={}",
-            started.elapsed().as_millis()
-        ),
-    });
-    result
-}
-
-#[tauri::command]
-async fn import_button_mapping_configuration(
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<ButtonMappings>, String> {
-    let started = std::time::Instant::now();
-    sayall_windows::gatt_note(
-        "shortcut_settings feature=button_mapping action=import phase=requested".to_owned(),
-    );
-    let settings = state.settings.clone();
-    let platform = Arc::clone(&state.platform);
-    let result = match tauri::async_runtime::spawn_blocking(
-        move || -> Result<Option<ButtonMappings>, String> {
-            let Some(path) = sayall_windows::file_dialog::pick_button_mapping_import_path()? else {
-                return Ok(None);
-            };
-            let imported = settings.import_button_mappings(&path)?;
-            // 文件完整校验并持久化成功后才热加载，失败时运行态保持原值。
-            platform.set_button_mappings(imported.clone());
-            Ok(Some(imported))
-        },
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(format!("导入按键映射配置任务失败：{error}")),
-    };
-    sayall_windows::gatt_note(match &result {
-        Ok(Some(imported)) => format!(
-            "shortcut_settings feature=button_mapping action=import phase=completed terminal_result=passed {} elapsed_ms={}",
-            button_mapping_log_summary(imported),
-            started.elapsed().as_millis()
-        ),
-        Ok(None) => format!(
-            "shortcut_settings feature=button_mapping action=import phase=completed terminal_result=cancelled elapsed_ms={}",
-            started.elapsed().as_millis()
-        ),
-        Err(_) => format!(
-            "shortcut_settings feature=button_mapping action=import phase=completed terminal_result=failed error_domain=settings error_code=import_failed reason=dialog_read_parse_validation_or_persistence_failed retryable=true elapsed_ms={}",
             started.elapsed().as_millis()
         ),
     });
@@ -760,6 +1028,169 @@ fn register_button_events(platform: &Arc<dyn PlatformRuntime>, app: tauri::AppHa
     }));
 }
 
+const SCENE_OVERLAY_LABEL: &str = "scene-overlay";
+
+fn create_scene_overlay(app: &tauri::App) -> tauri::Result<()> {
+    if app.get_webview_window(SCENE_OVERLAY_LABEL).is_some() {
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        app,
+        SCENE_OVERLAY_LABEL,
+        tauri::WebviewUrl::App("index.html?scene-overlay=1".into()),
+    )
+    .title("无线麦场景菜单")
+    .inner_size(380.0, 360.0)
+    .resizable(false)
+    .closable(false)
+    .minimizable(false)
+    .maximizable(false)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .focusable(false)
+    .visible(false)
+    .build()?;
+    sayall_windows::gatt_note(
+        "scene_overlay action=create focusable=false visible=false terminal_result=passed"
+            .to_owned(),
+    );
+    Ok(())
+}
+
+fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_control::SceneEvent) {
+    let sayall_windows::scene_control::SceneEvent::Snapshot { snapshot } = event else {
+        return;
+    };
+    let Some(window) = app.get_webview_window(SCENE_OVERLAY_LABEL) else {
+        sayall_windows::gatt_note(
+            "scene_overlay action=visibility terminal_result=failed reason=window_unavailable"
+                .to_owned(),
+        );
+        return;
+    };
+    let result = if snapshot.panel.is_some() {
+        position_scene_overlay(&window).and_then(|()| window.show())
+    } else {
+        window.hide()
+    };
+    sayall_windows::gatt_note(format!(
+        "scene_overlay action={} terminal_result={} reason={}",
+        if snapshot.panel.is_some() {
+            "show"
+        } else {
+            "hide"
+        },
+        if result.is_ok() { "passed" } else { "failed" },
+        if result.is_ok() {
+            "snapshot_applied"
+        } else {
+            "window_operation_failed"
+        },
+    ));
+}
+
+fn position_scene_overlay(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    let monitors = window.available_monitors()?;
+    let target_center = foreground_window_center();
+    let monitor = target_center
+        .and_then(|(x, y)| {
+            monitors.iter().find(|monitor| {
+                let position = monitor.position();
+                let size = monitor.size();
+                x >= position.x
+                    && y >= position.y
+                    && x < position.x.saturating_add(size.width as i32)
+                    && y < position.y.saturating_add(size.height as i32)
+            })
+        })
+        .or_else(|| monitors.first());
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+    let overlay = window.outer_size()?;
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let x = monitor_position
+        .x
+        .saturating_add((monitor_size.width.saturating_sub(overlay.width) / 2) as i32);
+    let y = monitor_position.y.saturating_add(24);
+    window.set_position(tauri::PhysicalPosition::new(x, y))
+}
+
+#[cfg(windows)]
+fn foreground_window_center() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let mut bounds = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut bounds) }.ok()?;
+    Some((
+        bounds.left.saturating_add(bounds.right) / 2,
+        bounds.top.saturating_add(bounds.bottom) / 2,
+    ))
+}
+
+#[cfg(not(windows))]
+fn foreground_window_center() -> Option<(i32, i32)> {
+    None
+}
+
+fn register_scene_events(
+    platform: &Arc<dyn PlatformRuntime>,
+    settings: SettingsStore,
+    app: tauri::AppHandle,
+) -> std::io::Result<()> {
+    use sayall_windows::scene_control::SceneEvent;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let runtime = Arc::clone(platform);
+    let event_app = app.clone();
+    std::thread::Builder::new()
+        .name("sayall-scene-settings".to_owned())
+        .spawn(move || {
+            while let Ok((template_id, mode, generation)) = receiver.recv() {
+                let result = settings.update_mapping_configuration(
+                    |configuration| {
+                        let template = configuration.templates.iter_mut().find(|template| template.id == template_id)
+                            .ok_or_else(|| "调节模式目标模板已删除".to_owned())?;
+                        template.adjustment_mode = mode;
+                        Ok(())
+                    },
+                    |configuration| apply_mapping_configuration(runtime.as_ref(), configuration),
+                );
+                if result.is_err() {
+                    let restored = settings.apply_current_mapping_configuration(|configuration| {
+                        apply_mapping_configuration(runtime.as_ref(), configuration);
+                    });
+                    sayall_windows::gatt_note(format!("scene_control action=restore_confirmed_configuration generation={generation} terminal_result={}", if restored.is_ok() { "passed" } else { "failed" }));
+                }
+                sayall_windows::gatt_note(format!(
+                    "scene_control action=persist_adjustment_mode generation={generation} terminal_result={} reason={}",
+                    if result.is_ok() { "passed" } else { "failed" },
+                    if result.is_ok() { "latest_configuration_updated" } else { "validation_or_write_failed" },
+                ));
+                let _ = app.emit("scene-mode-persistence", serde_json::json!({ "generation": generation, "saved": result.is_ok() }));
+            }
+        })
+        ?;
+    platform.subscribe_scene_events(Arc::new(move |event| {
+        update_scene_overlay(&event_app, &event);
+        let _ = event_app.emit("scene-event", &event);
+        if let SceneEvent::AdjustmentModePersistenceRequested { template_id, mode, generation } = &event {
+            if sender.send((template_id.clone(), *mode, *generation)).is_err() {
+                sayall_windows::gatt_note("scene_control action=persist_adjustment_mode terminal_result=failed reason=worker_unavailable".to_owned());
+            }
+        }
+    }));
+    Ok(())
+}
+
 /// Raw Input 监听自愈监督线程：启动尝试一次（遥控器休眠时可能失败）；
 /// 此后每 10 秒巡检，phase=Failed（启动失败或监听线程意外退出）时自动重启。
 /// Stopped（用户在按键页显式停止）不重启；成功后保持低频巡检自愈。
@@ -965,24 +1396,24 @@ pub fn run() {
                 }
             };
             let platform = create_platform();
-            let button_mappings = match settings.load_button_mappings() {
-                Ok(mappings) => {
+            let mapping_configuration = match settings.load_mapping_configuration() {
+                Ok(configuration) => {
                     sayall_windows::gatt_note(format!(
                         "shortcut_settings feature=button_mapping action=load phase=completed terminal_result=passed {}",
-                        button_mapping_log_summary(&mappings)
+                        button_mapping_log_summary(&configuration.common_mappings)
                     ));
-                    mappings
+                    configuration
                 }
                 Err(error) => {
                     sayall_windows::gatt_note(
                         "shortcut_settings feature=button_mapping action=load phase=completed terminal_result=failed error_domain=settings error_code=parse_or_read_failed reason=defaults_applied retryable=true".to_owned(),
                     );
                     eprintln!("{error}");
-                    ButtonMappings::default()
+                    sayall_windows::templates::MappingConfiguration::default()
                 }
             };
             // 启动即热加载已保存映射（引擎与门控吞键配置同步就绪）。
-            platform.set_button_mappings(button_mappings);
+            platform.set_mapping_configuration(mapping_configuration);
 
             #[cfg(windows)]
             if let (Some(endpoint_id), Some(endpoint_name)) = (
@@ -999,8 +1430,13 @@ pub fn run() {
 
             #[cfg(windows)]
             if let Some(device_id) = saved_settings.selected_remote_id {
-                if let Err(error) = platform.restore_remote(device_id) {
-                    eprintln!("恢复已保存的小米语音遥控器失败：{error}");
+                match platform.restore_remote(device_id) {
+                    Ok(snapshot) => synchronize_input_context(platform.as_ref(), &snapshot),
+                    Err(error) => {
+                        // A failed restore must fail closed so stale mappings cannot run.
+                        synchronize_input_context(platform.as_ref(), &ConnectionSnapshot::default());
+                        eprintln!("恢复已保存的小米语音遥控器失败：{error}");
+                    }
                 }
             }
 
@@ -1025,8 +1461,10 @@ pub fn run() {
             #[cfg(not(windows))]
             let _ = saved_settings;
 
+            create_scene_overlay(app)?;
             // 语义按键边沿与手势事件 → 前端（画布高亮与单击/双击/长按反馈）。
             register_button_events(&platform, app.handle().clone());
+            register_scene_events(&platform, settings.clone(), app.handle().clone())?;
 
             // Raw Input 监听自愈：启动即尝试，失败（遥控器休眠/未连接）进入
             // 10 秒重试循环；用户在按键页显式停止（Stopped）时不重试。
@@ -1063,6 +1501,7 @@ pub fn run() {
         get_connection_snapshot,
         connect_remote,
         disconnect_remote,
+        open_bluetooth_settings,
         list_audio_endpoints,
         get_audio_snapshot,
         select_audio_endpoint,
@@ -1070,10 +1509,25 @@ pub fn run() {
         start_raw_input,
         stop_raw_input,
         get_button_mappings,
+        get_mapping_configuration,
+        get_mapping_template_presets,
+        get_scene_snapshot,
+        get_component_status,
+        perform_component_action,
+        apply_mapping_template_preset,
+        preview_template_import,
+        preview_mapping_configuration_import,
+        apply_mapping_configuration_import,
+        export_mapping_configuration,
+        save_mapping_configuration,
+        create_mapping_template,
+        duplicate_mapping_template,
+        rename_mapping_template,
+        delete_mapping_template,
+        upsert_application_binding,
+        remove_application_binding,
         save_button_mappings,
         reset_button_mappings,
-        export_button_mapping_configuration,
-        import_button_mapping_configuration,
         test_button_mapping,
         list_preset_apps,
         pick_custom_app,
@@ -1100,6 +1554,7 @@ pub fn run() {
         get_connection_snapshot,
         connect_remote,
         disconnect_remote,
+        open_bluetooth_settings,
         list_audio_endpoints,
         get_audio_snapshot,
         select_audio_endpoint,
@@ -1107,10 +1562,25 @@ pub fn run() {
         start_raw_input,
         stop_raw_input,
         get_button_mappings,
+        get_mapping_configuration,
+        get_mapping_template_presets,
+        get_scene_snapshot,
+        get_component_status,
+        perform_component_action,
+        apply_mapping_template_preset,
+        preview_template_import,
+        preview_mapping_configuration_import,
+        apply_mapping_configuration_import,
+        export_mapping_configuration,
+        save_mapping_configuration,
+        create_mapping_template,
+        duplicate_mapping_template,
+        rename_mapping_template,
+        delete_mapping_template,
+        upsert_application_binding,
+        remove_application_binding,
         save_button_mappings,
         reset_button_mappings,
-        export_button_mapping_configuration,
-        import_button_mapping_configuration,
         test_button_mapping,
         list_preset_apps,
         pick_custom_app,

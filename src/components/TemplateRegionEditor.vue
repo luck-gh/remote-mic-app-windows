@@ -1,0 +1,17 @@
+<script setup lang="ts">
+import { ref, watch } from "vue";
+import type { ControlRegion, MappingTemplate, RemoteButton, SemanticAction } from "../lib/bridge";
+
+const props = defineProps<{ template: MappingTemplate }>();
+const emit = defineEmits<{ save: [template: MappingTemplate]; cancel: [] }>();
+const draft = ref<MappingTemplate>(structuredClone(props.template));
+watch(() => props.template, (value) => { draft.value = structuredClone(value); });
+const regions: Array<[ControlRegion, string]> = [["application_list", "程序列表"], ["content", "内容区"], ["input", "输入框"]];
+const buttons: Array<[RemoteButton, string]> = [["up","上"],["down","下"],["left","左"],["right","右"],["ok","确定"],["back","返回"],["home","主页"],["tv","直播"],["volume_up","音量＋"],["volume_down","音量－"],["power","电源"],["menu","菜单"]];
+const actions: Array<[SemanticAction,string]> = [["disabled","未设置"],["select_previous","选择上一项"],["select_next","选择下一项"],["select_parent","选择父项"],["expand_selection","展开"],["activate_selection","打开/激活"],["cancel_selection","取消选择"],["focus_application_list","聚焦列表"],["focus_content","聚焦内容"],["focus_input","聚焦输入框"],["scroll_up","向上滚动"],["scroll_down","向下滚动"],["browser_back","网页后退"],["previous_tab","上一标签页"],["next_tab","下一标签页"],["native_enter","原生 Enter"],["newline","换行"],["send","发送"],["backspace","退格"],["page_up","向上翻页"],["page_down","向下翻页"],["zoom_in","放大"],["zoom_out","缩小"],["escape","Esc"]];
+function value(region: ControlRegion, button: RemoteButton, trigger: "single"|"double"|"long") { return draft.value.regionActions[region]?.[button]?.[trigger] ?? "disabled"; }
+function set(region: ControlRegion, button: RemoteButton, trigger: "single"|"double"|"long", action: SemanticAction) { const all = structuredClone(draft.value.regionActions); const item = all[region]?.[button] ?? { single:"disabled",double:"disabled",long:"disabled" }; item[trigger]=action; all[region]={ ...(all[region]??{}), [button]:item }; draft.value={...draft.value,regionActions:all}; }
+function reset() { draft.value=structuredClone(props.template); emit("cancel"); }
+function save() { emit("save", structuredClone(draft.value)); }
+</script>
+<template><section class="card"><div class="card-title-row"><div><h2>{{ draft.name }} · 区域按键</h2><p class="muted">动作由应用公开能力决定；不可用时不会替代执行。</p></div><label>调节模式 <select v-model="draft.adjustmentMode"><option value="volume">音量</option><option value="page">翻页</option><option value="zoom">缩放</option></select></label></div><p class="muted">菜单短按打开程序列表、长按打开调节列表；语音键固定按住开始、释放结束。</p><details v-for="[region,label] in regions" :key="region"><summary>{{ label }}</summary><table><thead><tr><th>按键</th><th>单击</th><th>双击</th><th>长按</th></tr></thead><tbody><tr v-for="[button,label2] in buttons" :key="button"><th>{{ label2 }}</th><td v-for="trigger in ['single','double','long'] as const" :key="trigger"><span v-if="button==='menu' || button==='volume_up' || button==='volume_down'">{{ button==='menu' ? (trigger==='single'?'程序列表':trigger==='long'?'调节列表':'固定') : '当前调节模式' }}</span><select v-else :value="value(region,button,trigger)" @change="set(region,button,trigger,($event.target as HTMLSelectElement).value as SemanticAction)"><option v-for="[id,text] in actions" :key="id" :value="id">{{ text }}</option></select></td></tr></tbody></table></details><div class="button-row"><button type="button" @click="save">保存模板</button><button type="button" class="secondary-button" @click="reset">取消</button></div></section></template>

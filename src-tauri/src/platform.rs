@@ -2,7 +2,7 @@ use sayall_windows::raw_input::RawInputSnapshot;
 use sayall_windows::send_input::{KeyChord, SendInputSnapshot};
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformError,
-    PlatformSnapshot, UsageCounters, WindowsPlatform,
+    PlatformSnapshot, RemoteModel, UsageCounters, WindowsPlatform,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -34,10 +34,20 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo>;
     /// 打开/激活预设应用（测试按钮与引擎共用路径）。
     fn launch_app(&self, target: &str) -> Result<(), PlatformError>;
+    /// 打开固定的 Windows 蓝牙设置页；不接受前端 URI。
+    fn open_bluetooth_settings(&self) -> Result<(), PlatformError>;
     fn voice_hold_hotkey(&self) -> Option<KeyChord>;
     fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>);
     fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings;
     fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings);
+    fn set_mapping_configuration(
+        &self,
+        configuration: sayall_windows::templates::MappingConfiguration,
+    );
+    fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot>;
+    fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback);
+    /// Called by the owner of a connection state transition, never by a UI poll.
+    fn set_input_context(&self, _model: RemoteModel, _connected: bool) {}
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
     fn subscribe_button_edges(&self, callback: sayall_windows::button_mapping::ButtonEdgeCallback);
     fn subscribe_button_gestures(
@@ -131,6 +141,11 @@ impl PlatformRuntime for WindowsPlatform {
             .map_err(|error| PlatformError::SendInput(error.to_string()))
     }
 
+    fn open_bluetooth_settings(&self) -> Result<(), PlatformError> {
+        sayall_windows::app_launcher::open_bluetooth_settings()
+            .map_err(|error| PlatformError::WindowsApi(error.to_string()))
+    }
+
     fn voice_hold_hotkey(&self) -> Option<KeyChord> {
         WindowsPlatform::voice_hold_hotkey(self)
     }
@@ -145,6 +160,25 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings) {
         WindowsPlatform::set_button_mappings(self, mappings)
+    }
+
+    fn set_mapping_configuration(
+        &self,
+        configuration: sayall_windows::templates::MappingConfiguration,
+    ) {
+        WindowsPlatform::set_mapping_configuration(self, configuration)
+    }
+
+    fn set_input_context(&self, model: RemoteModel, connected: bool) {
+        WindowsPlatform::set_input_context(self, model, connected)
+    }
+
+    fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot> {
+        Some(WindowsPlatform::scene_snapshot(self))
+    }
+
+    fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback) {
+        WindowsPlatform::subscribe_scene_events(self, callback)
     }
 
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot {
@@ -420,6 +454,11 @@ mod simulation {
             Ok(())
         }
 
+        fn open_bluetooth_settings(&self) -> Result<(), PlatformError> {
+            // CI 仿真只验证固定命令闭环，不打开真实系统设置。
+            Ok(())
+        }
+
         fn voice_hold_hotkey(&self) -> Option<KeyChord> {
             lock(&self.voice_hold_hotkey).clone()
         }
@@ -436,6 +475,13 @@ mod simulation {
             *lock(&self.button_mappings) = mappings;
         }
 
+        fn set_mapping_configuration(
+            &self,
+            configuration: sayall_windows::templates::MappingConfiguration,
+        ) {
+            *lock(&self.button_mappings) = configuration.common_mappings;
+        }
+
         fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot {
             sayall_windows::button_mapping::ButtonMappingSnapshot {
                 enabled: lock(&self.button_mappings).enabled,
@@ -447,6 +493,17 @@ mod simulation {
                 last_fired: None,
                 last_error: None,
             }
+        }
+
+        fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot> {
+            // The CI voice simulation does not simulate foreground accessibility.
+            None
+        }
+
+        fn subscribe_scene_events(
+            &self,
+            _callback: sayall_windows::scene_control::SceneEventCallback,
+        ) {
         }
 
         fn subscribe_button_edges(
@@ -542,6 +599,7 @@ mod simulation {
         #[test]
         fn simulation_runs_connection_audio_raw_input_and_send_input_journey() {
             let platform = SimulatedPlatform::default();
+            platform.open_bluetooth_settings().unwrap();
             assert_eq!(platform.scan_paired_remotes().unwrap().len(), 2);
             assert_eq!(
                 platform

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
@@ -107,6 +108,64 @@ export interface ButtonActions {
 export interface ButtonMappings {
   enabled: boolean;
   actions: Partial<Record<RemoteButton, ButtonActions>>;
+}
+
+export type AdjustmentMode = "volume" | "page" | "zoom";
+export type ControlRegion = "application_list" | "content" | "input";
+export type SemanticAction =
+  | "disabled" | "select_previous" | "select_next" | "select_parent"
+  | "expand_selection" | "activate_selection" | "cancel_selection"
+  | "focus_application_list" | "focus_content" | "focus_input"
+  | "scroll_up" | "scroll_down" | "browser_back" | "previous_tab" | "next_tab"
+  | "native_enter" | "newline" | "send" | "backspace" | "page_up" | "page_down"
+  | "zoom_in" | "zoom_out" | "volume_up" | "volume_down"
+  | "open_application_menu" | "open_adjustment_menu" | "escape";
+export interface SemanticButtonActions { single: SemanticAction; double: SemanticAction; long: SemanticAction; }
+export interface MappingTemplate {
+  id: string; name: string;
+  regionActions: Partial<Record<ControlRegion, Partial<Record<RemoteButton, SemanticButtonActions>>>>;
+  adjustmentMode: AdjustmentMode;
+}
+export interface ApplicationBinding { applicationId: string; templateId: string; menuOrder: number; launchTarget?: string | null; }
+export interface MappingConfiguration {
+  commonMappings: ButtonMappings; templateControlEnabled: boolean;
+  templates: MappingTemplate[]; applicationBindings: ApplicationBinding[];
+}
+export interface MappingConfigurationImportPreview { token: string; sourceToken: string | null; formatVersion: number; configuration: MappingConfiguration; templateNameConflicts: string[]; unresolvedApplicationIds: string[]; }
+export interface SceneMenuItem { applicationId:string|null; templateId:string; label:string; running:boolean; }
+export type FocusRegion = "application_list" | "content" | "input" | "ime_candidate" | "modal" | "unknown";
+export type ActionResult = "performed" | "unavailable" | "blocked" | "stale" | "failed";
+export interface ActionOutcome { action: SemanticAction; result: ActionResult; reason: string | null; generation: number; }
+export interface SceneSnapshot { enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; focusRegion:FocusRegion; controlRegion:ControlRegion|null; adjustmentMode:AdjustmentMode|null; panel:"application"|"adjustment"|null; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; lastAction:SemanticAction|null; lastResult:ActionResult|null; status:string|null; }
+export type SceneEvent =
+  | { type:"snapshot"; snapshot:SceneSnapshot }
+  | { type:"action_completed"; outcome:ActionOutcome }
+  | { type:"launch_failed"; applicationId:string; generation:number; reason:string }
+  | { type:"adjustment_mode_persistence_requested"; templateId:string; mode:AdjustmentMode; generation:number };
+export interface TemplateImportRequest { templateIds: string[]; resolvedNames: Record<string,string>; replaceApplicationBindings: boolean; }
+export interface TemplateImportPreview { token:string; templates:Array<{sourceTemplateId:string;template:MappingTemplate}>; addedApplicationBindings:ApplicationBinding[]; replacedApplicationIds:string[]; skippedApplicationIds:string[]; unresolvedApplicationIds:string[]; }
+export type ComponentKind = "hid_enhancement" | "vb_cable";
+export type ComponentAction = "install" | "repair" | "remove" | "open_vendor_wizard";
+export type InstallationState = "unknown" | "not_installed" | "installed_not_loaded" | "available" | "restart_required" | "incompatible" | "failed" | "not_implemented";
+export type PackageState = "missing" | "trusted" | "signature_missing" | "authorization_missing" | "incompatible" | "failed" | "download_available";
+export type ComponentReason =
+  | "ready" | "not_installed" | "service_not_loaded" | "audio_endpoints_missing" | "identity_unavailable"
+  | "package_missing" | "signing_policy_missing" | "authorization_missing" | "uninstall_package_missing"
+  | "unsupported_platform" | "unsupported_architecture" | "detection_failed" | "access_denied"
+  | "restart_required" | "path_rejected" | "hash_mismatch" | "signature_invalid" | "publisher_mismatch"
+  | "version_mismatch" | "invalid_package" | "uac_cancelled" | "uac_denied" | "helper_unavailable"
+  | "helper_timed_out" | "helper_failed" | "verification_failed" | "operation_unsupported" | "operation_in_progress"
+  | "not_implemented" | "official_wizard_required" | "download_failed" | "wizard_closed";
+export type ComponentOperationOutcome = "blocked" | "cancelled" | "denied" | "timed_out" | "restart_required" | "failed" | "completed" | "wizard_closed";
+export interface ComponentStatus {
+  component: ComponentKind; installation: InstallationState; package: PackageState;
+  installedVersion: string | null; serviceInstalled: boolean | null; loaded: boolean | null;
+  bound: boolean | null; audioEndpointsReady: boolean | null; restartRequired: boolean;
+  reason: ComponentReason; blockers: ComponentReason[]; allowedActions: ComponentAction[];
+}
+export interface ComponentOperation {
+  component: ComponentKind; action: ComponentAction; outcome: ComponentOperationOutcome;
+  reason: ComponentReason; status: ComponentStatus;
 }
 
 export interface FiredGesture {
@@ -481,6 +540,41 @@ export async function getButtonMappings(): Promise<ButtonMappings> {
   return invoke<ButtonMappings>("get_button_mappings");
 }
 
+export async function openBluetoothSettings(): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开 Windows 蓝牙设置");
+  await invoke("open_bluetooth_settings");
+}
+
+export async function getMappingConfiguration(): Promise<MappingConfiguration> {
+  if (!isTauriRuntime()) return { commonMappings: { enabled: true, actions: {} }, templateControlEnabled: false, templates: [], applicationBindings: [] };
+  return invoke<MappingConfiguration>("get_mapping_configuration");
+}
+export async function saveMappingConfiguration(configuration: MappingConfiguration): Promise<MappingConfiguration> {
+  return invoke<MappingConfiguration>("save_mapping_configuration", { configuration });
+}
+export async function createMappingTemplate(name: string): Promise<MappingTemplate> { return invoke("create_mapping_template", { name }); }
+export async function duplicateMappingTemplate(templateId: string, name: string): Promise<MappingTemplate> { return invoke("duplicate_mapping_template", { templateId, name }); }
+export async function renameMappingTemplate(templateId: string, name: string): Promise<MappingConfiguration> { return invoke("rename_mapping_template", { templateId, name }); }
+export async function deleteMappingTemplate(templateId: string, replacementTemplateId: string | null): Promise<MappingConfiguration> { return invoke("delete_mapping_template", { templateId, replacementTemplateId }); }
+export async function upsertApplicationBinding(binding: ApplicationBinding): Promise<MappingConfiguration> { return invoke("upsert_application_binding", { binding }); }
+export async function removeApplicationBinding(applicationId: string): Promise<MappingConfiguration> { return invoke("remove_application_binding", { applicationId }); }
+export async function exportMappingConfiguration(templateIds: string[] | null = null): Promise<boolean> { return invoke("export_mapping_configuration", { templateIds }); }
+export async function previewMappingConfigurationImport(): Promise<MappingConfigurationImportPreview | null> { return invoke("preview_mapping_configuration_import"); }
+export async function applyMappingConfigurationImport(token: string): Promise<MappingConfiguration> { return invoke("apply_mapping_configuration_import", { token }); }
+export async function previewTemplateImport(sourceToken:string, request:TemplateImportRequest):Promise<TemplateImportPreview>{return invoke("preview_template_import",{sourceToken,request});}
+export async function getMappingTemplatePresets():Promise<MappingTemplate[]>{return invoke("get_mapping_template_presets");}
+export async function applyMappingTemplatePreset(presetId:string,name:string):Promise<MappingTemplate>{return invoke("apply_mapping_template_preset",{presetId,name});}
+export async function getSceneSnapshot():Promise<SceneSnapshot|null>{return invoke("get_scene_snapshot");}
+export async function subscribeSceneEvents(callback:(event:SceneEvent)=>void):Promise<()=>void>{const unlisten=await listen<SceneEvent>("scene-event",event=>callback(event.payload));return unlisten;}
+export async function getComponentStatus(): Promise<ComponentStatus[]> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法检测组件状态");
+  return invoke<ComponentStatus[]>("get_component_status");
+}
+export async function performComponentAction(component: ComponentKind, action: ComponentAction): Promise<ComponentOperation> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法执行组件操作");
+  return invoke<ComponentOperation>("perform_component_action", { component, action });
+}
+
 export async function saveButtonMappings(mappings: ButtonMappings): Promise<ButtonMappings> {
   if (!isTauriRuntime()) {
     throw new Error("当前是浏览器预览，无法保存按键映射");
@@ -495,21 +589,6 @@ export async function resetButtonMappings(): Promise<ButtonMappings> {
   return invoke<ButtonMappings>("reset_button_mappings");
 }
 
-/** 返回 false 表示用户在系统文件选择器中取消。 */
-export async function exportButtonMappingConfiguration(): Promise<boolean> {
-  if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法导出按键映射配置");
-  }
-  return invoke<boolean>("export_button_mapping_configuration");
-}
-
-/** 返回 null 表示用户在系统文件选择器中取消。 */
-export async function importButtonMappingConfiguration(): Promise<ButtonMappings | null> {
-  if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法导入按键映射配置");
-  }
-  return invoke<ButtonMappings | null>("import_button_mapping_configuration");
-}
 
 export async function testButtonMapping(
   button: RemoteButton,

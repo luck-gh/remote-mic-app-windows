@@ -1,17 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+import MappingTemplatesPanel from "../components/MappingTemplatesPanel.vue";
 import {
   actionSummary,
   buttonLabel,
   buttonLabels,
   buttonTriggerLabel,
   chordLabel,
-  exportButtonMappingConfiguration,
+  exportMappingConfiguration,
   getButtonMappingSnapshot,
   getButtonMappings,
   identityShortcutByButton,
-  importButtonMappingConfiguration,
   listPresetApps,
   pickCustomApp,
   registerPresetAppNames,
@@ -38,6 +38,7 @@ import {
 } from "../lib/bridge";
 
 const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+const activeSection = ref<"global" | "templates">("global");
 
 /** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 570，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
@@ -99,11 +100,7 @@ const remoteModel = computed<RemoteModel>(
  * RC001 上虽以 VK 0xFF 厂商键可达且可直接归因，为保持两型号行为一致而
  * 不开放配置。存量配置由后端（settings 持久化层 + 映射引擎）双重剥离。
  */
-const UNMAPPABLE_BUTTONS: ReadonlySet<RemoteButton> = new Set<RemoteButton>([
-  "back",
-  "volume_up",
-  "volume_down",
-]);
+const UNMAPPABLE_BUTTONS: ReadonlySet<RemoteButton> = new Set<RemoteButton>();
 
 function anchorPoint(placement: Placement): { x: number; y: number } {
   return {
@@ -432,26 +429,8 @@ async function exportConfiguration(): Promise<void> {
   busy.value = true;
   statusMessage.value = null;
   try {
-    const exported = await exportButtonMappingConfiguration();
+    const exported = await exportMappingConfiguration(null);
     if (exported) statusMessage.value = "按键映射配置已导出";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function importConfiguration(): Promise<void> {
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const imported = await importButtonMappingConfiguration();
-    if (!imported) return;
-    mappings.value = imported;
-    savedSnapshot.value = JSON.parse(JSON.stringify(imported)) as ButtonMappings;
-    editingTarget.value = null;
-    mappingSnapshot.value = await getButtonMappingSnapshot();
-    statusMessage.value = "按键映射配置已导入并生效";
   } catch (error) {
     statusMessage.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -720,6 +699,34 @@ onUnmounted(() => {
       </div>
     </header>
 
+    <div class="mapping-section-tabs" role="tablist" aria-label="按键设置分区">
+      <button
+        id="global-mapping-tab"
+        class="mapping-section-tab"
+        :class="{ active: activeSection === 'global' }"
+        type="button"
+        role="tab"
+        aria-controls="global-mapping-panel"
+        :aria-selected="activeSection === 'global'"
+        @click="activeSection = 'global'"
+      >
+        通用映射
+      </button>
+      <button
+        id="template-mapping-tab"
+        class="mapping-section-tab"
+        :class="{ active: activeSection === 'templates' }"
+        type="button"
+        role="tab"
+        aria-controls="template-mapping-panel"
+        :aria-selected="activeSection === 'templates'"
+        @click="activeSection = 'templates'"
+      >
+        模板与应用
+      </button>
+    </div>
+
+    <div id="global-mapping-panel" v-show="activeSection === 'global'" role="tabpanel" aria-labelledby="global-mapping-tab">
     <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px` }">
       <svg
         class="mapping-connections"
@@ -971,9 +978,6 @@ onUnmounted(() => {
         <button class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
           保存配置
         </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="importConfiguration">
-          导入配置…
-        </button>
         <button class="secondary-button" type="button" :disabled="busy" @click="exportConfiguration">
           导出配置…
         </button>
@@ -982,6 +986,12 @@ onUnmounted(() => {
         </button>
       </div>
     </footer>
+    </div>
+
+    <section id="template-mapping-panel" v-show="activeSection === 'templates'" class="template-management" role="tabpanel" aria-labelledby="template-mapping-tab">
+      <p class="muted">模板与应用绑定仅在模板控制开启且前台应用已绑定时生效；其他情况继续使用通用映射。</p>
+      <MappingTemplatesPanel />
+    </section>
 
     <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
     <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>

@@ -45,6 +45,7 @@ mod windows_impl {
     use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetTimer, SetWindowsHookExW,
         TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
@@ -77,6 +78,7 @@ mod windows_impl {
     static GATE_ACTIVE: AtomicBool = AtomicBool::new(false);
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static MAPPED_MASK: AtomicU64 = AtomicU64::new(0);
+    static POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
     /// 常驻抑制掩码（"遥控器优先"）：遥 online 期间无需武装直接吞。
     /// 由映射引擎在映射变化时写入（当前仅 Home/TV，见 button_mapping.rs）。
     static PERSISTENT_MASK: AtomicU64 = AtomicU64::new(0);
@@ -99,8 +101,42 @@ mod windows_impl {
     thread_local! {
         /// (vk, make) → 按住配对状态（true=本次按住的 DOWN 全部被吞）。
         /// 仅钩子线程读写。
-        static HOLD_PAIRING: RefCell<HashMap<(u16, u16), bool>> =
+        static HOLD_PAIRING: RefCell<HashMap<(u16, u16), HoldPairing>> =
             RefCell::new(HashMap::new());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct HoldPairing {
+        pub all_swallowed: bool,
+        pub generation: u64,
+    }
+
+    pub fn seed_native_hold(
+        previous: Option<HoldPairing>,
+        state: i16,
+        generation: u64,
+    ) -> Option<HoldPairing> {
+        previous.or_else(|| {
+            (state < 0).then_some(HoldPairing {
+                all_swallowed: false,
+                // Treat an already-native hold as belonging to the previous policy.
+                generation: generation.wrapping_sub(1),
+            })
+        })
+    }
+
+    /// A cancelled captured hold drains privately until UP. A leaked hold keeps
+    /// its native release; neither can be adopted by the next configuration.
+    pub fn cancelled_down(
+        pairing: Option<HoldPairing>,
+        generation: u64,
+        ready: bool,
+    ) -> Option<bool> {
+        match pairing {
+            Some(hold) if !ready || hold.generation != generation => Some(hold.all_swallowed),
+            None if !ready => Some(false),
+            _ => None,
+        }
     }
 
     pub const HOLD_NONE: u32 = 0;
@@ -178,11 +214,11 @@ mod windows_impl {
         if injected {
             return false;
         }
-        if !gate_ready {
-            return false;
-        }
         if is_key_up {
             return hold_pairing == HOLD_SWALLOWED_ALL;
+        }
+        if !gate_ready {
+            return false;
         }
         direct_attributed || armed_now
     }
@@ -198,8 +234,11 @@ mod windows_impl {
     /// 取走一次按住的配对裁决（UP 沿无论吞放都消费条目，纯函数供单测）：
     /// true=本次按住的 DOWN 全部被吞（吞 UP）；false/缺失=放行 UP。
     /// 条目在 UP 沿必定清除——泄漏污染不跨按住残留。
-    pub fn take_up_pairing(pairing: &mut HashMap<(u16, u16), bool>, key: (u16, u16)) -> bool {
-        pairing.remove(&key).unwrap_or(false)
+    pub fn take_up_pairing(
+        pairing: &mut HashMap<(u16, u16), HoldPairing>,
+        key: (u16, u16),
+    ) -> bool {
+        pairing.remove(&key).is_some_and(|hold| hold.all_swallowed)
     }
 
     fn feed_edge(button: RemoteButton, is_pressed: bool) {
@@ -237,11 +276,6 @@ mod windows_impl {
         let Some(button) = button_for_keyboard(vk_code as u16, make_code) else {
             return false;
         };
-        if !gate_ready(button) {
-            // 未映射按键：不吞、不记配对（原始行为透传）。
-            return false;
-        }
-
         if is_key_up {
             // UP 沿无论吞放都消费配对条目：泄漏污染只在"本次按住"内生效
             //（2026-09-06 调查档案"后续发现"的修复——此前泄漏后的条目跨按住
@@ -252,6 +286,39 @@ mod windows_impl {
             if swallow {
                 SWALLOWED_EDGES.fetch_add(1, Ordering::Relaxed);
                 feed_edge(button, false);
+            }
+            return swallow;
+        }
+
+        let generation = POLICY_GENERATION.load(Ordering::Acquire);
+        let key = (vk_code as u16, make_code);
+        let mut previous = HOLD_PAIRING.with(|pairing| pairing.borrow().get(&key).copied());
+        if previous.is_none() {
+            // LowLevelKeyboardProc runs BEFORE asynchronous state is updated.
+            // Only a positive high-bit observation proves an earlier native DOWN;
+            // zero is also returned for inaccessible desktops and proves no identity.
+            // https://learn.microsoft.com/windows/win32/winmsg/lowlevelkeyboardproc
+            let state = unsafe { GetAsyncKeyState(vk_code as i32) };
+            previous = seed_native_hold(None, state, generation);
+            if let Some(hold) = previous {
+                HOLD_PAIRING.with(|pairing| {
+                    pairing.borrow_mut().insert(key, hold);
+                });
+                crate::ble::gatt_note(
+                    "map_gate_existing_native_down attribution=unknown release=passthrough"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(swallow) = cancelled_down(previous, generation, gate_ready(button)) {
+            HOLD_PAIRING.with(|pairing| {
+                pairing.borrow_mut().entry(key).or_insert(HoldPairing {
+                    all_swallowed: false,
+                    generation,
+                });
+            });
+            if swallow {
+                SWALLOWED_EDGES.fetch_add(1, Ordering::Relaxed);
             }
             return swallow;
         }
@@ -280,14 +347,22 @@ mod windows_impl {
         // 配对状态：true=本次按住的 DOWN 全部被吞（供 UP 沿裁决）。
         HOLD_PAIRING.with(|pairing| {
             let mut pairing = pairing.borrow_mut();
-            let next = track_down(
-                pairing.get(&(vk_code as u16, make_code)).copied(),
-                attributed,
+            let next = track_down(pairing.get(&key).map(|hold| hold.all_swallowed), attributed);
+            pairing.insert(
+                key,
+                HoldPairing {
+                    all_swallowed: next,
+                    generation,
+                },
             );
-            pairing.insert((vk_code as u16, make_code), next);
         });
         if attributed {
             SWALLOWED_EDGES.fetch_add(1, Ordering::Relaxed);
+            // A context change may happen during the bounded attribution wait.
+            // Keep the captured pair, but never dispatch that stale DOWN.
+            if POLICY_GENERATION.load(Ordering::Acquire) != generation || !gate_ready(button) {
+                return true;
+            }
             // 自我续期武装：覆盖同一次按住的后续事件（多键盘事件/未知固件形态）。
             ARMED_UNTIL_MS[button.ordinal()].store(now_ms() + ARM_GRACE_MS, Ordering::Relaxed);
             feed_edge(button, true);
@@ -423,6 +498,13 @@ mod windows_impl {
         MAPPED_MASK.store(mapped_mask, Ordering::Relaxed);
     }
 
+    pub fn cancel_pending_holds() {
+        POLICY_GENERATION.fetch_add(1, Ordering::AcqRel);
+        for slot in &ARMED_UNTIL_MS {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// 更新常驻抑制掩码（"遥控器优先"，映射引擎在映射变化时调用）：
     /// 当前为已映射的 Home/TV 位。仅在掩码位命中且遥控器在线时，
     /// 该键按下沿无需武装直接吞（跳过 60ms 有界等待，零额外延迟）。
@@ -441,6 +523,7 @@ mod windows_impl {
     pub fn set_listener_active(active: bool) {
         LISTENER_ACTIVE.store(active, Ordering::Relaxed);
         if !active {
+            cancel_pending_holds();
             for slot in &ARMED_UNTIL_MS {
                 slot.store(0, Ordering::Relaxed);
             }
@@ -479,8 +562,8 @@ mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    arm_button, configure, decide, is_gate_thread_alive, leaked_down_count, listener_active,
-    set_edge_sink, set_listener_active, set_persistent_mask, set_remote_connected,
+    arm_button, cancel_pending_holds, configure, decide, is_gate_thread_alive, leaked_down_count,
+    listener_active, set_edge_sink, set_listener_active, set_persistent_mask, set_remote_connected,
     swallowed_edge_count, KeyGate, HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWED_ALL,
 };
 
@@ -502,6 +585,7 @@ mod fallback {
     }
 
     pub fn configure(_enabled: bool, _mapped_mask: u64) {}
+    pub fn cancel_pending_holds() {}
     pub fn set_persistent_mask(_mask: u64) {}
     pub fn set_remote_connected(_connected: bool) {}
     pub fn set_listener_active(_active: bool) {}
@@ -615,11 +699,23 @@ mod tests {
         // 泄漏污染只在"本次按住"内生效，不跨按住残留。
         let mut pairing = std::collections::HashMap::new();
         // 第一次按住：DOWN 泄漏（false）→ UP 放行且条目被消费。
-        pairing.insert((0x5D, 0x5D), false);
+        pairing.insert(
+            (0x5D, 0x5D),
+            windows_impl::HoldPairing {
+                all_swallowed: false,
+                generation: 1,
+            },
+        );
         assert!(!windows_impl::take_up_pairing(&mut pairing, (0x5D, 0x5D)));
         assert!(pairing.is_empty(), "泄漏条目必须在 UP 沿清除");
         // 第二次按住：DOWN 全吞 → UP 吞（不受上一次泄漏污染）。
-        pairing.insert((0x5D, 0x5D), true);
+        pairing.insert(
+            (0x5D, 0x5D),
+            windows_impl::HoldPairing {
+                all_swallowed: true,
+                generation: 1,
+            },
+        );
         assert!(windows_impl::take_up_pairing(&mut pairing, (0x5D, 0x5D)));
         assert!(pairing.is_empty(), "全吞条目同样在 UP 沿清除");
         // 配对未知（钩子中途启动）→ 放行。
@@ -655,6 +751,71 @@ mod tests {
         assert!(!decide(
             0x0D, 0x1C, true, false, false, true, HOLD_NONE, true
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_holds_drain_and_releases_survive_disable_disconnect_and_restart() {
+        use windows_impl::{cancelled_down, take_up_pairing, HoldPairing};
+        for all_swallowed in [true, false] {
+            let hold = HoldPairing {
+                all_swallowed,
+                generation: 1,
+            };
+            assert_eq!(cancelled_down(Some(hold), 1, false), Some(all_swallowed));
+            assert_eq!(cancelled_down(Some(hold), 2, true), Some(all_swallowed));
+            let mut pairing = std::collections::HashMap::from([((0x0D, 0x1C), hold)]);
+            assert_eq!(take_up_pairing(&mut pairing, (0x0D, 0x1C)), all_swallowed);
+            assert!(pairing.is_empty());
+            assert!(!take_up_pairing(&mut pairing, (0x0D, 0x1C)));
+        }
+        assert!(decide(
+            0x0D,
+            0x1C,
+            true,
+            false,
+            false,
+            false,
+            HOLD_SWALLOWED_ALL,
+            false
+        ));
+        assert!(!decide(
+            0x0D,
+            0x1C,
+            true,
+            false,
+            false,
+            false,
+            HOLD_LEAKED,
+            false
+        ));
+        assert_eq!(cancelled_down(None, 2, false), Some(false));
+        assert_eq!(cancelled_down(None, 2, true), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn previously_native_down_survives_process_restart_or_another_keyboard() {
+        use windows_impl::{cancelled_down, seed_native_hold, take_up_pairing, HoldPairing};
+        for observed in [i16::MIN, -1] {
+            let seeded = seed_native_hold(None, observed, 0).unwrap();
+            assert!(!seeded.all_swallowed);
+            assert_eq!(cancelled_down(Some(seeded), 0, true), Some(false));
+            let mut holds = std::collections::HashMap::from([((0x0D, 0x1C), seeded)]);
+            assert!(!take_up_pairing(&mut holds, (0x0D, 0x1C)));
+        }
+        // The unreliable low bit and a zero/unknown result never seed a hold.
+        assert!(seed_native_hold(None, 1, 3).is_none());
+        assert!(seed_native_hold(None, 0, 3).is_none());
+        let own = HoldPairing {
+            all_swallowed: true,
+            generation: 3,
+        };
+        assert!(
+            seed_native_hold(Some(own), i16::MIN, 3)
+                .unwrap()
+                .all_swallowed
+        );
     }
 
     #[cfg(not(windows))]

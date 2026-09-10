@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
 pub mod app_launcher;
+pub mod application_control;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
@@ -18,6 +19,7 @@ mod bluetooth_radio;
 mod button_gestures;
 pub mod button_mapping;
 pub mod compatibility;
+pub mod component_support;
 pub mod file_dialog;
 #[cfg(windows)]
 pub use ble::{gatt_note, initialize_diagnostic_log, DiagnosticLogMetadata};
@@ -33,11 +35,13 @@ pub mod raw_input;
 mod raw_input_windows;
 #[cfg(any(windows, test))]
 mod reconnect;
+pub mod scene_control;
 pub mod send_input;
 /// 真实注入运行时（2026-09-06 起 pub：预设注入链路真机验证探针
 /// examples/preset_inject_probe.rs 需复用与映射引擎完全相同的管线）。
 #[cfg(windows)]
 pub mod send_input_windows;
+pub mod templates;
 #[cfg(windows)]
 mod wetype_revive;
 
@@ -211,6 +215,7 @@ pub struct WindowsPlatform {
     usage: Arc<UsageCounters>,
     voice_hold_hotkey: Arc<Mutex<Option<send_input::KeyChord>>>,
     button_mapping: Arc<ButtonMappingRuntime>,
+    scene_control: Arc<scene_control::SceneController>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
     // 抑制器与门控句柄"持有即运行"：字段本身不被读取，随平台生命周期保活
     //（Drop 时停止钩子线程）。
@@ -273,6 +278,16 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
             ));
+            let scene_control = scene_control::SceneController::new();
+            scene_control::register_voice_scene(&scene_control);
+            button_mapping.set_gesture_handler(Some(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |gesture| scene.handle_gesture(gesture)
+            })));
+            button_mapping.subscribe_button_edges(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |edge| scene.handle_edge(edge)
+            }));
             // 语音键 F5 抑制器与 BLE 工作线程通过模块级静态状态协作，
             // 这里只负责随平台生命周期启动/停止。
             let voice_key_suppressor = Arc::new(key_suppressor::VoiceKeySuppressor::start());
@@ -297,6 +312,7 @@ impl Default for WindowsPlatform {
                 usage,
                 voice_hold_hotkey,
                 button_mapping,
+                scene_control,
                 raw_input_snapshot,
                 voice_key_suppressor,
                 key_gate,
@@ -317,10 +333,21 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
             ));
+            let scene_control = scene_control::SceneController::new();
+            scene_control::register_voice_scene(&scene_control);
+            button_mapping.set_gesture_handler(Some(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |gesture| scene.handle_gesture(gesture)
+            })));
+            button_mapping.subscribe_button_edges(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |edge| scene.handle_edge(edge)
+            }));
             Self {
                 usage,
                 voice_hold_hotkey,
                 button_mapping,
+                scene_control,
                 raw_input_snapshot,
             }
         }
@@ -416,6 +443,33 @@ impl WindowsPlatform {
     /// 更新按键映射：持久化由 Tauri 层负责，这里热加载到引擎并同步门控配置。
     pub fn set_button_mappings(&self, mappings: send_input::ButtonMappings) {
         self.button_mapping.set_mappings(mappings);
+    }
+
+    /// Apply the complete persisted mapping state in one host callback.
+    /// This method never calls persistence callbacks and is safe under the
+    /// settings transaction lock.
+    pub fn set_mapping_configuration(&self, configuration: templates::MappingConfiguration) {
+        let common = configuration.common_mappings.clone();
+        let scene = self.scene_control.set_configuration(configuration);
+        self.button_mapping.set_mappings(common);
+        self.button_mapping.set_scene_mappings(scene);
+    }
+
+    pub fn scene_snapshot(&self) -> scene_control::SceneSnapshot {
+        self.scene_control.snapshot()
+    }
+
+    pub fn subscribe_scene_events(&self, callback: scene_control::SceneEventCallback) {
+        self.scene_control.subscribe(callback);
+    }
+
+    pub fn notify_scene_voice_active(&self, active: bool) {
+        self.scene_control.notify_voice_active(active);
+    }
+
+    /// Synchronize the identified connection at the same transition that owns it.
+    pub fn set_input_context(&self, model: RemoteModel, connected: bool) {
+        self.button_mapping.set_input_context(model, connected);
     }
 
     pub fn button_mappings(&self) -> send_input::ButtonMappings {
