@@ -3,12 +3,13 @@ use sayall_windows::send_input::{
     ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, SendInputSnapshot,
 };
 use sayall_windows::{
-    AudioEndpoint, AudioSnapshot, ConnectionPhase, ConnectionSnapshot, PairedRemote,
-    PlatformSnapshot, WindowsPlatform,
+    AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformSnapshot,
+    WindowsPlatform,
 };
 use serde::{Deserialize, Serialize};
 use settings::SettingsStore;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use tauri::{Emitter, Manager};
 
 mod diagnostics;
@@ -31,20 +32,341 @@ struct RuntimeSnapshot {
     platform: PlatformSnapshot,
 }
 
+#[tauri::command]
+fn get_capture_input(
+    state: tauri::State<'_, AppState>,
+) -> sayall_windows::capture_input::CaptureInputSnapshot {
+    state.platform.capture_input_snapshot()
+}
+#[tauri::command]
+async fn list_capture_inputs(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AudioEndpoint>, String> {
+    let platform = state.platform.clone();
+    tauri::async_runtime::spawn_blocking(move || platform.list_capture_inputs())
+        .await
+        .map_err(|_| "输入设备枚举任务失败".to_owned())?
+}
+
+#[tauri::command]
+async fn set_capture_input(
+    state: tauri::State<'_, AppState>,
+    config: sayall_core::CaptureInputSettings,
+) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+    let platform = state.platform.clone();
+    let settings = state.settings.clone();
+    let operation = state.capture_config_operation.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        capture_config_transaction(&operation, platform.as_ref(), config, |value| {
+            settings.save_capture_input(value)
+        })
+    })
+    .await
+    .map_err(|_| "输入设备设置任务失败".to_owned())?
+}
+fn capture_config_transaction(
+    operation: &Mutex<()>,
+    platform: &dyn PlatformRuntime,
+    config: sayall_core::CaptureInputSettings,
+    persist: impl FnOnce(sayall_core::CaptureInputSettings) -> Result<(), String>,
+) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+    let _operation = operation.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = platform.capture_input_snapshot().settings;
+    match platform.configure_capture_input(config.clone()) {
+        Ok(_) => {}
+        Err(error) => {
+            let rollback = platform.configure_capture_input(previous);
+            sayall_windows::gatt_note(format!(
+                "capture_input action=config_apply result=failed rollback_ok={}",
+                rollback.is_ok()
+            ));
+            return Err(error);
+        }
+    };
+    if persist(config).is_err() {
+        let rollback = platform.configure_capture_input(previous);
+        sayall_windows::gatt_note(format!(
+            "capture_input action=config_persist result=failed rollback_ok={}",
+            rollback.is_ok()
+        ));
+        return Err("保存输入设备设置失败，请重新检查设置".to_owned());
+    }
+    Ok(platform.capture_input_snapshot())
+}
+
+#[tauri::command]
+async fn resolve_capture_recovery(
+    state: tauri::State<'_, AppState>,
+    restore: bool,
+) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+    let platform = state.platform.clone();
+    let operation = state.capture_config_operation.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = operation.lock().unwrap_or_else(|e| e.into_inner());
+        platform.resolve_capture_recovery(restore)
+    })
+    .await
+    .map_err(|_| "输入设备恢复任务失败".to_owned())?
+}
+
 struct AppState {
+    capture_config_operation: Arc<Mutex<()>>,
     platform: Arc<dyn PlatformRuntime>,
+    exit_cleanup: ExitCleanup,
     settings: SettingsStore,
     /// check_app_update 暂存的待安装更新（install_app_update 取走）。
     /// tauri_plugin_updater::Update 未实现 Debug，用手写 impl 只呈现存在性。
     pending_update: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
 }
 
-fn synchronize_input_context(platform: &dyn PlatformRuntime, snapshot: &ConnectionSnapshot) {
-    let connected = matches!(
-        snapshot.phase,
-        ConnectionPhase::Ready | ConnectionPhase::Streaming | ConnectionPhase::Draining
-    );
-    platform.set_input_context(snapshot.remote_model, connected);
+#[derive(Debug, Clone, Copy)]
+enum ExitCleanupPhase {
+    Idle,
+    Running,
+    Finished { clean: bool },
+}
+
+struct RawInputSupervisorWorker {
+    handle: std::thread::JoinHandle<()>,
+    stopped: mpsc::Receiver<()>,
+}
+
+struct RawInputSupervisor {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    worker: Mutex<Option<RawInputSupervisorWorker>>,
+    spawn_failed: bool,
+}
+
+impl RawInputSupervisor {
+    fn stop(&self) -> Result<(), &'static str> {
+        {
+            let (lock, wake) = self.stop.as_ref();
+            *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            wake.notify_all();
+        }
+        let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return if self.spawn_failed {
+                Err("worker_spawn_failed")
+            } else {
+                Ok(())
+            };
+        };
+        match worker
+            .stopped
+            .recv_timeout(raw_input_supervisor_stop_bound())
+        {
+            Ok(()) => worker.handle.join().map_err(|_| "worker_panicked"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                worker.handle.join().map_err(|_| "worker_panicked")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Dropping a JoinHandle detaches it. The worker only owns a
+                // Weak platform reference and every start attempt is
+                // independently bounded, so a late worker cannot keep the
+                // platform alive or begin another iteration after stop.
+                drop(worker.handle);
+                Err("worker_stop_timeout")
+            }
+        }
+    }
+}
+
+struct ExitCleanupInner {
+    platform: Arc<dyn PlatformRuntime>,
+    supervisor: RawInputSupervisor,
+    phase: Mutex<ExitCleanupPhase>,
+    phase_changed: Condvar,
+    exit_worker_started: AtomicBool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExitCleanup(Arc<ExitCleanupInner>);
+
+impl ExitCleanup {
+    fn new(platform: Arc<dyn PlatformRuntime>, supervisor: RawInputSupervisor) -> Self {
+        Self(Arc::new(ExitCleanupInner {
+            platform,
+            supervisor,
+            phase: Mutex::new(ExitCleanupPhase::Idle),
+            phase_changed: Condvar::new(),
+            exit_worker_started: AtomicBool::new(false),
+        }))
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(
+            *self
+                .0
+                .phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ExitCleanupPhase::Finished { .. }
+        )
+    }
+
+    fn begin_exit_worker(&self) -> bool {
+        !self.is_finished()
+            && self
+                .0
+                .exit_worker_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    fn reset_exit_worker(&self) {
+        self.0.exit_worker_started.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn shutdown_blocking(&self) -> bool {
+        let mut phase = self
+            .0
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            match *phase {
+                ExitCleanupPhase::Finished { clean } => return clean,
+                ExitCleanupPhase::Idle => {
+                    *phase = ExitCleanupPhase::Running;
+                    break;
+                }
+                ExitCleanupPhase::Running => {
+                    let waited = self
+                        .0
+                        .phase_changed
+                        .wait_timeout(phase, std::time::Duration::from_secs(45))
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    phase = waited.0;
+                    if waited.1.timed_out() {
+                        sayall_windows::gatt_note(
+                            "app_shutdown stage=wait_for_owner phase=completed terminal_result=failed error_domain=lifecycle error_code=cleanup_wait_timeout reason=owner_not_completed retryable=true took_ms=45000".to_owned(),
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+        drop(phase);
+
+        let overall_started = std::time::Instant::now();
+        let mut failures = 0u8;
+        sayall_windows::gatt_note(
+            "app_shutdown stage=overall phase=started terminal_result=pending".to_owned(),
+        );
+
+        let started = std::time::Instant::now();
+        sayall_windows::gatt_note(
+            "app_shutdown stage=supervisor_stop phase=started terminal_result=pending".to_owned(),
+        );
+        let supervisor_result = self.0.supervisor.stop();
+        failures += u8::from(supervisor_result.is_err());
+        sayall_windows::gatt_note(format!(
+            "app_shutdown stage=supervisor_stop phase=completed terminal_result={} error_code={} took_ms={}",
+            if supervisor_result.is_ok() {
+                "passed"
+            } else {
+                "failed"
+            },
+            supervisor_result.err().unwrap_or("none"),
+            started.elapsed().as_millis()
+        ));
+
+        let started = std::time::Instant::now();
+        sayall_windows::gatt_note(
+            "app_shutdown stage=input_quiesce phase=started terminal_result=pending".to_owned(),
+        );
+        let input_result = self.0.platform.quiesce_input();
+        failures += u8::from(input_result.is_err());
+        sayall_windows::gatt_note(format!(
+            "app_shutdown stage=input_quiesce phase=completed terminal_result={} error_code={} took_ms={}",
+            if input_result.is_ok() {
+                "passed"
+            } else {
+                "failed"
+            },
+            if input_result.is_ok() {
+                "none"
+            } else {
+                "barrier_failed"
+            },
+            started.elapsed().as_millis()
+        ));
+
+        let started = std::time::Instant::now();
+        sayall_windows::gatt_note(
+            "app_shutdown stage=raw_input_stop phase=started terminal_result=pending".to_owned(),
+        );
+        let raw_input_result = self.0.platform.stop_raw_input();
+        failures += u8::from(raw_input_result.is_err());
+        sayall_windows::gatt_note(format!(
+            "app_shutdown stage=raw_input_stop phase=completed terminal_result={} error_code={} took_ms={}",
+            if raw_input_result.is_ok() {
+                "passed"
+            } else {
+                "failed"
+            },
+            if raw_input_result.is_ok() {
+                "none"
+            } else {
+                "stop_failed"
+            },
+            started.elapsed().as_millis()
+        ));
+
+        let started = std::time::Instant::now();
+        sayall_windows::gatt_note(
+            "app_shutdown stage=ble_disconnect phase=started terminal_result=pending".to_owned(),
+        );
+        let disconnect_result = self.0.platform.disconnect_remote();
+        failures += u8::from(disconnect_result.is_err());
+        sayall_windows::gatt_note(format!(
+            "app_shutdown stage=ble_disconnect phase=completed terminal_result={} error_code={} took_ms={}",
+            if disconnect_result.is_ok() {
+                "passed"
+            } else {
+                "failed"
+            },
+            if disconnect_result.is_ok() {
+                "none"
+            } else {
+                "disconnect_failed"
+            },
+            started.elapsed().as_millis()
+        ));
+
+        // BLE owns hotkey UP and audio interruption; never restore capture first.
+        if disconnect_result.is_ok() {
+            let route_result = self.0.platform.shutdown_capture_input();
+            failures += u8::from(route_result.is_err());
+            sayall_windows::gatt_note(format!(
+                "app_shutdown stage=capture_route result={}",
+                route_result
+                    .as_ref()
+                    .map(|_| "passed")
+                    .unwrap_or_else(|e| e.as_str())
+            ));
+        }
+        let clean = failures == 0;
+        sayall_windows::gatt_note(format!(
+            "app_shutdown stage=overall phase=completed terminal_result={} failed_stages={} took_ms={}",
+            if clean { "passed" } else { "failed" },
+            failures,
+            overall_started.elapsed().as_millis()
+        ));
+        let mut phase = self
+            .0
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *phase = ExitCleanupPhase::Finished { clean };
+        self.0.phase_changed.notify_all();
+        clean
+    }
 }
 
 impl std::fmt::Debug for AppState {
@@ -129,11 +451,9 @@ async fn connect_remote(
     let settings = state.settings.clone();
     tauri::async_runtime::spawn_blocking(move || {
         settings.save_selected_remote_id(device_id.clone())?;
-        let snapshot = platform
+        platform
             .connect_remote(device_id)
-            .map_err(|error| error.to_string())?;
-        synchronize_input_context(platform.as_ref(), &snapshot);
-        Ok(snapshot)
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("连接任务失败：{error}"))?
@@ -145,11 +465,9 @@ async fn disconnect_remote(
 ) -> Result<ConnectionSnapshot, String> {
     let platform = Arc::clone(&state.platform);
     tauri::async_runtime::spawn_blocking(move || {
-        let snapshot = platform
+        platform
             .disconnect_remote()
-            .map_err(|error| error.to_string())?;
-        synchronize_input_context(platform.as_ref(), &snapshot);
-        Ok(snapshot)
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("断开任务失败：{error}"))?
@@ -1194,24 +1512,119 @@ fn register_scene_events(
 /// Raw Input 监听自愈监督线程：启动尝试一次（遥控器休眠时可能失败）；
 /// 此后每 10 秒巡检，phase=Failed（启动失败或监听线程意外退出）时自动重启。
 /// Stopped（用户在按键页显式停止）不重启；成功后保持低频巡检自愈。
-fn spawn_raw_input_supervisor(platform: Arc<dyn PlatformRuntime>) {
-    std::thread::Builder::new()
+fn raw_input_supervisor_interval() -> std::time::Duration {
+    #[cfg(test)]
+    return std::time::Duration::from_millis(20);
+    #[cfg(not(test))]
+    std::time::Duration::from_secs(10)
+}
+
+fn raw_input_supervisor_stop_bound() -> std::time::Duration {
+    #[cfg(test)]
+    return std::time::Duration::from_secs(1);
+    #[cfg(not(test))]
+    // RawInputRuntime::start has a 5s ready wait followed by a bounded 2s
+    // stop attempt. One extra second covers supervisor scheduling.
+    std::time::Duration::from_secs(8)
+}
+
+fn spawn_raw_input_supervisor(platform: Weak<dyn PlatformRuntime>) -> RawInputSupervisor {
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_stop = Arc::clone(&stop);
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let worker = std::thread::Builder::new()
         .name("sayall-raw-input-supervisor".to_owned())
         .spawn(move || {
             let mut initial_attempt_pending = true;
             loop {
+                let (stop_lock, _) = worker_stop.as_ref();
+                if *stop_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                {
+                    break;
+                }
+                let Some(platform) = platform.upgrade() else {
+                    break;
+                };
                 let phase = platform.raw_input_snapshot().phase;
                 let should_start = phase == sayall_windows::raw_input::RawInputPhase::Failed
                     || (initial_attempt_pending
                         && phase == sayall_windows::raw_input::RawInputPhase::Stopped);
                 if should_start {
+                    // stop can arrive after the snapshot; re-check at the only
+                    // point that may re-enable the listener.
+                    if *stop_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    {
+                        break;
+                    }
                     let _ = platform.start_raw_input();
                 }
                 initial_attempt_pending = false;
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                drop(platform);
+                let (stop_lock, wake) = worker_stop.as_ref();
+                let stopped = stop_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *stopped {
+                    break;
+                }
+                let (stopped, _) = wake
+                    .wait_timeout(stopped, raw_input_supervisor_interval())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *stopped {
+                    break;
+                }
             }
+            let _ = stopped_tx.send(());
+        });
+    let (worker, spawn_failed) = match worker {
+        Ok(handle) => (
+            Some(RawInputSupervisorWorker {
+                handle,
+                stopped: stopped_rx,
+            }),
+            false,
+        ),
+        Err(_) => {
+            sayall_windows::gatt_note(
+                "raw_input_supervisor stage=spawn phase=completed terminal_result=failed error_domain=thread error_code=spawn_failed reason=worker_unavailable retryable=true".to_owned(),
+            );
+            (None, true)
+        }
+    };
+    RawInputSupervisor {
+        stop,
+        worker: Mutex::new(worker),
+        spawn_failed,
+    }
+}
+
+fn request_clean_exit(app: tauri::AppHandle, exit_code: i32) {
+    let cleanup = app.state::<AppState>().exit_cleanup.clone();
+    if cleanup.is_finished() {
+        app.exit(exit_code);
+        return;
+    }
+    if !cleanup.begin_exit_worker() {
+        return;
+    }
+    let exit_app = app.clone();
+    if std::thread::Builder::new()
+        .name("sayall-exit-cleanup".to_owned())
+        .spawn(move || {
+            cleanup.shutdown_blocking();
+            exit_app.exit(exit_code);
         })
-        .ok();
+        .is_err()
+    {
+        app.state::<AppState>().exit_cleanup.reset_exit_worker();
+        sayall_windows::gatt_note(
+            "app_shutdown stage=worker_spawn phase=completed terminal_result=failed error_domain=thread error_code=spawn_failed reason=cleanup_not_started retryable=true".to_owned(),
+        );
+    }
 }
 
 #[cfg(feature = "runtime-simulation")]
@@ -1345,7 +1758,7 @@ pub fn run() {
                                 let _ = window.set_focus();
                             }
                         }
-                        "tray-quit" => app.exit(0),
+                        "tray-quit" => request_clean_exit(app.clone(), 0),
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {
@@ -1396,6 +1809,10 @@ pub fn run() {
                 }
             };
             let platform = create_platform();
+            if let Err(error) = platform.initialize_capture_input(settings.capture_journal_path(), saved_settings.capture_input.clone()) {
+                sayall_windows::gatt_note(format!("capture_input action=initialize result=failed error_code={error}"));
+            }
+
             let mapping_configuration = match settings.load_mapping_configuration() {
                 Ok(configuration) => {
                     sayall_windows::gatt_note(format!(
@@ -1431,10 +1848,8 @@ pub fn run() {
             #[cfg(windows)]
             if let Some(device_id) = saved_settings.selected_remote_id {
                 match platform.restore_remote(device_id) {
-                    Ok(snapshot) => synchronize_input_context(platform.as_ref(), &snapshot),
+                    Ok(_) => {}
                     Err(error) => {
-                        // A failed restore must fail closed so stale mappings cannot run.
-                        synchronize_input_context(platform.as_ref(), &ConnectionSnapshot::default());
                         eprintln!("恢复已保存的小米语音遥控器失败：{error}");
                     }
                 }
@@ -1468,10 +1883,13 @@ pub fn run() {
 
             // Raw Input 监听自愈：启动即尝试，失败（遥控器休眠/未连接）进入
             // 10 秒重试循环；用户在按键页显式停止（Stopped）时不重试。
-            spawn_raw_input_supervisor(Arc::clone(&platform));
+            let supervisor = spawn_raw_input_supervisor(Arc::downgrade(&platform));
+            let exit_cleanup = ExitCleanup::new(Arc::clone(&platform), supervisor);
 
             app.manage(AppState {
+                capture_config_operation: platform.capture_config_gate(),
                 platform,
+                exit_cleanup,
                 settings,
                 pending_update: std::sync::Mutex::new(None),
             });
@@ -1495,6 +1913,10 @@ pub fn run() {
 
     #[cfg(feature = "runtime-simulation")]
     let builder = builder.invoke_handler(tauri::generate_handler![
+        get_capture_input,
+        list_capture_inputs,
+        set_capture_input,
+        resolve_capture_recovery,
         get_runtime_snapshot,
         get_diagnostic_report,
         scan_paired_remotes,
@@ -1548,6 +1970,10 @@ pub fn run() {
     ]);
     #[cfg(not(feature = "runtime-simulation"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
+        get_capture_input,
+        list_capture_inputs,
+        set_capture_input,
+        resolve_capture_recovery,
         get_runtime_snapshot,
         get_diagnostic_report,
         scan_paired_remotes,
@@ -1598,13 +2024,403 @@ pub fn run() {
         report_frontend_event
     ]);
 
-    if let Err(_) = builder.run(tauri::generate_context!()) {
+    let app = builder.build(tauri::generate_context!()).unwrap_or_else(|_| {
         sayall_windows::gatt_note(
-            "app_lifecycle event=event_loop phase=completed terminal_result=failed error_domain=tauri error_code=run_failed reason=event_loop_failed retryable=false".to_owned(),
+            "app_lifecycle event=event_loop phase=completed terminal_result=failed error_domain=tauri error_code=build_failed reason=application_build_failed retryable=false".to_owned(),
         );
-        panic!("failed to run SayAll Windows app");
-    }
+        panic!("failed to build SayAll Windows app");
+    });
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            let cleanup = app.state::<AppState>().exit_cleanup.clone();
+            if !cleanup.is_finished() {
+                api.prevent_exit();
+                request_clean_exit(app.clone(), code.unwrap_or(0));
+            }
+        }
+    });
     sayall_windows::gatt_note(
         "app_lifecycle event=process_exit phase=completed terminal_result=passed".to_owned(),
     );
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use sayall_windows::raw_input::{RawInputPhase, RawInputSnapshot};
+    use sayall_windows::send_input::{ButtonMappings, KeyChord, SendInputSnapshot};
+    use sayall_windows::{
+        AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformError,
+        PlatformSnapshot, UsageCounters,
+    };
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    #[derive(Debug)]
+    struct TestPlatform {
+        calls: Mutex<Vec<&'static str>>,
+        raw_phase: Mutex<RawInputPhase>,
+        starts: AtomicUsize,
+        fail_disconnect: AtomicBool,
+        quiesce_delay_ms: AtomicU64,
+        capture: Mutex<sayall_core::CaptureInputSettings>,
+    }
+
+    impl Default for TestPlatform {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                raw_phase: Mutex::new(RawInputPhase::Stopped),
+                starts: AtomicUsize::new(0),
+                fail_disconnect: AtomicBool::new(false),
+                quiesce_delay_ms: AtomicU64::new(0),
+                capture: Mutex::new(Default::default()),
+            }
+        }
+    }
+
+    impl TestPlatform {
+        fn record(&self, call: &'static str) {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn set_raw_phase(&self, phase: RawInputPhase) {
+            *self
+                .raw_phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = phase;
+        }
+    }
+
+    impl PlatformRuntime for TestPlatform {
+        fn capture_input_snapshot(&self) -> sayall_windows::capture_input::CaptureInputSnapshot {
+            sayall_windows::capture_input::CaptureInputSnapshot {
+                settings: self.capture.lock().unwrap().clone(),
+                ..Default::default()
+            }
+        }
+        fn configure_capture_input(
+            &self,
+            settings: sayall_core::CaptureInputSettings,
+        ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+            *self.capture.lock().unwrap() = settings;
+            Ok(self.capture_input_snapshot())
+        }
+        fn shutdown_capture_input(&self) -> Result<(), String> {
+            self.record("capture_shutdown");
+            Ok(())
+        }
+
+        fn usage_counters(&self) -> Arc<UsageCounters> {
+            Arc::new(UsageCounters::default())
+        }
+
+        fn snapshot(&self) -> PlatformSnapshot {
+            panic!("not used by lifecycle tests")
+        }
+
+        fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError> {
+            Ok(Vec::new())
+        }
+
+        fn connection_snapshot(&self) -> ConnectionSnapshot {
+            ConnectionSnapshot::default()
+        }
+
+        fn connect_remote(&self, _device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn disconnect_remote(&self) -> Result<ConnectionSnapshot, PlatformError> {
+            self.record("disconnect");
+            if self.fail_disconnect.load(Ordering::Acquire) {
+                Err(PlatformError::WorkerUnavailable)
+            } else {
+                Ok(ConnectionSnapshot::default())
+            }
+        }
+
+        #[cfg(windows)]
+        fn restore_remote(&self, _device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn list_audio_endpoints(&self) -> Result<Vec<AudioEndpoint>, PlatformError> {
+            Ok(Vec::new())
+        }
+
+        fn select_audio_endpoint(
+            &self,
+            _endpoint_id: String,
+        ) -> Result<AudioSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        #[cfg(windows)]
+        fn restore_audio_endpoint(
+            &self,
+            _endpoint_id: String,
+            _expected_name: String,
+        ) -> Result<AudioSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn audio_snapshot(&self) -> AudioSnapshot {
+            AudioSnapshot::default()
+        }
+
+        fn raw_input_snapshot(&self) -> RawInputSnapshot {
+            RawInputSnapshot {
+                phase: *self
+                    .raw_phase
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                ..RawInputSnapshot::default()
+            }
+        }
+
+        fn start_raw_input(&self) -> Result<RawInputSnapshot, PlatformError> {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            self.record("start");
+            self.set_raw_phase(RawInputPhase::Ready);
+            Ok(self.raw_input_snapshot())
+        }
+
+        fn stop_raw_input(&self) -> Result<RawInputSnapshot, PlatformError> {
+            self.record("stop");
+            self.set_raw_phase(RawInputPhase::Stopped);
+            Ok(self.raw_input_snapshot())
+        }
+
+        fn send_input_snapshot(&self) -> SendInputSnapshot {
+            SendInputSnapshot::default()
+        }
+
+        fn test_shortcut(&self, _chord: KeyChord) -> Result<SendInputSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
+            Vec::new()
+        }
+
+        fn launch_app(&self, _target: &str) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn open_bluetooth_settings(&self) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn voice_hold_hotkey(&self) -> Option<KeyChord> {
+            None
+        }
+
+        fn set_voice_hold_hotkey(&self, _hotkey: Option<KeyChord>) {}
+
+        fn button_mappings(&self) -> ButtonMappings {
+            ButtonMappings::default()
+        }
+
+        fn set_button_mappings(&self, _mappings: ButtonMappings) {}
+
+        fn set_mapping_configuration(
+            &self,
+            _configuration: sayall_windows::templates::MappingConfiguration,
+        ) {
+        }
+
+        fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot> {
+            None
+        }
+
+        fn subscribe_scene_events(
+            &self,
+            _callback: sayall_windows::scene_control::SceneEventCallback,
+        ) {
+        }
+
+        fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot {
+            Default::default()
+        }
+
+        fn subscribe_button_edges(
+            &self,
+            _callback: sayall_windows::button_mapping::ButtonEdgeCallback,
+        ) {
+        }
+
+        fn subscribe_button_gestures(
+            &self,
+            _callback: sayall_windows::button_mapping::ButtonGestureCallback,
+        ) {
+        }
+
+        fn quiesce_input(&self) -> Result<(), PlatformError> {
+            self.record("quiesce");
+            std::thread::sleep(std::time::Duration::from_millis(
+                self.quiesce_delay_ms.load(Ordering::Acquire),
+            ));
+            Ok(())
+        }
+    }
+
+    fn stopped_supervisor() -> RawInputSupervisor {
+        RawInputSupervisor {
+            stop: Arc::new((Mutex::new(false), Condvar::new())),
+            worker: Mutex::new(None),
+            spawn_failed: false,
+        }
+    }
+
+    #[test]
+    fn capture_config_save_failure_rolls_back_before_releasing_gate() {
+        let platform = TestPlatform::default();
+        let gate = Mutex::new(());
+        let next = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("target".into()),
+            endpoint_name: Some("target".into()),
+        };
+        let result = capture_config_transaction(&gate, &platform, next, |_| {
+            assert!(gate.try_lock().is_err());
+            Err("disk_failed".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            platform.capture_input_snapshot().settings,
+            Default::default()
+        );
+        assert!(gate.try_lock().is_ok());
+    }
+    #[test]
+    fn capture_config_concurrent_saves_keep_runtime_and_persisted_value_aligned() {
+        let platform = Arc::new(TestPlatform::default());
+        let gate = Arc::new(Mutex::new(()));
+        let saved = Arc::new(Mutex::new(sayall_core::CaptureInputSettings::default()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let a = {
+            let platform = platform.clone();
+            let gate = gate.clone();
+            let saved = saved.clone();
+            std::thread::spawn(move || {
+                capture_config_transaction(
+                    &gate,
+                    platform.as_ref(),
+                    sayall_core::CaptureInputSettings {
+                        endpoint_id: Some("a".into()),
+                        ..Default::default()
+                    },
+                    |value| {
+                        entered_tx.send(()).unwrap();
+                        continue_rx.recv().unwrap();
+                        *saved.lock().unwrap() = value;
+                        Ok(())
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+        assert!(gate.try_lock().is_err());
+        let b = {
+            let platform = platform.clone();
+            let gate = gate.clone();
+            let saved = saved.clone();
+            std::thread::spawn(move || {
+                capture_config_transaction(
+                    &gate,
+                    platform.as_ref(),
+                    sayall_core::CaptureInputSettings {
+                        endpoint_id: Some("b".into()),
+                        ..Default::default()
+                    },
+                    |value| {
+                        *saved.lock().unwrap() = value;
+                        Ok(())
+                    },
+                )
+            })
+        };
+        continue_tx.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(
+            platform.capture_input_snapshot().settings,
+            *saved.lock().unwrap()
+        );
+        assert_eq!(saved.lock().unwrap().endpoint_id.as_deref(), Some("b"));
+    }
+    #[test]
+    fn capture_shutdown_follows_ble_owner_release_barrier() {
+        let platform = Arc::new(TestPlatform::default());
+        let cleanup = ExitCleanup::new(
+            platform.clone(),
+            RawInputSupervisor {
+                stop: Arc::new((Mutex::new(true), Condvar::new())),
+                worker: Mutex::new(None),
+                spawn_failed: false,
+            },
+        );
+        assert!(cleanup.shutdown_blocking());
+        assert_eq!(
+            platform.calls(),
+            vec!["quiesce", "stop", "disconnect", "capture_shutdown"]
+        );
+    }
+
+    #[test]
+    fn supervisor_stop_prevents_restart_and_releases_platform_owner() {
+        let platform = Arc::new(TestPlatform::default());
+        let runtime: Arc<dyn PlatformRuntime> = platform.clone();
+        let supervisor = spawn_raw_input_supervisor(Arc::downgrade(&runtime));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while platform.starts.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(platform.starts.load(Ordering::Acquire), 1);
+
+        assert_eq!(supervisor.stop(), Ok(()));
+        let starts_after_stop = platform.starts.load(Ordering::Acquire);
+        platform.set_raw_phase(RawInputPhase::Failed);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(platform.starts.load(Ordering::Acquire), starts_after_stop);
+
+        let weak = Arc::downgrade(&runtime);
+        drop(runtime);
+        drop(platform);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn exit_cleanup_is_ordered_idempotent_and_retains_failure_result() {
+        let platform = Arc::new(TestPlatform::default());
+        platform.fail_disconnect.store(true, Ordering::Release);
+        platform.quiesce_delay_ms.store(50, Ordering::Release);
+        let runtime: Arc<dyn PlatformRuntime> = platform.clone();
+        let cleanup = ExitCleanup::new(runtime, stopped_supervisor());
+
+        let owner_cleanup = cleanup.clone();
+        let owner = std::thread::spawn(move || owner_cleanup.shutdown_blocking());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while platform.calls().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let repeated_cleanup = cleanup.clone();
+        let repeated = std::thread::spawn(move || repeated_cleanup.shutdown_blocking());
+        assert!(!owner.join().unwrap());
+        assert!(!repeated.join().unwrap());
+        assert!(cleanup.is_finished());
+        assert!(!cleanup.begin_exit_worker());
+        assert_eq!(platform.calls(), vec!["quiesce", "stop", "disconnect"]);
+    }
 }

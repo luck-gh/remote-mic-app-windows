@@ -110,6 +110,33 @@ export interface ButtonMappings {
   actions: Partial<Record<RemoteButton, ButtonActions>>;
 }
 
+export interface CaptureInputSettings {
+  enabled: boolean;
+  endpointId: string | null;
+  endpointName: string | null;
+}
+export interface CaptureInputSnapshot {
+  settings: CaptureInputSettings;
+  phase: string;
+  recoveryPending: boolean;
+  lastError: string | null;
+}
+export async function getCaptureInput(): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) return { settings: { enabled: false, endpointId: null, endpointName: null }, phase: "unsupported", recoveryPending: false, lastError: null };
+  return invoke<CaptureInputSnapshot>("get_capture_input");
+}
+export async function listCaptureInputs(): Promise<AudioEndpoint[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<AudioEndpoint[]>("list_capture_inputs");
+}
+export async function setCaptureInput(config: CaptureInputSettings): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) throw new Error("请在 Windows 应用中设置会话输入设备");
+  return invoke<CaptureInputSnapshot>("set_capture_input", { config });
+}
+export async function resolveCaptureRecovery(restore: boolean): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) throw new Error("请在 Windows 应用中恢复输入设备");
+  return invoke<CaptureInputSnapshot>("resolve_capture_recovery", { restore });
+}
 export type AdjustmentMode = "volume" | "page" | "zoom";
 export type ControlRegion = "application_list" | "content" | "input";
 export type SemanticAction =

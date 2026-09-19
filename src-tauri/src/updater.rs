@@ -269,22 +269,22 @@ async fn resolve_update_endpoint(include_prereleases: bool) -> Result<UpdateEndp
 /// 构建更新器：注册安装前清理回调 + 端点覆盖 + 检查超时。
 fn build_updater(
     app: &AppHandle,
-    platform: Arc<dyn crate::platform::PlatformRuntime>,
+    exit_cleanup: crate::ExitCleanup,
     runtime_endpoint: Option<reqwest::Url>,
 ) -> Result<tauri_plugin_updater::Updater, String> {
     let mut builder = app.updater_builder().timeout(CHECK_TIMEOUT);
     // on_before_exit 在安装器启动前、std::process::exit(0) 前同步执行：
-    // 显式断开 BLE 链路（正常断开序列 CCCD 退订/服务释放），避免残留
-    // 未关闭的 GATT 会话把链路留成僵死状态。
+    // 执行与托盘退出一致的完整、有界、幂等清理，避免只断开 BLE 而让
+    // Raw Input 监督线程、映射按住状态或监听器继续存活到 process::exit。
     builder = builder.on_before_exit(move || {
         let started = Instant::now();
-        let outcome = if platform.disconnect_remote().is_ok() {
+        let outcome = if exit_cleanup.shutdown_blocking() {
             "ok"
         } else {
             "err"
         };
         note(format!(
-            "install.before_exit disconnect={outcome} took_ms={}",
+            "install.before_exit cleanup={outcome} took_ms={}",
             elapsed_ms(started)
         ));
     });
@@ -333,12 +333,12 @@ pub async fn check_app_update(
             date: None,
         });
     }
-    let platform = Arc::clone(&state.platform);
+    let exit_cleanup = state.exit_cleanup.clone();
     let runtime_endpoint = match endpoint {
         UpdateEndpoint::Runtime(url) => Some(url),
         UpdateEndpoint::ConfiguredStable | UpdateEndpoint::NoPublishedPreview => None,
     };
-    let updater = build_updater(&app, platform, runtime_endpoint)?;
+    let updater = build_updater(&app, exit_cleanup, runtime_endpoint)?;
     match updater.check().await {
         Ok(Some(update)) => {
             let info = AppUpdateInfo {

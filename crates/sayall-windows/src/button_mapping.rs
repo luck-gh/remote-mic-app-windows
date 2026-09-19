@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -60,8 +60,7 @@ pub enum EngineMessage {
         execution: ButtonMappings,
         recognition: ButtonMappings,
     },
-    #[cfg(test)]
-    Flush(Sender<()>),
+    Barrier(Sender<()>),
     Shutdown,
 }
 
@@ -418,6 +417,14 @@ impl ButtonMappingRuntime {
     }
 }
 
+impl ButtonMappingRuntime {
+    pub fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let (sender, receiver) = mpsc::channel();
+        self.sender.send(EngineMessage::Barrier(sender)).is_ok()
+            && receiver.recv_timeout(timeout).is_ok()
+    }
+}
+
 impl Drop for ButtonMappingRuntime {
     fn drop(&mut self) {
         let _ = self.sender.send(EngineMessage::Shutdown);
@@ -483,8 +490,7 @@ fn engine_worker(
         };
 
         match message {
-            #[cfg(test)]
-            EngineMessage::Flush(reply) => {
+            EngineMessage::Barrier(reply) => {
                 let _ = reply.send(());
             }
             EngineMessage::Keyboard(event) => {
@@ -896,7 +902,10 @@ mod tests {
 
     fn flush(runtime: &ButtonMappingRuntime) {
         let (sender, receiver) = mpsc::channel();
-        runtime.sender().send(EngineMessage::Flush(sender)).unwrap();
+        runtime
+            .sender()
+            .send(EngineMessage::Barrier(sender))
+            .unwrap();
         receiver.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 

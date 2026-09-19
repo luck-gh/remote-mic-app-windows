@@ -94,3 +94,19 @@
 - **发布资产命名**：NSIS 产物名含中文与空格（`无线麦 SayAll_*.exe`），GitHub 资产直链需 percent-encoding；为消除编码风险，Release 资产在 CI 中复制为纯 ASCII 名（`SayAll-Windows-<version>-x64-setup.exe`）后上传，本地构建产物名不变（CI 全部脚本按 `*-setup.exe` 过滤定位，实测不受新增 `.sig` 影响）。
 - **NSIS 与既有安装器门禁的相互作用**：updater 以 `/P`（passive）+ `/UPDATE` 运行，既有 installer-hooks.nsh 的 PREINSTALL SemVer 降级门禁照常生效（升级路径不受影响）；POSTINSTALL 的 VB-CABLE 提示在 passive（非 Silent）模式下仍会弹出——仅影响未装 VB-CABLE 的用户，与首装行为一致，保留。
 - **预览版通道（2026-09-08 增补）**：Tauri 官方 Runtime Configuration 文档明确支持通过 `UpdaterBuilder::endpoints` 在运行时选择 stable/beta 等独立通道；本仓库据此保持默认稳定端点不变，仅在用户显式开启“检查预览版更新”后覆盖端点。GitHub Releases 页面公开提供标准 Atom feed（`releases.atom`），包含已发布的正式版与 Pre-release、排除 Draft；实现从本仓库 feed 的 `alternate` 链接读取 SemVer tag，选择最高版本并自行构造本仓库 `https://github.com/GetSayAll/remote-mic-app-windows/releases/download/<tag>/latest.json`，避开匿名 REST API 每 IP 60 次/小时限流。最终安装包仍由 Tauri minisign 强制验签。
+
+
+### 会话临时 Capture 默认设备（2026-09-16，用户限定例外）
+
+用户明确授权“允许受限使用，并接受外部改选时让出控制”。仅在本功能内独立绑定 `IPolicyConfig::SetDefaultEndpoint`；不复制第三方切换器实现，不扩展其他私有 API。固定 ABI 研究来源：[AudioEndPointLibrary / PolicyConfig.h](https://github.com/Belphemur/AudioEndPointLibrary/blob/4fd74314f7a8e4ceaaa6767cdc9f936c3916a2a8/DefSound/PolicyConfig.h)（SoundSwitch 使用、EreTIk 来源）、[Sunshine 交叉定义](https://github.com/LizardByte/Sunshine/blob/f54f9dfc57848971e85cda7fb4b7723594926422/src/platform/windows/PolicyConfig.h)。两者 GPL；本项目 GPL-3.0-only，当前仅独立声明 IID/CLSID/slot13 ABI 事实，没有拷贝其他方法实现或二进制。SoundSwitch 主仓研究固定点 `9e69fd3ef0d20474684cf6fe2f8789440dd09e4c`。
+
+公开读回与通知复用现有 wasapi 0.24 / windows 0.62 的 MMDevice 接口。[OnDefaultDeviceChanged](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immnotificationclient-ondefaultdevicechanged) 不提供更改者；只唤醒三角色实际读回，不按时间窗认领自身写入。IPolicyConfig 没有 CAS/可取消 setter 契约：逐步前后读回与源 epoch 缩小竞态，无法证明外部在读写间或同值选择绝不被覆盖。任一可观察外部冲突整体让出，全部角色保留；写前 journal 和崩溃后显式选择避免无证据自动恢复。源码/模拟事务测试不是默认路由真机或微信输入法实际收音验收。
+
+### 2026-09-16 会话输入切换的角色联动纠偏
+
+9a7048包实测首按在Console setter后被本应用exact-vector中止（3次），第二按仅剩Communications切换；不能标第三方就绪延迟。Windows公开ERole概念不保证本次未文档化setter独立性。SoundSwitch成熟实现按Console/Multimedia/Communications逐项检查并设置（既有固定来源研究），不从其循环推出三个setter互不影响。
+
+作者原始实验参考：[IPolicyConfig from Go](https://zenn.dev/gsnhjj/articles/go-windows-ipolicyconfig-default-audio?locale=en) 直接报告Console/Multimedia双向联动，非微软契约、非本机因果证明。仅用于形成可证伪组模型；本机实际新候选须由匿名before/after掩码证实。未复制该文实现。组事务仍拒绝任何第三值或组外改变；同值外改无actor/CAS不能归因。详细失败与候选验证见 `artifacts/capture-input-session-20260916/first-use-fix/evidence.md`。
+
+
+2026-09-19用户确认非target冷首按与布局修复通过；正常退出/启动取消复用BLE owner配对顺序及Tauri公开退出事件，未增加输入驱动依赖。未解20秒溢出不在本次已修复结论内。

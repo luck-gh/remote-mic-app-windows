@@ -101,6 +101,19 @@ impl SettingsStore {
         parse_settings(&contents)
     }
 
+    pub fn capture_journal_path(&self) -> PathBuf {
+        self.path.with_file_name("capture-input-session.json")
+    }
+
+    pub fn save_capture_input(
+        &self,
+        value: sayall_core::CaptureInputSettings,
+    ) -> Result<(), String> {
+        self.update("保存会话输入设备", |settings| {
+            settings.capture_input = value
+        })
+    }
+
     pub fn save_audio_endpoint(
         &self,
         endpoint_id: String,

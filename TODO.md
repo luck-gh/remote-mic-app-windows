@@ -6,6 +6,9 @@
 
 ## Windows RC001 / RC003
 
+- [x] 会话临时Capture输入锁定与长设备名布局：2026-09-19用户明确确认RC003非target冷首按正常、下拉框不越界。默认关闭，仅本功能获准受限IPolicyConfig，结束条件恢复、检测外部改选整体让出；详见 Testing/CaptureInputSession.md。
+- [ ] 临时Capture锁定剩余真机矩阵：耳机/手动改选、快速释放/连续/闲置组合、断连/睡眠/退出、崩溃可见恢复及RC001分别记录；用户本次确认不外推。20秒PCM溢出独立未解决，60秒停止研究暂停。
+
 - [x] 建立独立 Rust + Tauri 2 + Vue 3 工程结构。
 - [x] 建立 Mac 原版风格设置界面骨架。
 - [x] 建立 ATVV、ADPCM 和语音会话纯 Rust 核心。

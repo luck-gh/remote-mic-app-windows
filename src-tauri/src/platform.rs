@@ -2,12 +2,43 @@ use sayall_windows::raw_input::RawInputSnapshot;
 use sayall_windows::send_input::{KeyChord, SendInputSnapshot};
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformError,
-    PlatformSnapshot, RemoteModel, UsageCounters, WindowsPlatform,
+    PlatformSnapshot, UsageCounters, WindowsPlatform,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
 
 pub trait PlatformRuntime: Debug + Send + Sync {
+    fn capture_config_gate(&self) -> Arc<std::sync::Mutex<()>> {
+        Arc::new(std::sync::Mutex::new(()))
+    }
+    fn shutdown_capture_input(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn capture_input_snapshot(&self) -> sayall_windows::capture_input::CaptureInputSnapshot {
+        Default::default()
+    }
+    fn initialize_capture_input(
+        &self,
+        _journal: std::path::PathBuf,
+        _settings: sayall_core::CaptureInputSettings,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn list_capture_inputs(&self) -> Result<Vec<AudioEndpoint>, String> {
+        Err("capture_routing_unsupported".into())
+    }
+    fn configure_capture_input(
+        &self,
+        _settings: sayall_core::CaptureInputSettings,
+    ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+        Err("capture_routing_unsupported".into())
+    }
+    fn resolve_capture_recovery(
+        &self,
+        _restore: bool,
+    ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+        Err("capture_routing_unsupported".into())
+    }
     fn usage_counters(&self) -> Arc<UsageCounters>;
     fn snapshot(&self) -> PlatformSnapshot;
     fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError>;
@@ -46,14 +77,13 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     );
     fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot>;
     fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback);
-    /// Called by the owner of a connection state transition, never by a UI poll.
-    fn set_input_context(&self, _model: RemoteModel, _connected: bool) {}
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
     fn subscribe_button_edges(&self, callback: sayall_windows::button_mapping::ButtonEdgeCallback);
     fn subscribe_button_gestures(
         &self,
         callback: sayall_windows::button_mapping::ButtonGestureCallback,
     );
+    fn quiesce_input(&self) -> Result<(), PlatformError>;
 
     #[cfg(feature = "runtime-simulation")]
     fn run_simulated_voice_session(&self) -> Result<PlatformSnapshot, PlatformError> {
@@ -62,6 +92,38 @@ pub trait PlatformRuntime: Debug + Send + Sync {
 }
 
 impl PlatformRuntime for WindowsPlatform {
+    fn capture_config_gate(&self) -> Arc<std::sync::Mutex<()>> {
+        self.capture_config_gate()
+    }
+    fn shutdown_capture_input(&self) -> Result<(), String> {
+        self.shutdown_capture_input()
+    }
+    fn capture_input_snapshot(&self) -> sayall_windows::capture_input::CaptureInputSnapshot {
+        self.capture_input_snapshot()
+    }
+    fn initialize_capture_input(
+        &self,
+        journal: std::path::PathBuf,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<(), String> {
+        self.initialize_capture_input(journal, settings)
+    }
+    fn list_capture_inputs(&self) -> Result<Vec<AudioEndpoint>, String> {
+        self.list_capture_inputs()
+    }
+    fn configure_capture_input(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+        self.configure_capture_input(settings)
+    }
+    fn resolve_capture_recovery(
+        &self,
+        restore: bool,
+    ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+        self.resolve_capture_recovery(restore)
+    }
+
     fn usage_counters(&self) -> Arc<UsageCounters> {
         self.usage_counters()
     }
@@ -169,10 +231,6 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::set_mapping_configuration(self, configuration)
     }
 
-    fn set_input_context(&self, model: RemoteModel, connected: bool) {
-        WindowsPlatform::set_input_context(self, model, connected)
-    }
-
     fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot> {
         Some(WindowsPlatform::scene_snapshot(self))
     }
@@ -194,6 +252,10 @@ impl PlatformRuntime for WindowsPlatform {
         callback: sayall_windows::button_mapping::ButtonGestureCallback,
     ) {
         WindowsPlatform::subscribe_button_gestures(self, callback)
+    }
+
+    fn quiesce_input(&self) -> Result<(), PlatformError> {
+        WindowsPlatform::quiesce_input(self)
     }
 }
 
@@ -518,6 +580,10 @@ mod simulation {
             _callback: sayall_windows::button_mapping::ButtonGestureCallback,
         ) {
             // CI 仿真不产生真实手势。
+        }
+
+        fn quiesce_input(&self) -> Result<(), PlatformError> {
+            Ok(())
         }
 
         fn run_simulated_voice_session(&self) -> Result<PlatformSnapshot, PlatformError> {

@@ -18,6 +18,7 @@ mod ble;
 mod bluetooth_radio;
 mod button_gestures;
 pub mod button_mapping;
+pub mod capture_input;
 pub mod compatibility;
 pub mod component_support;
 pub mod file_dialog;
@@ -298,6 +299,10 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&send_input),
                 Arc::clone(&voice_hold_hotkey),
+                Arc::new({
+                    let button_mapping = Arc::clone(&button_mapping);
+                    move |model, connected| button_mapping.set_input_context(model, connected)
+                }),
             ));
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
@@ -355,6 +360,94 @@ impl Default for WindowsPlatform {
 }
 
 impl WindowsPlatform {
+    pub fn capture_config_gate(&self) -> Arc<Mutex<()>> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.config_gate.clone()
+        }
+        #[cfg(not(windows))]
+        {
+            Arc::new(Mutex::new(()))
+        }
+    }
+    pub fn shutdown_capture_input(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.shutdown()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+    pub fn capture_input_snapshot(&self) -> capture_input::CaptureInputSnapshot {
+        #[cfg(windows)]
+        {
+            self.audio.capture.snapshot()
+        }
+        #[cfg(not(windows))]
+        {
+            capture_input::CaptureInputSnapshot {
+                phase: "unsupported".into(),
+                ..Default::default()
+            }
+        }
+    }
+    pub fn initialize_capture_input(
+        &self,
+        journal: std::path::PathBuf,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.initialize(journal, settings)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (journal, settings);
+            Ok(())
+        }
+    }
+    pub fn list_capture_inputs(&self) -> Result<Vec<AudioEndpoint>, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.list()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
+    pub fn configure_capture_input(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<capture_input::CaptureInputSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.configure(settings)?;
+            Ok(self.audio.capture.snapshot())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = settings;
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
+    pub fn resolve_capture_recovery(
+        &self,
+        restore: bool,
+    ) -> Result<capture_input::CaptureInputSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.recover(restore)?;
+            Ok(self.audio.capture.snapshot())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = restore;
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
     pub fn usage_counters(&self) -> Arc<UsageCounters> {
         Arc::clone(&self.usage)
     }
@@ -470,6 +563,24 @@ impl WindowsPlatform {
     /// Synchronize the identified connection at the same transition that owns it.
     pub fn set_input_context(&self, model: RemoteModel, connected: bool) {
         self.button_mapping.set_input_context(model, connected);
+    }
+
+    /// Disable input execution and wait until all held mapping and scene state
+    /// has been cancelled. The barrier is bounded so normal exit cannot wait
+    /// forever for the mapping worker.
+    pub fn quiesce_input(&self) -> Result<(), PlatformError> {
+        self.button_mapping
+            .set_input_context(RemoteModel::Unknown, false);
+        if self
+            .button_mapping
+            .wait_for_idle(std::time::Duration::from_secs(2))
+        {
+            Ok(())
+        } else {
+            Err(PlatformError::WindowsApi(
+                "button mapping shutdown barrier timed out".to_owned(),
+            ))
+        }
     }
 
     pub fn button_mappings(&self) -> send_input::ButtonMappings {
@@ -793,6 +904,10 @@ pub enum PlatformError {
     AudioOperationTimedOut,
     #[error("select an output endpoint before starting voice")]
     AudioEndpointNotSelected,
+    #[error(
+        "the selected audio endpoint is temporarily unavailable; its saved selection is retained"
+    )]
+    AudioSinkUnavailable,
     #[error("WASAPI output is busy with an active voice session")]
     AudioBusy,
     #[error("WASAPI audio belongs to another voice session")]

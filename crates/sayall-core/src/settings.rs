@@ -17,6 +17,15 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// A capture endpoint is distinct from the render endpoint receiving decoded PCM.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CaptureInputSettings {
+    pub enabled: bool,
+    pub endpoint_id: Option<String>,
+    pub endpoint_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -24,6 +33,7 @@ pub struct AppSettings {
     pub selected_remote_id: Option<String>,
     pub audio_endpoint_id: Option<String>,
     pub audio_endpoint_name: Option<String>,
+    pub capture_input: CaptureInputSettings,
     pub gain_db: f32,
     pub voice_trigger_mode: VoiceTriggerMode,
     pub launch_at_login: bool,
@@ -40,6 +50,7 @@ impl Default for AppSettings {
             selected_remote_id: None,
             audio_endpoint_id: None,
             audio_endpoint_name: None,
+            capture_input: CaptureInputSettings::default(),
             gain_db: 0.0,
             voice_trigger_mode: VoiceTriggerMode::Hold,
             launch_at_login: false,
