@@ -598,3 +598,10 @@ Rust观察/执行隔离与生命周期3项、IPC序列化1项、按键页24项�
 18 个冲突文件逐段融合；严格来源/边沿配对与普通主程序边界保留。上游仅 BLE 建链吞 F5 不采用，单 RawInput 注册改进保留；安装器接入现有 ExitCleanup，超时中止安装。现有模板直接键语义与草稿明确保存保留，应用库启动目标独立于程序匹配身份，导出清除本机应用库。新上游历史硬件文件已脱敏，未执行其探针。
 
 首轮前端169项为165passed/4failed（新增观察字段及即时保存旧断言），受影响修正后34/34passed。默认并发 Rust 测试曾在系统回收站 Shell 扩展 libapr_tsvn.dll 内发生 access violation；IFileOperation 清理串行后不再复现。全局 KeyGate/组件操作夹具互扰改为 test-only 独占，updater 真实日志落盘用独立测试子进程，未降低生产门控。最终 `scripts/ci-preflight.ps1` exit0、7/7passed：前端169/169，Rust331passed/17ignored（原硬件/故障专项条件），生产前端、普通宿主及 runtime-simulation feature 编译通过；`git diff --check HEAD` exit0。没有执行历史硬件探针或电源/无线电操作。当前无最终合并包/安装/新实机结论。过程日志限 `target/dev/rc003-three-key/upstream-*`，保留本轮首个失败与最终门禁以供对照，完成安装/PR后回收可再生成中间输出；不把未反馈的旧UI高亮/语音/Menu等用例补记 passed。
+
+
+合并候选已保存为 `729d14dfa60022253a31ef9d4f9e989eab8a99ee`；236份原有未跟踪材料未纳入。生产构建 exit0，0.2.6 NSIS 包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27 03:19:58+08:00，26,412,928 bytes，SHA256 `0a15fd2f2c0f5c6b833aae720efab4d71aa44fc1f63c3001b23dcc192fc2ce35`。旧App/Helper通过托盘正常退出，App整体清理128ms、failed_stages0，Helper terminal0；03:16退出前的历史宿主detach事件不补记为本轮主动卸载passed。
+
+管理员覆盖既有D盘安装目录 exit0。安装EXE SHA256 `83538e8a21c37c134b260fd8e771e92bfed23c116f84004d1253c71c08a32376`；与构建EXE只差Tauri打包时 `__TAURI_BUNDLE_TYPE_VAR_UNK`→`...NSS`的3字节，其余全部字节相同。固定Helper SHA256 `2d344265e2ed6d116631fa64dcfb10c0065d2d2d499f8a82655df55d46c92c55`。真实Explorer启动App32936（03:22:44.176652，TokenElevation0）和用户已保存opt-in启动Helper27836（03:22:45.574294，TokenElevation1）；日志source_revision精确为上述合并提交。settings、button-mappings、capture-input-session三文件退出/安装/启动哈希相同，5模板/6关联与用户Menu偏好true保留。
+
+BLE真实连接ready、input_context connected=true、电量公开读取available、journal为空；Helper已握手与bound、配置mask7回执成功，但新run `864b2e7a45b14fb097f895a3cc444684` 仍 `pending_per_request`，不以进程存在宣称增强动作ready。复用现有Notepad→BUDTH关联，建立独立空白 `RC003-acceptance-merge.txt`（PID33472）；03:26:52.608起仅请求语音短句hold/release+x验收，等待用户实际反馈。三键首实际报告、映射/注入、菜单/键盘录入与其他受影响硬件结果仍pending；无电源/无线电操作。此后允许push test并建draft PR运行CI，main合入仍需CI及受影响实机门禁通过。
