@@ -22,6 +22,8 @@ pub mod capture_input;
 pub mod compatibility;
 pub mod component_support;
 pub mod file_dialog;
+pub mod hid_host;
+mod input_driver;
 #[cfg(windows)]
 pub use ble::{gatt_note, initialize_diagnostic_log, DiagnosticLogMetadata};
 #[cfg(windows)]
@@ -258,6 +260,34 @@ impl MappingInjector for UnsupportedInjector {
     }
 }
 
+fn subscribe_button_profile(
+    scene: &Arc<scene_control::SceneController>,
+    runtime: &Arc<ButtonMappingRuntime>,
+) {
+    let weak_scene = Arc::downgrade(scene);
+    let runtime = Arc::clone(runtime);
+    scene.subscribe(Arc::new(move |event| {
+        if matches!(event, scene_control::SceneEvent::Snapshot { .. }) {
+            if let Some(scene) = weak_scene.upgrade() {
+                let (profile, semantic, generation, foreground, notice) =
+                    scene.application_mapping_update();
+                runtime.set_application_mappings(profile, semantic);
+                let weak = Arc::downgrade(&scene);
+                runtime.publish_mapping_notice(move |available| {
+                    if let Some(scene) = weak.upgrade() {
+                        scene.confirm_mapping_notice(
+                            generation,
+                            foreground,
+                            notice.clone(),
+                            available,
+                        );
+                    }
+                });
+            }
+        }
+    }));
+}
+
 impl Default for WindowsPlatform {
     fn default() -> Self {
         let usage = Arc::new(UsageCounters::default());
@@ -281,6 +311,7 @@ impl Default for WindowsPlatform {
             ));
             let scene_control = scene_control::SceneController::new();
             scene_control::register_voice_scene(&scene_control);
+            subscribe_button_profile(&scene_control, &button_mapping);
             button_mapping.set_gesture_handler(Some(Arc::new({
                 let scene = Arc::clone(&scene_control);
                 move |gesture| scene.handle_gesture(gesture)
@@ -307,6 +338,7 @@ impl Default for WindowsPlatform {
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
                 button_mapping.sender(),
+                Some(Arc::clone(&button_mapping)),
             ));
             // 遥控器 HID 活动通知接线（断连时遥控器醒来按键 → 立即重连）。
             let wake_runtime = Arc::clone(&runtime);
@@ -340,6 +372,7 @@ impl Default for WindowsPlatform {
             ));
             let scene_control = scene_control::SceneController::new();
             scene_control::register_voice_scene(&scene_control);
+            subscribe_button_profile(&scene_control, &button_mapping);
             button_mapping.set_gesture_handler(Some(Arc::new({
                 let scene = Arc::clone(&scene_control);
                 move |gesture| scene.handle_gesture(gesture)
@@ -542,14 +575,55 @@ impl WindowsPlatform {
     /// This method never calls persistence callbacks and is safe under the
     /// settings transaction lock.
     pub fn set_mapping_configuration(&self, configuration: templates::MappingConfiguration) {
+        ble::gatt_note(format!("template_configuration result=applied program_defaults_enabled={} third_party_ui_query=false", configuration.button_mapping_follow_enabled));
         let common = configuration.common_mappings.clone();
-        let scene = self.scene_control.set_configuration(configuration);
         self.button_mapping.set_mappings(common);
-        self.button_mapping.set_scene_mappings(scene);
+        let _ = self.scene_control.set_configuration(configuration);
     }
 
     pub fn scene_snapshot(&self) -> scene_control::SceneSnapshot {
         self.scene_control.snapshot()
+    }
+
+    pub fn set_template_menu_focus(&self, focused: bool) {
+        self.scene_control.set_template_menu_focus(focused);
+    }
+
+    pub fn template_menu_key(
+        &self,
+        generation: u64,
+        button: raw_input::RemoteButton,
+        down: bool,
+    ) -> bool {
+        self.scene_control
+            .template_menu_key(generation, button, down)
+    }
+
+    pub fn set_template_menu_update_default(&self, generation: u64, enabled: bool) -> bool {
+        self.scene_control.set_update_default(generation, enabled)
+    }
+    pub fn complete_template_default_save(&self, request_id: u64, saved: bool) {
+        self.scene_control.complete_default_save(request_id, saved);
+    }
+    pub fn complete_menu_preference_save(&self, request_id: u64, saved: bool) {
+        self.scene_control
+            .complete_menu_preference_save(request_id, saved);
+    }
+
+    pub fn prepare_template_menu_exit(&self) -> bool {
+        self.scene_control.prepare_template_menu_exit()
+    }
+
+    pub fn restore_template_menu_target(&self) -> bool {
+        self.scene_control.restore_target_foreground().is_ok()
+    }
+
+    pub fn template_menu_restore_failed(&self) {
+        self.scene_control.template_menu_restore_failed();
+    }
+
+    pub fn set_mapping_notice_enabled(&self, enabled: bool) {
+        self.scene_control.set_mapping_notice_enabled(enabled);
     }
 
     pub fn subscribe_scene_events(&self, callback: scene_control::SceneEventCallback) {
@@ -593,7 +667,7 @@ impl WindowsPlatform {
 
     /// 订阅语义按键边沿（画布高亮数据源）。
     pub fn subscribe_button_edges(&self, callback: button_mapping::ButtonEdgeCallback) {
-        self.button_mapping.subscribe_button_edges(callback);
+        self.button_mapping.subscribe_button_observations(callback);
     }
 
     /// 订阅已触发手势（单击/双击/长按反馈）。

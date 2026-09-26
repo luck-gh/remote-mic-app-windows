@@ -97,7 +97,11 @@ pub fn activate_wetype_session() -> Result<WeTypeActivation, String> {
         started.elapsed().as_millis(),
         foreground_process_name().is_some(),
         if result.is_ok() { "none" } else { "tsf" },
-        if result.is_ok() { "none" } else { "activation_failed" },
+        if result.is_ok() {
+            "none"
+        } else {
+            "activation_failed"
+        },
         result.is_err(),
     ));
     result

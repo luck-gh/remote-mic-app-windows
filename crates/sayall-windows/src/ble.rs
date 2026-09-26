@@ -307,6 +307,7 @@ pub(crate) enum WorkerMessage {
     ConnectionChanged {
         connection_generation: u64,
         status: BluetoothConnectionStatus,
+        observed_at: Instant,
     },
     CallbackError {
         connection_generation: u64,
@@ -587,9 +588,6 @@ fn worker_loop(
                     Ok(()) => {
                         let snapshot = ConnectionSnapshot::default();
                         *lock(&state) = snapshot.clone();
-                        crate::key_gate::set_remote_connected(gate_remote_connected(
-                            snapshot.phase,
-                        ));
                         let _ = reply.send(Ok(snapshot));
                     }
                     Err(error) => {
@@ -626,7 +624,6 @@ fn worker_loop(
                     }
                 };
                 *lock(&state) = snapshot.clone();
-                crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
                 let _ = reply.send(Ok(snapshot));
             }
             WorkerMessage::WakeReconnect => {
@@ -796,19 +793,45 @@ fn worker_loop(
             WorkerMessage::ConnectionChanged {
                 connection_generation: message_generation,
                 status,
+                observed_at,
             } => {
                 if message_generation == connection_generation
                     && status == BluetoothConnectionStatus::Disconnected
                 {
                     capabilities_deadline = None;
-                    if let Err(error) = invalidate_connection(
+                    // Publish the known link loss before any blocking cleanup.
+                    // UI/input snapshots must not keep advertising Ready while
+                    // Windows is completing remote GATT teardown.
+                    publish_disconnected(
+                        &state,
+                        preferred_device_id.is_some() && !system_suspended,
+                    );
+                    if let Some(connected) = session.as_mut() {
+                        connected.link_disconnected = true;
+                    }
+                    gatt_note(format!(
+                        "ble_disconnect phase=published connection_generation={message_generation} event_queue_ms={} cleanup_pending=true",
+                        observed_at.elapsed().as_millis()
+                    ));
+                    let cleanup_started = Instant::now();
+                    let cleanup_result = invalidate_connection(
                         &mut session,
                         &mut pipeline,
                         &audio,
                         &send_input,
                         &mut held_hotkey,
                         &mut connection_generation,
-                    ) {
+                    );
+                    gatt_note(format!(
+                        "ble_disconnect phase=cleanup_completed result={} elapsed_ms={}",
+                        if cleanup_result.is_ok() {
+                            "passed"
+                        } else {
+                            "failed"
+                        },
+                        cleanup_started.elapsed().as_millis()
+                    ));
+                    if let Err(error) = cleanup_result {
                         keep_reconnecting_after_cleanup_failure(
                             &state,
                             &mut preferred_device_id,
@@ -828,9 +851,6 @@ fn worker_loop(
                     } else {
                         let mut snapshot = lock(&state);
                         snapshot.phase = ConnectionPhase::Disconnected;
-                        crate::key_gate::set_remote_connected(gate_remote_connected(
-                            snapshot.phase,
-                        ));
                         snapshot.voice_state = VoiceSessionState::Idle;
                         snapshot.last_error = Some("小米语音遥控器蓝牙连接已断开".to_owned());
                     }
@@ -863,7 +883,6 @@ fn worker_loop(
                         schedule_reconnect(&state, &mut backoff, &mut reconnect_deadline, &error);
                     } else {
                         *lock(&state) = failed_snapshot(error);
-                        crate::key_gate::set_remote_connected(false);
                     }
                 }
             }
@@ -896,7 +915,6 @@ fn worker_loop(
                     last_error: Some("Windows 已进入睡眠，小米语音遥控器资源已释放".to_owned()),
                     ..ConnectionSnapshot::default()
                 };
-                crate::key_gate::set_remote_connected(false);
             }
             WorkerMessage::SystemResumed => {
                 if !system_suspended {
@@ -915,10 +933,8 @@ fn worker_loop(
                         last_error: Some("Windows 已恢复，正在重新连接小米语音遥控器".to_owned()),
                         ..ConnectionSnapshot::default()
                     };
-                    crate::key_gate::set_remote_connected(true);
                 } else {
                     *lock(&state) = ConnectionSnapshot::default();
-                    crate::key_gate::set_remote_connected(false);
                 }
             }
             WorkerMessage::Shutdown => {
@@ -931,22 +947,6 @@ fn worker_loop(
             }
         }
     }
-}
-
-/// 连接相位 → 门控"遥控器在线"判定：常驻抑制键（Home/TV"遥控器优先"，
-/// key_gate.rs）仅在线时接管原生输入；离线（含 Connecting/Discovering 建
-/// 链途中、Failed、Disconnected、Suspended）恢复物理键盘原生透传。
-/// Reconnecting 视为在线：短暂断链期间保持接管稳定，避免遥控器按压在
-/// 重连间隙退回双响应（2026-09-07 方案 C 落地决策）。
-fn gate_remote_connected(phase: ConnectionPhase) -> bool {
-    matches!(
-        phase,
-        ConnectionPhase::AwaitingCapabilities
-            | ConnectionPhase::Ready
-            | ConnectionPhase::Streaming
-            | ConnectionPhase::Draining
-            | ConnectionPhase::Reconnecting
-    )
 }
 
 fn nearest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
@@ -996,7 +996,6 @@ fn attempt_connection(
         reconnect_attempt,
         ..ConnectionSnapshot::default()
     };
-    crate::key_gate::set_remote_connected(reconnecting);
 
     let connected = BleSession::connect(
         device_id,
@@ -1013,7 +1012,6 @@ fn attempt_connection(
         ..ConnectionSnapshot::default()
     };
     *lock(state) = snapshot.clone();
-    crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
     *session = Some(connected);
     *capabilities_deadline = Some(Instant::now() + CAPABILITIES_TIMEOUT);
     Ok(snapshot)
@@ -1069,7 +1067,6 @@ fn keep_reconnecting_after_cleanup_failure(
     } else {
         *reconnect_deadline = None;
         *lock(state) = failed_snapshot(error.to_string());
-        crate::key_gate::set_remote_connected(false);
     }
 }
 
@@ -1083,7 +1080,6 @@ fn schedule_reconnect(
     *reconnect_deadline = Some(Instant::now() + delay);
     let mut snapshot = lock(state);
     snapshot.phase = ConnectionPhase::Reconnecting;
-    crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
     snapshot.capabilities = None;
     snapshot.voice_state = VoiceSessionState::Idle;
     snapshot.generation = 0;
@@ -1092,6 +1088,19 @@ fn schedule_reconnect(
         "{reason}；将在 {} 秒后进行第 {attempt} 次重连",
         delay.as_secs()
     ));
+}
+
+fn publish_disconnected(state: &Arc<Mutex<ConnectionSnapshot>>, reconnecting: bool) {
+    let mut snapshot = lock(state);
+    snapshot.phase = if reconnecting {
+        ConnectionPhase::Reconnecting
+    } else {
+        ConnectionPhase::Disconnected
+    };
+    snapshot.capabilities = None;
+    snapshot.voice_state = VoiceSessionState::Idle;
+    snapshot.generation = 0;
+    snapshot.last_error = Some("小米语音遥控器蓝牙连接已断开".to_owned());
 }
 
 fn handle_control(
@@ -1126,7 +1135,6 @@ fn handle_control(
             snapshot.last_error = Some(error.to_string());
             if snapshot.phase == ConnectionPhase::AwaitingCapabilities {
                 snapshot.phase = ConnectionPhase::Failed;
-                crate::key_gate::set_remote_connected(false);
                 snapshot.voice_state = VoiceSessionState::Idle;
             }
             return;
@@ -1137,7 +1145,6 @@ fn handle_control(
         PipelineOutput::Ready(capabilities) => {
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Ready;
-            crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
             snapshot.capabilities = Some(capabilities);
             snapshot.voice_state = VoiceSessionState::Idle;
             snapshot.last_error = None;
@@ -1347,7 +1354,6 @@ fn handle_control(
             *extend_deadline = Some(Instant::now() + MICROPHONE_EXTEND_INTERVAL);
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Streaming;
-            crate::key_gate::set_remote_connected(true);
             snapshot.voice_state = VoiceSessionState::Streaming;
             snapshot.generation = generation;
             snapshot.last_error = None;
@@ -1364,7 +1370,6 @@ fn handle_control(
             {
                 let mut snapshot = lock(state);
                 snapshot.phase = ConnectionPhase::Draining;
-                crate::key_gate::set_remote_connected(true);
                 snapshot.voice_state = VoiceSessionState::Draining;
             }
             if let Err(error) = audio.finish_session(generation) {
@@ -1392,7 +1397,6 @@ fn handle_control(
             *active_voice_samples = 0;
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Ready;
-            crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
             snapshot.voice_state = VoiceSessionState::Idle;
         }
         PipelineOutput::DecoderSynchronized { .. }
@@ -1509,7 +1513,6 @@ fn abort_voice_session(
     } else {
         ConnectionPhase::Failed
     };
-    crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
     snapshot.voice_state = VoiceSessionState::Idle;
     snapshot.last_error = Some(error);
 }
@@ -1786,6 +1789,7 @@ struct BleSession {
     voice_flow: Option<VoiceFlow>,
     closed: bool,
     cleanup_failure: Option<String>,
+    link_disconnected: bool,
 }
 
 impl BleSession {
@@ -1835,7 +1839,6 @@ impl BleSession {
         {
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Discovering;
-            crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
             snapshot.remote_name = Some(name.clone());
             snapshot.remote_model = model;
             snapshot.last_error = None;
@@ -1884,12 +1887,15 @@ impl BleSession {
                 move |device, _| {
                     if let Some(device) = device.as_ref() {
                         if let Ok(status) = device.ConnectionStatus() {
+                            let observed_at = Instant::now();
                             if status == BluetoothConnectionStatus::Disconnected {
                                 disconnected_epoch.fetch_add(1, Ordering::SeqCst);
+                                gatt_note(format!("ble_disconnect phase=callback connection_generation={connection_generation}"));
                             }
                             let _ = sender.send(WorkerMessage::ConnectionChanged {
                                 connection_generation,
                                 status,
+                                observed_at,
                             });
                         }
                     }
@@ -1926,6 +1932,7 @@ impl BleSession {
             voice_flow: None,
             closed: false,
             cleanup_failure: None,
+            link_disconnected: false,
         };
         connected.write(
             &AtvvCommand::GetCapabilitiesV10
@@ -2011,8 +2018,19 @@ impl BleSession {
         // The remote CCCD can no longer be written after a physical disconnect.
         // Local handler removal and object Close are the ownership boundary;
         // notification disable remains best-effort in that expected state.
-        let _ = disable_notifications(&self.audio);
-        let _ = disable_notifications(&self.control);
+        let link_disconnected = self.link_disconnected
+            || self.device.ConnectionStatus().ok() == Some(BluetoothConnectionStatus::Disconnected);
+        if link_disconnected {
+            gatt_note("ble_cleanup phase=remote_cccd action=skipped reason=link_disconnected local_close_required=true".to_owned());
+        } else {
+            let started = Instant::now();
+            let audio_result = disable_notifications(&self.audio);
+            let control_result = disable_notifications(&self.control);
+            gatt_note(format!(
+                "ble_cleanup phase=remote_cccd action=attempted audio_ok={} control_ok={} elapsed_ms={}",
+                audio_result.is_ok(), control_result.is_ok(), started.elapsed().as_millis()
+            ));
+        }
         // 连接参数请求先于设备释放（request 活跃期与 device 绑定）。
         if let Some(request) = self.params_request.take() {
             let _ = request.Close();
@@ -2707,6 +2725,49 @@ mod tests {
             format_utc_timestamp(std::time::Duration::from_millis(1_773_446_400_123)),
             "2026-03-14T00:00:00.123Z"
         );
+    }
+
+    #[test]
+    fn physical_disconnect_snapshot_is_not_ready_while_cleanup_is_pending() {
+        for reconnecting in [false, true] {
+            let state = Arc::new(Mutex::new(ConnectionSnapshot {
+                phase: ConnectionPhase::Streaming,
+                remote_model: RemoteModel::Rc003,
+                remote_name: Some("test-remote".to_owned()),
+                generation: 42,
+                voice_state: VoiceSessionState::Streaming,
+                ..ConnectionSnapshot::default()
+            }));
+            publish_disconnected(&state, reconnecting);
+            // A separate snapshot reader remains usable before teardown finishes.
+            let reader = Arc::clone(&state);
+            let snapshot = std::thread::spawn(move || lock(&reader).clone())
+                .join()
+                .unwrap();
+            assert!(!input_execution_connected(snapshot.phase));
+            assert_eq!(
+                snapshot.phase,
+                if reconnecting {
+                    ConnectionPhase::Reconnecting
+                } else {
+                    ConnectionPhase::Disconnected
+                }
+            );
+            assert_eq!(snapshot.remote_model, RemoteModel::Rc003);
+            assert_eq!(snapshot.remote_name.as_deref(), Some("test-remote"));
+            assert_eq!(snapshot.voice_state, VoiceSessionState::Idle);
+            assert_eq!(snapshot.generation, 0);
+            assert!(snapshot.capabilities.is_none());
+            // Finishing cleanup may schedule retry but cannot make the stale
+            // Ready snapshot visible again.
+            if reconnecting {
+                let mut backoff = ReconnectBackoff::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
+                let mut deadline = None;
+                schedule_reconnect(&state, &mut backoff, &mut deadline, "test-disconnect");
+                assert!(!input_execution_connected(lock(&state).phase));
+                assert!(deadline.is_some());
+            }
+        }
     }
 
     #[test]

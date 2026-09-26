@@ -15,3 +15,5 @@ Console/Multimedia可能联动，写前持久记录before/desired/mask，仅接�
 - 耳机/手选、快按/重复/闲置组合、断连/睡眠/退出、crash恢复的完整真机矩阵仍待验证；RC001缺本轮硬件deferred。60秒问题按用户要求暂停。
 
 来源与受限API边界见[ATTRIBUTION](../ATTRIBUTION.md)，剩余验收归[TODO](../TODO.md)。本地详细证据在artifacts/capture-input-session-20260916和capture-input-commit-20260919，不提交私有配置、设备身份或语音。
+
+源码复现以提交 `85fffc84d41c3bdaf822e49ab115e1d922c75e42` 为准。2026-09-19 核对提交候选目录的 235 个受管文件与该提交内容一致（允许 CRLF/LF 换行差异），其余 13 个文件均为构建或测试生成物；按用户确认范围清理 `candidate/`、临时 diff、索引和提交准备文件。原目录继续保留 `commit-result.json`、源码清单与验证日志；`capture-input-session-20260916/` 的安装包、失败现场及首按修复证据完整保留。

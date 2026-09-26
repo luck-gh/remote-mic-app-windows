@@ -20,7 +20,7 @@ pub(crate) use windows::CaptureInputRuntime;
 
 type Roles = [Option<String>; 3];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transaction {
     version: u32,
@@ -35,7 +35,7 @@ struct Transaction {
     transition: Option<Transition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transition {
     role: usize,
@@ -184,6 +184,35 @@ fn apply(
 fn restore(backend: &mut impl RouteBackend, tx: &mut Transaction) -> Result<(), String> {
     restore_checked(backend, tx, || Ok(()))
 }
+
+/// A removed original endpoint can return and Windows can already have restored
+/// every role. Confirm the complete original identity vector without any setter.
+/// Callers retain the journal unless this read-only completion is fully proven.
+fn complete_if_already_restored(
+    backend: &mut impl RouteBackend,
+    tx: &Transaction,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<bool, String> {
+    check()?;
+    if tx.transition.is_some() || backend.roles()? != tx.original {
+        return Ok(false);
+    }
+    for role in 0..3 {
+        let id = tx.original[role].as_deref().ok_or("original_missing")?;
+        if Some(backend.active_name(id)?) != tx.original_names[role] {
+            return Err("original_changed".into());
+        }
+    }
+    check()?;
+    let actual = backend.roles()?;
+    if actual != tx.original {
+        return Ok(false);
+    }
+    backend.persist(None)?;
+    backend.observe("already_restored", tx, &actual);
+    Ok(true)
+}
+
 fn restore_checked(
     backend: &mut impl RouteBackend,
     tx: &mut Transaction,
@@ -232,12 +261,20 @@ mod tests {
         cancel_after: Option<usize>,
         fail_persist: bool,
         coupled: bool,
+        missing: Option<String>,
+        read_error: bool,
     }
     impl RouteBackend for Fake {
         fn roles(&mut self) -> Result<Roles, String> {
+            if self.read_error {
+                return Err("default_read_failed".into());
+            }
             Ok(self.actual.clone())
         }
         fn active_name(&mut self, id: &str) -> Result<String, String> {
+            if self.missing.as_deref() == Some(id) {
+                return Err("capture_endpoint_missing".into());
+            }
             Ok(id.to_owned())
         }
         fn set(&mut self, role: usize, id: &str) -> Result<(), String> {
@@ -287,9 +324,108 @@ mod tests {
                 cancel_after: None,
                 fail_persist: false,
                 coupled: false,
+                missing: None,
+                read_error: false,
             },
             tx,
         )
+    }
+    #[test]
+    fn returned_original_vector_completes_journal_without_a_setter() {
+        let (mut io, mut tx) = fixture();
+        apply(&mut io, &mut tx, || false).unwrap();
+        io.missing = Some("a".into());
+        assert_eq!(
+            restore(&mut io, &mut tx).unwrap_err(),
+            "capture_endpoint_missing"
+        );
+        let writes = io.writes.len();
+        io.missing = None;
+        io.actual = tx.original.clone();
+        assert!(complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap());
+        assert_eq!(io.writes.len(), writes);
+        assert!(io.durable.is_none());
+    }
+    #[test]
+    fn zero_write_completion_never_accepts_target_mixed_or_external_roles() {
+        let (mut io, mut tx) = fixture();
+        apply(&mut io, &mut tx, || false).unwrap();
+        let durable = io.durable.clone();
+        let writes = io.writes.len();
+        for actual in [
+            tx.expected.clone(),
+            [
+                tx.original[0].clone(),
+                tx.original[1].clone(),
+                Some("target".into()),
+            ],
+            [
+                tx.original[0].clone(),
+                tx.original[1].clone(),
+                Some("external".into()),
+            ],
+        ] {
+            io.actual = actual.clone();
+            assert!(!complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap());
+            assert_eq!(io.actual, actual);
+            assert_eq!(io.durable, durable);
+            assert_eq!(io.writes.len(), writes);
+        }
+    }
+    #[test]
+    fn zero_write_completion_retains_record_on_endpoint_read_journal_or_cancel_failure() {
+        let (mut io, mut tx) = fixture();
+        apply(&mut io, &mut tx, || false).unwrap();
+        io.actual = tx.original.clone();
+        let durable = io.durable.clone();
+        let writes = io.writes.len();
+        io.missing = Some("a".into());
+        assert_eq!(
+            complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap_err(),
+            "capture_endpoint_missing"
+        );
+        io.missing = None;
+        io.read_error = true;
+        assert_eq!(
+            complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap_err(),
+            "default_read_failed"
+        );
+        io.read_error = false;
+        io.fail_persist = true;
+        assert_eq!(
+            complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap_err(),
+            "journal_failed"
+        );
+        io.fail_persist = false;
+        assert_eq!(
+            complete_if_already_restored(&mut io, &tx, || Err("cancelled".into())).unwrap_err(),
+            "cancelled"
+        );
+        tx.original_names[0] = Some("renamed".into());
+        assert_eq!(
+            complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap_err(),
+            "original_changed"
+        );
+        assert_eq!(io.durable, durable);
+        assert_eq!(io.writes.len(), writes);
+    }
+    #[test]
+    fn zero_write_completion_does_not_bypass_an_unresolved_setter_transition() {
+        let (mut io, mut tx) = fixture();
+        tx.transition = Some(Transition {
+            role: 0,
+            mask: 3,
+            before: tx.original.clone(),
+            desired: [
+                Some("target".into()),
+                Some("target".into()),
+                tx.original[2].clone(),
+            ],
+        });
+        io.durable = Some(tx.clone());
+        assert!(!complete_if_already_restored(&mut io, &tx, || Ok(())).unwrap());
+        assert_eq!(io.durable, Some(tx));
+        assert!(io.writes.is_empty());
     }
     #[test]
     fn normal_session_restores_only_its_changes() {

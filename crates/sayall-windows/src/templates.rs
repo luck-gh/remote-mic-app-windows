@@ -11,83 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEMPLATE_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdjustmentMode {
-    #[default]
-    Volume,
-    Page,
-    Zoom,
-}
-
-/// A focused area that gives the same physical key an explicit meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlRegion {
-    ApplicationList,
-    Content,
-    Input,
-}
-
-/// Intent resolved by a public application adapter.  It is never a fallback
-/// shortcut: an unavailable intent is reported as unavailable by that adapter.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SemanticAction {
-    #[default]
-    Disabled,
-    SelectPrevious,
-    SelectNext,
-    SelectParent,
-    ExpandSelection,
-    ActivateSelection,
-    CancelSelection,
-    FocusApplicationList,
-    FocusContent,
-    FocusInput,
-    ScrollUp,
-    ScrollDown,
-    BrowserBack,
-    PreviousTab,
-    NextTab,
-    NativeEnter,
-    Newline,
-    Send,
-    Backspace,
-    PageUp,
-    PageDown,
-    ZoomIn,
-    ZoomOut,
-    VolumeUp,
-    VolumeDown,
-    OpenApplicationMenu,
-    OpenAdjustmentMenu,
-    Escape,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SemanticButtonActions {
-    #[serde(default)]
-    pub single: SemanticAction,
-    #[serde(default)]
-    pub double: SemanticAction,
-    #[serde(default)]
-    pub long: SemanticAction,
-}
-
+/// One fixed-key mapping model for every built-in and user template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MappingTemplate {
     pub id: String,
     pub name: String,
-    /// Region-scoped semantic intents.  Unbound applications use
-    /// `MappingConfiguration.common_mappings` instead.
-    #[serde(default)]
-    pub region_actions:
-        BTreeMap<ControlRegion, BTreeMap<crate::raw_input::RemoteButton, SemanticButtonActions>>,
-    #[serde(default)]
-    pub adjustment_mode: AdjustmentMode,
+    pub mappings: ButtonMappings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +30,30 @@ pub struct ApplicationBinding {
     /// Local-only launch target.  It is intentionally omitted from exports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_target: Option<String>,
+}
+
+pub type ButtonMappingTemplate = MappingTemplate;
+
+pub const BUILTIN_AGENT_TEMPLATE_ID: &str = "preset-agent";
+pub const BUILTIN_CHAT_TEMPLATE_ID: &str = "preset-chat";
+pub const BUILTIN_BROWSER_TEMPLATE_ID: &str = "preset-browser";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateCatalogKind {
+    Direct,
+}
+
+/// Read-only projection used by the UI. Built-ins are generated from the
+/// canonical fixed-key definitions and are never written into user settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: TemplateCatalogKind,
+    pub read_only: bool,
+    pub button_mappings: Option<ButtonMappings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,13 +78,22 @@ impl From<&ApplicationBinding> for ExportApplicationBinding {
 #[serde(rename_all = "camelCase")]
 pub struct MappingConfiguration {
     #[serde(default)]
-    pub common_mappings: ButtonMappings,
+    pub menu_update_default: bool,
     #[serde(default)]
-    pub template_control_enabled: bool,
+    pub menu_template_switch_enabled: bool,
+    #[serde(default = "mapping_notice_default")]
+    pub mapping_notice_enabled: bool,
+    #[serde(default)]
+    pub common_mappings: ButtonMappings,
     #[serde(default)]
     pub templates: Vec<MappingTemplate>,
     #[serde(default)]
     pub application_bindings: Vec<ApplicationBinding>,
+    /// Application-specific ordinary-button profiles are opt-in. Bindings are
+    /// retained while disabled so turning the feature back on restores the
+    /// user's explicit associations without rewriting them.
+    #[serde(default)]
+    pub button_mapping_follow_enabled: bool,
 }
 
 /// A share-safe import preview. The token retains local launch resolutions;
@@ -144,6 +107,7 @@ pub struct MappingConfigurationImportPreview {
     pub source_token: Option<String>,
     pub format_version: u32,
     pub configuration: MappingConfiguration,
+    pub builtin_template_ids: Vec<String>,
     pub template_name_conflicts: Vec<String>,
     pub unresolved_application_ids: Vec<String>,
 }
@@ -180,12 +144,19 @@ pub struct TemplateImportPreview {
 impl Default for MappingConfiguration {
     fn default() -> Self {
         Self {
+            menu_update_default: false,
+            menu_template_switch_enabled: false,
+            mapping_notice_enabled: true,
             common_mappings: ButtonMappings::default(),
-            template_control_enabled: false,
             templates: Vec::new(),
             application_bindings: Vec::new(),
+            button_mapping_follow_enabled: false,
         }
     }
+}
+
+fn mapping_notice_default() -> bool {
+    true
 }
 
 impl MappingConfiguration {
@@ -193,193 +164,263 @@ impl MappingConfiguration {
         self.common_mappings = self
             .common_mappings
             .normalized()
-            .map_err(|error| format!("通用映射无效：{error}"))?;
+            .map_err(|e| format!("通用映射无效：{e}"))?;
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
         for template in &mut self.templates {
+            if template.mappings.actions.values().any(|actions| {
+                [&actions.single, &actions.double, &actions.long]
+                    .iter()
+                    .any(|action| matches!(action, crate::send_input::ButtonAction::OpenApp { .. }))
+            }) {
+                return Err("模板只支持固定按键或组合键".into());
+            }
             template.id = normalized_required(&template.id, "模板 ID")?;
             template.name = normalized_required(&template.name, "模板名称")?;
-            if !ids.insert(template.id.clone()) {
-                return Err("模板 ID 重复".to_owned());
+            reject_builtin_template_mutation(&template.id)?;
+            if !ids.insert(template.id.clone()) || !names.insert(template.name.clone()) {
+                return Err("模板 ID 或名称重复".to_owned());
             }
-            if !names.insert(template.name.clone()) {
-                return Err("模板名称重复".to_owned());
-            }
+            template.mappings = template
+                .mappings
+                .clone()
+                .normalized()
+                .map_err(|e| format!("按键模板无效：{e}"))?;
         }
         let mut applications = HashSet::new();
         for binding in &mut self.application_bindings {
             binding.application_id = normalized_required(&binding.application_id, "应用 ID")?;
             binding.template_id = normalized_required(&binding.template_id, "模板 ID")?;
-            if !applications.insert(binding.application_id.clone()) {
-                return Err("应用绑定重复".to_owned());
+            if !applications.insert(binding.application_id.to_lowercase()) {
+                return Err("每个程序只能关联一个默认模板".to_owned());
             }
-            if !ids.contains(&binding.template_id) {
+            if !ids.contains(&binding.template_id) && !is_builtin_template_id(&binding.template_id)
+            {
                 return Err("应用绑定引用了不存在的模板".to_owned());
             }
             binding.launch_target = binding
                 .launch_target
                 .take()
-                .map(|target| normalized_required(&target, "启动目标"))
+                .map(|v| normalized_required(&v, "程序目标"))
                 .transpose()?;
         }
         Ok(self)
     }
 
-    pub fn create_template(&mut self, name: String) -> Result<MappingTemplate, String> {
+    pub fn save_button_mapping_template(
+        &mut self,
+        name: String,
+        mappings: ButtonMappings,
+    ) -> Result<MappingTemplate, String> {
         let name = normalized_required(&name, "模板名称")?;
-        if self.templates.iter().any(|template| template.name == name) {
+        if self.templates.iter().any(|t| t.name == name) {
             return Err("模板名称重复".to_owned());
         }
         let template = MappingTemplate {
             id: new_template_id(),
             name,
-            region_actions: BTreeMap::new(),
-            adjustment_mode: AdjustmentMode::Volume,
+            mappings: mappings
+                .normalized()
+                .map_err(|e| format!("按键模板无效：{e}"))?,
         };
         self.templates.push(template.clone());
         Ok(template)
     }
-
+    pub fn create_template(&mut self, name: String) -> Result<MappingTemplate, String> {
+        self.save_button_mapping_template(name, ButtonMappings::default())
+    }
     pub fn duplicate_template(
         &mut self,
-        template_id: &str,
+        id: &str,
         name: String,
     ) -> Result<MappingTemplate, String> {
-        let name = normalized_required(&name, "模板名称")?;
-        if self.templates.iter().any(|template| template.name == name) {
-            return Err("模板名称重复".to_owned());
-        }
-        let source = self
-            .templates
-            .iter()
-            .find(|template| template.id == template_id)
-            .cloned()
+        let mappings = self
+            .template_mappings(id)
             .ok_or_else(|| "模板不存在".to_owned())?;
-        let template = MappingTemplate {
-            id: new_template_id(),
-            name,
-            ..source
-        };
-        self.templates.push(template.clone());
-        Ok(template)
+        self.save_button_mapping_template(name, mappings)
     }
-
-    pub fn recommended_templates() -> Vec<MappingTemplate> {
-        [
-            ("preset-agent", "Agent", agent_regions()),
-            ("preset-chat", "聊天工具", agent_regions()),
-            ("preset-browser", "浏览器", browser_regions()),
-        ]
-        .into_iter()
-        .map(|(id, name, region_actions)| MappingTemplate {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            region_actions,
-            adjustment_mode: AdjustmentMode::Volume,
-        })
-        .collect()
-    }
-
-    pub fn apply_template_preset(
+    pub fn update_button_mapping_template(
         &mut self,
-        preset_id: &str,
-        name: String,
+        id: &str,
+        mappings: ButtonMappings,
     ) -> Result<MappingTemplate, String> {
-        let preset = Self::recommended_templates()
-            .into_iter()
-            .find(|preset| preset.id == preset_id)
-            .ok_or_else(|| "推荐模板不存在".to_owned())?;
-        let created = self.create_template(name)?;
+        reject_builtin_template_mutation(id)?;
         let template = self
             .templates
             .iter_mut()
-            .find(|template| template.id == created.id)
-            .expect("new template is present");
-        template.region_actions = preset.region_actions;
-        template.adjustment_mode = preset.adjustment_mode;
+            .find(|t| t.id == id)
+            .ok_or_else(|| "模板不存在".to_owned())?;
+        template.mappings = mappings
+            .normalized()
+            .map_err(|e| format!("按键模板无效：{e}"))?;
         Ok(template.clone())
     }
-}
-
-fn action(single: SemanticAction) -> SemanticButtonActions {
-    let long = if single == SemanticAction::OpenApplicationMenu {
-        SemanticAction::OpenAdjustmentMenu
-    } else {
-        SemanticAction::Disabled
-    };
-    SemanticButtonActions {
-        single,
-        long,
-        ..Default::default()
+    pub fn template_mappings(&self, id: &str) -> Option<ButtonMappings> {
+        self.templates
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.mappings.clone())
+            .or_else(|| {
+                Self::recommended_templates()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.mappings)
+            })
+    }
+    pub fn upsert_application_binding(
+        &mut self,
+        mut binding: ApplicationBinding,
+    ) -> Result<(), String> {
+        if self.template_mappings(&binding.template_id).is_none() {
+            return Err("模板不存在".to_owned());
+        }
+        binding.menu_order = self
+            .application_bindings
+            .iter()
+            .find(|b| {
+                b.application_id
+                    .eq_ignore_ascii_case(&binding.application_id)
+            })
+            .map(|b| b.menu_order)
+            .unwrap_or_else(|| {
+                self.application_bindings
+                    .iter()
+                    .map(|b| b.menu_order)
+                    .max()
+                    .map_or(0, |i| i.saturating_add(1))
+            });
+        self.remove_application_binding(&binding.application_id);
+        self.application_bindings.push(binding);
+        Ok(())
+    }
+    pub fn remove_application_binding(&mut self, application_id: &str) {
+        self.application_bindings
+            .retain(|b| !b.application_id.eq_ignore_ascii_case(application_id));
+    }
+    pub fn reorder_application_associations(&mut self, ids: Vec<String>) -> Result<(), String> {
+        let requested: HashSet<_> = ids.iter().map(|id| id.trim().to_lowercase()).collect();
+        let existing: HashSet<_> = self
+            .application_bindings
+            .iter()
+            .map(|b| b.application_id.to_lowercase())
+            .collect();
+        if requested.len() != ids.len() || requested != existing {
+            return Err("程序关联顺序必须完整包含当前全部且不得重复".to_owned());
+        }
+        for (i, id) in ids.iter().enumerate() {
+            self.application_bindings
+                .iter_mut()
+                .find(|b| b.application_id.eq_ignore_ascii_case(id.trim()))
+                .unwrap()
+                .menu_order = i as u32;
+        }
+        Ok(())
+    }
+    pub fn recommended_templates() -> Vec<MappingTemplate> {
+        [
+            (BUILTIN_AGENT_TEMPLATE_ID, "Agent", false),
+            (BUILTIN_CHAT_TEMPLATE_ID, "聊天工具", false),
+            (BUILTIN_BROWSER_TEMPLATE_ID, "浏览器", true),
+        ]
+        .into_iter()
+        .map(|(id, name, browser)| MappingTemplate {
+            id: id.into(),
+            name: name.into(),
+            mappings: fixed_keys(browser),
+        })
+        .collect()
+    }
+    pub fn template_catalog(&self) -> Vec<TemplateCatalogEntry> {
+        Self::recommended_templates()
+            .into_iter()
+            .chain(self.templates.iter().cloned())
+            .map(|t| TemplateCatalogEntry {
+                read_only: is_builtin_template_id(&t.id),
+                id: t.id,
+                name: t.name,
+                kind: TemplateCatalogKind::Direct,
+                button_mappings: Some(t.mappings),
+            })
+            .collect()
+    }
+    pub fn copy_template_catalog_entry(
+        &mut self,
+        id: &str,
+        name: String,
+    ) -> Result<TemplateCatalogEntry, String> {
+        let template = self.duplicate_template(id, name)?;
+        Ok(TemplateCatalogEntry {
+            id: template.id,
+            name: template.name,
+            kind: TemplateCatalogKind::Direct,
+            read_only: false,
+            button_mappings: Some(template.mappings),
+        })
+    }
+    pub fn apply_template_preset(
+        &mut self,
+        id: &str,
+        name: String,
+    ) -> Result<MappingTemplate, String> {
+        if !is_builtin_template_id(id) {
+            return Err("推荐模板不存在".to_owned());
+        }
+        self.duplicate_template(id, name)
     }
 }
 
-fn agent_regions(
-) -> BTreeMap<ControlRegion, BTreeMap<crate::raw_input::RemoteButton, SemanticButtonActions>> {
-    use crate::raw_input::RemoteButton::*;
-    use SemanticAction::*;
-    let mut list = BTreeMap::new();
-    list.insert(Up, action(SelectPrevious));
-    list.insert(Down, action(SelectNext));
-    list.insert(Left, action(SelectParent));
-    list.insert(Right, action(ExpandSelection));
-    list.insert(Ok, action(ActivateSelection));
-    list.insert(Back, action(CancelSelection));
-    list.insert(Home, action(FocusApplicationList));
-    list.insert(Tv, action(FocusInput));
-    list.insert(Menu, action(OpenApplicationMenu));
-    list.insert(Power, action(Escape));
-    let mut content = BTreeMap::new();
-    content.insert(Up, action(ScrollUp));
-    content.insert(Down, action(ScrollDown));
-    content.insert(Left, action(FocusApplicationList));
-    content.insert(Right, action(FocusInput));
-    content.insert(Ok, action(FocusInput));
-    content.insert(Back, action(FocusApplicationList));
-    content.insert(Menu, action(OpenApplicationMenu));
-    content.insert(Power, action(Escape));
-    let mut input = BTreeMap::new();
-    input.insert(
-        Ok,
-        SemanticButtonActions {
-            single: Newline,
-            long: Send,
-            ..Default::default()
-        },
-    );
-    input.insert(Back, action(Backspace));
-    input.insert(Menu, action(OpenApplicationMenu));
-    input.insert(Power, action(Escape));
-    BTreeMap::from([
-        (ControlRegion::ApplicationList, list),
-        (ControlRegion::Content, content),
-        (ControlRegion::Input, input),
-    ])
+/// Fixed input-region equivalents only. UI-dependent actions have no default.
+fn fixed_keys(browser: bool) -> ButtonMappings {
+    use crate::raw_input::RemoteButton;
+    use crate::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
+    let mut mappings = ButtonMappings {
+        enabled: true,
+        actions: BTreeMap::new(),
+    };
+    for (button, keys) in [
+        (RemoteButton::Up, vec![KeyCode::Up]),
+        (RemoteButton::Down, vec![KeyCode::Down]),
+        (RemoteButton::Left, vec![KeyCode::Left]),
+        (RemoteButton::Right, vec![KeyCode::Right]),
+        (RemoteButton::Back, vec![KeyCode::Backspace]),
+        (
+            RemoteButton::Ok,
+            if browser {
+                vec![KeyCode::Enter]
+            } else {
+                vec![KeyCode::Shift, KeyCode::Enter]
+            },
+        ),
+        (RemoteButton::VolumeUp, vec![KeyCode::VolumeUp]),
+        (RemoteButton::VolumeDown, vec![KeyCode::VolumeDown]),
+        (RemoteButton::Power, vec![KeyCode::Escape]),
+    ] {
+        mappings.actions.insert(
+            button,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord { keys },
+                },
+                ..Default::default()
+            },
+        );
+    }
+    mappings
 }
 
-fn browser_regions(
-) -> BTreeMap<ControlRegion, BTreeMap<crate::raw_input::RemoteButton, SemanticButtonActions>> {
-    use crate::raw_input::RemoteButton::*;
-    use SemanticAction::*;
-    let mut page = BTreeMap::new();
-    page.insert(Up, action(ScrollUp));
-    page.insert(Down, action(ScrollDown));
-    page.insert(Left, action(PreviousTab));
-    page.insert(Right, action(NextTab));
-    page.insert(Ok, action(ActivateSelection));
-    page.insert(Home, action(FocusInput));
-    page.insert(Back, action(BrowserBack));
-    page.insert(Menu, action(OpenApplicationMenu));
-    page.insert(Power, action(Escape));
-    let mut input = BTreeMap::new();
-    input.insert(Ok, action(NativeEnter));
-    input.insert(Back, action(Backspace));
-    input.insert(Menu, action(OpenApplicationMenu));
-    input.insert(Power, action(Escape));
-    BTreeMap::from([
-        (ControlRegion::Content, page),
-        (ControlRegion::Input, input),
-    ])
+pub fn is_builtin_template_id(id: &str) -> bool {
+    matches!(
+        id,
+        BUILTIN_AGENT_TEMPLATE_ID | BUILTIN_CHAT_TEMPLATE_ID | BUILTIN_BROWSER_TEMPLATE_ID
+    )
+}
+
+pub fn reject_builtin_template_mutation(id: &str) -> Result<(), String> {
+    if is_builtin_template_id(id) {
+        Err("内置模板为只读，请先复制后编辑".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 fn normalized_required(value: &str, field: &str) -> Result<String, String> {
@@ -403,62 +444,75 @@ pub fn new_template_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn duplicate_makes_an_independent_stable_id() {
-        let mut configuration = MappingConfiguration::default();
-        let first = configuration.create_template("阅读".to_owned()).unwrap();
-        let copy = configuration
-            .duplicate_template(&first.id, "阅读副本".to_owned())
-            .unwrap();
-        assert_ne!(first.id, copy.id);
-        assert_eq!(copy.name, "阅读副本");
+    fn builtin_wire_fixture_matches_production_fixed_keys() {
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/ipc/template-catalog-builtins.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(MappingConfiguration::default().template_catalog()).unwrap(),
+            expected
+        );
     }
-
     #[test]
-    fn bindings_must_reference_unique_existing_templates() {
-        let configuration = MappingConfiguration {
-            application_bindings: vec![ApplicationBinding {
-                application_id: "edge".to_owned(),
-                template_id: "missing".to_owned(),
-                menu_order: 0,
+    fn every_template_uses_one_fixed_key_model_and_preserves_missing_actions() {
+        use crate::raw_input::RemoteButton;
+        let mut c = MappingConfiguration::default();
+        let copied = c
+            .duplicate_template(BUILTIN_AGENT_TEMPLATE_ID, "Copy".into())
+            .unwrap();
+        assert_eq!(c.template_catalog().len(), 4);
+        assert!(c
+            .template_catalog()
+            .iter()
+            .all(|t| t.button_mappings.is_some()));
+        assert!(!copied.mappings.actions.contains_key(&RemoteButton::Home));
+        assert!(!copied.mappings.actions.contains_key(&RemoteButton::Tv));
+        assert_eq!(
+            copied.mappings.actions[&RemoteButton::Ok].long,
+            crate::send_input::ButtonAction::Disabled
+        );
+        let raw = serde_json::to_string(&c).unwrap();
+        assert!(!raw.contains("regionActions"));
+        assert_eq!(
+            serde_json::from_str::<MappingConfiguration>(&raw)
+                .unwrap()
+                .normalized()
+                .unwrap(),
+            c
+        );
+        assert!(serde_json::from_str::<MappingTemplate>(
+            r#"{"id":"x","name":"x","regionActions":{}}"#
+        )
+        .is_err());
+    }
+    #[test]
+    fn one_default_per_program_preserves_template_and_binding_order() {
+        let mut c = MappingConfiguration::default();
+        let t = c.create_template("Empty".into()).unwrap();
+        for id in [BUILTIN_AGENT_TEMPLATE_ID, t.id.as_str()] {
+            c.upsert_application_binding(ApplicationBinding {
+                application_id: "codex".into(),
+                template_id: id.into(),
+                menu_order: 99,
                 launch_target: None,
-            }],
-            ..Default::default()
-        };
-        assert!(configuration.normalized().is_err());
-    }
-
-    #[test]
-    fn preset_application_copies_canonical_regions_without_enabling_control() {
-        let presets = MappingConfiguration::recommended_templates();
-        assert_eq!(presets, MappingConfiguration::recommended_templates());
-        let mut configuration = MappingConfiguration::default();
-        let original_common = configuration.common_mappings.clone();
-        let first = configuration
-            .apply_template_preset("preset-agent", "我的Agent".to_owned())
+            })
             .unwrap();
-        let second = configuration
-            .apply_template_preset("preset-agent", "工作Agent".to_owned())
-            .unwrap();
-        assert_ne!(first.id, second.id);
-        assert_ne!(first.id, "preset-agent");
-        assert_eq!(first.region_actions, presets[0].region_actions);
-        assert!(!configuration.template_control_enabled);
-        assert_eq!(configuration.common_mappings, original_common);
-        assert!(configuration
-            .apply_template_preset("preset-agent", first.name)
-            .is_err());
-        assert!(configuration
-            .apply_template_preset("missing", "未知".to_owned())
-            .is_err());
-        for preset in presets {
-            for region in preset.region_actions.values() {
-                let menu = &region[&crate::raw_input::RemoteButton::Menu];
-                assert_eq!(menu.single, SemanticAction::OpenApplicationMenu);
-                assert_eq!(menu.long, SemanticAction::OpenAdjustmentMenu);
-                assert_eq!(menu.double, SemanticAction::Disabled);
-            }
         }
+        assert_eq!(c.application_bindings.len(), 1);
+        assert_eq!(c.application_bindings[0].template_id, t.id);
+        assert!(c.clone().normalized().is_ok());
+        assert!(c
+            .update_button_mapping_template(BUILTIN_AGENT_TEMPLATE_ID, ButtonMappings::default())
+            .is_err());
+        let mut duplicate = c.clone();
+        duplicate
+            .application_bindings
+            .push(c.application_bindings[0].clone());
+        assert!(duplicate.normalized().is_err());
+        assert!(c
+            .reorder_application_associations(vec!["missing".into()])
+            .is_err());
     }
 }

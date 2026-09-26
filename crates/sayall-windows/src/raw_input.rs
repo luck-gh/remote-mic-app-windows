@@ -262,9 +262,23 @@ pub fn button_for_keyboard(virtual_key: u16, make_code: u16) -> Option<RemoteBut
 pub struct ButtonStateMerger {
     keyboard: BTreeSet<RemoteButton>,
     hid: BTreeSet<RemoteButton>,
+    driver: BTreeSet<RemoteButton>,
 }
 
 impl ButtonStateMerger {
+    pub(crate) fn keyboard_button_is_pressed(&self, button: RemoteButton) -> bool {
+        self.keyboard.contains(&button)
+    }
+
+    pub fn apply_driver_button_edge(&mut self, edge: ButtonEdge) -> Vec<ButtonEdge> {
+        let before = self.active_buttons();
+        if edge.is_pressed {
+            self.driver.insert(edge.button);
+        } else {
+            self.driver.remove(&edge.button);
+        }
+        edges_between(&before, &self.active_buttons())
+    }
     pub fn update_keyboard(&mut self, event: RawKeyboardEvent) -> Vec<ButtonEdge> {
         let Some(button) = event.button() else {
             return Vec::new();
@@ -318,6 +332,7 @@ impl ButtonStateMerger {
         let active = self.active_buttons();
         self.keyboard.clear();
         self.hid.clear();
+        self.driver.clear();
         active
             .into_iter()
             .map(|button| ButtonEdge {
@@ -328,7 +343,11 @@ impl ButtonStateMerger {
     }
 
     fn active_buttons(&self) -> BTreeSet<RemoteButton> {
-        self.keyboard.union(&self.hid).copied().collect()
+        self.keyboard
+            .union(&self.hid)
+            .copied()
+            .chain(self.driver.iter().copied())
+            .collect()
     }
 }
 

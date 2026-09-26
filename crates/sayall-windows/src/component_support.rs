@@ -1,7 +1,8 @@
 //! Read-only component evidence and the fixed, fail-closed elevation boundary.
 //! Release trust is compiled into the application/helper, never supplied by IPC
 //! or by an adjacent, editable manifest. VB-CABLE uses its official interactive
-//! setup as the separate elevation boundary; no HID enhancement is implemented.
+//! setup as the separate elevation boundary. HID source and its device channel
+//! exist; fixed package hashes and kernel catalog policy gate maintenance.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,6 +10,20 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+#[path = "input_driver_package.rs"]
+mod hid_package;
+/// Separate Helper only: no caller-provided log path is accepted at elevation.
+pub fn initialize_helper_diagnostics() -> bool {
+    #[cfg(windows)]
+    {
+        hid_package::enable_helper_audit()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +152,7 @@ impl ComponentOperation {
             OperationOutcome::Denied => 5,
             OperationOutcome::TimedOut => 1460,
             OperationOutcome::RestartRequired => 3010,
+            OperationOutcome::Failed if self.status.restart_required => 3011,
             OperationOutcome::Failed => 1,
         }
     }
@@ -194,19 +210,19 @@ fn describe(component: ComponentKind, evidence: Evidence) -> ComponentStatus {
     let blockers = if is_vb {
         vec![ComponentReason::OfficialWizardRequired]
     } else {
-        vec![ComponentReason::NotImplemented]
+        vec![ComponentReason::SigningPolicyMissing]
     };
     ComponentStatus {
         component,
         installation: if is_vb {
             installation
         } else {
-            InstallationState::NotImplemented
+            InstallationState::Unknown
         },
         package: if is_vb {
             PackageState::DownloadAvailable
         } else {
-            PackageState::Missing
+            PackageState::SignatureMissing
         },
         installed_version: None,
         service_installed: evidence.installed,
@@ -217,7 +233,7 @@ fn describe(component: ComponentKind, evidence: Evidence) -> ComponentStatus {
         reason: if is_vb {
             reason
         } else {
-            ComponentReason::NotImplemented
+            ComponentReason::SigningPolicyMissing
         },
         blockers,
         allowed_actions: if is_vb && wizard_supported {
@@ -229,6 +245,10 @@ fn describe(component: ComponentKind, evidence: Evidence) -> ComponentStatus {
 }
 
 fn inspect_one(component: ComponentKind) -> ComponentStatus {
+    #[cfg(windows)]
+    if component == ComponentKind::HidEnhancement {
+        return hid_package::inspect();
+    }
     let evidence = match component {
         // A guessed service name is not evidence of this product's filter.
         ComponentKind::HidEnhancement => Evidence {
@@ -241,7 +261,12 @@ fn inspect_one(component: ComponentKind) -> ComponentStatus {
         ComponentKind::VbCable => probe_vb_cable(),
     };
     let status = describe(component, evidence);
-    crate::gatt_note(format!("component_support action=inspect component={component:?} installation={:?} reason={:?} allowed_actions={}", status.installation, status.reason, status.allowed_actions.len()));
+    crate::gatt_note(format!(
+        "component_support action=inspect component={component:?} installation={:?} reason={:?} allowed_actions={}",
+        status.installation,
+        status.reason,
+        status.allowed_actions.len()
+    ));
     status
 }
 
@@ -271,12 +296,12 @@ pub fn parse_helper_arguments(arguments: &[String]) -> Option<(ComponentKind, Co
     Some((component, action))
 }
 
-// No generic installer strategy: only the independently verified vendor wizard
-// exists. The separate product Helper cannot perform silent driver operations.
+// VB-CABLE stays on its independent vendor wizard. Non-Windows HID cannot use
+// the Windows-only fixed-package Helper implementation.
 fn unsupported_operation_reason(component: ComponentKind) -> ComponentReason {
     match component {
         ComponentKind::VbCable => ComponentReason::OfficialWizardRequired,
-        ComponentKind::HidEnhancement => ComponentReason::NotImplemented,
+        ComponentKind::HidEnhancement => ComponentReason::SigningPolicyMissing,
     }
 }
 
@@ -286,6 +311,10 @@ pub fn perform_component_action(
     component: ComponentKind,
     action: ComponentAction,
 ) -> ComponentOperation {
+    #[cfg(windows)]
+    if component == ComponentKind::HidEnhancement {
+        return operation_result(component, action, hid_package::launch(action));
+    }
     if action == ComponentAction::OpenVendorWizard {
         return operation_result(component, action, open_vendor_wizard(component));
     }
@@ -296,8 +325,12 @@ pub fn perform_component_action(
     )
 }
 
-/// Directly invoking the product Helper never bypasses the vendor wizard.
+/// The independent Helper rechecks the fixed HID package; VB stays on its wizard.
 pub fn helper_request(component: ComponentKind, action: ComponentAction) -> ComponentOperation {
+    #[cfg(windows)]
+    if component == ComponentKind::HidEnhancement {
+        return operation_result(component, action, hid_package::maintain(action));
+    }
     operation_result(
         component,
         action,
@@ -310,7 +343,10 @@ fn operation_result(
     action: ComponentAction,
     result: Result<Option<u32>, ComponentReason>,
 ) -> ComponentOperation {
-    let status = inspect_one(component);
+    let mut status = inspect_one(component);
+    if matches!(result, Ok(Some(3010 | 3011 | 1641))) {
+        status.restart_required = true;
+    }
     let (outcome, reason) = match result {
         Ok(exit) => outcome_after_helper(exit, action, &status),
         Err(reason) => (
@@ -325,7 +361,13 @@ fn operation_result(
             reason,
         ),
     };
-    crate::gatt_note(format!("component_support action={action:?} component={component:?} terminal_result={outcome:?} reason={reason:?}"));
+    let message=format!(
+        "component_support action={action:?} component={component:?} terminal_result={outcome:?} reason={reason:?}"
+    );
+    #[cfg(windows)]
+    hid_package::note(message);
+    #[cfg(not(windows))]
+    crate::gatt_note(message);
     ComponentOperation {
         component,
         action,
@@ -370,6 +412,7 @@ fn outcome_after_helper(
             OperationOutcome::RestartRequired,
             ComponentReason::RestartRequired,
         ),
+        Some(3011) => (OperationOutcome::Failed, ComponentReason::RestartRequired),
         Some(0) => {
             let verified = if action == ComponentAction::Remove {
                 status.installation == InstallationState::NotInstalled
@@ -706,7 +749,7 @@ mod tests {
         assert_eq!(ready.installed_version, None);
         assert_eq!(
             describe(ComponentKind::HidEnhancement, evidence(None, None, None)).installation,
-            InstallationState::NotImplemented
+            InstallationState::Unknown
         );
     }
 
@@ -764,7 +807,12 @@ mod tests {
         let result =
             perform_component_action(ComponentKind::HidEnhancement, ComponentAction::Install);
         assert_eq!(result.outcome, OperationOutcome::Blocked);
-        assert_eq!(result.reason, ComponentReason::NotImplemented);
+        assert!(matches!(
+            result.reason,
+            ComponentReason::SigningPolicyMissing
+                | ComponentReason::PackageMissing
+                | ComponentReason::PathRejected
+        ));
         assert_eq!(result.exit_code(), 50);
     }
 
@@ -1182,7 +1230,8 @@ mod native {
             return Err(ComponentReason::HelperFailed);
         }
         let process = launch.hProcess;
-        let wait = unsafe { WaitForSingleObject(process, 600_000) };
+        let wait =
+            unsafe { WaitForSingleObject(process, if vendor_wizard { 600_000 } else { 60_000 }) };
         if wait == WAIT_TIMEOUT {
             // Never kill an installer or pretend it rolled back. Retain the
             // verified file and operation lock until its actual termination.

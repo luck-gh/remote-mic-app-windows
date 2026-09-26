@@ -29,6 +29,7 @@ pub struct CaptureInputSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    pub ui_preferences: UiPreferences,
     pub schema_version: u32,
     pub selected_remote_id: Option<String>,
     pub audio_endpoint_id: Option<String>,
@@ -38,6 +39,7 @@ pub struct AppSettings {
     pub voice_trigger_mode: VoiceTriggerMode,
     pub launch_at_login: bool,
     pub open_window_at_launch: bool,
+    pub restore_hid_enhancement: bool,
     pub check_prerelease_updates: bool,
     pub theme_preference: ThemePreference,
     pub usage_statistics: UsageStatistics,
@@ -46,6 +48,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            ui_preferences: UiPreferences::default(),
             schema_version: 3,
             selected_remote_id: None,
             audio_endpoint_id: None,
@@ -55,9 +58,43 @@ impl Default for AppSettings {
             voice_trigger_mode: VoiceTriggerMode::Hold,
             launch_at_login: false,
             open_window_at_launch: true,
+            restore_hid_enhancement: false,
             check_prerelease_updates: false,
             theme_preference: ThemePreference::System,
             usage_statistics: UsageStatistics::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UiPreferences {
+    pub lock_button_selection: bool,
+    pub templates_expanded: bool,
+    pub associations_expanded: bool,
+}
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            lock_button_selection: true,
+            templates_expanded: true,
+            associations_expanded: true,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiPreference {
+    LockButtonSelection,
+    TemplatesExpanded,
+    AssociationsExpanded,
+}
+impl UiPreferences {
+    pub fn set(&mut self, field: UiPreference, enabled: bool) {
+        match field {
+            UiPreference::LockButtonSelection => self.lock_button_selection = enabled,
+            UiPreference::TemplatesExpanded => self.templates_expanded = enabled,
+            UiPreference::AssociationsExpanded => self.associations_expanded = enabled,
         }
     }
 }

@@ -61,6 +61,7 @@ fn rust_serialization_matches_the_shared_windows_runtime_contract() {
             button_mapping: ButtonMappingSnapshot {
                 enabled: true,
                 gate_active: true,
+                observed_buttons: Vec::new(),
                 listener_active: true,
                 swallowed_edges: 4,
                 leaked_downs: 0,

@@ -10,6 +10,7 @@ import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
 import DriverGuidePage from "./pages/DriverGuidePage.vue";
 import PermissionsPage from "./pages/PermissionsPage.vue";
+import TemplatesPage from "./pages/TemplatesPage.vue";
 
 const activePage = ref<PageId>("buttons");
 const runtime = ref<RuntimeSnapshot | null>(null);
@@ -22,6 +23,7 @@ let initialRuntimeReported = false;
 const activeComponent = computed(() => ({
   drivers: DriverGuidePage,
   buttons: ButtonsPage,
+  templates: TemplatesPage,
   connection: ConnectionPage,
   permissions: PermissionsPage,
   about: AboutPage,

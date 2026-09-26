@@ -76,6 +76,28 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         configuration: sayall_windows::templates::MappingConfiguration,
     );
     fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot>;
+    fn set_template_menu_focus(&self, _focused: bool) {}
+    fn template_menu_key(
+        &self,
+        _generation: u64,
+        _button: sayall_windows::raw_input::RemoteButton,
+        _down: bool,
+    ) -> bool {
+        false
+    }
+    fn set_template_menu_update_default(&self, _generation: u64, _enabled: bool) -> bool {
+        false
+    }
+    fn complete_template_default_save(&self, _request_id: u64, _saved: bool) {}
+    fn complete_menu_preference_save(&self, _request_id: u64, _saved: bool) {}
+    fn prepare_template_menu_exit(&self) -> bool {
+        true
+    }
+    fn restore_template_menu_target(&self) -> bool {
+        false
+    }
+    fn template_menu_restore_failed(&self) {}
+    fn set_mapping_notice_enabled(&self, enabled: bool);
     fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback);
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
     fn subscribe_button_edges(&self, callback: sayall_windows::button_mapping::ButtonEdgeCallback);
@@ -233,6 +255,40 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot> {
         Some(WindowsPlatform::scene_snapshot(self))
+    }
+
+    fn set_template_menu_focus(&self, focused: bool) {
+        WindowsPlatform::set_template_menu_focus(self, focused);
+    }
+    fn template_menu_key(
+        &self,
+        generation: u64,
+        button: sayall_windows::raw_input::RemoteButton,
+        down: bool,
+    ) -> bool {
+        WindowsPlatform::template_menu_key(self, generation, button, down)
+    }
+    fn set_template_menu_update_default(&self, generation: u64, enabled: bool) -> bool {
+        self.set_template_menu_update_default(generation, enabled)
+    }
+    fn complete_template_default_save(&self, request_id: u64, saved: bool) {
+        self.complete_template_default_save(request_id, saved);
+    }
+    fn complete_menu_preference_save(&self, request_id: u64, saved: bool) {
+        self.complete_menu_preference_save(request_id, saved);
+    }
+    fn prepare_template_menu_exit(&self) -> bool {
+        WindowsPlatform::prepare_template_menu_exit(self)
+    }
+    fn restore_template_menu_target(&self) -> bool {
+        WindowsPlatform::restore_template_menu_target(self)
+    }
+    fn template_menu_restore_failed(&self) {
+        WindowsPlatform::template_menu_restore_failed(self);
+    }
+
+    fn set_mapping_notice_enabled(&self, enabled: bool) {
+        WindowsPlatform::set_mapping_notice_enabled(self, enabled)
     }
 
     fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback) {
@@ -548,6 +604,7 @@ mod simulation {
             sayall_windows::button_mapping::ButtonMappingSnapshot {
                 enabled: lock(&self.button_mappings).enabled,
                 gate_active: false,
+                observed_buttons: Vec::new(),
                 listener_active: false,
                 swallowed_edges: 0,
                 leaked_downs: 0,
@@ -561,6 +618,8 @@ mod simulation {
             // The CI voice simulation does not simulate foreground accessibility.
             None
         }
+
+        fn set_mapping_notice_enabled(&self, _enabled: bool) {}
 
         fn subscribe_scene_events(
             &self,

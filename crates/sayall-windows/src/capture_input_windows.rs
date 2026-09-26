@@ -69,6 +69,9 @@ struct Native {
     policy: Option<PolicyConfig>,
     journal: Option<PathBuf>,
     generation: u64,
+    // Only finish() in this process can own automatic zero-write completion.
+    // A journal loaded at startup never acquires this ownership.
+    normal_recovery: Option<Transaction>,
 }
 impl Native {
     fn new() -> Result<Self, String> {
@@ -79,6 +82,7 @@ impl Native {
             policy: None,
             journal: None,
             generation: 0,
+            normal_recovery: None,
         })
     }
     fn ensure_policy(&mut self) -> Result<(), String> {
@@ -488,10 +492,12 @@ fn finish(
     io.generation = tx.generation;
     match restore(io, &mut tx) {
         Ok(()) => {
+            io.normal_recovery = None;
             publish(state, "idle", None, false);
             note("restore", "passed", started.elapsed());
         }
         Err(e) if e == "external_change" => {
+            io.normal_recovery = None;
             let cleared = io.persist(None);
             publish(
                 state,
@@ -506,8 +512,49 @@ fn finish(
             );
         }
         Err(e) => {
+            io.normal_recovery = Some(tx);
             publish(state, "recovery_required", Some(e.clone()), true);
             note("restore", &e, started.elapsed());
+        }
+    }
+}
+fn reconcile_normal_recovery(io: &mut Native, state: &Mutex<CaptureInputSnapshot>) {
+    let Some(tx) = io.normal_recovery.clone() else {
+        return;
+    };
+    let started = Instant::now();
+    match io.load_journal() {
+        Ok(Some(saved)) if saved == tx => {}
+        _ => {
+            note_for(
+                tx.generation,
+                "recovery_reconcile",
+                "journal_ownership_unconfirmed",
+                started.elapsed(),
+            );
+            return;
+        }
+    }
+    match super::complete_if_already_restored(io, &tx, || Ok(())) {
+        Ok(true) => {
+            io.normal_recovery = None;
+            publish(state, "idle", None, false);
+            note_for(
+                tx.generation,
+                "recovery_reconcile",
+                "already_restored_zero_writes",
+                started.elapsed(),
+            );
+        }
+        Ok(false) => note_for(
+            tx.generation,
+            "recovery_reconcile",
+            "original_vector_not_confirmed",
+            started.elapsed(),
+        ),
+        Err(e) => {
+            publish(state, "recovery_required", Some(e.clone()), true);
+            note_for(tx.generation, "recovery_reconcile", &e, started.elapsed());
         }
     }
 }
@@ -692,6 +739,9 @@ fn run(
                     if !config.enabled {
                         return Err("configuration_changed".into());
                     }
+                    // Continue this same DOWN after a proven zero-write recovery;
+                    // do not consume an extra preparation press or start a timer.
+                    reconcile_normal_recovery(&mut io, &state);
                     if state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -759,13 +809,16 @@ fn run(
                             finish(&mut io, &mut active, &state);
                         }
                         let mut s = state.lock().unwrap_or_else(|v| v.into_inner());
-                        s.last_error = Some(e.clone());
+                        if e != "recovery_required" {
+                            s.last_error = Some(e.clone());
+                        }
                         let _ = reply.send(Err(e));
                     }
                 }
             }
             Command::Reconcile => {
                 dirty.store(false, Ordering::SeqCst);
+                reconcile_normal_recovery(&mut io, &state);
             }
             // Epoch ownership, not command arrival order, decides which lease ends.
             Command::End => {}
@@ -778,18 +831,29 @@ fn run(
                     if !should_restore {
                         request.check()?;
                         io.persist(None)?;
+                        io.normal_recovery = None;
                         publish(&state, "idle", None, false);
                         return Ok(());
                     }
                     if let Some(mut tx) = io.load_journal()? {
                         io.generation = tx.generation;
-                        io.ensure_policy()?;
-                        let actual = io.roles()?;
-                        super::validate_recovery(&tx, &actual)?;
-                        super::confirm_actual(&mut tx, actual);
-                        io.persist(Some(&tx))?;
-                        super::restore_checked(&mut io, &mut tx, || request.check())?;
+                        if super::complete_if_already_restored(&mut io, &tx, || request.check())? {
+                            note_for(
+                                tx.generation,
+                                "recovery_choice",
+                                "already_restored_zero_writes",
+                                Duration::ZERO,
+                            );
+                        } else {
+                            io.ensure_policy()?;
+                            let actual = io.roles()?;
+                            super::validate_recovery(&tx, &actual)?;
+                            super::confirm_actual(&mut tx, actual);
+                            io.persist(Some(&tx))?;
+                            super::restore_checked(&mut io, &mut tx, || request.check())?;
+                        }
                     }
+                    io.normal_recovery = None;
                     publish(&state, "idle", None, false);
                     Ok(())
                 })();
@@ -805,6 +869,7 @@ fn run(
             }
             Command::Shutdown(done) => {
                 finish(&mut io, &mut active, &state);
+                reconcile_normal_recovery(&mut io, &state);
                 let s = state.lock().unwrap_or_else(|e| e.into_inner());
                 let result = if s.recovery_pending {
                     Err("route_restore_unconfirmed".into())

@@ -6,6 +6,7 @@ describe("Windows navigation", () => {
     expect(navigationItems.map((item) => item.id)).toEqual([
       "drivers",
       "buttons",
+      "templates",
       "connection",
       "permissions",
       "about",

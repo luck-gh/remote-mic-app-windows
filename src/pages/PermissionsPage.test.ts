@@ -50,7 +50,7 @@ const runtime: RuntimeSnapshot = {
     buttonMapping: {
       enabled: true,
       gateActive: false,
-      listenerActive: false,
+      observedButtons: [], listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
       firedGestures: 0,

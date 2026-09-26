@@ -26,13 +26,14 @@ onMounted(() => { void refreshConnection(); });
     <header class="page-header"><div><h1>驱动与配对</h1><p class="muted">可先检查增强支持，再连接已配对的遥控器。基础语音和模板不依赖增强驱动。</p></div></header>
     <div class="guide-grid">
       <article class="card"><h2>1. 可选增强支持</h2><p class="muted">按键增强驱动目前只影响额外按键能力，不影响基础语音和模板。</p><ComponentSupportPanel /></article>
-      <article class="card"><h2>2. 遥控器配对与连接</h2><div v-if="ready" class="info-callout"><strong>已完成连接</strong><p>{{ connection?.remoteName ?? remoteModelLabel(connection?.remoteModel ?? 'unknown') }} 已就绪，可直接使用语音和按键设置。实际语音仍需现场按住语音键确认。</p></div><template v-else><p class="muted">RC003：同时长按菜单和主页，直到遥控器进入配对模式。RC001：请按随附说明书进入配对模式。</p><div class="button-row"><button type="button" class="secondary-button" :disabled="scanning" @click="openSettings">打开 Windows 蓝牙设置</button><button type="button" :disabled="scanning" @click="scan">{{ scanning ? "扫描中…" : "扫描已配对遥控器" }}</button></div><p v-if="connection" class="muted">当前状态：{{ connectionPhaseLabel(connection.phase) }}</p><ul v-if="devices.length" class="device-list"><li v-for="device in devices" :key="device.id"><div><strong>{{ device.name }}</strong><small>{{ device.isSupportedCandidate ? `${remoteModelLabel(device.model)} · Windows 已配对并被 SayAll 发现` : "不支持的设备" }}</small></div><button type="button" :disabled="Boolean(connectingDeviceId) || !device.isSupportedCandidate" @click="connect(device)">{{ connectingDeviceId === device.id ? "连接中…" : "连接" }}</button></li></ul></template><p v-if="message" class="operation-message" aria-live="polite">{{ message }}</p></article>
+      <article class="card"><h2>2. 遥控器配对与连接</h2><div v-if="ready" class="info-callout"><strong>已完成连接</strong><p>{{ connection?.remoteName ?? remoteModelLabel(connection?.remoteModel ?? 'unknown') }} 已就绪，可直接使用语音和按键设置。实际语音仍需现场按住语音键确认。</p></div><div class="pairing-guide"><strong>重新配对方法</strong><p class="muted">RC003：同时长按菜单和主页，直到遥控器进入配对模式。RC001：请按随附说明书进入配对模式。</p><div class="button-row"><button type="button" class="secondary-button" :disabled="scanning" @click="openSettings">打开 Windows 蓝牙设置</button><button type="button" :disabled="scanning" @click="scan">{{ scanning ? "扫描中…" : "扫描已配对遥控器" }}</button></div></div><p v-if="connection" class="muted">当前状态：{{ connectionPhaseLabel(connection.phase) }}</p><ul v-if="devices.length" class="device-list"><li v-for="device in devices" :key="device.id"><div><strong>{{ device.name }}</strong><small>{{ device.isSupportedCandidate ? `${remoteModelLabel(device.model)} · Windows 已配对并被 SayAll 发现` : "不支持的设备" }}</small></div><button type="button" :disabled="Boolean(connectingDeviceId) || !device.isSupportedCandidate" @click="connect(device)">{{ connectingDeviceId === device.id ? "连接中…" : "连接" }}</button></li></ul><p v-if="message" class="operation-message" aria-live="polite">{{ message }}</p></article>
     </div>
   </section>
 </template>
 
 <style scoped>
-.guide-grid { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+.guide-grid { display: grid; gap: 14px; grid-template-columns: 1fr; align-items: start; }
 .guide-grid > .card :deep(.component-support) { margin: 12px 0 0; padding: 0; border: 0; box-shadow: none; background: transparent; }
-@media (max-width: 860px) { .guide-grid { grid-template-columns: 1fr; } }
+.pairing-guide { margin-top: 12px; }
+.pairing-guide p { margin: 5px 0 10px; }
 </style>

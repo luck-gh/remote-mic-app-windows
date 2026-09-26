@@ -50,6 +50,7 @@
       "enabled": true,
       "gateActive": true,
       "listenerActive": true,
+      "observedButtons": [],
       "swallowedEdges": 4,
       "leakedDowns": 0,
       "firedGestures": 3,

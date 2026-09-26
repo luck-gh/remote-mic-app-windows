@@ -21,18 +21,18 @@
    证明 2026-09-05 结论"吞掉的事件不再投递 Raw Input"对**硬件事件**同样成立
    （此前仅用注入事件验证过）。推论：钩子 60ms 有界等待期间，本事件的 WM_INPUT
    不可能到达监听器（RIT 在钩子链返回后才投递），武装信号被钩子自身堵死。
-4. **独立预信号管线两条候选路线均死**：
-   - CreateFileW+ReadFile 直读键盘集合：err=5（ERROR_ACCESS_DENIED，Windows 对
-     键盘/鼠标 HID 集合独占打开，安全策略，管理员权限亦无效）；
-   - WinRT GATT 订阅 HID 服务（0x1812）Report 特征值：GetCharacteristicsAsync
-     返回空（OS HID 栈占用，Testing/probe-rc003-hid-gatt.ps1）。
+4. **独立预信号管线的历史证据边界（2026-09-19 校正）**：
+   - 当时 CreateFileW+ReadFile 打开键盘 HID collection 得到 err=5；这是该 collection 的访问结果，不能外推 BluetoothGATT 服务接口。
+   - 旧 WinRT 脚本只记录空集合，缺少 RequestAccessAsync、Status/ProtocolError 与原始运行摘要；不能据此证明“OS HID 栈占用”或所有公开 GATT 路线不可用。
+   - 9/19 普通 Explorer 用户、STA、unpackaged 的只读复核：选定设备 access=Allowed、唯一 0x1812 服务枚举 Success，但该服务 RequestAccessAsync=DeniedBySystem。随即停止，未读取 Report 值、写 CCCD 或注册通知；配置哈希一致。这只证明本机此次 WinRT 服务访问被系统拒绝。证据见 `artifacts/hid-gatt-access-20260919/winrt-result.json`。
+   - Win32 BluetoothGATT 独立接口的访问检查另行核验，不能借 WinRT 拒绝或 HID collection 错误代替实测。
 5. **dwExtraInfo=0**：LL 钩子事件无设备指纹可用。
 
 ## 结论
 
 - **根因**：key_gate 的"武装归因"模型假设存在先于键盘孪生事件到达的独立 HID 报文
   管线（macOS 版有：IOHIDManager 直订全部 collection）。RC003/Windows 上该管线
-  结构性不存在，武装唯一来源（Raw Input 键盘事件）又被钩子等待堵死 →
+  在当时已验证的输入入口中未获得，武装来源（Raw Input 键盘事件）又被钩子等待堵死 →
   **孤立按压（超过武装宽限间隔）首沿必泄漏**，随后 Raw Input 才看到事件并武装 →
   引擎经泄漏路径继续点火 → 双响应。250ms 宽限使"每次孤立按压"都命中此路径。
 - ADR 0002（双轨注入架构，已接受）预判了该约束："公开 API 无法按设备全局屏蔽

@@ -66,7 +66,17 @@
   --pressed-ring: rgba(239, 148, 32, 0.55);
 }
 
-:root.scene-overlay-document, :root.scene-overlay-document body, :root.scene-overlay-document #app { background: transparent; }
+:root.scene-overlay-document,
+:root.scene-overlay-document body,
+:root.scene-overlay-document #app {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  background: transparent;
+  overflow: hidden;
+}
 
 html[data-theme="dark"] {
   color-scheme: dark;
@@ -191,6 +201,13 @@ nav { display: grid; gap: 4px; }
 .card p { line-height: 1.5; }
 .muted { color: var(--muted); }
 .card-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.collapsible-card > summary { padding: 9px 2px; line-height: 24px; cursor: pointer; border-radius: 4px; }
+.collapsible-card > summary::marker { color: var(--muted); }
+.collapsible-card > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.collapsible-card > summary h2 { display: inline; margin: 0; }
+.collapsible-card > summary .section-count { margin-left: 10px; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.collapsible-card > .collapsible-body { margin-top: 8px; }
+.collapsible-body > p:first-child { margin-top: 0; }
 .button-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .capture-input-settings, .capture-input-settings .button-row { min-width: 0; max-width: 100%; }
 .capture-input-settings select { box-sizing: border-box; min-width: 0; width: 100%; max-width: 100%; }
@@ -360,15 +377,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .toggle-input:checked { background: var(--accent); }
 .toggle-input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--toggle-thumb); box-shadow: 0 1px 3px var(--toggle-shadow); transition: left 0.15s; }
 .toggle-input:checked::after { left: 16px; }
-/* 画布对齐 Mac RemoteMappingLayout：高度 570、宽度流式（占满容器，
+/* 画布对齐 Mac RemoteMappingLayout：高度 640、宽度流式（占满容器，
    卡宽 = clamp((容器宽-260)/2, 270, 300)）；容器不足最小画布 800px 时
    （小于最小窗口 980 的恢复态窗口）按视口连续缩放兜底，左边原点。 */
 .mapping-canvas {
   position: relative;
   width: 100%;
   min-width: 800px;
-  height: 570px;
-  margin-bottom: calc(-570px * (1 - var(--map-scale)));
+  height: 640px;
+  margin-bottom: calc(-640px * (1 - var(--map-scale)));
   flex: 0 0 auto;
   --map-scale: min(1, (100vw - 152px) / 800px, 100vh / 640px);
   transform: scale(var(--map-scale));
@@ -382,14 +399,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .mapping-connections polygon.selected { fill: var(--accent); }
 .mapping-connections polygon.active { fill: var(--pressed); }
 /* 遥控器图无底板（PNG 自带透明背景）；连线画在图之上（z-index 高于照片）。 */
-.remote-photo { position: absolute; z-index: 1; width: 202px; height: 410px; margin: 0; border-radius: 14px; overflow: hidden; top: 80px; }
+.remote-photo { position: absolute; z-index: 1; width: 202px; height: 410px; margin: 0; border-radius: 14px; overflow: hidden; }
 .remote-photo img { width: 100%; height: 100%; object-fit: cover; user-select: none; }
 /* 锚点橙点对齐 Mac：8px 纯圆点（无光环）。 */
 .anchor-dot { position: absolute; width: 8px; height: 8px; border-radius: 50%; background: var(--pressed); opacity: 0; pointer-events: none; transition: opacity 0.06s; }
 .anchor-dot.visible { opacity: 1; }
-.mapping-card { position: absolute; height: 72px; padding: 6px 9px; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--mapping-neutral); cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease; }
+.mapping-card { position: absolute; height: var(--mapping-card-height); padding: 6px 9px; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--mapping-neutral); cursor: pointer; transition: background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease; }
 .mapping-card.left { left: 0; }
 .mapping-card.right { right: 0; }
+.mapping-card.center { left: 50%; transform: translateX(-50%); }
 .mapping-card:hover { background: var(--surface-hover); border-color: var(--accent-border); box-shadow: 0 3px 12px var(--shadow-control); }
 .mapping-card.selected { background: var(--accent-surface); border-color: var(--accent-border); }
 .mapping-card.active { background: var(--pressed-surface); border-color: var(--pressed-border); }

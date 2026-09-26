@@ -45,21 +45,26 @@ thread_local! {
     static THREAD_CONTEXT: RefCell<Option<ListenerContext>> = const { RefCell::new(None) };
 }
 
-#[derive(Debug)]
 pub struct RawInputRuntime {
     snapshot: Arc<Mutex<RawInputSnapshot>>,
     engine: Sender<EngineMessage>,
     control: Mutex<Option<ListenerControl>>,
+    mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
 }
 
 impl RawInputRuntime {
-    pub fn new(snapshot: Arc<Mutex<RawInputSnapshot>>, engine: Sender<EngineMessage>) -> Self {
+    pub fn new(
+        snapshot: Arc<Mutex<RawInputSnapshot>>,
+        engine: Sender<EngineMessage>,
+        mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
+    ) -> Self {
         // 监听器把语义事件交给映射引擎，被 key_gate 吞掉的键盘边沿由钩子线程
         // 直接投递（见 docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md）。
         Self {
             snapshot,
             engine,
             control: Mutex::new(None),
+            mapping,
         }
     }
 
@@ -97,10 +102,18 @@ impl RawInputRuntime {
         // Each listener lifetime gets a clone; stopping must not consume the
         // runtime's only sender and disconnect all subsequent starts.
         let engine = self.engine.clone();
+        let mapping = self.mapping.clone();
         let join = thread::Builder::new()
             .name("sayall-raw-input".to_owned())
             .spawn(move || {
-                listener_thread(snapshot, engine, thread_stop, thread_hwnd, ready_sender)
+                listener_thread(
+                    snapshot,
+                    engine,
+                    thread_stop,
+                    thread_hwnd,
+                    ready_sender,
+                    mapping,
+                )
             })
             .map_err(|error| PlatformError::RawInput(error.to_string()))?;
         let mut control = ListenerControl {
@@ -166,6 +179,7 @@ impl Default for RawInputRuntime {
         Self::new(
             Arc::new(Mutex::new(RawInputSnapshot::default())),
             mpsc::channel().0,
+            None,
         )
     }
 }
@@ -223,6 +237,7 @@ fn listener_thread(
     stop_requested: Arc<AtomicBool>,
     hwnd_slot: Arc<AtomicIsize>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
 ) {
     let result = run_listener(
         Arc::clone(&snapshot),
@@ -230,6 +245,7 @@ fn listener_thread(
         Arc::clone(&stop_requested),
         Arc::clone(&hwnd_slot),
         &ready,
+        mapping,
     );
     if let Err(error) = &result {
         let _ = ready.try_send(Err(error.clone()));
@@ -266,6 +282,7 @@ fn run_listener(
     stop_requested: Arc<AtomicBool>,
     hwnd_slot: Arc<AtomicIsize>,
     ready: &mpsc::SyncSender<Result<(), String>>,
+    mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
 ) -> Result<(), String> {
     let paths = enumerate_matching_device_paths()?;
     {
@@ -354,6 +371,13 @@ fn run_listener(
         state.last_error = None;
     }
     let _ = ready.send(Ok(()));
+    let driver_worker = mapping.and_then(|mapping| {
+        if crate::hid_host::packaged() {
+            crate::hid_host::start(selected_path, Arc::clone(&stop_requested), mapping)
+        } else {
+            crate::input_driver::start(selected_path, Arc::clone(&stop_requested), mapping)
+        }
+    });
 
     if stop_requested.load(Ordering::Acquire) {
         let _ = unsafe { PostMessageW(Some(window), WM_CLOSE, WPARAM(0), LPARAM(0)) };
@@ -374,6 +398,10 @@ fn run_listener(
         }
     };
 
+    stop_requested.store(true, Ordering::Release);
+    if let Some(worker) = driver_worker {
+        let _ = worker.join();
+    }
     let removals = [
         RAWINPUTDEVICE {
             usUsagePage: 0x01,

@@ -97,6 +97,138 @@ pub fn preset_app(id: &str) -> Option<&'static PresetApp> {
     PRESET_APPS.iter().find(|app| app.id == id)
 }
 
+/// Stable application identity shared by foreground matching, running-app
+/// discovery and manual selection. Presets keep their portable logical id;
+/// every other executable uses its normalized full path.
+pub fn application_identity_for_path(path: &str) -> String {
+    let path_value = std::path::Path::new(path);
+    let executable = path_value
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(app) = PRESET_APPS.iter().find(|app| {
+        app.exe_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&executable))
+    }) {
+        return app.id.to_owned();
+    }
+    // The packaged Windows Codex desktop app exposes a ChatGPT.exe host. Its
+    // public package directory remains distinguishable from the ordinary
+    // ChatGPT product, so do not classify every ChatGPT.exe as Codex.
+    if executable.eq_ignore_ascii_case("ChatGPT.exe")
+        && path_value.components().any(|component| {
+            let component = component.as_os_str().to_string_lossy();
+            let component = component.to_ascii_lowercase();
+            component.starts_with("openai.codex_") && component.ends_with("__2p2nqsd0c76g0")
+        })
+    {
+        return "codex".to_owned();
+    }
+    path.trim_start_matches(r"\\?\")
+        .replace('/', r"\")
+        .to_lowercase()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningAppInfo {
+    pub application_id: String,
+    pub name: String,
+    pub preset: bool,
+}
+
+#[cfg(windows)]
+pub fn list_running_apps() -> Vec<RunningAppInfo> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Context {
+        process_ids: BTreeSet<u32>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let context = &mut *(lparam.0 as *mut Context);
+        if IsWindowVisible(hwnd).as_bool() {
+            let mut process_id = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+            if process_id != 0 {
+                context.process_ids.insert(process_id);
+            }
+        }
+        BOOL::from(true)
+    }
+
+    let mut context = Context {
+        process_ids: BTreeSet::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut context as *mut Context as isize));
+    }
+    let visible_processes = context.process_ids.len();
+    let mut apps = BTreeMap::new();
+    for process_id in context.process_ids {
+        let Some(path) = process_executable_path(process_id) else {
+            continue;
+        };
+        let application_id = application_identity_for_path(&path);
+        if application_id.is_empty() {
+            continue;
+        }
+        let preset = preset_app(&application_id);
+        let name = preset.map(|app| app.name.to_owned()).unwrap_or_else(|| {
+            std::path::Path::new(&path)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "应用程序".to_owned())
+        });
+        apps.entry(application_id.clone())
+            .or_insert(RunningAppInfo {
+                application_id,
+                name,
+                preset: preset.is_some(),
+            });
+    }
+    crate::ble::gatt_note(format!(
+        "application_discovery phase=completed terminal_result=passed visible_processes={} applications={} inaccessible_skipped={}",
+        visible_processes,
+        apps.len(),
+        visible_processes.saturating_sub(apps.len())
+    ));
+    apps.into_values().collect()
+}
+
+#[cfg(not(windows))]
+pub fn list_running_apps() -> Vec<RunningAppInfo> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub(crate) fn process_executable_path(process_id: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
+        let mut buffer = vec![0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        let queried = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        queried.then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+}
+
 /// 探测预设应用安装状态（System32 直存或 App Paths 注册表命中）。
 /// 无线麦自身恒为已安装（映射运行时它必然在运行）。
 #[cfg(windows)]
@@ -124,6 +256,9 @@ pub struct CustomAppPick {
     pub name: String,
     /// 完整路径（.exe/.lnk）。作为 `OpenApp.target` 持久化。
     pub path: String,
+    /// Foreground matching identity. Presets use a logical id; custom apps use
+    /// the resolved executable's normalized full path.
+    pub application_id: String,
 }
 
 /// 判断 OpenApp 目标是否为自定义路径（非预设 id）。
@@ -577,7 +712,17 @@ pub fn pick_custom_app() -> Option<CustomAppPick> {
                         .file_stem()
                         .map(|stem| stem.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.clone());
-                    Some(CustomAppPick { name, path })
+                    let identity_path = if path.to_ascii_lowercase().ends_with(".lnk") {
+                        resolve_lnk(&path).map(|resolved| resolved.exe_path)?
+                    } else {
+                        path.clone()
+                    };
+                    let application_id = application_identity_for_path(&identity_path);
+                    Some(CustomAppPick {
+                        name,
+                        path,
+                        application_id,
+                    })
                 }
             })();
             unsafe {
@@ -732,6 +877,84 @@ mod tests {
             .expect("无线麦自身应在预设表首位");
         assert!(sayall.installed, "无线麦自身恒为已安装");
         assert_eq!(apps[0].id, "sayall", "对齐 Mac：自身排首位");
+    }
+
+    #[test]
+    fn application_identity_uses_preset_ids_or_normalized_full_paths() {
+        assert_eq!(
+            application_identity_for_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            "chrome"
+        );
+        assert_eq!(
+            application_identity_for_path(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.903.8094.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+            ),
+            "codex"
+        );
+        assert_eq!(
+            application_identity_for_path(r"C:\Program Files\OpenAI\Codex.exe"),
+            "codex"
+        );
+        assert_eq!(
+            application_identity_for_path(
+                r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2.3.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+            ),
+            r"c:\program files\windowsapps\openai.chatgpt-desktop_1.2.3.0_x64__2p2nqsd0c76g0\app\chatgpt.exe"
+        );
+        assert_eq!(
+            application_identity_for_path(r"C:\Program Files\OpenAI\ChatGPT.exe"),
+            r"c:\program files\openai\chatgpt.exe"
+        );
+        assert_eq!(
+            application_identity_for_path(r"\\?\D:/Tools/Reader.EXE"),
+            r"d:\tools\reader.exe"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn running_app_discovery_returns_visible_process_identities() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("SayAll application discovery probe"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                320,
+                180,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("probe window should be created")
+        };
+        let apps = list_running_apps();
+        let current_exe = std::env::current_exe().expect("test process path should be available");
+        let expected = application_identity_for_path(&current_exe.to_string_lossy());
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert!(apps.iter().any(|app| app.application_id == expected));
+        let mut identities = std::collections::HashSet::new();
+        for app in apps {
+            assert!(identities.insert(app.application_id.to_lowercase()));
+            if app.preset {
+                assert!(preset_app(&app.application_id).is_some());
+            } else {
+                assert!(std::path::Path::new(&app.application_id).is_absolute());
+                assert!(app.application_id.to_ascii_lowercase().ends_with(".exe"));
+            }
+            assert!(!app.name.trim().is_empty());
+        }
     }
 
     #[test]
