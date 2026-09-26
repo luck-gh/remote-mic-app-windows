@@ -9,12 +9,13 @@ use sayall_windows::{
 use serde::{Deserialize, Serialize};
 use settings::SettingsStore;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock, Weak};
 use tauri::{Emitter, Manager};
 
 mod diagnostics;
 mod platform;
 mod settings;
+mod startup;
 mod updater;
 
 use diagnostics::DiagnosticReport;
@@ -421,6 +422,73 @@ fn get_diagnostic_report(
     )
 }
 
+/// 在系统文件资源管理器里打开诊断日志目录（关于页"打开日志目录"入口）。
+///
+/// 路径来自日志初始化的**实际**落盘路径，不接受前端传入：否则等于把"用
+/// ShellExecuteW 打开任意路径"的能力交给 WebView，与本仓库 capabilities 的
+/// 最小权限设计（opener 仅放行 VB-CABLE 官网一个 URL）直接冲突。
+///
+/// 目录不存在时先创建：日志初始化理论上已建好父目录（`create_dir_all`），
+/// 但 `SAYALL_GATT_LOG` 覆盖或初始化失败的场景下可能缺失，而资源管理器对
+/// 不存在的目录只会弹一个误导性的"找不到"对话框。
+///
+/// 日志只记结果，**绝不记路径**（隐私规则：日志内容不得含用户路径）。
+#[tauri::command]
+fn open_log_directory() -> Result<String, String> {
+    let directory = sayall_windows::diagnostic_log_directory()
+        .ok_or_else(|| "诊断日志目录尚未就绪".to_owned())?;
+    std::fs::create_dir_all(&directory).map_err(|error| format!("创建日志目录失败：{error}"))?;
+    match sayall_windows::app_launcher::open_directory(&directory) {
+        Ok(()) => {
+            sayall_windows::gatt_note(
+                "about feature=open_log_directory action=open phase=completed terminal_result=passed reason=explorer_launch_requested"
+                    .to_owned(),
+            );
+            Ok(directory.display().to_string())
+        }
+        Err(error) => {
+            sayall_windows::gatt_note(
+                "about feature=open_log_directory action=open phase=completed terminal_result=failed error_domain=shell error_code=open_failed retryable=true reason=explorer_launch_failed"
+                    .to_owned(),
+            );
+            Err(format!("无法打开日志目录：{error}"))
+        }
+    }
+}
+
+/// Ctrl+W：关闭主窗口——与点标题栏"X"走同一动作，`window.hide()` 后由托盘驻留。
+///
+/// 为什么前端不直接调 `@tauri-apps/api` 的 `getCurrentWindow().close()`：那条路径
+/// 在 Windows 上究竟会触发 `CloseRequested`（走到本文件 `on_window_event` 的
+/// `prevent_close` + hide，即隐藏到托盘）还是直接销毁窗口，取决于 tao 的平台实现
+/// 细节，跨版本可能静默改变语义；而本应用的窗口语义要求"关闭"恒等于托盘驻留、
+/// 不动 BLE/语音链路。这里显式调 `window.hide()`，动作与"X"的收尾是同一行代码。
+///
+/// 日志只落结果、可见性与耗时，不含窗口标题或任何用户信息。
+#[tauri::command]
+fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let Some(window) = app.get_webview_window("main") else {
+        sayall_windows::gatt_note(
+            "window_close action=hide_to_tray source=ctrl_w phase=completed terminal_result=failed error_domain=window error_code=not_found retryable=true reason=main_window_missing"
+                .to_owned(),
+        );
+        return Err("主窗口不存在".to_owned());
+    };
+    // `hide()` 的返回值只说明"消息已投递"，不代表窗口真的隐藏了（见
+    // `on_window_event` 的同款注释）：同时记录前后 tao 报告的可见性，
+    // `visible_after=true` 即为"按了却没藏起来"的直接否证证据。
+    let visible_before = window.is_visible().unwrap_or(true);
+    let result = window.hide().map_err(|error| error.to_string());
+    let visible_after = window.is_visible().unwrap_or(true);
+    sayall_windows::gatt_note(format!(
+        "window_close action=hide_to_tray source=ctrl_w phase=completed terminal_result={} visible_before={visible_before} visible_after={visible_after} elapsed_ms={}",
+        if result.is_ok() { "passed" } else { "failed" },
+        started.elapsed().as_millis()
+    ));
+    result
+}
+
 #[tauri::command]
 async fn scan_paired_remotes(
     state: tauri::State<'_, AppState>,
@@ -453,6 +521,9 @@ async fn connect_remote(
         settings.save_selected_remote_id(device_id.clone())?;
         platform
             .connect_remote(device_id)
+            // 跨到前端的错误统一归并回公开的 `Gatt(String)` 形状（2026-09-22）：
+            // 内部细分变体只服务结构化日志与文案分流，前端契约保持不变。
+            .map_err(sayall_windows::PlatformError::into_public)
             .map_err(|error| error.to_string())
     })
     .await
@@ -1246,18 +1317,24 @@ async fn reset_button_mappings(
 fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut shortcut_count = 0_usize;
     let mut open_app_count = 0_usize;
+    let mut scroll_count = 0_usize;
+    let mut mouse_count = 0_usize;
     let mut disabled_count = 0_usize;
     for actions in mappings.actions.values() {
         for action in [&actions.single, &actions.double, &actions.long] {
             match action {
                 ButtonAction::Shortcut { .. } => shortcut_count += 1,
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
+                ButtonAction::Scroll { .. } => scroll_count += 1,
+                ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
+                    mouse_count += 1
+                }
                 ButtonAction::Disabled => disabled_count += 1,
             }
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} disabled_cell_count={disabled_count}",
+        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} scroll_count={scroll_count} mouse_count={mouse_count} disabled_cell_count={disabled_count}",
         mappings.enabled,
         mappings.actions.len()
     )
@@ -1272,6 +1349,18 @@ async fn test_button_mapping(
     let action = state.platform.button_mappings().action_for(button, trigger);
     let platform = Arc::clone(&state.platform);
     match action {
+        ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
+            tauri::async_runtime::spawn_blocking(move || platform.test_mouse_action(action))
+                .await
+                .map_err(|error| format!("测试鼠标任务失败：{error}"))?
+                .map_err(|error| error.to_string())
+        }
+        ButtonAction::Scroll { direction, steps } => {
+            tauri::async_runtime::spawn_blocking(move || platform.test_scroll(direction, steps))
+                .await
+                .map_err(|error| format!("测试滚轮任务失败：{error}"))?
+                .map_err(|error| error.to_string())
+        }
         ButtonAction::Shortcut { chord } => {
             tauri::async_runtime::spawn_blocking(move || platform.test_shortcut(chord))
                 .await
@@ -1309,10 +1398,47 @@ fn pick_custom_app() -> Option<sayall_windows::app_launcher::CustomAppPick> {
 }
 
 #[tauri::command]
+async fn scan_registered_apps(
+) -> Result<Vec<sayall_windows::registered_apps::AppLibraryEntry>, String> {
+    tauri::async_runtime::spawn_blocking(sayall_windows::registered_apps::scan_registered_apps)
+        .await
+        .map_err(|error| format!("应用扫描任务失败：{error}"))?
+}
+
+#[tauri::command]
 fn get_button_mapping_snapshot(
     state: tauri::State<'_, AppState>,
 ) -> sayall_windows::button_mapping::ButtonMappingSnapshot {
     state.platform.button_mapping_snapshot()
+}
+
+#[tauri::command]
+fn start_shortcut_capture() -> Result<(), String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(
+        "shortcut_capture action=start phase=requested suppression=global_paired_edges capture_mode=main_key_only".to_owned(),
+    );
+    if !sayall_windows::key_gate::set_shortcut_capture_active(true) {
+        sayall_windows::gatt_note(format!(
+            "shortcut_capture action=start phase=completed terminal_result=failed error_domain=keyboard_hook error_code=gate_unavailable reason=hook_not_active retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ));
+        return Err("键盘保护钩子尚未就绪，请稍后重试".to_owned());
+    }
+    sayall_windows::gatt_note(format!(
+        "shortcut_capture action=start phase=completed terminal_result=passed capture_mode=main_key_only elapsed_ms={}",
+        started.elapsed().as_millis()
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_shortcut_capture() {
+    let _ = sayall_windows::key_gate::set_shortcut_capture_active(false);
+    sayall_windows::gatt_note(
+        "shortcut_capture action=stop phase=completed terminal_result=passed pending_key_ups=paired"
+            .to_owned(),
+    );
 }
 
 #[tauri::command]
@@ -1469,6 +1595,56 @@ async fn set_theme_preference(
             started.elapsed().as_millis()
         )),
     }
+    result
+}
+
+#[tauri::command]
+fn get_launch_at_login(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    let result = startup::is_enabled();
+    sayall_windows::gatt_note(match &result {
+        Ok(enabled) => format!(
+            "startup feature=launch_at_login action=load terminal_result=passed enabled={} elapsed_ms={}",
+            enabled,
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "startup feature=launch_at_login action=load terminal_result=failed error_domain=windows_registry error_code=query_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    // Keep the parameter in the signature so the command follows the same state
+    // ownership convention as other settings commands.
+    let _ = state;
+    result
+}
+
+#[tauri::command]
+fn set_launch_at_login(enabled: bool, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "startup feature=launch_at_login action=save phase=requested enabled={enabled}"
+    ));
+    let previous = startup::is_enabled().unwrap_or(false);
+    let result = (|| {
+        startup::set_enabled(enabled)?;
+        if let Err(error) = state.settings.save_launch_at_login(enabled) {
+            let _ = startup::set_enabled(previous);
+            return Err(error);
+        }
+        Ok(enabled)
+    })();
+    sayall_windows::gatt_note(match &result {
+        Ok(enabled) => format!(
+            "startup feature=launch_at_login action=save phase=completed terminal_result=passed enabled={} elapsed_ms={}",
+            enabled,
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "startup feature=launch_at_login action=save phase=completed terminal_result=failed error_domain=startup error_code=update_failed reason=registry_or_settings_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
     result
 }
 
@@ -2174,6 +2350,28 @@ fn register_scene_events(
     Ok(())
 }
 
+/// 低级键盘钩子只做非阻塞 try_send；独立线程负责向 WebView 发事件，避免
+/// 在系统输入回调中执行 Tauri/IPC 工作。
+fn register_shortcut_capture_events(app: tauri::AppHandle) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+    sayall_windows::key_gate::set_shortcut_capture_sink(Arc::new(move |edge| {
+        let _ = sender.try_send(edge);
+    }));
+    std::thread::Builder::new()
+        .name("sayall-shortcut-capture-events".to_owned())
+        .spawn(move || {
+            while let Ok(edge) = receiver.recv() {
+                sayall_windows::gatt_note(format!(
+                    "shortcut_capture action=edge phase=observed key={:?} edge={} delivery=webview",
+                    edge.key,
+                    if edge.is_pressed { "down" } else { "up" }
+                ));
+                let _ = app.emit("shortcut-capture-edge", &edge);
+            }
+        })
+        .ok();
+}
+
 /// Raw Input 监听自愈监督线程：启动尝试一次（遥控器休眠时可能失败）；
 /// 此后每 10 秒巡检，phase=Failed（启动失败或监听线程意外退出）时自动重启。
 /// Stopped（用户在按键页显式停止）不重启；成功后保持低频巡检自愈。
@@ -2314,6 +2512,47 @@ fn request_clean_exit(app: tauri::AppHandle, exit_code: i32) {
 fn runtime_simulation_requested() -> bool {
     std::env::var_os("SAYALL_WINDOWS_RUNTIME_SIMULATION").as_deref()
         == Some(std::ffi::OsStr::new("1"))
+}
+
+/// 监听安装器发出的"请优雅退出"信号（2026-09-16）。
+///
+/// 为什么需要：Tauri 的 NSIS 安装器在检测到应用正在运行时**直接
+/// `TerminateProcess`**（`tauri-bundler/.../nsis/utils.nsh` 的
+/// `CheckIfAppIsRunning`：没有优雅退出请求、`Sleep 500` 后即继续；静默安装
+/// 连提示都没有）。于是"升级"这个动作会留下未正常关闭的 GATT 会话——正是
+/// AGENTS.md 记录的链路僵死诱因。安装器侧现在会先置位一个命名事件并等待应用
+/// 自行退出（见 `windows/installer-hooks.nsh`），本线程即那个等待端。
+fn spawn_installer_graceful_exit_watcher(app: tauri::AppHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("sayall-graceful-exit".to_owned())
+        .spawn(move || {
+            let signal = match sayall_windows::graceful_exit::GracefulExitSignal::create() {
+                Ok(signal) => signal,
+                Err(error) => {
+                    sayall_windows::gatt_note(format!(
+                        "app_exit graceful_exit_signal phase=completed terminal_result=failed error_domain=windows error_code=create_event_failed retryable=false detail={error}"
+                    ));
+                    return;
+                }
+            };
+            sayall_windows::gatt_note(
+                "app_exit graceful_exit_signal phase=completed terminal_result=passed reason=listening"
+                    .to_owned(),
+            );
+            if !signal.wait() {
+                return;
+            }
+            sayall_windows::gatt_note(
+                "app_exit graceful_exit_signal phase=completed terminal_result=passed reason=installer_requested_exit"
+                    .to_owned(),
+            );
+            request_clean_exit(app, 0);
+        });
+    if let Err(error) = spawned {
+        sayall_windows::gatt_note(format!(
+            "app_exit graceful_exit_signal phase=completed terminal_result=failed error_domain=thread error_code=spawn_failed retryable=false detail={error}"
+        ));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2491,6 +2730,25 @@ pub fn run() {
                     Default::default()
                 }
             };
+            // 启动时把持久化偏好同步到 Windows 当前用户登录启动项；失败只记录，
+            // 不阻断主程序启动，用户可在“关于”页重试。
+            #[cfg(windows)]
+            if let Err(error) = startup::set_enabled(saved_settings.launch_at_login) {
+                sayall_windows::gatt_note(
+                    "startup feature=launch_at_login action=sync phase=completed terminal_result=failed error_domain=windows_registry error_code=sync_failed reason=startup_preference_not_applied retryable=true".to_owned(),
+                );
+                eprintln!("同步开机自启动设置失败：{error}");
+            } else {
+                sayall_windows::gatt_note(format!(
+                    "startup feature=launch_at_login action=sync phase=completed terminal_result=passed enabled={}",
+                    saved_settings.launch_at_login
+                ));
+            }
+            // Radio::RequestAccessAsync 可能显示系统授权，微软要求从可交互的 UI
+            // 上下文调用。setup 线程在创建 BLE 后台线程前预热并缓存 Radio，
+            // 使蓝牙栈资源耗尽时仍能自动关开无线电，而不是再依赖失败的枚举。
+            #[cfg(all(windows, not(feature = "runtime-simulation")))]
+            sayall_windows::prepare_bluetooth_radio_recovery();
             let platform = create_platform();
             if saved_settings.restore_hid_enhancement {
                 sayall_windows::hid_host::restore_on_start();
@@ -2536,7 +2794,7 @@ pub fn run() {
                 match platform.restore_remote(device_id) {
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!("恢复已保存的小米语音遥控器失败：{error}");
+                        eprintln!("恢复已保存的小米语音遥控器失败：{}", error.into_public());
                     }
                 }
             }
@@ -2566,6 +2824,7 @@ pub fn run() {
             // 语义按键边沿与手势事件 → 前端（画布高亮与单击/双击/长按反馈）。
             register_button_events(&platform, app.handle().clone());
             register_scene_events(&platform, settings.clone(), app.handle().clone())?;
+            register_shortcut_capture_events(app.handle().clone());
 
             // Raw Input 监听自愈：启动即尝试，失败（遥控器休眠/未连接）进入
             // 10 秒重试循环；用户在按键页显式停止（Stopped）时不重试。
@@ -2579,6 +2838,23 @@ pub fn run() {
                 settings,
                 pending_update: std::sync::Mutex::new(None),
             });
+            // 安装/升级前的优雅退出监听（2026-09-16）：安装器会先请求退出、
+            // 若清理未完成则安装器中止，不允许强杀。
+            spawn_installer_graceful_exit_watcher(app.handle().clone());
+            // "打开无线麦"（自身窗口）后的 tao 可见性缓存同步：`app_launcher` 用
+            // Win32 `ShowWindow` 显示已隐藏的自身主窗口（同步生效，其后抢前台才有
+            // 意义），但那会绕过 tao 的 `WindowFlags::VISIBLE` 缓存，使随后点 X 的
+            // `window.hide()` 被判为"无差异"而跳过——窗口关不进托盘（2026-09-16
+            // 真机实测）。这里用 tao 的 `show()` 把缓存置回"可见"；窗口已可见时为
+            // 幂等无副作用。显示与隐藏同走一条事件队列，FIFO 保证同步在前。
+            {
+                let handle = app.handle().clone();
+                sayall_windows::app_launcher::set_self_show_sync(move || {
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                    }
+                });
+            }
             sayall_windows::gatt_note(
                 "app_lifecycle event=tauri_setup phase=completed terminal_result=passed window_created=true state_managed=true".to_owned(),
             );
@@ -2586,8 +2862,10 @@ pub fn run() {
         });
 
     let builder = builder
-        // 关闭主窗口 → 隐藏到托盘驻留（托盘菜单"退出"才真正退出；
-        // 退出走 Tauri 正常事件循环结束，平台组件 Drop 清理照常执行）。
+        // 关闭主窗口 → 隐藏到托盘驻留（托盘菜单"退出"才真正退出）。
+        // 注意：**不能**依赖 Drop 做退出清理——Tauri 的 `run()` 收尾是
+        // `std::process::exit`，不执行析构；退出收尾统一在
+        // `RunEvent::ExitRequested` 里显式做（见 `request_clean_exit`）。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(focused) = event {
                 let role = match window.label() {
@@ -2601,7 +2879,15 @@ pub fn run() {
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    let _ = window.hide();
+                    // `hide()` 的返回值只说明"消息已投递"，不代表窗口真的隐藏了，
+                    // 因此同时记录 hide 前后 tao 报告的实际可见性：`visible_after=true`
+                    // 表示窗口仍在屏幕上（hide 未生效），可直接否证"已隐藏到托盘"。
+                    let visible_before = window.is_visible().unwrap_or(true);
+                    let hide_result = window.hide();
+                    let visible_after = window.is_visible().unwrap_or(true);
+                    sayall_windows::gatt_note(format!(
+                        "window_close action=hide_to_tray label=main hide_result={hide_result:?} visible_before={visible_before} visible_after={visible_after} prevent_close=true"
+                    ));
                     api.prevent_close();
                 }
             }
@@ -2615,6 +2901,8 @@ pub fn run() {
         resolve_capture_recovery,
         get_runtime_snapshot,
         get_diagnostic_report,
+        open_log_directory,
+        hide_main_window,
         scan_paired_remotes,
         get_connection_snapshot,
         connect_remote,
@@ -2667,12 +2955,17 @@ pub fn run() {
         list_preset_apps,
         list_running_apps,
         pick_custom_app,
+        scan_registered_apps,
         get_button_mapping_snapshot,
+        start_shortcut_capture,
+        stop_shortcut_capture,
         get_send_input_snapshot,
         get_voice_hold_hotkey,
         set_voice_hold_hotkey,
         get_theme_preference,
         set_theme_preference,
+        get_launch_at_login,
+        set_launch_at_login,
         report_theme_result,
         get_app_update_preferences,
         set_app_update_preferences,
@@ -2690,6 +2983,8 @@ pub fn run() {
         resolve_capture_recovery,
         get_runtime_snapshot,
         get_diagnostic_report,
+        open_log_directory,
+        hide_main_window,
         scan_paired_remotes,
         get_connection_snapshot,
         connect_remote,
@@ -2742,12 +3037,17 @@ pub fn run() {
         list_preset_apps,
         list_running_apps,
         pick_custom_app,
+        scan_registered_apps,
         get_button_mapping_snapshot,
+        start_shortcut_capture,
+        stop_shortcut_capture,
         get_send_input_snapshot,
         get_voice_hold_hotkey,
         set_voice_hold_hotkey,
         get_theme_preference,
         set_theme_preference,
+        get_launch_at_login,
+        set_launch_at_login,
         report_theme_result,
         get_app_update_preferences,
         set_app_update_preferences,
@@ -2989,6 +3289,20 @@ mod lifecycle_tests {
             Err(PlatformError::UnsupportedPlatform)
         }
 
+        fn test_scroll(
+            &self,
+            _direction: sayall_windows::send_input::ScrollDirection,
+            _steps: u16,
+        ) -> Result<SendInputSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+        fn test_mouse_action(
+            &self,
+            _action: sayall_windows::send_input::ButtonAction,
+        ) -> Result<SendInputSnapshot, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
         fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
             Vec::new()
         }
@@ -3204,5 +3518,170 @@ mod lifecycle_tests {
         assert!(cleanup.is_finished());
         assert!(!cleanup.begin_exit_worker());
         assert_eq!(platform.calls(), vec!["quiesce", "stop", "disconnect"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 安装器钩子源码。契约测试要在**构建期**读它：这些断言存在的理由就是
+    /// "有人改了一侧、忘了另一侧"（2026-09-16 的僵死 Bug 正是文档写了规则、
+    /// 安装器从未实现）。
+    const INSTALLER_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
+
+    /// 去掉 NSIS 注释（`;` 到行尾）：注释里会引用被禁用的 API 名做说明，
+    /// 负向断言必须在正文上做。
+    fn strip_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split(';').next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn define_number(hooks: &str, name: &str) -> u64 {
+        let prefix = format!("!define {name} ");
+        let start = hooks
+            .find(&prefix)
+            .unwrap_or_else(|| panic!("安装器钩子缺少 `{prefix}`"))
+            + prefix.len();
+        hooks[start..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("`{name}` 必须是十进制数字字面量"))
+    }
+
+    fn macro_body(hooks: &str, name: &str) -> String {
+        let opener = format!("!macro {name}");
+        let start = hooks
+            .find(&opener)
+            .unwrap_or_else(|| panic!("安装器钩子缺少 `{opener}`"));
+        let rest = &hooks[start..];
+        let end = rest
+            .find("!macroend")
+            .unwrap_or_else(|| panic!("`{opener}` 未以 !macroend 结束"));
+        rest[..end].to_owned()
+    }
+
+    /// 安装器必须用**应用注册的那个事件名**请应用退出。
+    /// 改名会让整套机制静默失效（安装器打不开事件 → 直接跳过 → 回落到强杀）。
+    #[test]
+    fn installer_hook_requests_graceful_exit_with_the_app_event_name() {
+        let expected = format!(
+            "!define SAYALL_GRACEFUL_EXIT_EVENT \"{}\"",
+            sayall_windows::graceful_exit::GRACEFUL_EXIT_EVENT_NAME
+        );
+        assert!(
+            INSTALLER_HOOKS.contains(&expected),
+            "安装器事件名必须与应用常量逐字一致，缺少 `{expected}`"
+        );
+
+        let request = macro_body(INSTALLER_HOOKS, "SayAllRequestGracefulExit");
+        for token in ["OpenEventW", "SetEvent", "CloseHandle"] {
+            assert!(request.contains(token), "优雅退出宏缺少 `{token}`");
+        }
+
+        // 安装与卸载两条路径都会强杀正在运行的应用，都必须先请求退出。
+        for hook in ["NSIS_HOOK_PREINSTALL", "NSIS_HOOK_PREUNINSTALL"] {
+            assert!(
+                macro_body(INSTALLER_HOOKS, hook)
+                    .contains("!insertmacro SayAllRequestGracefulExit"),
+                "`{hook}` 没有请求应用优雅退出"
+            );
+        }
+    }
+
+    #[test]
+    fn installer_timeout_aborts_before_the_force_kill_fallback() {
+        let request = macro_body(INSTALLER_HOOKS, "SayAllRequestGracefulExit");
+        let timeout = request.find("sayall_timeout_").expect("timeout exit label");
+        let done = request[timeout..]
+            .find("sayall_done_")
+            .expect("success label");
+        assert!(request[timeout..timeout + done].contains("Abort"));
+    }
+
+    /// `FindProcessCurrentUser` 只按**进程名**匹配：传全路径时它永远返回 1
+    /// （"没有在跑"），整段等待逻辑会被静默跳过，直接落到 Tauri 的强杀弹窗。
+    /// 2026-09-16 探针实测（artifacts/nsis-probe/sayall-findproc-probe2-result.txt）：
+    /// 裸名 `sayall.exe` → 0（在跑），全路径 `C:\...\sayall.exe` → 1（不在跑）。
+    #[test]
+    fn installer_hook_looks_up_processes_by_bare_name() {
+        let request = macro_body(INSTALLER_HOOKS, "SayAllRequestGracefulExit");
+        assert!(
+            request.contains("FindProcessCurrentUser \"${MAINBINARYNAME}.exe\""),
+            "必须传裸进程名，与 Tauri 自己的 CheckIfAppIsRunning 一致"
+        );
+        assert!(
+            !request.contains("FindProcessCurrentUser \"$INSTDIR"),
+            "不得给 FindProcessCurrentUser 传全路径：实测它不按路径匹配，会导致等待逻辑被跳过"
+        );
+    }
+
+    /// `System::Call` 的输出寄存器**大小写敏感**：`.R8` 写 `$R8`，`.r8` 写 `$8`。
+    /// 旧实现用 `.r8` 却判断 `$R8`（永远是空值，而空值 `!= 0` 在 NSIS 里为真），
+    /// 于是"事件存在"分支恒真，旧版检测从来没生效过。
+    /// 2026-09-16 探针实测（artifacts/nsis-probe/sayall-probe3-result.txt）：
+    /// `.R8` 成功 → `916`，事件不存在 → `0`；`.r8` 写进的是 `$8`。
+    #[test]
+    fn installer_hook_reads_the_register_it_writes() {
+        let request = macro_body(INSTALLER_HOOKS, "SayAllRequestGracefulExit");
+        assert!(
+            request.contains("p .R8"),
+            "OpenEventW 的输出必须写 `$R8`（`.R8`）；写成 `.r8` 会落到 `$8`"
+        );
+        assert!(
+            !request.contains("p .r8"),
+            "`.r8` 写的是 `$8`，与后续判断的 `$R8` 不是同一个变量"
+        );
+        assert!(
+            request.contains("SetEvent(p R8)"),
+            "SetEvent 必须读回同一个寄存器"
+        );
+    }
+
+    /// 等待必须**轮询到进程真的消失**，而不是睡一个固定时长：应用侧 BLE 收尾预算
+    /// 是 5s，睡固定时长必然提前落到 Tauri 的强杀弹窗。
+    #[test]
+    fn installer_hook_polls_until_the_process_is_gone() {
+        let request = macro_body(INSTALLER_HOOKS, "SayAllRequestGracefulExit");
+        let lookups = request.matches("FindProcessCurrentUser").count();
+        assert!(
+            lookups >= 2,
+            "必须先查一次再轮询到退出，当前只有 {lookups} 次进程查询"
+        );
+        assert!(request.contains("sayall_wait_"), "必须有轮询等待循环");
+        // 标签后缀由调用方传入：`${__LINE__}` 在卸载段会展开成复合 token。
+        for call in [
+            "SayAllRequestGracefulExit install",
+            "SayAllRequestGracefulExit uninstall",
+        ] {
+            assert!(
+                INSTALLER_HOOKS.contains(call),
+                "调用必须带唯一标签后缀，缺少 `{call}`"
+            );
+        }
+    }
+
+    /// 安装器钩子**不得**自己引入强杀。Tauri 模板在钩子之后跑
+    /// `CheckIfAppIsRunning`；只要应用已退出，那一步自然落空。
+    #[test]
+    fn installer_hook_never_force_kills_the_app() {
+        let code = strip_comments(INSTALLER_HOOKS).to_ascii_lowercase();
+        for token in [
+            "killprocess",
+            "terminateprocess",
+            "taskkill",
+            "stop-process",
+        ] {
+            assert!(
+                !code.contains(token),
+                "安装器钩子出现强杀 `{token}`：强杀会留下未关闭的 GATT 会话并楔死系统蓝牙栈"
+            );
+        }
     }
 }

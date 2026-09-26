@@ -34,7 +34,7 @@ Windows UI 的唯一产品设计基准是无线麦 macOS 原版。Windows 使用
 Vue 3 UI
   ├─ 按键
   ├─ 统计
-  ├─ 连接与语音
+  ├─ 连接
   ├─ 权限
   └─ 关于
         │
@@ -66,7 +66,7 @@ Application State
 ### 3.2 `sayall-windows`
 
 只包含 Windows 公共 API。所有 Windows 句柄、COM、WinRT、HID 和音频资源必须有明确生命周期。BLE 回调和音频回调不得执行阻塞文件或进程操作。
-RC001/RC003 断连由 BLE 工作线程统一清理后进入 2–30 秒指数退避；用户主动断开只停止本次运行的重连。连接时优先从已批准设备名识别型号，名称不足以判定时可选读取标准 Device Information / Model Number（2A24）；型号未知不阻断共用 ATVV 路径。Windows 电源回调只投递事件，睡眠前的 GATT/音频释放与恢复后的重新发现仍在同一工作线程串行完成，旧 connection generation 回调继续丢弃。
+RC001/RC003 断连由 BLE 工作线程统一清理后进入 2–30 秒指数退避；用户主动断开只停止本次运行的重连。连接时优先从已批准设备名识别型号，名称不足以判定时可选读取标准 Device Information / Model Number（2A24）；型号未知不阻断共用 ATVV 路径。Windows 电源回调只投递事件，睡眠前的 GATT/音频释放与恢复后的重新发现仍在同一工作线程串行完成，旧 connection generation 回调继续丢弃。2026-09-10 修复升级重启后的重连窗口 F5 泄漏：Raw Input 每设备类在进程内只保留一个注册窗口，由主监听器统一转发设备归因；Connecting/Discovering/AwaitingCapabilities/Reconnecting 期间临时保护语音 F5，进入稳定/失败/挂起状态即释放实体键盘 F5；每次连接的设备激活、属性、服务/特征发现、CCCD 订阅与能力请求均记录脱敏结构化耗时，详见 `Bugs/2026-09-10-voice-f5-timestamp-during-reconnect.md`。
 
 ### 3.3 Tauri Host
 
@@ -85,7 +85,7 @@ Tauri command 只依赖宿主内的 `PlatformRuntime` 接口。普通构建唯�
 
 1. 按键；
 2. 统计；
-3. 连接与语音；
+3. 连接；
 4. 权限；
 5. 关于。
 
@@ -156,7 +156,7 @@ Windows 深色模式已于 2026-09-08 实现：“关于”页面提供“系统
 
 安装包采用 Tauri NSIS current-user 模式，固定应用 identifier、publisher、开始菜单目录和禁止降级策略。最低系统版本统一定义为 Windows 10 1809（build 17763）：NSIS 在复制应用文件前通过官方 installer hook 拒绝更低 build，Tauri Host 在创建 WebView、BLE、WASAPI 和 Raw Input 资源前再次读取真实系统版本并失败关闭，覆盖绕过安装器直接运行 exe 的情况。普通 CI 校验 hook 路径与门槛值，并只生成明确标记为 unsigned 的短期 Preview artifact；该 artifact 只证明代码和打包结构可构建，不能替代 Windows 10 1809 / Windows 11 上的提示、安装升级、Authenticode 或 SmartScreen 真机验收。
 
-权限页已接入只读运行诊断摘要：Tauri Host 从现有平台快照提取能力、阶段、代次和计数，并在 Rust 边界直接丢弃设备 ID、蓝牙地址、HID 路径、遥控器名称、音频端点身份、错误原文和用户内容。页面只在用户主动操作后生成并复制可见 JSON；该能力不是持久日志，也不代表任何 Windows 真机路径已通过。
+关于页已接入只读运行诊断摘要（2026-09-16 从权限页迁入，权限页只保留蓝牙/按键/音频三项状态）：Tauri Host 从现有平台快照提取能力、阶段、代次和计数，并在 Rust 边界直接丢弃设备 ID、蓝牙地址、HID 路径、遥控器名称、音频端点身份、错误原文和用户内容。页面只在用户主动操作后生成并复制可见 JSON；该能力不是持久日志，也不代表任何 Windows 真机路径已通过。同页另有“打开日志目录”：目录路径由 Rust 从诊断日志的实际落盘位置推导、前端不接受路径参数（维持 capabilities 最小权限），经 ShellExecuteW 交给系统资源管理器。
 
 使用统计已按长期边界接入：Windows 平台层只维护线程安全的累计计数，不在 BLE、WASAPI 或 Raw Input 回调中写文件；Tauri Host 在后台合并增量并写入本应用 `settings.json`。普通按键只统计去重后的语义按下边沿，语音只在 WASAPI 排空和 ATVV drain 都成功后记录一次，并按 16 kHz 已解码采样折算时长。核心层只保存每日汇总，不保存设备、端点、按键名称、语音内容或应用上下文；统计页沿用 Mac 原版的今日、本周、全部和最近 7 天信息层级。真实 Windows 事件和升级保留仍按测试手册验收。
 

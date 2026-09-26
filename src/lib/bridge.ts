@@ -35,6 +35,20 @@ export interface AudioEndpoint {
   isVirtualCableCandidate: boolean;
 }
 
+/**
+ * 界面上的“推荐”判据：只有 VB-CABLE 标准包提供的 CABLE Input
+ * （渲染端点友好名 `CABLE Input (VB-Audio Virtual Cable)`）值得推荐给
+ * 微信输入法等语音工具作麦克风来源。
+ *
+ * 后端的 `isVirtualCableCandidate` 是更宽的候选判定（含 VB-CABLE A/B 的
+ * CABLE-A/B Input 与 CI 仿真端点），只用于自动选择与安装检测，不足以
+ * 决定推荐标记；两者刻意分开，避免给非标准端点打上推荐。
+ */
+export function isRecommendedVoiceEndpoint(endpoint: AudioEndpoint): boolean {
+  const name = endpoint.name.trim().toLowerCase();
+  return name.includes("cable input") && name.includes("vb-audio");
+}
+
 export interface AudioSnapshot {
   phase: AudioPhase;
   selectedEndpointId: string | null;
@@ -45,7 +59,7 @@ export interface AudioSnapshot {
   lastError: string | null;
 }
 
-export type RawInputPhase = "stopped" | "starting" | "ready" | "failed" | "unsupported";
+export type RawInputPhase = "stopped" | "starting" | "awaiting" | "ready" | "failed" | "unsupported";
 
 export type RemoteButton =
   | "back"
@@ -69,6 +83,11 @@ export interface ButtonEdge {
   isPressed: boolean;
 }
 
+export interface ShortcutCaptureEdge {
+  key: KeyCode;
+  isPressed: boolean;
+}
+
 export interface RawInputSnapshot {
   phase: RawInputPhase;
   matchedDeviceCount: number;
@@ -78,6 +97,8 @@ export interface RawInputSnapshot {
   lastIsPressed: boolean | null;
   activeButtons: RemoteButton[];
   lastError: string | null;
+  /** 报文来自遥控器但路径与绑定不符而被丢弃的次数（绑定失效的直接证据）。 */
+  staleRemoteEventCount: number;
 }
 
 export type KeyCode = string;
@@ -86,9 +107,17 @@ export interface KeyChord {
   keys: KeyCode[];
 }
 
+export type MouseClickKind = "left" | "right" | "double_left" | "middle";
+export type MoveDirection = "up" | "down" | "left" | "right";
+export const mouseClickLabels: Record<MouseClickKind, string> = { left: "左键单击", right: "右键单击", double_left: "左键双击", middle: "中键单击" };
+export const mouseMoveLabels: Record<MoveDirection, string> = { up: "鼠标向上", down: "鼠标向下", left: "鼠标向左", right: "鼠标向右" };
+
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
+  | { type: "scroll"; direction: "up" | "down"; steps?: number }
+  | { type: "mouse_click"; kind: MouseClickKind }
+  | { type: "mouse_move"; direction: MoveDirection; distance: number }
   | { type: "open_app"; target: string };
 
 /** 预设应用条目（list_preset_apps 返回；对齐 Mac PresetApplication）。 */
@@ -108,6 +137,7 @@ export interface ButtonActions {
 export interface ButtonMappings {
   enabled: boolean;
   actions: Partial<Record<RemoteButton, ButtonActions>>;
+  applications?: AppLibraryEntry[];
 }
 
 export interface CaptureInputSettings {
@@ -222,6 +252,7 @@ export interface AtvvCapabilities {
 
 export interface ConnectionSnapshot {
   phase: ConnectionPhase;
+  batteryLevel?: number | null;
   remoteName: string | null;
   remoteModel: RemoteModel;
   capabilities: AtvvCapabilities | null;
@@ -333,6 +364,16 @@ export interface AppUpdatePreferences {
 
 export type ThemePreference = "system" | "light" | "dark";
 
+export async function getLaunchAtLogin(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invoke<boolean>("get_launch_at_login");
+}
+
+export async function setLaunchAtLogin(enabled: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法设置开机自启动");
+  return invoke<boolean>("set_launch_at_login", { enabled });
+}
+
 export interface AppUpdateProgress {
   downloaded: number;
   contentLength: number | null;
@@ -380,6 +421,7 @@ const browserSnapshot: RuntimeSnapshot = {
       lastIsPressed: null,
       activeButtons: [],
       lastError: null,
+      staleRemoteEventCount: 0,
     },
     buttonMapping: {
       enabled: true,
@@ -474,6 +516,30 @@ export function formatDiagnosticReport(
   generatedAt = new Date().toISOString(),
 ): string {
   return JSON.stringify({ generatedAt, ...report }, null, 2);
+}
+
+/**
+ * 打开诊断日志目录（关于页入口）。返回实际打开的目录供界面显示。
+ *
+ * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径——
+ * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网一个 URL）。
+ */
+export async function openLogDirectory(): Promise<string> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开日志目录");
+  return invoke<string>("open_log_directory");
+}
+
+/**
+ * Ctrl+W：关闭主窗口——隐藏到托盘驻留，语义与点标题栏“X”完全一致。
+ *
+ * 有意**不**调用 `@tauri-apps/api` 的 `getCurrentWindow().close()`：那条路径在
+ * Windows 上究竟是触发 `CloseRequested`（→ Rust 侧 `prevent_close` + hide，
+ * 即隐藏到托盘）还是直接销毁窗口，取决于 tao 的平台实现细节，跨版本可能静默
+ * 改变语义；这里显式调 Rust 命令，动作与“X”的收尾是同一行代码。
+ */
+export async function hideMainWindow(): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法关闭窗口");
+  await invoke("hide_main_window");
 }
 
 export async function scanPairedRemotes(): Promise<PairedRemote[]> {
@@ -714,6 +780,30 @@ export async function subscribeButtonGestures(
   }
   const { listen } = await import("@tauri-apps/api/event");
   const unlisten = await listen<FiredGesture>("button-gesture", (event) => handler(event.payload));
+  return () => {
+    void unlisten();
+  };
+}
+
+export async function startShortcutCapture(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invoke("start_shortcut_capture");
+}
+
+export async function stopShortcutCapture(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invoke("stop_shortcut_capture");
+}
+
+/** 原生低级钩子录入边沿；Win+L 等系统组合在到达 Shell 前已成对吞下。 */
+export async function subscribeShortcutCaptureEdges(
+  handler: (edge: ShortcutCaptureEdge) => void,
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<ShortcutCaptureEdge>("shortcut-capture-edge", (event) =>
+    handler(event.payload),
+  );
   return () => {
     void unlisten();
   };
@@ -979,7 +1069,9 @@ export function shortcutCapability(
 
 const keyLabels: Record<string, string> = {
   ...voiceHotkeyKeyLabels,
-  backspace: "退格",
+  // 用厂商印在键帽上的英文名，避免“退格/删除”在中文里被混为一谈。
+  backspace: "Backspace",
+  home: "Home",
   page_up: "Page Up",
   page_down: "Page Down",
   end: "End",
@@ -1033,6 +1125,12 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
 
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
+  if (action.type === "scroll") {
+    const label = action.direction === "up" ? "滚轮向上" : "滚轮向下";
+    return (action.steps ?? 1) === 1 ? label : `${label} ${action.steps} 格`;
+  }
+  if (action.type === "mouse_click") return mouseClickLabels[action.kind];
+  if (action.type === "mouse_move") return `${mouseMoveLabels[action.direction]} ${action.distance} px`;
   if (action.type === "open_app") {
     const known = presetAppNames.get(action.target);
     if (known) return `打开${known}`;
@@ -1049,6 +1147,13 @@ export interface CustomAppPick {
   name: string;
   path: string;
   applicationId: string;
+}
+
+export type AppLibraryEntry = Pick<CustomAppPick, "name" | "path">;
+
+export async function scanRegisteredApps(): Promise<AppLibraryEntry[]> {
+  if (!isTauriRuntime()) throw new Error("应用扫描需要在 Windows 客户端中使用");
+  return invoke<AppLibraryEntry[]>("scan_registered_apps");
 }
 
 /**

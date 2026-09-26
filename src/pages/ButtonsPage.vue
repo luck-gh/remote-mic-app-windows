@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import ButtonActionEditor from "../components/ButtonActionEditor.vue";
+import BatteryIndicator from "../components/BatteryIndicator.vue";
 import SettingsDialog from "../components/SettingsDialog.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import { useUiPreference } from "../lib/ui-preferences";
@@ -520,6 +521,8 @@ function phaseLabel(phase: RawInputPhase | undefined): string {
       return "监听启动失败（自动重试中）";
     case "stopped":
       return "监听已停止";
+    case "awaiting":
+      return "等待遥控器连接（系统 HID 接口未就绪）";
     case "unsupported":
       return "当前环境暂不支持";
     default:
@@ -661,6 +664,7 @@ onUnmounted(() => {
         <div class="device-chip" :class="{ connected: connectionInfo?.phase === 'ready' || connectionInfo?.phase === 'streaming' }">
           <span class="status-dot" :class="connectionInfo?.phase === 'streaming' ? 'active' : connectionInfo?.phase === 'ready' ? 'success' : 'pending'"></span>
           <span>{{ connectionInfo?.remoteName ?? "未连接遥控器" }}</span>
+          <BatteryIndicator :connection="connectionInfo" />
         </div>
       </div>
       <div class="mapping-header-controls">
@@ -826,6 +830,7 @@ onUnmounted(() => {
         </div>
       </div>
       <ButtonActionEditor
+        :key="`${editingSource}:${editingTarget.button}:${editingTarget.trigger}`"
           :shortcuts-only="editingSource !== 'common'"
         v-if="!templateReadOnly"
         :mappings="mappings"
@@ -834,6 +839,7 @@ onUnmounted(() => {
         :preset-apps="presetApps"
         :capability-note="capabilityNote"
         @update="applyAction"
+        @applications="mappings = { ...mappings, applications: $event }"
         @status="statusMessage = $event"
       />
 

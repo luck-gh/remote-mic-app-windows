@@ -1,0 +1,14 @@
+=== PnP HID devices (VID_2717/PID_32B8) ===
+OK|Bluetooth|REDACTED_device_31
+OK|Bluetooth|REDACTED_device_51
+OK|Bluetooth|REDACTED_device_70
+OK|HIDClass|REDACTED_device_48
+OK|Bluetooth|REDACTED_device_28
+OK|Bluetooth|REDACTED_device_46
+OK|Bluetooth|REDACTED_device_17
+OK|Bluetooth|REDACTED_device_95
+OK|Keyboard|REDACTED_device_9
+OK|Bluetooth|REDACTED_device_86
+
+=== Raw Input registry entry (HID TLCs) ===
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\REDACTED_device_67

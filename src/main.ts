@@ -4,6 +4,7 @@ import SceneOverlay from "./components/SceneOverlay.vue";
 import { isTauriRuntime } from "./lib/bridge";
 import { initializeTheme } from "./lib/theme";
 import { installFrontendDiagnostics, reportFrontendEvent } from "./lib/frontend-diagnostics";
+import { installFocusModalityTracking } from "./lib/focus-modality";
 import "./styles.css";
 
 const sceneOverlay = new URLSearchParams(window.location.search).get("scene-overlay") === "1";
@@ -43,6 +44,11 @@ try {
 if (isTauriRuntime()) {
   document.addEventListener("contextmenu", (event) => event.preventDefault());
 }
+
+// 焦点环模态跟踪（实现见 src/lib/focus-modality.ts，样式见 styles.css）：
+// 默认保留原生焦点指示，仅在最近一次交互是指针时抑制，消除遥控器按键在
+// 鼠标点过的控件上凭空点亮的幽灵焦点环。
+installFocusModalityTracking();
 
 if (import.meta.env.VITE_SAYALL_RUNTIME_SIMULATION === "1") {
   void import("./runtime-simulation").then(({ runRuntimeSimulationSmoke }) =>

@@ -1,8 +1,19 @@
 # TODO
 
+- [ ] 2026-09-27 Windows 上游整合：本地 checkpoint `bd2349b` / `f32ae1b` 已保存，`test/windows-upstream-integration` 正逐块合并固定 `74230bf`（115 个上游提交）。共享自动同步仅本仓库条目已停用（控制仓库 PR #1）；保留全部本地 ancestry/用户配置、纯直接模板与严格增强来源。源码冲突标记已闭合，项目7步预检通过（前端169、Rust331passed/17ignored）；合并候选本机安装/受影响实机尚未完成；未 push/PR Windows 功能分支，不把上游历史 passed 作为本候选结论。
+
 ## v1 决策（2026-09-04）
 
 - 第一版只做微信输入法听写：按住说话快捷键默认 左Ctrl+左Win（适配微信输入法默认语音热键）；语音可用 = 按住语音键 → 注入快捷键 → ATVV 音频经 CABLE Input → 微信输入法麦克风（CABLE Output）→ 云端识别 → 文字上屏。端到端链路音频段已本机实证（调查报告 evidence/n）；注入段配方约束已本机实证（evidence/p：WeType 拒绝单批零间隔和弦，须逐事件注入；间隔 20/40/60ms 均 4/4 触发、零间隔 0/2，~~默认取 20ms 压低按键延迟~~（2026-09-05 更正：20ms 为热态验证结论，冷/节流态必失败已实证并回退 80ms，见下方"性能已知项"与提交 86e5314——延迟优化必须以成功率保证为前提），Bugs\2026-09-04-wetype-zero-gap-injection.md）；**延迟账目已量化（2026-09-05，evidence/p 端点预热对照实验）**：注入→WeType 开麦固定 ~163ms（冷/热端点中位数差 0.3ms，预热无效；WeType 内部处理，第三方边界不可干预），两型号实际均直接 0x04 推流（无开麦往返可并行），0x04 早于 HID F5 60-90ms（触发点已最早），全链 ≈215-245ms 其中应用侧仅和弦 20ms 可控——**应用侧延迟优化到此收敛**；RC001 遥控器端到端真机 passed（2026-09-04，用户确认文字上屏；用户侧前提=输出端点选 CABLE Input + 系统默认录音设备切 CABLE Output，应用不修改系统默认设备）；RC003 真机待验。豆包（注入判死四层闭环）与 WinUHid 增强轨延后，见 ADR 0002 与 docs/investigations/2026-09-04-avoid-driver-signing-input-paths-final.md。
+
+## 后续产品功能（开发前对照 Mac App）
+
+以下功能均以 Mac App 的产品流程、页面结构、状态反馈、文案语义和异常处理为实现参考；开发前先完成对照调研并记录结论。Windows 侧仍须遵守本仓库架构边界，只使用公开 API、公开协议、全局快捷键和用户可见的辅助功能界面；因平台能力产生的差异须在 `ATTRIBUTION.md`、路线图或对应调查文档中说明，不直接移植 macOS 平台代码。
+
+- [ ] 增加首次使用 Onboarding 流程页面：参考 Mac App 的步骤顺序和完成条件，覆盖遥控器连接、语音输出设备、目标输入法选择、按住说话验证与失败恢复；支持中断后继续、完成后重新进入，并为关键状态、分支和外部调用补齐结构化日志。
+- [ ] 支持 Typeless：参考 Mac App 的选择、配置、触发、状态反馈和恢复流程，调研 Windows 公开能力后实现按住说话生命周期、音频路由与失败关闭；分别完成 RC001/RC003、冷态首用、快速连按、断连和睡眠恢复真机验收。
+- [ ] 支持豆包输入法：参考 Mac App 的产品行为与配置引导，在不读取或修改豆包私有配置、内部数据库、内存或私有协议的前提下设计 Windows 支持路径；基础能力不得依赖进程注入，若必须使用提权 Helper 或虚拟 HID，须保持独立、显式启用且不影响现有语音主路径，并分别完成 RC001/RC003 真机验收。
+- [ ] 完善聚焦输入框处理：参考 Mac App 对目标输入框的识别、焦点保持、恢复和无可编辑目标时的用户提示；Windows 仅使用公开的焦点与辅助功能 API，避免静默把语音结果送入错误窗口，并覆盖焦点切换、窗口关闭、应用切换、Onboarding/设置窗口前后台切换及语音会话中焦点变化。
 
 ## Windows RC001 / RC003
 
@@ -15,6 +26,17 @@
 - [ ] 2026-09-22 完整模板面板长按Menu切换“同时更新此程序的默认模板”：复用既有长按识别，每个面板内物理长按仅切一次，UP不取消；短Menu仍取消，打开面板的那次按键不切换。当时意图仅在确认模板时持久化；后续用户已要求单独记住偏好，以上方新条目为准。代次/目标/焦点失效拒绝。13项场景路由与13项浮层测试通过，16:25最终daa336fb候选已正常安装/Explorer普通启动，最新用户配置字节不变；实体长按/取消尚待观察，不外推旧按键或UI pending项。
 - [ ] 2026-09-22 模板页排序与折叠：顺序为模板切换规则→完整按键模板→程序关联，后两块原生details/summary独立折叠、首次默认展开、标题/实际数量常显；按钮位于展开内容而非summary。组件保留，刷新/开关保存不重开，折叠不清草稿，无新设置或配置写入。模板页15项＋关联12项通过，14:50最终ab9aa895包构建/正常安装/Explorer普通启动通过，配置字节未变；排序/原生折叠实际观察、上一轮闪烁及旧按键组仍待用户反馈，不外推passed。
 - [ ] 2026-09-22 模板切换规则布局与稳定反馈：本块三个原生 checkbox 统一左列，名称/常驻说明同一文字列，整行 label 和焦点轮廓保留。实际安装页左坐标一致、文字完整已自验且用户截图确认。顶部成功文案插拔已修；用户在ec164ed5新版再次指出整块淡出闪烁，已定位共享saving→全页disabled/opacity。改为每字段pending及aria-busy/事件防重复，成功只合并该字段；同项失败保留持久值、局部固定反馈，其他控件不禁用不淡出。模板页13项通过，含pending节点/控件状态、重复操作和两个字段逆序回包；11:44最终1466c7a2包已正常安装/Explorer普通启动，用户最新配置字节不变。最终UIA导航不可访问，未点击开关，实际点击视觉等待用户反馈，不由单测外推。旧未回复按键组暂停，未记通过。
+
+以下条目来自上游历史记录；合并候选的本机状态以本轮整合验收为准，不继承旧包实机通过结论。
+
+- [x] 参考 macOS `SMAppService.mainApp` 实现 Windows 当前用户登录自启动：关于页可开关，使用 `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，启动时同步并记录结构化日志；不需要管理员权限。**2026-09-15 本机 Windows 真机 passed**：release 安装版 0.2.6 注销重登后自动启动，进程父进程为 `explorer`（由登录 shell 拉起，非手动启动），启动链 `document_load finished → vue_mount(80ms) → initial_ipc_ready(337ms)` 完整，日志 `startup feature=launch_at_login action=sync terminal_result=passed enabled=true`。验证要点：`Win+L` 锁屏再解锁**不会**触发 `Run` 项（用户会话未结束），必须注销（`shutdown /l`）或重启才能验证。
+
+- [ ] 鼠标动作映射：支持左/右/中键单击、左键双击、每次 1–100 格滚轮及每次 1–2000 物理像素指针移动；不修改默认绑定。RC001/RC003 实体按键及闲置首按回归仍需分别验收，见 `Testing/WindowsMouseActions.md`。
+- [ ] Windows 注册应用扫描与应用库：支持搜索、多选/全选、配置保存及导入导出；扫描或添加应用不会自动启动或绑定。RC001/RC003 实体按键回归仍需分别验收，见 `Testing/WindowsRegisteredApps.md`。
+- [ ] 遥控器电量显示：按所选 BLE 对端读取 Windows 缓存电量，断连、睡眠或缺失时显示未知，不额外进行 GATT 操作。持续更新、断连、睡眠及 RC001/RC003 实机验收见 `Testing/WindowsBattery.md`。
+- [ ] 关于页"启动行为"与"软件更新"之间补 12px 分组间距：与上方应用标识/外观卡的堆叠节奏一致，两组独立设置不再读成同一张卡的两段。前端类型检查与 AboutPage 仿真测试 passed；纯 CSS 间距无需真机专项。
+- [ ] 主窗口 Ctrl+W 关闭快捷键：Ctrl+W 隐藏主窗口并由托盘驻留，语义与点标题栏"X"完全一致（不动 BLE/语音链路、不退出进程，真正退出仍走托盘菜单"退出"）；带 Alt/Shift/Meta 的组合与按住连发均不触发，Rust 侧落 `window_close source=ctrl_w` 结构化日志。不复用前端 `getCurrentWindow().close()`——它在 Windows 上是否触发 `CloseRequested`（→ 隐藏到托盘）取决于 tao 的平台实现，跨版本可能静默改变语义，故显式走 IPC 调 `window.hide()`。自动化验证 passed（前端 vitest 95 例含 Ctrl+W 边沿、`pnpm build`、`cargo check` 含 runtime-simulation、`cargo fmt --check`、`cargo test` 单线程全量）；**Windows 真机 Ctrl+W 按键与托盘恢复 deferred**（worktree git 元数据异常，本次未能出本地包）。
+
 - [x] 建立独立 Rust + Tauri 2 + Vue 3 工程结构。
 - [x] 建立 Mac 原版风格设置界面骨架。
 - [x] 建立 ATVV、ADPCM 和语音会话纯 Rust 核心。
@@ -28,11 +50,13 @@
 - [x] 会话临时Capture输入锁定与长设备名布局：2026-09-19用户明确确认RC003非target冷首按正常、下拉框不越界。默认关闭，仅本功能获准受限IPolicyConfig，结束条件恢复、检测外部改选整体让出；详见 Testing/CaptureInputSession.md。
 - [ ] 扩展验收待完成；2026-09-19用户已确认首按及布局通过。原范围：提供“遥控器说话时临时锁定麦克风输入”开关及目标capture设备选择，仅Voice DOWN会话期间生效；区分普通/communications默认角色和目标软件私选，记录原值，UP/取消/断连/睡眠/正常退出恢复，原设备不可用或用户主动改选时不得覆盖；评估异常退出恢复与按住期间设备变化。当前VB路径写CABLE Input、目标采集CABLE Output，但不能据此猜用户选择。2026-09-16用户明确“允许受限使用，并接受外部改选时让出控制”，仅此功能使用IPolicyConfig设置当前用户Capture默认三角色；任何外部改选整次让出并保留全部角色，正常结束仅恢复本次实际改过且仍满足条件的角色；无CAS残余竞态不得宣称消除。崩溃journal须用户可见恢复/保留，不静默恢复。当前源码、隔离测试及定向审查完成；2026-09-16 17:15最终9a7048本地包安装、Explorer普通用户启动、载荷/配置核验passed，新功能默认关闭。RC003真实首按验收failed：normal角色联动被当作外部改选中止，第二次才成功；下拉框另有宽度溢出。当前组事务/在途journal与CSS修复候选19项Windows+5项页面tests passed，18:07修复包970e6c已覆盖安装并核普通权限/原开启配置保留，待非target首按与恢复实测，见 artifacts/capture-input-session-20260916/first-use-fix/evidence.md。不得为快速释放新增阈值、迟到切换或闲置抢占，不由音量键触发；RC003真实hold/release/quick/repeat/idle-first/headset/manual-select/disconnect/disabled验收，RC001本轮硬件deferred。
 - [ ] 修复 WASAPI 失败后永久丢失输出 sink：保留原端点选择，下一新语音会话仅重建原精确 ID/name；失败取消不复活旧会话，控制释放/断连/睡眠在排队前取消启动准备。2026-09-15 开发候选：定向逻辑与真实 WASAPI 静音队列故障→首新会话消费/排空 passed；16:12覆盖安装与Explorer普通权限启动/载荷和配置保留 passed；随后 RC003 短会话实际提交/排空、用户反馈麦克风正常；长会话19秒内部PCM队列再次溢出 failed。原端点恢复与持续吞吐问题分开，闲置/睡眠仍未验收；EventsShared/MMCSS隔离候选未解决，不打包。证据见 `artifacts/audio-sink-recovery-20260915/evidence.md`。 2026-09-16固定旧/新包实机均在仍按住时约60s收到远端`00 02`，续期正常、无overflow并正常排空；旧包另有WeType实际CABLE Output路由证据。该停止链路与9/15内部溢出不同，不能宣称硬件上限或修复完成，详见同证据目录 `sixty-second-20260916/evidence.md`。 已正常回切原fbc修复包并核普通权限/配置，observer正常退出；终态诊断3项测试与源码review通过，已随9/16输入锁定候选安装；不代表音频故障修复。输入锁定受限API已获用户明确授权，20s内部溢出未关闭，60s远端停止按用户要求暂停研究。
-- [x] 实现用户显式配置的语音键按住说话快捷键（连接页预设：关闭、右 Alt、F5、Win+H、左 Ctrl+左 Win）：按下语音键准备音频资源后注入 DOWN（2026-09-15 候选在阻塞准备前后核对释放/取消，准备完成不等于已输出），释放统一注入 UP，断连/睡眠/中止/退出强制释放；注入时序参考 ZSTDJan 按住说话快捷键与 Voice_VibeCoding 的 Hold 语义，仅使用 SendInput 公共 API（见 ATTRIBUTION.md）。2026-09-04 修复一：和弦改为逐事件提交、事件间 80ms 间隔（WeType 拒绝单批零间隔，evidence/p）。修复二：F5 抑制器会话武装信号误接未启动的旧模块 voice_key_suppressor（ble.rs），遥控器 F5 泄漏进和弦致 WeType "额外按键"拒绝——改接 key_suppressor 并删除旧模块（Bugs\2026-09-04-wetype-zero-gap-injection.md）。加固：钩子链头 bump（会话开始 + 10s 定时）+ Raw Input 归因独立线程。**RC001 真机端到端 passed（2026-09-04，用户确认文字上屏；前提=输出端点 CABLE Input + 系统默认录音 CABLE Output）**；RC003 真机待验。
+- [x] 实现用户显式配置的语音键按住说话快捷键（连接页默认左 Ctrl+左 Win，并支持自由录入及关闭）：按下语音键准备音频资源后注入 DOWN（2026-09-15 候选在阻塞准备前后核对释放/取消，准备完成不等于已输出），释放统一注入 UP，断连/睡眠/中止/退出强制释放；注入时序参考 ZSTDJan 按住说话快捷键与 Voice_VibeCoding 的 Hold 语义，仅使用 SendInput 公共 API（见 ATTRIBUTION.md）。2026-09-04 修复一：和弦改为逐事件提交、事件间 80ms 间隔（WeType 拒绝单批零间隔，evidence/p）。修复二：F5 抑制器会话武装信号误接未启动的旧模块 voice_key_suppressor（ble.rs），遥控器 F5 泄漏进和弦致 WeType "额外按键"拒绝——改接 key_suppressor 并删除旧模块（Bugs\2026-09-04-wetype-zero-gap-injection.md）。加固：钩子链头 bump（会话开始 + 10s 定时）+ Raw Input 归因独立线程。**RC001 真机端到端 passed（2026-09-04，用户确认文字上屏；前提=输出端点 CABLE Input + 系统默认录音 CABLE Output）**；RC003 真机待验。
+
+- 上游自由录入使用 OS 级配对捕获，全部释放才落盘；本地保留音频准备前后取消检查与会话输入锁定，不采用旧“先注入再准备”描述。
 - [ ] 使用真实 RC001/RC003 和第三方语音程序（微信输入法、Win+H 等）验证按住说话快捷键：DOWN/UP 严格成对、无粘键、无重复音频，且断连和睡眠恢复后不残留按住的快捷键。RC001 基本链路与加固版回归均已 passed（2026-09-04，型号经应用 2A24 显示双证）；RC003 基本链路 passed（连接/触发/MIC_EXTEND 续期正常），音频送达率经**重配对后复测 passed**（55%→98.7%，与 RC001 基准持平，文字"一二三四五六七八九十"全对——初次配对的连接参数带宽不足，重配对即修复，已列为标准处置；Bugs\2026-09-04-rc003-voice-quality.md）。剩余待验：快速连按成对性、断连/睡眠恢复残留复验。
-- [x] 实现 RC001/RC003 选择持久化、意外断连指数退避重连和 Windows 睡眠/恢复通知代码路径；真机恢复仍待验收。
+- [x] 实现 RC001/RC003 选择持久化、意外断连指数退避重连和 Windows 睡眠/恢复通知代码路径；2026-09-12 修复 BLE MTA 线程误用 UI-thread-only `FromIdAsync` 导致 Windows 资源错误/工作线程卡死，改由配对 ID 的对端地址调用 `FromBluetoothAddressAsync`，并补齐连接阶段、退避与无线电恢复结构化日志；2026-09-13 针对 `0x80070008` 补充启动期 Radio 预热缓存，把“两次恢复后永久耗尽”改为 60 秒冷却后自动重开恢复窗口，并补齐设备创建后所有连接失败路径的事件退订、CCCD、连接参数、GATT service 和设备显式释放，避免重试自身持续泄漏 WinRT BLE 资源；2026-09-14 增加系统 BLE 栈已经连 Radio 枚举都失败时的 BTHUSB 设备节点自动重启兜底（系统 UAC 明示授权、精确选择唯一适配器、独立 WinRT 读回验证），并修复会话 Close 首次失败后不再真正重试 service/device 释放的问题。现场 `0x80070008` 经新兜底恢复 passed；本地包与 RC001/RC003 各自端到端验收见 `Testing/WindowsBleResourceRecovery.md`。
 - [x] 在 Windows 主机编译 Tauri NSIS Preview 安装包；Windows CI 已生成并复验绑定精确来源 Commit、SHA-256 和未签名状态的 artifact，安装、升级、卸载与正式签名仍待完成。
-- [x] 提供去标识化运行诊断摘要和页面内复制入口；自动化已证明不导出设备身份、路径、端点名称或错误原文，Windows WebView 剪贴板仍待运行验收。
+- [x] 提供去标识化运行诊断摘要和页面内复制入口；自动化已证明不导出设备身份、路径、端点名称或错误原文，Windows WebView 剪贴板仍待运行验收。2026-09-16 诊断入口从权限页迁到关于页（权限页只保留蓝牙/按键/音频三项状态，仿真新增断言防止入口回流），并在关于页增加"打开日志目录"：目录由 Rust 从日志初始化的实际落盘路径推导、前端不传路径（维持 capabilities 最小权限），打开复用 ShellExecuteW 链路；Windows CI 仿真只验证 WebView → Tauri IPC → Rust → shell 的往返与终态消息，真实桌面资源管理器打开仍 deferred。
 - [x] 持久化并展示仅保存在本机的每日按键次数、完整语音会话次数和语音采样时长；Windows/RC001/RC003 真实事件计数与升级保留仍待真机验收。
 - [x] 对低于 Windows 10 1809（build 17763）的系统增加 NSIS 安装与应用启动双层拒绝门禁；Windows 10 1809 / Windows 11 提示和安装行为仍待真机验收。
 - [x] 在 Windows CI 对 NSIS Preview 执行 `/S` 当前用户安装、启动存活、`/S` 卸载及设置保留边界验证；该自动化不代替可见安装界面、SmartScreen、Windows 10 1809 或真实用户环境验收。
@@ -48,7 +72,7 @@
 - [ ] 如未来需要捆绑或自动执行 VB-CABLE 驱动包，先取得与 Pack45 内附许可一致的作者书面授权，并实现来源校验、显式 UAC、结果检测和重启流程。
 - [x] 持久化用户选择的输出端点，并在端点消失或更名时失败关闭；Windows 运行时恢复仍待真机验收。
 - [x] 实现设备路径 fail-closed、隐藏消息窗口、Keyboard/HID 双来源合并和停止释放的 Raw Input 代码路径；Windows 与 RC001/RC003 真机按键验收仍待完成。
-- [ ] 实现按键映射保存、热加载和 SendInput：独立映射文件、显式热加载、批量 SendInput、部分提交回滚和界面测试已完成；真实 Raw Input 边沿自动执行须分别等待 Windows/RC001/RC003 确认 Keyboard/HID 事件形态，避免重复输入。
+- [ ] 实现按键映射保存、热加载和 SendInput：独立映射文件、显式热加载、批量 SendInput、部分提交回滚和界面测试已完成；2026-09-10 修复 Win+L：锁定动作改走公开 `LockWorkStation` API（RC003 电源单击现场 passed）。精确 Win+L 先等待实体 UP、门控完成边沿配对后再锁屏；2026-09-12 进一步实证 `microsoft-edge:` 弹窗并非迟到边沿，而是 TV 原生 Shell 协议动作在后续锁屏时由系统服务创建 `OpenWith.exe`，新增仅在 TV→SayAll 锁屏周期启用的 CREATE 阶段精准拦截（原型四轮现场 passed，产品化安装包待验）。当前主机实证物理 Win+L 无法由普通用户态钩子可靠阻止，链首刷新方案又造成事件丢失，已回退；录入默认保留直接模式，并增加默认关闭的安全模式开关（界面选修饰键、键盘只按主键），两种模式自动化 passed、安全模式安装现场复验 deferred。真实 Raw Input 边沿自动执行仍须分别等待 Windows/RC001/RC003 确认 Keyboard/HID 事件形态，避免重复输入。
 - [x] 按键映射页增加“保存配置 / 导入配置 / 导出配置”：沿用保存即热加载，导出版本化且稳定排序的 JSON；导入先做 1 MiB 上限、格式版本、动作与快捷键完整校验，落盘成功后才一次性替换运行态，取消选择不报错。Rust/Vue 自动化与 Windows COM 对话框代码路径 passed；可见文件选择器、跨机器迁移及 RC001/RC003 导入后实体按键回归 deferred。
 - [ ] 完成 Windows 10 1809 / Windows 11 安装、升级和卸载验证。
 - [x] 在 Windows CI 构建较低版本 NSIS 候选，验证当前用户安装、升级后单一安装身份、设置/映射/统计逐字节保留、降级不替换当前版本和最终卸载保留用户数据；该矩阵不代表真实历史二进制、可见安装界面或 Windows 10 1809 / Windows 11 真机验收。Tauri 2.11.1 静默页不会可靠设置内置降级检查所依赖的版本比较结果，已在既有 preinstall hook 中增加独立 SemVer 门禁；Run 33637195089 通过并确认 predecessor `/S` 返回 1638、当前 0.1.0 与用户数据保持不变。
@@ -59,7 +83,7 @@
 ### 2026-09-05 附加
 
 - **应用内更新（tauri-plugin-updater + GitHub Releases，新增）**：关于页"检查更新"手动入口 + 启动静默检查（失败完全无声）+ 下载进度 + passive 安装自动重启；默认稳定通道使用 `releases/latest/download/latest.json`，用户可显式开启“检查预览版更新”，经 GitHub Releases Atom feed 选择最高 SemVer 的已发布版本（包含 Pre-release）；开关默认关闭并持久化，两个通道均由 minisign 强制验签。安装器启动前经 `on_before_exit` 显式断开 BLE 链路（插件在 Windows 上 `std::process::exit(0)` 不走 Drop 清理）。待完成边界：① 已安装 0.2.1 不含预览通道开关，无法自行发现 Pre-release，0.2.2 首次引导需单独处理；② GitHub Secret `TAURI_SIGNING_PRIVATE_KEY` 未配置时 CI 用一次性密钥兜底、正式 Release workflow 直接失败；③ Authenticode 代码签名仍待建立（updater minisign 验签独立于 Authenticode）；④ 大陆访问 GitHub 的网络可用性未量化（插件支持多端点兜底与系统代理，已留扩展位）。参考与源码核对记录见 ATTRIBUTION.md 更新调研节。
-- **BLE 僵死链路自动恢复（bluetooth_radio.rs，新增）**：应用被强杀后 OS 侧 GATT/HID 链路或服务缓存可能僵死，普通重试永不恢复（真机取证 + Qt 论坛同结论：关开蓝牙是唯一有效公开 API 手段）。重连循环连续失败 5 次（约 60s）自动关开蓝牙无线电一次（Off→2s→On），每僵死周期最多 2 次防抖动，UI 提示全程可见；WinRT Radio API 未打包进程可用、无需提权（真机验证：开关周期后重连立即成功）。详见 docs\investigations\evidence\p\FINDINGS.md 2026-09-05 节与 ATTRIBUTION.md BLE 恢复调研来源。
+- **BLE 僵死链路自动恢复（bluetooth_radio.rs，新增）**：应用被强杀后 OS 侧 GATT/HID 链路或服务缓存可能僵死，普通重试永不恢复。重连循环连续失败 5 次后自动执行 Off→2s→On；每窗口最多 2 次，之后冷却 60 秒并自动开启下一窗口，既防抖又不永久停止自愈。2026-09-12 按微软文档补 `RequestAccessAsync` + Allowed 检查 + Off/On 有界状态确认；2026-09-13 再补 Tauri UI setup 阶段预先取得权限并缓存 Radio 对象，使系统稍后进入 `0x80070008` 时无需重新枚举即可恢复，连接恢复后也会补建缓存；同时以 `PendingBleConnection` 保证服务/特征发现和订阅任一步失败都显式回滚已取得的 WinRT BLE 资源，防止自愈重试反过来扩大资源耗尽。2026-09-14 现场进一步证明参考实现 `FromIdAsync`、直接 GATT selector 和 Win32 GATT 均无法穿透已经僵死的内核蓝牙栈；新增仅在 `0x80070008`/`0x80004004` 且 Radio 路径失败时触发的 PnP 兜底：SetupAPI 精确定位唯一 `BTHUSB` 设备节点，使用系统 `pnputil /restart-device` 请求 UAC 后重启，并以 WinRT Radio 重新枚举作为成功判据。现场恢复测试 1.95s passed，随后设备对象创建恢复；会话 Close 的 service/device 失败也改为后续调用真正重试。完整本地包启动验证待本次交付，RC001/RC003 各自制造僵死后的自动连接仍 deferred。详见 Bugs/2026-09-07-ble-unreachable-both-remotes.md、Testing/WindowsBleResourceRecovery.md 与 ATTRIBUTION.md BLE 恢复调研来源。
 - 语音键 F5 抑制器补防粘键配对（VVC 同款"DOWN 漏进 OS 则 UP 必放行"）：按下沿 60ms 有界等待超时泄漏时，释放沿放行，杜绝"F5 粘住→和弦全部被拒"的整机失效模式。
 
 ### 2026-09-05 IME 专项

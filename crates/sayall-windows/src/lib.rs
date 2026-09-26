@@ -13,24 +13,35 @@ pub mod application_control;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
+pub mod battery;
+#[cfg(windows)]
 mod ble;
 #[cfg(windows)]
 mod bluetooth_radio;
+#[cfg(windows)]
+pub use bluetooth_radio::prepare_bluetooth_radio_recovery;
 mod button_gestures;
 pub mod button_mapping;
 pub mod capture_input;
 pub mod compatibility;
 pub mod component_support;
 pub mod file_dialog;
+#[cfg(windows)]
+pub mod graceful_exit;
 pub mod hid_host;
 mod input_driver;
+pub mod registered_apps;
 #[cfg(windows)]
-pub use ble::{gatt_note, initialize_diagnostic_log, DiagnosticLogMetadata};
+pub use ble::{
+    diagnostic_log_directory, gatt_note, initialize_diagnostic_log, DiagnosticLogMetadata,
+};
 #[cfg(windows)]
 mod ime;
 pub mod key_gate;
 #[cfg(windows)]
 mod key_suppressor;
+#[cfg(windows)]
+mod lock_open_with_guard;
 #[cfg(windows)]
 mod power;
 pub mod raw_input;
@@ -38,6 +49,8 @@ pub mod raw_input;
 mod raw_input_windows;
 #[cfg(any(windows, test))]
 mod reconnect;
+#[cfg(windows)]
+mod resource_probe;
 pub mod scene_control;
 pub mod send_input;
 /// 真实注入运行时（2026-09-06 起 pub：预设注入链路真机验证探针
@@ -153,6 +166,8 @@ pub enum ConnectionPhase {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionSnapshot {
     pub phase: ConnectionPhase,
+    #[serde(default)]
+    pub battery_level: Option<u8>,
     pub remote_name: Option<String>,
     pub remote_model: RemoteModel,
     pub capabilities: Option<AtvvCapabilities>,
@@ -200,6 +215,7 @@ impl Default for ConnectionSnapshot {
     fn default() -> Self {
         Self {
             phase: ConnectionPhase::Idle,
+            battery_level: None,
             remote_name: None,
             remote_model: RemoteModel::Unknown,
             capabilities: None,
@@ -345,6 +361,13 @@ impl Default for WindowsPlatform {
             key_suppressor::set_remote_hid_activity_notify(Box::new(move || {
                 wake_runtime.wake_reconnect();
             }));
+            // 遥控器 HID 接口重新出现接线（PnP `GIDC_ARRIVAL` → 立即重连）。
+            // 与上面按键触发同源同理，但更早：设备一上线就重试，不必等
+            // 用户先按一下，也不必等退避到期。
+            let arrived_runtime = Arc::clone(&runtime);
+            raw_input_windows::set_device_arrived_notify(Box::new(move || {
+                arrived_runtime.notify_remote_device_arrived();
+            }));
             Self {
                 usage,
                 voice_hold_hotkey,
@@ -483,6 +506,44 @@ impl WindowsPlatform {
     }
     pub fn usage_counters(&self) -> Arc<UsageCounters> {
         Arc::clone(&self.usage)
+    }
+
+    pub fn test_scroll(
+        &self,
+        direction: send_input::ScrollDirection,
+        steps: u16,
+    ) -> Result<send_input::SendInputSnapshot, PlatformError> {
+        #[cfg(windows)]
+        {
+            self.send_input.scroll(direction, steps)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (direction, steps);
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn test_mouse_action(
+        &self,
+        action: send_input::ButtonAction,
+    ) -> Result<send_input::SendInputSnapshot, PlatformError> {
+        #[cfg(windows)]
+        {
+            match action {
+                send_input::ButtonAction::MouseClick { kind } => self.send_input.mouse_click(kind),
+                send_input::ButtonAction::MouseMove {
+                    direction,
+                    distance,
+                } => self.send_input.mouse_move(direction, distance),
+                _ => Err(PlatformError::SendInput("unsupported mouse action".into())),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = action;
+            Err(PlatformError::UnsupportedPlatform)
+        }
     }
 
     pub fn voice_hold_hotkey(&self) -> Option<send_input::KeyChord> {
@@ -970,6 +1031,22 @@ pub enum PlatformError {
     VoiceCharacteristicMissing(&'static str),
     #[error("Xiaomi voice remote GATT operation failed: {0}")]
     Gatt(String),
+    /// GATT 状态类失败的细分变体（2026-09-22，P0-1）。
+    ///
+    /// `GattCommunicationStatus` 的 Unreachable/ProtocolError/AccessDenied
+    /// 是三个不同的故障层：遥控器不在线（可自愈）、链路在但协议出错、
+    /// 以及系统拒绝了访问（需要用户动作）。此前全部压成 `Gatt(String)`，
+    /// 结构化日志里无法区分，用户报障只能靠肉眼读原文。
+    ///
+    /// 这三个变体只在 crate 内部流转；跨 crate 边界前统一由
+    /// `as_public_gatt_error` 归并回 `Gatt(String)`，因此
+    /// `sayall-core` 与前端看到的形状与升级前完全一致。
+    #[error("Xiaomi voice remote GATT operation failed: {0}")]
+    GattUnreachable(String),
+    #[error("Xiaomi voice remote GATT operation failed: {0}")]
+    GattProtocolError(String),
+    #[error("Xiaomi voice remote GATT operation failed: {0}")]
+    GattAccessDenied(String),
     #[error("ATVV protocol failed: {0}")]
     Protocol(String),
     #[error("WASAPI audio worker is unavailable")]
@@ -998,6 +1075,22 @@ pub enum PlatformError {
     RawInput(String),
     #[error("SendInput failed: {0}")]
     SendInput(String),
+}
+
+impl PlatformError {
+    /// 归并回公开的 `Gatt(String)` 形状（2026-09-22，P0-1）。
+    ///
+    /// 跨 crate 边界的调用方（`src-tauri` 转发给前端）只认 `Gatt(String)`；
+    /// `GattUnreachable` / `GattProtocolError` / `GattAccessDenied` 这些
+    /// 细分变体是 crate 内部的诊断手段，出界前必须收敛，否则前端契约会漂移。
+    pub fn into_public(self) -> Self {
+        match self {
+            Self::GattUnreachable(message)
+            | Self::GattProtocolError(message)
+            | Self::GattAccessDenied(message) => Self::Gatt(message),
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -686,18 +686,34 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn updater_notes_land_in_diagnostic_log() {
-        let path = std::env::temp_dir().join(format!(
-            "sayall-updater-note-test-{}.log",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        // 本测试二进制内无其他代码先初始化 gatt_sink（OnceLock 首次调用生效）。
-        // SAFETY: 测试进程内单线程操作该环境变量，其余测试不读取它。
-        unsafe { std::env::set_var("SAYALL_GATT_LOG", &path) };
+        const CHILD: &str = "SAYALL_UPDATER_LOG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The production sink is process-wide and other tests legitimately use it.
+            // Set the child's environment before startup, never race OnceLock/env in this process.
+            let path = std::env::temp_dir().join(format!(
+                "sayall-updater-note-test-{}-{}.log",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "updater::tests::updater_notes_land_in_diagnostic_log",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("SAYALL_GATT_LOG", &path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated diagnostic sink test failed");
+            return;
+        }
+        let path = std::path::PathBuf::from(std::env::var_os("SAYALL_GATT_LOG").unwrap());
         note("check.fail stage=endpoint_override_parse error_domain=url error_code=parse_failed reason=invalid_override retryable=false".to_owned());
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
-        unsafe { std::env::remove_var("SAYALL_GATT_LOG") };
-        let _ = std::fs::remove_file(&path);
         assert!(
             contents.contains("updater.check.fail stage=endpoint_override_parse")
                 && contents.contains("error_code=parse_failed")

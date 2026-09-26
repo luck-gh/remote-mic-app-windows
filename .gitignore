@@ -22,6 +22,42 @@ credentials.json
 coverage/
 .idea/
 .vscode/
+.workbuddy/memory/
 pnpm-debug.log*
 /artifacts/windows-preview/SHA256SUMS.txt
 /artifacts/windows-preview/build-metadata.json
+__pycache__/
+*.pyc
+
+# 文档流水线工作目录（一次性生成物）
+output/
+
+# TypeScript / Vite 增量构建缓存（vue-tsc）
+*.tsbuildinfo
+
+# Python 本地环境（scripts/、Testing/ 下有一批辅助 .py）
+.venv/
+venv/
+.pytest_cache/
+
+# Windows 系统与崩溃产物
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.lnk
+*.dmp
+*.stackdump
+
+# 补丁 / 合并 / 编辑器残留（本仓库常手工 git apply）
+*.orig
+*.rej
+*.bak
+*~
+*.swp
+*.tmp
+
+# ---- 硬件取证证据（例外） ----
+# hardware/<型号>/evidence/ 下存放的是**有意归档的一次性真机采集输出**，
+# 不是易变的运行日志，因此对上面的 `*.log` 规则做例外。
+# 说明见 hardware/RC003/README.md。
+!hardware/RC003/evidence/*.log

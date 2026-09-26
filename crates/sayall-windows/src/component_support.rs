@@ -681,6 +681,9 @@ fn confined_path(root: &Path, relative: &str) -> Result<PathBuf, ComponentReason
 mod tests {
     use super::*;
 
+    // Component operations deliberately share one process-wide exclusion guard.
+    static OPERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn evidence(
         installed: Option<bool>,
         loaded: Option<bool>,
@@ -723,6 +726,9 @@ mod tests {
 
     #[test]
     fn service_presence_alone_never_means_available() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for loaded in [None, Some(false), Some(true)] {
             let status = describe(
                 ComponentKind::VbCable,
@@ -755,6 +761,9 @@ mod tests {
 
     #[test]
     fn explicit_component_reboot_and_query_errors_are_preserved() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut observed = evidence(Some(true), Some(false), None);
         observed.restart = true;
         assert_eq!(
@@ -770,6 +779,9 @@ mod tests {
 
     #[test]
     fn helper_accepts_only_exact_component_action_pairs() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             parse_helper_arguments(&["vb_cable".into(), "install".into()]),
             Some((ComponentKind::VbCable, ComponentAction::Install))
@@ -790,6 +802,9 @@ mod tests {
 
     #[test]
     fn absent_release_material_blocks_every_write_without_elevation() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for component in [ComponentKind::HidEnhancement, ComponentKind::VbCable] {
             for action in [
                 ComponentAction::Install,
@@ -818,6 +833,9 @@ mod tests {
 
     #[test]
     fn helper_exit_zero_requires_actual_postcondition_and_never_implies_reboot() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let absent = describe(
             ComponentKind::VbCable,
             evidence(Some(false), Some(false), Some(false)),
@@ -853,6 +871,9 @@ mod tests {
 
     #[test]
     fn vendor_wizard_rejects_other_components_without_processes() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             open_vendor_wizard(ComponentKind::HidEnhancement),
             Err(ComponentReason::NotImplemented)
@@ -868,6 +889,9 @@ mod tests {
 
     #[test]
     fn vendor_archive_rejects_traversal_duplicates_and_missing_payload() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::io::Write;
         for names in [
             vec!["../escape.exe"],
@@ -891,6 +915,9 @@ mod tests {
     #[test]
     #[ignore = "requires the independently downloaded official Pack45; verifies only, never launches"]
     fn official_vendor_pack_verifies_without_launching() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let path = std::env::var_os("SAYALL_VBCABLE_TEST_ZIP").expect("official test ZIP location");
         let bytes = std::fs::read(path).unwrap();
         let package = prepare_vendor_package(&bytes).unwrap();
@@ -914,6 +941,9 @@ mod tests {
     #[test]
     #[ignore = "official HTTPS download and signature verification only; never launches"]
     fn official_vendor_download_verifies_without_launching() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let package = download_vendor_package().unwrap();
         let directory = package.path.parent().unwrap().to_owned();
         drop(package);
@@ -925,6 +955,9 @@ mod tests {
 
     #[test]
     fn package_path_rejects_escape_unc_ads_and_nonexistent_files() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = fixture();
         std::fs::write(root.join("safe.exe"), b"fixture").unwrap();
         assert!(confined_path(&root, "safe.exe").is_ok());
@@ -950,6 +983,9 @@ mod tests {
 
     #[test]
     fn package_hash_and_machine_validation_reject_tampering() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = fixture();
         let bytes = pe_bytes(0x8664);
         let path = root.join("test.exe");
@@ -973,6 +1009,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unsigned_package_is_rejected_by_real_windows_trust_api() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = fixture();
         let bytes = pe_bytes(0x8664);
         std::fs::write(root.join("test.exe"), &bytes).unwrap();
@@ -985,6 +1024,9 @@ mod tests {
 
     #[test]
     fn operation_guard_prevents_overlap_until_owner_finishes() {
+        let _operation_test = OPERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let first = OperationGuard::acquire().unwrap();
         assert!(matches!(
             OperationGuard::acquire(),
@@ -1262,6 +1304,13 @@ mod native {
     }
 
     pub(super) fn recycle_wizard_directory(path: &Path) {
+        // Shell may load third-party in-process extensions during recycling.
+        // Keep our operations serial, including STA teardown (parallel calls
+        // reproduced an access violation in libapr_tsvn.dll on this host).
+        static RECYCLE_OPERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = RECYCLE_OPERATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use windows::Win32::System::Com::{
             CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
             COINIT_APARTMENTTHREADED,

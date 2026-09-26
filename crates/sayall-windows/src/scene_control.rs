@@ -1014,6 +1014,7 @@ fn recognition_marker() -> ButtonAction {
 fn active_scene_mappings_from(state: &State) -> ButtonMappings {
     let mut mappings = ButtonMappings {
         enabled: false,
+        applications: Vec::new(),
         actions: Default::default(),
     };
     if state.token.is_some() && state.configuration.menu_template_switch_enabled {

@@ -1,0 +1,120 @@
+硬编码目标串: REDACTED_device_15
+======================================================================
+
+### 树 BTHLEDEVICE
+  实例 8&14b2359b&b&0800   Service=UmPass
+      HardwareID     REDACTED_device_87
+      HardwareID     REDACTED_device_50
+      HardwareID     REDACTED_device_21
+      CompatibleIDs  REDACTED_device_93
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&001d   Service=UmPass
+      HardwareID     REDACTED_device_58
+      HardwareID     REDACTED_device_99
+      HardwareID     REDACTED_device_14
+      CompatibleIDs  REDACTED_device_63
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&0001   Service=UmPass
+      HardwareID     REDACTED_device_24
+      HardwareID     REDACTED_device_32
+      HardwareID     REDACTED_device_66
+      CompatibleIDs  REDACTED_device_73
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&003a   Service=UmPass
+      HardwareID     REDACTED_device_41
+      HardwareID     REDACTED_device_23
+      HardwareID     REDACTED_device_47
+      CompatibleIDs  REDACTED_device_69
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&002e   Service=UmPass
+      HardwareID     REDACTED_device_74
+      HardwareID     REDACTED_device_16
+      HardwareID     REDACTED_device_5
+      CompatibleIDs  REDACTED_device_103
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&0055   Service=mshidumdf
+      HardwareID     REDACTED_device_38
+      HardwareID     REDACTED_device_102
+      HardwareID     REDACTED_device_76
+      CompatibleIDs  REDACTED_device_80
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&0804   Service=UmPass
+      HardwareID     REDACTED_device_30
+      HardwareID     REDACTED_device_34
+      HardwareID     REDACTED_device_13
+      CompatibleIDs  REDACTED_device_1
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&0500   Service=UmPass
+      HardwareID     REDACTED_device_90
+      HardwareID     REDACTED_device_75
+      HardwareID     REDACTED_device_78
+      CompatibleIDs  REDACTED_device_54
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+  实例 8&14b2359b&b&0300   Service=UmPass
+      HardwareID     REDACTED_device_92
+      HardwareID     REDACTED_device_37
+      HardwareID     REDACTED_device_57
+      CompatibleIDs  REDACTED_device_49
+      CompatibleIDs  REDACTED_device_91
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+      [前缀] BTHLEDevice\ ...  (与 INF 匹配串不同前缀)
+
+### 树 HID
+  实例 9&1748ac9e&0&0000   Service=kbdhid
+      HardwareID     REDACTED_device_15  <<<< 命中目标串
+      HardwareID     REDACTED_device_40
+      HardwareID     REDACTED_device_4
+      HardwareID     REDACTED_device_71
+      HardwareID     HID_DEVICE_SYSTEM_KEYBOARD
+      HardwareID     HID_DEVICE_UP:0001_U:0006
+      HardwareID     HID_DEVICE
+      CompatibleIDs
+      [前缀] HID\ ...  (与 INF 匹配串同前缀)
+      [前缀] HID\ ...  (与 INF 匹配串同前缀)
+      [前缀] HID\ ...  (与 INF 匹配串同前缀)
+      [前缀] HID\ ...  (与 INF 匹配串同前缀)
+
+======================================================================
+### 结论
+
+RemoteMapper 的 INF 第 24 行与 install-driver.ps1 第 6 行使用的匹配串：
+    REDACTED_device_2
+而本机该设备父节点实际 HardwareID 首项：
+    REDACTED_device_101
+
+两串前缀不同（HID\ vs REDACTED_device_77
+HardwareID/CompatibleIDs 都不含带 HID\ 前缀的那一串，
+则 install-driver.ps1 会抛 not present —— 该 blocker 必须在下发前解决。

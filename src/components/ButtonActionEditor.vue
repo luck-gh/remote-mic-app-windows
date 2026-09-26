@@ -1,7 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import RegisteredAppsDialog from "./RegisteredAppsDialog.vue";
 import {
   actionSummary,
+  mouseClickLabels, mouseMoveLabels, registerPresetAppNames,
+  startShortcutCapture, stopShortcutCapture, subscribeShortcutCaptureEdges,
+  type MoveDirection, type AppLibraryEntry,
   chordLabel,
   pickCustomApp,
   type ButtonAction,
@@ -23,15 +27,25 @@ const props = defineProps<{
 const emit = defineEmits<{
   update: [action: ButtonAction];
   status: [message: string];
+  applications: [apps: AppLibraryEntry[]];
 }>();
 
-const capturing = ref(false);
+const capturingShortcut = ref(false);
+const captureStarting = ref(false);
 const captureDisplay = ref<string[]>([]);
-const heldModifiers = reactive(new Set<KeyCode>());
+const safeCaptureMode = ref(false);
+const capturePressedKeys = new Set<KeyCode>();
+let capturedChord: KeyCode[] | null = null;
+let captureTimeout: number | null = null;
+let captureRequestId = 0;
+let unmounted = false;
+let unlistenCapture: (() => void) | null = null;
+const statusMessage = ref<string | null>(null);
+watch(statusMessage, message => { if (message) emit("status", message); });
 const action = computed<ButtonAction>(() => props.mappings.actions[props.button]?.[props.trigger] ?? { type: "disabled" });
 const presetIds = computed(() => new Set(props.presetApps.map((app) => app.id)));
 const customApps = computed(() => {
-  const found = new Map<string, string>();
+  const found = new Map<string, string>((props.mappings.applications ?? []).map(app => [app.path, app.name]));
   for (const actions of Object.values(props.mappings.actions)) {
     for (const mapped of Object.values(actions)) {
       if (mapped.type === "open_app" && !presetIds.value.has(mapped.target)) {
@@ -76,61 +90,412 @@ async function addCustomApp(): Promise<void> {
   const pick = await pickCustomApp();
   if (pick) apply({ type: "open_app", target: pick.path });
 }
+/** KeyboardEvent.code → KeyCode（serde snake_case）。 */
 function codeToKeyCode(code: string): KeyCode | null {
+  const modifierMap: Record<string, KeyCode> = {
+    ControlLeft: "left_control",
+    ControlRight: "right_control",
+    ShiftLeft: "left_shift",
+    ShiftRight: "right_shift",
+    AltLeft: "left_alt",
+    AltRight: "right_alt",
+    MetaLeft: "left_windows",
+    MetaRight: "right_windows",
+  };
+  if (modifierMap[code]) return modifierMap[code];
   const named: Record<string, KeyCode> = {
-    ControlLeft: "left_control", ControlRight: "right_control", ShiftLeft: "left_shift", ShiftRight: "right_shift",
-    AltLeft: "left_alt", AltRight: "right_alt", MetaLeft: "left_windows", MetaRight: "right_windows",
-    Enter: "enter", Space: "space", Tab: "tab", Backspace: "backspace", Escape: "escape",
-    ArrowLeft: "left", ArrowUp: "up", ArrowRight: "right", ArrowDown: "down", Home: "home", End: "end",
-    PageUp: "page_up", PageDown: "page_down", Insert: "insert", Delete: "delete", ContextMenu: "apps",
-    VolumeMute: "volume_mute", VolumeUp: "volume_up", VolumeDown: "volume_down",
+    Enter: "enter",
+    Space: "space",
+    Tab: "tab",
+    Backspace: "backspace",
+    Escape: "escape",
+    ArrowLeft: "left",
+    ArrowUp: "up",
+    ArrowRight: "right",
+    ArrowDown: "down",
+    Home: "home",
+    End: "end",
+    PageUp: "page_up",
+    PageDown: "page_down",
+    Insert: "insert",
+    Delete: "delete",
+    ContextMenu: "apps",
+    VolumeMute: "volume_mute",
+    VolumeUp: "volume_up",
+    VolumeDown: "volume_down",
   };
   if (named[code]) return named[code];
-  const letter = /^Key([A-Z])$/.exec(code); if (letter) return letter[1].toLowerCase();
-  const digit = /^Digit([0-9])$/.exec(code); if (digit) return `digit${digit[1]}`;
-  const fn = /^F([1-9]|1[0-2])$/.exec(code); return fn ? `f${fn[1]}` : null;
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1].toLowerCase();
+  const digit = /^Digit([0-9])$/.exec(code);
+  if (digit) return `digit${digit[1]}`;
+  const functionKey = /^F([1-9]|1[0-2])$/.exec(code);
+  if (functionKey) return `f${functionKey[1]}`;
+  return null;
 }
-function keydown(event: KeyboardEvent): void {
-  if (!capturing.value) return;
-  event.preventDefault(); event.stopPropagation();
-  const code = codeToKeyCode(event.code); if (!code) return;
-  const modifier = /control|shift|alt|windows/.test(code);
-  if (modifier) { if (!event.repeat) heldModifiers.add(code); captureDisplay.value = [...heldModifiers]; return; }
-  if (code === "escape" && !heldModifiers.size) { capturing.value = false; emit("status", "已取消录入"); return; }
-  const keys = [...heldModifiers, code];
+
+const selectedCaptureModifiers = reactive(new Set<KeyCode>());
+const pressedCaptureModifiers = new Set<KeyCode>();
+const MODIFIER_KEYS = new Set<KeyCode>([
+  "left_control",
+  "right_control",
+  "left_shift",
+  "right_shift",
+  "left_alt",
+  "right_alt",
+  "left_windows",
+  "right_windows",
+]);
+const CAPTURE_MODIFIER_OPTIONS: Array<{ key: KeyCode; label: string }> = [
+  { key: "left_control", label: "左 Ctrl" },
+  { key: "left_shift", label: "左 Shift" },
+  { key: "left_alt", label: "左 Alt" },
+  { key: "left_windows", label: "左 Win" },
+  { key: "right_control", label: "右 Ctrl" },
+  { key: "right_shift", label: "右 Shift" },
+  { key: "right_alt", label: "右 Alt" },
+  { key: "right_windows", label: "右 Win" },
+];
+
+function toggleCaptureModifier(key: KeyCode): void {
+  if (!capturingShortcut.value || capturedChord) return;
+  if (selectedCaptureModifiers.has(key)) selectedCaptureModifiers.delete(key);
+  else selectedCaptureModifiers.add(key);
+  captureDisplay.value = [...selectedCaptureModifiers];
+}
+
+async function beginShortcutCapture(): Promise<void> {
+  if (capturingShortcut.value || captureStarting.value) return;
+  const requestId = ++captureRequestId;
+  captureStarting.value = true;
+  statusMessage.value = null;
+  try {
+    await startShortcutCapture();
+    if (unmounted || requestId !== captureRequestId) {
+      await stopShortcutCapture().catch(() => undefined);
+      return;
+    }
+    capturePressedKeys.clear();
+    capturedChord = null;
+    selectedCaptureModifiers.clear();
+    pressedCaptureModifiers.clear();
+    captureDisplay.value = [];
+    capturingShortcut.value = true;
+    if (captureTimeout !== null) window.clearTimeout(captureTimeout);
+    captureTimeout = window.setTimeout(() => {
+      void finishShortcutCapture("录入已超时，请重新录入");
+    }, 15_000);
+  } catch (error) {
+    statusMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (requestId === captureRequestId) captureStarting.value = false;
+  }
+}
+
+async function finishShortcutCapture(message?: string): Promise<void> {
+  captureRequestId += 1;
+  captureStarting.value = false;
+  capturingShortcut.value = false;
+  if (captureTimeout !== null) window.clearTimeout(captureTimeout);
+  captureTimeout = null;
+  await stopShortcutCapture().catch(() => undefined);
+  capturePressedKeys.clear();
+  capturedChord = null;
+  pressedCaptureModifiers.clear();
+  if (message) statusMessage.value = message;
+}
+
+function handleCaptureBlur(): void {
+  if (capturingShortcut.value || captureStarting.value) {
+    void finishShortcutCapture("窗口失去焦点，已取消录入");
+  }
+}
+
+function acceptCapturedKey(code: KeyCode, isPressed: boolean, repeat = false): void {
+  if (!capturingShortcut.value) return;
+  if (!isPressed) {
+    capturePressedKeys.delete(code);
+    if (MODIFIER_KEYS.has(code)) pressedCaptureModifiers.delete(code);
+    if (capturedChord) {
+      captureDisplay.value = capturedChord;
+      if (capturePressedKeys.size === 0) {
+        const label = chordLabel({ keys: capturedChord });
+        void finishShortcutCapture(`快捷键已录入：${label}`);
+      }
+    } else {
+      captureDisplay.value = safeCaptureMode.value
+        ? [...selectedCaptureModifiers]
+        : [...pressedCaptureModifiers];
+    }
+    return;
+  }
+  if (!repeat) capturePressedKeys.add(code);
+  // 已经拿到终止键后继续保持原生拦截，直到本次组合的所有 DOWN 都收到配对 UP。
+  // 这避免 Win+L 在录入完成但物理键尚未松开时被 Windows 补执行。
+  if (capturedChord) return;
+  if (MODIFIER_KEYS.has(code)) {
+    if (!repeat) pressedCaptureModifiers.add(code);
+    if (safeCaptureMode.value) {
+      statusMessage.value = "安全录入中：请松开键盘修饰键，并在界面中点击选择";
+    } else {
+      captureDisplay.value = [...pressedCaptureModifiers];
+    }
+    return;
+  }
+  if (safeCaptureMode.value && pressedCaptureModifiers.size > 0) {
+    statusMessage.value = "未录入：请不要按住键盘修饰键；先在界面选择修饰键，再单独按主键";
+    return;
+  }
+  const modifiers = safeCaptureMode.value
+    ? [...selectedCaptureModifiers]
+    : [...pressedCaptureModifiers];
+  if (code === "escape" && modifiers.length === 0) {
+    void finishShortcutCapture("已取消录入");
+    return;
+  }
+  const keys = [...modifiers, code];
+  capturedChord = keys;
+  captureDisplay.value = keys;
   apply({ type: "shortcut", chord: { keys } });
-  capturing.value = false; heldModifiers.clear(); captureDisplay.value = [];
-  emit("status", `快捷键已录入：${chordLabel({ keys })}`);
+  statusMessage.value = `已录入 ${chordLabel({ keys })}，松开全部按键后完成`;
 }
-function keyup(event: KeyboardEvent): void {
-  if (!capturing.value) return;
-  const code = codeToKeyCode(event.code); if (code) heldModifiers.delete(code);
-  captureDisplay.value = [...heldModifiers];
+
+function handleCaptureKeydown(event: KeyboardEvent): void {
+  if (!capturingShortcut.value) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const code = codeToKeyCode(event.code);
+  if (code === null) return;
+  acceptCapturedKey(code, true, event.repeat);
 }
-onMounted(() => { window.addEventListener("keydown", keydown, true); window.addEventListener("keyup", keyup, true); });
-onUnmounted(() => { window.removeEventListener("keydown", keydown, true); window.removeEventListener("keyup", keyup, true); });
+
+function handleCaptureKeyup(event: KeyboardEvent): void {
+  if (!capturingShortcut.value) return;
+  const code = codeToKeyCode(event.code);
+  if (code) acceptCapturedKey(code, false);
+}
+
+watch(capturingShortcut, (active) => {
+  if (!active) {
+    selectedCaptureModifiers.clear();
+    pressedCaptureModifiers.clear();
+    captureDisplay.value = [];
+  }
+});
+
+const selectedAction = action;
+const scrollSteps = computed(() => selectedAction.value?.type === "scroll" ? selectedAction.value.steps ?? 1 : 1);
+const moveDistance = computed(() => selectedAction.value?.type === "mouse_move" ? selectedAction.value.distance : 30);
+const moveSymbols: Record<MoveDirection, string> = { up: "↑", down: "↓", left: "←", right: "→" };
+
+function updateMouseAmount(event: Event, kind: "scroll" | "mouse_move"): void {
+  const input = event.target as HTMLInputElement;
+  const value = input.valueAsNumber;
+  const maximum = kind === "scroll" ? 100 : 2000;
+  if (!Number.isInteger(value) || value < 1 || value > maximum) {
+    statusMessage.value = `请输入 1 到 ${maximum} 之间的整数`;
+    input.value = String(kind === "scroll" ? scrollSteps.value : moveDistance.value);
+    return;
+  }
+  const action = selectedAction.value;
+  if (action?.type === "scroll" && kind === "scroll") void apply({ ...action, steps: value });
+  if (action?.type === "mouse_move" && kind === "mouse_move") void apply({ ...action, distance: value });
+}
+
+function isActiveScroll(direction: "up" | "down"): boolean {
+  const current = action.value;
+  return current.type === "scroll" && current.direction === direction;
+}
+
+
+const appPickerOpen = ref(false);
+const appFilter = ref("");
+const filteredCustomApps = computed(() => customApps.value.filter(app => app.name.toLocaleLowerCase().includes(appFilter.value.trim().toLocaleLowerCase())));
+watch([() => props.presetApps, () => props.mappings.applications], () => {
+  registerPresetAppNames([...props.presetApps, ...(props.mappings.applications ?? []).map(app => ({id: app.path, name: app.name}))]);
+}, {deep: true, immediate: true});
+function addScannedApps(apps: AppLibraryEntry[]): void {
+  const unique = new Map((props.mappings.applications ?? []).map(app => [app.path.toLowerCase(), app]));
+  for (const app of apps) unique.set(app.path.toLowerCase(), app);
+  emit("applications", [...unique.values()]);
+  appPickerOpen.value = false;
+  emit("status", `已添加 ${apps.length} 个应用到草稿；保存当前配置后生效，按键绑定未改变`);
+}
+onMounted(async () => {
+  window.addEventListener("keydown", handleCaptureKeydown, true);
+  window.addEventListener("keyup", handleCaptureKeyup, true);
+  window.addEventListener("blur", handleCaptureBlur);
+  try {
+    const stop = await subscribeShortcutCaptureEdges(edge => acceptCapturedKey(edge.key, edge.isPressed));
+    if (unmounted) stop(); else unlistenCapture = stop;
+  } catch (cause) { statusMessage.value = String(cause); }
+});
+onUnmounted(() => {
+  unmounted = true;
+  window.removeEventListener("keydown", handleCaptureKeydown, true);
+  window.removeEventListener("keyup", handleCaptureKeyup, true);
+  window.removeEventListener("blur", handleCaptureBlur);
+  unlistenCapture?.();
+  if (capturingShortcut.value || captureStarting.value) void finishShortcutCapture();
+});
 </script>
 
 <template>
   <div class="button-action-editor">
     <p class="muted">当前：{{ actionSummary(action) }}</p>
-    <p v-if="capabilityNote" class="muted capability-note">{{ capabilityNote }}</p>
-    <button class="secondary-button" :class="{ 'is-active': action.type === 'disabled' }" type="button" @click="apply({ type: 'disabled' })">禁用按键</button>
-    <section v-for="group in groups" :key="group.label" class="action-section">
-      <h4>{{ group.label }}</h4>
-      <div class="preset-grid"><button v-for="preset in group.items" :key="preset.label" class="chip" :class="{ selected: selected(preset.keys) }" type="button" @click="apply({ type: 'shortcut', chord: { keys: [...preset.keys] } })">{{ preset.label }}</button></div>
-    </section>
-    <section v-if="!shortcutsOnly" class="action-section"><h4>打开应用</h4><div class="preset-grid">
-      <button v-for="app in presetApps" :key="app.id" class="chip" :class="{ selected: action.type === 'open_app' && action.target === app.id }" type="button" @click="apply({ type: 'open_app', target: app.id })">{{ app.name }}</button>
-      <button v-for="app in customApps" :key="app.path" class="chip" :class="{ selected: action.type === 'open_app' && action.target === app.path }" type="button" @click="apply({ type: 'open_app', target: app.path })">{{ app.name }}</button>
-      <button class="chip" type="button" @click="addCustomApp">＋ 添加应用</button>
-    </div></section>
-    <section class="action-section"><h4>自定义</h4><button class="chip" :class="{ selected: capturing }" type="button" @click="capturing = !capturing">{{ capturing ? "录入中…（按 Esc 取消）" : "录入自定义快捷键" }}</button><span v-if="capturing" class="capture-display">{{ captureDisplay.length ? captureDisplay.join(" + ") : "请按下快捷键组合" }}</span></section>
+<div class="action-sections">
+        <p v-if="capabilityNote" class="muted editor-note capability-note">{{ capabilityNote }}</p>
+        <section v-for="group in groups" :key="group.label" class="action-section">
+          <h4 class="action-section-title">{{ group.label }}</h4>
+          <div class="preset-grid">
+            <!-- 芯片显示实际按键组合（组合在不同 App 里语义不同，功能描述
+                 只作悬停提示，避免把 Ctrl+C 一类写成"复制"造成误判）。 -->
+            <button
+              v-for="preset in group.items"
+              :key="preset.label"
+              class="chip"
+              :class="{ selected: selected(preset.keys) }"
+              type="button"
+              :title="preset.label"
+              @click="apply({ type: 'shortcut', chord: { keys: [...preset.keys] } })"
+            >
+              {{ chordLabel({ keys: preset.keys }) }}
+            </button>
+          </div>
+        </section>
+
+        <section v-if="!shortcutsOnly" class="action-section">
+          <h4 class="action-section-title">鼠标滚轮</h4>
+          <div class="preset-grid">
+            <button v-for="direction in (['up', 'down'] as const)" :key="direction" class="chip"
+              :class="{ selected: isActiveScroll(direction) }" type="button" title="在鼠标当前位置滚动"
+              @click="apply({ type: 'scroll', direction, steps: scrollSteps })">{{ direction === "up" ? "滚轮向上" : "滚轮向下" }}</button>
+          </div>
+          <label v-if="selectedAction?.type === 'scroll'" class="mouse-amount">
+            <span>每次滚动</span>
+            <input aria-label="每次滚动格数" type="number" min="1" max="100" step="1" :value="scrollSteps" @change="updateMouseAmount($event, 'scroll')" />
+            <span>格</span>
+          </label>
+        </section>
+
+        <section v-if="!shortcutsOnly" class="action-section">
+          <h4 class="action-section-title">鼠标点击</h4>
+          <div class="preset-grid">
+            <button v-for="(label, kind) in mouseClickLabels" :key="kind" class="chip" type="button"
+              :class="{ selected: selectedAction?.type === 'mouse_click' && selectedAction.kind === kind }"
+              title="点击鼠标当前位置" @click="apply({ type: 'mouse_click', kind })">{{ label }}</button>
+          </div>
+        </section>
+
+        <section v-if="!shortcutsOnly" class="action-section">
+          <h4 class="action-section-title">鼠标移动</h4>
+          <div class="preset-grid">
+            <button v-for="(label, direction) in mouseMoveLabels" :key="direction" class="chip mouse-direction" type="button"
+              :aria-label="label" :title="label" :class="{ selected: selectedAction?.type === 'mouse_move' && selectedAction.direction === direction }"
+              @click="apply({ type: 'mouse_move', direction, distance: moveDistance })">{{ moveSymbols[direction] }}</button>
+          </div>
+          <label v-if="selectedAction?.type === 'mouse_move'" class="mouse-amount">
+            <span>每次移动</span>
+            <input aria-label="每次移动像素" type="number" min="1" max="2000" step="1" :value="moveDistance" @change="updateMouseAmount($event, 'mouse_move')" />
+            <span>像素</span>
+          </label>
+        </section>
+
+        <section v-if="!shortcutsOnly" class="action-section">
+          <h4 class="action-section-title">打开应用</h4>
+          <div class="preset-grid">
+            <button
+              v-for="app in presetApps"
+              :key="app.id"
+              class="chip"
+              :class="{ selected: (action.type === 'open_app' ? action.target : null) === app.id }"
+              type="button"
+              title="已运行则切到该应用窗口，未运行则启动"
+              @click="apply({ type: 'open_app', target: app.id })"
+            >
+              {{ app.name }}
+            </button>
+            <button class="chip" type="button" @click="appPickerOpen = true">扫描本机应用</button>
+            <button
+              class="chip add-app"
+              type="button"
+              title="从本机选择任意程序或快捷方式"
+              @click="addCustomApp"
+            >
+              ＋ 添加应用
+            </button>
+          </div>
+          <input v-if="customApps.length > 12" v-model="appFilter" class="app-library-search" type="search" aria-label="筛选已添加应用" placeholder="筛选已添加应用" />
+          <div v-if="customApps.length" class="preset-grid saved-app-grid">
+            <button v-for="app in filteredCustomApps" :key="app.path" class="chip" type="button"
+              :class="{ selected: (action.type === 'open_app' ? action.target : null) === app.path }"
+              :title="app.name" @click="apply({ type: 'open_app', target: app.path })">{{ app.name }}</button>
+          </div>
+        </section>
+
+        <section class="action-section">
+          <h4 class="action-section-title">自定义</h4>
+          <div class="custom-shortcut-row">
+            <button
+              class="chip"
+              :class="{ selected: capturingShortcut }"
+              type="button"
+              :disabled="captureStarting"
+              @click="capturingShortcut ? finishShortcutCapture('已取消录入') : beginShortcutCapture()"
+            >
+              {{ capturingShortcut ? "录入中…（按 Esc 取消）" : "录入自定义快捷键" }}
+            </button>
+            <span v-if="capturingShortcut" class="capture-display">
+              {{ captureDisplay.length ? chordLabel({ keys: captureDisplay }) : (safeCaptureMode ? "先选择修饰键" : "请按下快捷键组合") }}
+            </span>
+          </div>
+          <label
+            class="toggle-row safe-capture-toggle"
+            title="开启后，通过界面选择修饰键，键盘只需按主键。"
+          >
+            <span>安全录入模式</span>
+            <input
+              v-model="safeCaptureMode"
+              type="checkbox"
+              class="toggle-input"
+              :disabled="capturingShortcut || captureStarting"
+            />
+            <small class="muted safe-capture-hint">
+              直接录入无法完成或会触发系统动作时再开启。
+            </small>
+          </label>
+          <template v-if="capturingShortcut && safeCaptureMode">
+            <p class="muted editor-note capture-guide">
+              请用鼠标选择修饰键，再只按一次主键。不要在键盘上按完整组合，系统快捷键不会被执行。
+            </p>
+            <div class="preset-grid capture-modifiers">
+              <button
+                v-for="modifier in CAPTURE_MODIFIER_OPTIONS"
+                :key="modifier.key"
+                class="chip"
+                :class="{ selected: selectedCaptureModifiers.has(modifier.key) }"
+                type="button"
+                @click="toggleCaptureModifier(modifier.key)"
+              >
+                {{ modifier.label }}
+              </button>
+            </div>
+            <p class="capture-display">然后单独按主键（例如选择“左 Win”后，只按 L）</p>
+          </template>
+        </section>
+      </div>
+
+    <RegisteredAppsDialog v-if="appPickerOpen" :known-apps="mappings.applications ?? []" :saving="false" :save-error="null" @close="appPickerOpen = false" @add="addScannedApps" />
   </div>
 </template>
 
 <style scoped>
 .button-action-editor { display: grid; gap: 14px; }
+.action-sections { display: grid; gap: 18px; }
+.mouse-amount { display: flex; align-items: center; gap: 8px; }
+.mouse-amount input { width: 84px; }
+.saved-app-grid { max-height: 200px; overflow-y: auto; }
+.app-library-search { max-width: 280px; margin: 8px 0; }
 .action-section { display: grid; gap: 8px; }
 .action-section h4 { margin: 0; }
 .preset-grid { display: flex; flex-wrap: wrap; gap: 8px; }

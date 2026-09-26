@@ -5,9 +5,11 @@ import ButtonsPage from "./ButtonsPage.vue";
 
 type EdgeHandler = (edge: { button: string; isPressed: boolean }) => void;
 type GestureHandler = (gesture: { button: string; trigger: string }) => void;
+type ShortcutCaptureHandler = (edge: { key: string; isPressed: boolean }) => void;
 
 let edgeHandler: EdgeHandler | null = null;
 let gestureHandler: GestureHandler | null = null;
+let shortcutCaptureHandler: ShortcutCaptureHandler | null = null;
 
 vi.mock("../lib/bridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/bridge")>();
@@ -68,6 +70,9 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     saveButtonMappingTemplate: vi.fn(async (name: string, mappings: unknown) => ({ id: "new-template", name, mappings })),
     updateButtonMappingTemplate: vi.fn(async (templateId: string, mappings: unknown) => ({ id: templateId, name: "模板 A", mappings })),
     resetButtonMappings: vi.fn(async () => ({ enabled: true, actions: {} })),
+    scanRegisteredApps: vi.fn(async () => [
+      { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
+    ]),
     testButtonMapping: vi.fn(async () => ({
       available: true,
       submittedBatches: 1,
@@ -80,6 +85,12 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     }),
     subscribeButtonGestures: vi.fn(async (handler: GestureHandler) => {
       gestureHandler = handler;
+      return () => {};
+    }),
+    startShortcutCapture: vi.fn(async () => undefined),
+    stopShortcutCapture: vi.fn(async () => undefined),
+    subscribeShortcutCaptureEdges: vi.fn(async (handler: ShortcutCaptureHandler) => {
+      shortcutCaptureHandler = handler;
       return () => {};
     }),
   };
@@ -95,8 +106,10 @@ import {
   saveButtonMappings,
   saveButtonMappingTemplate,
   updateButtonMappingTemplate,
+  startShortcutCapture,
+  stopShortcutCapture,
 } from "../lib/bridge";
-import type { RuntimeSnapshot } from "../lib/bridge";
+import type { ButtonMappings, RuntimeSnapshot } from "../lib/bridge";
 
 const runtime: RuntimeSnapshot = {
   appVersion: "0.1.0",
@@ -139,6 +152,7 @@ const runtime: RuntimeSnapshot = {
       lastIsPressed: null,
       activeButtons: [],
       lastError: null,
+      staleRemoteEventCount: 0,
     },
     buttonMapping: {
       enabled: true,
@@ -177,6 +191,9 @@ async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003"): Promis
 }
 
 beforeEach(() => {
+  shortcutCaptureHandler = null;
+  vi.mocked(startShortcutCapture).mockClear();
+  vi.mocked(stopShortcutCapture).mockClear();
   edgeHandler = null;
   gestureHandler = null;
   vi.mocked(getMappingConfiguration).mockClear();
@@ -190,6 +207,37 @@ beforeEach(() => {
 });
 
 describe("buttons mapping page", () => {
+  it("adds scanned apps to the library without changing button bindings", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await wrapper
+      .findAll("button")
+      .find((button) => button.text() === "扫描本机应用")!
+      .trigger("click");
+    await flushPromises();
+    await wrapper.get('input[aria-label="全选当前结果"]').setValue(true);
+    await wrapper.get(".registered-apps-dialog .primary-button").trigger("click");
+    await flushPromises();
+
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0];
+    expect(saved.applications).toEqual([
+      { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
+    ]);
+    expect(saved.actions.power).toBeUndefined();
+    expect(saved.actions.ok?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["enter"] },
+    });
+    wrapper.unmount();
+  });
+
   it("uses one measured image frame for connector starts and the 13-key layout", async () => {
     const wrapper = await mountPage();
     const leftCards = wrapper.findAll(".mapping-card.left");
@@ -319,6 +367,7 @@ describe("buttons mapping page", () => {
 
     await button("保存当前配置").trigger("click");
     await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
+    await flushPromises();
     expect(wrapper.text()).toContain("配置已保存并生效");
 
     expect(wrapper.text()).toContain("保存为模板");
@@ -508,6 +557,7 @@ describe("buttons mapping page", () => {
     };
     expect(saved.actions.power!.long.type).toBe("shortcut");
     expect(saved.actions.power!.long.chord!.keys).toEqual(["escape"]);
+    await flushPromises();
 
     // 禁用按键按钮同样只修改草稿。
     const disableButton = wrapper
@@ -517,6 +567,119 @@ describe("buttons mapping page", () => {
     await disableButton!.trigger("click");
     expect(saveButtonMappings).toHaveBeenCalledOnce();
     expect(wrapper.text()).toContain("未保存更改");
+  });
+
+  it("configures mouse actions with independent validated amounts", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const choose = async (label: string) => {
+      await wrapper
+        .findAll(".mapping-editor button")
+        .find((button) => button.text() === label)!
+        .trigger("click");
+      await flushPromises();
+    };
+
+    const saveDraft = async () => {
+      await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+    };
+    await choose("滚轮向下");
+    await wrapper.get('input[aria-label="每次滚动格数"]').setValue("5");
+    await flushPromises();
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await saveDraft();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "scroll",
+      direction: "down",
+      steps: 5,
+    });
+
+    const saveCount = vi.mocked(saveButtonMappings).mock.calls.length;
+    await wrapper.get('input[aria-label="每次滚动格数"]').setValue("101");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(saveCount);
+    expect(wrapper.text()).toContain("请输入 1 到 100 之间的整数");
+
+    await choose("左键双击");
+    await saveDraft();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "mouse_click",
+      kind: "double_left",
+    });
+    wrapper.unmount();
+  });
+
+  it("records a physical Win+L chord directly by default", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+
+    shortcutCaptureHandler!({ key: "left_windows", isPressed: true });
+    shortcutCaptureHandler!({ key: "l", isPressed: true });
+    shortcutCaptureHandler!({ key: "l", isPressed: false });
+    await flushPromises();
+    expect(stopShortcutCapture).not.toHaveBeenCalled();
+    shortcutCaptureHandler!({ key: "left_windows", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as ButtonMappings;
+    expect(saved.actions.power?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["left_windows", "l"] },
+    });
+  });
+
+  it("records Win+L safely after the user enables fallback mode", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const safeToggle = wrapper.find(".safe-capture-toggle input");
+    const shortcutRow = wrapper.find(".custom-shortcut-row");
+    const toggleRow = wrapper.find(".safe-capture-toggle");
+    expect(shortcutRow.element.nextElementSibling).toBe(toggleRow.element);
+    expect(safeToggle.classes()).toContain("toggle-input");
+    expect(safeToggle.element.nextElementSibling?.textContent).toContain(
+      "直接录入无法完成或会触发系统动作时再开启",
+    );
+    expect((safeToggle.element as HTMLInputElement).checked).toBe(false);
+    await safeToggle.setValue(true);
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+    await vi.waitFor(() => expect(startShortcutCapture).toHaveBeenCalledOnce());
+
+    const leftWin = wrapper
+      .findAll(".capture-modifiers .chip")
+      .find((button) => button.text() === "左 Win")!;
+    await leftWin.trigger("click");
+    shortcutCaptureHandler!({ key: "l", isPressed: true });
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(wrapper.text()).toContain("已录入 左 Win + L，松开全部按键后完成"),
+    );
+    shortcutCaptureHandler!({ key: "l", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：左 Win + L"));
+    await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power?.single).toEqual({type: "shortcut", chord: {keys: ["left_windows", "l"]}});
+    wrapper.unmount();
   });
 
   it("highlights the card for a pressed physical button and clears it on release", async () => {
@@ -616,11 +779,30 @@ describe("buttons mapping page", () => {
     expect(chipState(wrapper, "Enter")).toBe(false);
     expect(chipState(wrapper, "Home")).toBe(false);
     expect(chipState(wrapper, "空格")).toBe(false);
-    expect(chipState(wrapper, "粘贴")).toBe(false);
+    expect(chipState(wrapper, "Ctrl + V")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
     // 武装族按键显示冷首按原生副作用提示（信息性，不门控）。
     expect(wrapper.find(".mapping-editor").text()).toContain("原生按键动作");
+  });
+
+  it("预设芯片显示实际按键组合，功能描述退为悬停提示", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 0);
+    const chips = wrapper.findAll(".mapping-editor .chip");
+    const texts = chips.map((chip) => chip.text());
+
+    expect(texts).toContain("Ctrl + C");
+    expect(texts).toContain("Alt + Tab");
+    expect(texts).toContain("Backspace");
+    expect(texts).toContain("左 Win + Shift + S");
+    expect(texts).not.toContain("复制");
+    expect(texts).not.toContain("退格");
+    expect(texts).not.toContain("截图");
+    expect(chips.find((chip) => chip.text() === "Ctrl + C")!.attributes("title")).toBe("复制");
+    expect(chips.find((chip) => chip.text() === "Alt + Tab")!.attributes("title")).toBe(
+      "切换窗口",
+    );
   });
 
   it("全开放：确定·双击与 TV 所有操作可配 + 各自的单响应提示", async () => {
@@ -643,7 +825,7 @@ describe("buttons mapping page", () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "左", 0);
     expect(chipState(wrapper, "←")).toBe(false);
-    expect(chipState(wrapper, "退格")).toBe(false);
+    expect(chipState(wrapper, "Backspace")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).toContain("原生按键动作");
 
@@ -660,7 +842,7 @@ describe("buttons mapping page", () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "电源", 2);
     expect(chipState(wrapper, "Esc")).toBe(false);
-    expect(chipState(wrapper, "截图")).toBe(false);
+    expect(chipState(wrapper, "左 Win + Shift + S")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).not.toContain("原生按键动作");

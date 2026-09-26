@@ -375,6 +375,7 @@ fn fixed_keys(browser: bool) -> ButtonMappings {
     use crate::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
     let mut mappings = ButtonMappings {
         enabled: true,
+        applications: Vec::new(),
         actions: BTreeMap::new(),
     };
     for (button, keys) in [

@@ -141,6 +141,12 @@ impl SettingsStore {
         })
     }
 
+    pub fn save_launch_at_login(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存开机自启动设置", move |settings| {
+            settings.launch_at_login = enabled;
+        })
+    }
+
     pub fn save_theme_preference(&self, preference: ThemePreference) -> Result<(), String> {
         self.update("保存外观设置", move |settings| {
             settings.theme_preference = preference;
@@ -749,6 +755,8 @@ fn portable_common_mappings(
         return Err("应用 ID 必须为逻辑引用，不能包含路径或协议".to_owned());
     }
     let mut mappings = configuration.common_mappings.clone();
+    // Installed application targets belong to this machine, not a portable template.
+    mappings.applications.clear();
     let mut references = HashMap::<String, String>::new();
     let mut reserved: HashSet<String> = configuration
         .application_bindings
@@ -1653,6 +1661,24 @@ mod tests {
     }
 
     #[test]
+    fn launch_at_login_defaults_off_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-launch-at-login-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert!(!store.load().unwrap().launch_at_login);
+        store.save_launch_at_login(true).unwrap();
+        assert!(store.load().unwrap().launch_at_login);
+        store.save_launch_at_login(false).unwrap();
+        assert!(!store.load().unwrap().launch_at_login);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn button_mapping_json_round_trip_preserves_typed_shortcut() {
         use sayall_windows::raw_input::RemoteButton;
         use sayall_windows::send_input::{
@@ -1687,6 +1713,82 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn exported_button_mapping_configuration_is_stable_versioned_and_rejects_before_mutation() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
+
+        let base = std::env::temp_dir().join(format!(
+            "sayall-test-button-mapping-config-{}",
+            std::process::id()
+        ));
+        let settings_path = base.join("settings.json");
+        let export_path = base.join("mapping.json");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(settings_path);
+        let mut mappings = ButtonMappings::default();
+        mappings
+            .applications
+            .push(sayall_windows::registered_apps::AppLibraryEntry {
+                name: "Example".into(),
+                path: "shell:AppsFolder\\Example!App".into(),
+            });
+        mappings.actions.insert(
+            RemoteButton::Power,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Escape],
+                    },
+                },
+                double: ButtonAction::Disabled,
+                long: ButtonAction::Disabled,
+            },
+        );
+
+        store.save_button_mappings(mappings.clone()).unwrap();
+        assert_eq!(store.load_button_mappings().unwrap(), mappings);
+        let configuration = store.load_mapping_configuration().unwrap();
+        store
+            .export_mapping_configuration(&export_path, configuration.clone(), None)
+            .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&export_path).unwrap()).unwrap();
+        assert_eq!(exported["formatVersion"], 3);
+        assert!(exported.get("commonMappings").is_some());
+        assert!(!std::fs::read_to_string(&export_path)
+            .unwrap()
+            .contains("AppsFolder"));
+        let first_export = std::fs::read(&export_path).unwrap();
+        store
+            .export_mapping_configuration(&export_path, configuration, None)
+            .unwrap();
+        assert_eq!(std::fs::read(&export_path).unwrap(), first_export);
+        let preview = store
+            .preview_mapping_configuration_import(&export_path)
+            .unwrap();
+        assert_eq!(
+            preview.configuration.common_mappings.actions,
+            mappings.actions
+        );
+        assert!(preview
+            .configuration
+            .common_mappings
+            .applications
+            .is_empty());
+        std::fs::write(
+            &export_path,
+            br#"{"formatVersion":99,"buttonMappings":{"enabled":false,"actions":{}}}"#,
+        )
+        .unwrap();
+        assert!(store
+            .preview_mapping_configuration_import(&export_path)
+            .is_err());
+        assert_eq!(store.load_button_mappings().unwrap(), mappings);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

@@ -1,9 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  actionSummary,
   audioPhaseLabel,
+  chordLabel,
   connectionPhaseLabel,
   formatDiagnosticReport,
   identityShortcutByButton,
+  isRecommendedVoiceEndpoint,
+  openLogDirectory,
   openVbCableDownloadPage,
   remoteModelLabel,
   shortcutCapability,
@@ -12,6 +17,16 @@ import {
   type ConnectionPhase,
   type DiagnosticReport,
 } from "./bridge";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+describe("mouse actions", () => {
+  it("summarizes clicks, movement, and wheel amounts", () => {
+    expect(actionSummary({ type: "scroll", direction: "down", steps: 5 })).toBe("滚轮向下 5 格");
+    expect(actionSummary({ type: "mouse_move", direction: "left", distance: 75 })).toBe("鼠标向左 75 px");
+    expect(actionSummary({ type: "mouse_click", kind: "double_left" })).toBe("左键双击");
+  });
+});
 
 describe("mapping capability matrix（单响应判定，用于信息提示）", () => {
   it("直接归因族（电源/菜单）全部触发单响应", () => {
@@ -53,6 +68,31 @@ describe("mapping capability matrix（单响应判定，用于信息提示）", 
     expect(identityShortcutByButton.home).toBe("home");
     expect(identityShortcutByButton.tv).toBeUndefined();
     expect(identityShortcutByButton.power).toBeUndefined();
+  });
+});
+
+describe("voice endpoint recommendation", () => {
+  const candidate = (name: string, isVirtualCableCandidate = true) => ({
+    id: name,
+    name,
+    isVirtualCableCandidate,
+  });
+
+  it("recommends only the standard VB-Audio CABLE Input", () => {
+    expect(isRecommendedVoiceEndpoint(candidate("CABLE Input (VB-Audio Virtual Cable)"))).toBe(
+      true,
+    );
+    // 后端的候选判定更宽（自动选择与安装检测用）：非标准端点不得进推荐位。
+    expect(isRecommendedVoiceEndpoint(candidate("CABLE-A Input (VB-Audio Cable A)"))).toBe(false);
+    expect(isRecommendedVoiceEndpoint(candidate("CABLE Input (CI Simulation)"))).toBe(false);
+    expect(isRecommendedVoiceEndpoint(candidate("扬声器 (Realtek Audio)", false))).toBe(false);
+  });
+
+  it("uses the vendor key names for keys that were confusable in Chinese", () => {
+    expect(chordLabel({ keys: ["backspace"] })).toBe("Backspace");
+    expect(chordLabel({ keys: ["delete"] })).toBe("Delete");
+    expect(chordLabel({ keys: ["control", "c"] })).toBe("Ctrl + C");
+    expect(chordLabel({ keys: ["left_windows", "shift", "s"] })).toBe("左 Win + Shift + S");
   });
 });
 
@@ -190,5 +230,28 @@ describe("VB-CABLE download guidance", () => {
 
     expect(open).toHaveBeenCalledWith(VB_CABLE_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
     open.mockRestore();
+  });
+});
+
+describe("诊断日志目录入口", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("在 Tauri 运行时按精确命令名交给 Rust，并原样回传目录", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const directory = "C:\\Users\\probe\\AppData\\Local\\SayAll\\Logs";
+    vi.mocked(invoke).mockResolvedValue(directory);
+
+    await expect(openLogDirectory()).resolves.toBe(directory);
+    // 命令名写错或 Rust 侧漏注册时这里会红——这是该入口唯一的前端契约。
+    // 前端不拼接、不传路径参数：目录由 Rust 从日志初始化结果推导。
+    expect(invoke).toHaveBeenCalledWith("open_log_directory");
+  });
+
+  it("浏览器预览下明确不可用而不是静默失败", async () => {
+    await expect(openLogDirectory()).rejects.toThrow("当前是浏览器预览，无法打开日志目录");
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

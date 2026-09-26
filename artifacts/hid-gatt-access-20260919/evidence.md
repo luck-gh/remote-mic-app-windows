@@ -588,3 +588,13 @@ Rust观察/执行隔离与生命周期3项、IPC序列化1项、按键页24项�
 底栏最终构建75323 exit0（含前端生产构建），唯一0.2.5包 `target/release/bundle/nsis/无线麦 SayAll_0.2.5_x64-setup.exe`，2026-09-27T01:21:00.2441426+08:00，26,291,469字节，SHA256 `ff8f8f6cdb3a431a1756b04b978bcc166c522deca8c4843b855fbb56ba5fcb99`。01:16:57旧App33900/Helper20952经既有托盘命令1001正常退出，overall passed/failed_stages0/156ms、Helper清理四终态均code0。管理员原目录覆盖exit0；installed App SHA256 `b6dc1237b0dca7c1915e8eca7e01bb1b5128ab237aa2078641e933af2c53cd17`，与release仅标准NSIS标记差异，HID Helper b6044e9b…未变。
 
 真实Explorer新App39028创建01:22:11.1625948、TokenElevation=0，自动Helper37924创建01:22:15.2421179、TokenElevation=1；公开QueryFullProcessImageName确认二者均为既有D盘安装目录对应映像。最新配置在退出前/安装后/新启动后完全一致，不回滚Menu或UI偏好。受影响源码/测试和本段文档保持未提交；没有第二次UI提交、push、设备按键/无线电/电源操作，也未重试旧失败UIA或截图路线。随后用户明确反馈“已经能看到这4个按钮在底部了”，据此仅确认安装版四操作底部可见；滚动全位置、窄窗/遮挡/弹窗、切页与实际保存动作仍未获得对应观察，不外推passed。新过程输出仅fixed-actions-ui.log、fixed-actions-release.log与配置hash基线，复用既有主题目录，保留用于本次交付与待验对照。
+
+### 2026-09-27 Windows 官方上游整合（进行中）
+
+固定输入 `74230bf5f841cac2f099d1c6fd25683dac50131d`，本地 checkpoint `f32ae1b14f93bd56ec82e5c650c48085fd1f329c`，共同基线 `6504010828b12713ce033cb3e231087af6a6482f`。本地 `85fffc84`、`d94f6f7`、`7d9b068` 均为祖先；没有 reset/clean/整配置恢复。
+
+另一个已结束任务仅将 fork main 快进至上游，没有第二套产品提交。共享 `sync_git_repos` 的 SayAll 矩阵项通过 PR #1 / `94dbb8e8750e5d0dbe649b9065e926c8a6e971f7` 停用，其他九项保留；本仓库继续人工 test 分支/PR 门禁。
+
+18 个冲突文件逐段融合；严格来源/边沿配对与普通主程序边界保留。上游仅 BLE 建链吞 F5 不采用，单 RawInput 注册改进保留；安装器接入现有 ExitCleanup，超时中止安装。现有模板直接键语义与草稿明确保存保留，应用库启动目标独立于程序匹配身份，导出清除本机应用库。新上游历史硬件文件已脱敏，未执行其探针。
+
+首轮前端169项为165passed/4failed（新增观察字段及即时保存旧断言），受影响修正后34/34passed。默认并发 Rust 测试曾在系统回收站 Shell 扩展 libapr_tsvn.dll 内发生 access violation；IFileOperation 清理串行后不再复现。全局 KeyGate/组件操作夹具互扰改为 test-only 独占，updater 真实日志落盘用独立测试子进程，未降低生产门控。最终 `scripts/ci-preflight.ps1` exit0、7/7passed：前端169/169，Rust331passed/17ignored（原硬件/故障专项条件），生产前端、普通宿主及 runtime-simulation feature 编译通过；`git diff --check HEAD` exit0。没有执行历史硬件探针或电源/无线电操作。当前无最终合并包/安装/新实机结论。过程日志限 `target/dev/rc003-three-key/upstream-*`，保留本轮首个失败与最终门禁以供对照，完成安装/PR后回收可再生成中间输出；不把未反馈的旧UI高亮/语音/Menu等用例补记 passed。
