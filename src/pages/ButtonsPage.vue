@@ -650,8 +650,7 @@ onUnmounted(() => {
 
 <template>
   <section class="buttons-page">
-    <!-- 头部对齐 Mac mappingPage：标题 + 启用开关相邻居左，遥控器状态最右
-         （保存按钮移入编辑面板，与"测试一次/关闭"同排）。 -->
+    <div class="buttons-scroll">
     <header class="page-header mapping-header">
       <div class="mapping-heading-row">
         <h1>按键映射</h1>
@@ -846,7 +845,7 @@ onUnmounted(() => {
       </p>
     </article>
 
-    <footer class="card mapping-footer">
+    <div class="card mapping-footer">
       <small class="muted">按下高亮只表示已收到按键；动作按当前程序的模板执行，未配置则不执行。</small>
       <div class="mapping-footer-status">
         <span class="status-dot" :class="rawInput?.phase === 'ready' ? 'success' : 'pending'"></span>
@@ -869,6 +868,14 @@ onUnmounted(() => {
       </label>
       <span class="muted lock-hint">按遥控器时保持当前编辑项</span>
       <span v-if="selectionPreference.error.value" role="alert" class="error-text">{{ selectionPreference.error.value }}</span>
+    </div>
+    </div>
+
+    <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
+    <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
+    </div>
+
+    <footer class="mapping-actions" aria-label="按键配置操作">
       <div class="button-row">
         <button v-if="!templateReadOnly" class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
           保存当前配置
@@ -887,10 +894,6 @@ onUnmounted(() => {
         </button>
       </div>
     </footer>
-    </div>
-
-    <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
-    <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
   </section>
 
   <SettingsDialog
@@ -911,6 +914,28 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.buttons-page {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+.buttons-scroll {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 0 4px 16px;
+  scrollbar-gutter: stable;
+}
+.mapping-actions {
+  min-width: 0;
+  padding: 12px 4px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-canvas);
+}
+.mapping-actions .button-row { justify-content: flex-end; }
+.mapping-actions button { max-width: 100%; white-space: normal; }
 .editing-source-picker {
   display: grid;
   gap: 4px;

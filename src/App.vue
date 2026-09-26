@@ -85,7 +85,7 @@ onUnmounted(() => {
 <template>
   <div class="app-shell">
     <Sidebar :active-page="activePage" @select="activePage = $event" />
-    <main class="content">
+    <main class="content" :class="{ 'content-buttons': activePage === 'buttons' }">
       <div v-if="loadError" class="error-banner">无法读取运行状态：{{ loadError }}</div>
       <div v-if="updateBannerVisible" class="update-banner">
         <span>发现新版本 {{ updateInfo?.version }}</span>

@@ -315,7 +315,7 @@ describe("buttons mapping page", () => {
   it("keeps global mapping save on the dedicated buttons page", async () => {
     const wrapper = await mountPage();
     const button = (label: string) =>
-      wrapper.findAll(".mapping-footer button").find((item) => item.text() === label)!;
+      wrapper.findAll(".mapping-actions button").find((item) => item.text() === label)!;
 
     await button("保存当前配置").trigger("click");
     await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
@@ -331,7 +331,7 @@ describe("buttons mapping page", () => {
 
   it("saves a named template only after dialog confirmation and keeps failures editable", async () => {
     const wrapper = await mountPage();
-    const open = wrapper.findAll(".mapping-footer button").find((item) => item.text() === "保存为模板")!;
+    const open = wrapper.findAll(".mapping-actions button").find((item) => item.text() === "保存为模板")!;
     await open.trigger("click");
     expect(saveButtonMappingTemplate).not.toHaveBeenCalled();
     await wrapper.find("[role='dialog'] input").setValue("会议控制");
@@ -359,7 +359,7 @@ describe("buttons mapping page", () => {
     await powerCell.trigger("click");
     expect(wrapper.find(".mapping-editor").exists()).toBe(true);
 
-    const save = wrapper.findAll(".mapping-footer button").find((item) => item.text() === "保存当前配置")!;
+    const save = wrapper.findAll(".mapping-actions button").find((item) => item.text() === "保存当前配置")!;
     await save.trigger("click");
     await wrapper.vm.$nextTick();
     expect(wrapper.find(".mapping-editor").exists()).toBe(true);
@@ -377,7 +377,7 @@ describe("buttons mapping page", () => {
       type: "shortcut",
       chord: { keys: ["space"] },
     });
-    await wrapper.findAll(".mapping-footer button").find((item) => item.text() === "保存当前配置")!.trigger("click");
+    await wrapper.findAll(".mapping-actions button").find((item) => item.text() === "保存当前配置")!.trigger("click");
     await vi.waitFor(() => expect(updateButtonMappingTemplate).toHaveBeenCalledOnce());
     expect(updateButtonMappingTemplate).toHaveBeenCalledWith("profile-a", expect.objectContaining({
       actions: expect.objectContaining({
@@ -456,7 +456,7 @@ describe("buttons mapping page", () => {
     wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", {
       type: "shortcut", chord: { keys: ["space"] },
     });
-    await wrapper.findAll(".mapping-footer button").find((item) => item.text() === "保存当前配置")!.trigger("click");
+    await wrapper.findAll(".mapping-actions button").find((item) => item.text() === "保存当前配置")!.trigger("click");
     await flushPromises();
     expect((source.element as HTMLSelectElement).disabled).toBe(true);
     expect(okCard.findAll(".mapping-cell")[0]!.element).toHaveProperty("disabled", true);
@@ -501,7 +501,7 @@ describe("buttons mapping page", () => {
     const escapeChip = chips.find((chip) => chip.text() === "Esc");
     await escapeChip!.trigger("click");
     expect(saveButtonMappings).not.toHaveBeenCalled();
-    await wrapper.findAll(".mapping-footer button").find((item) => item.text() === "保存当前配置")!.trigger("click");
+    await wrapper.findAll(".mapping-actions button").find((item) => item.text() === "保存当前配置")!.trigger("click");
     await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalledOnce());
     const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
       actions: Record<string, { long: { type: string; chord?: { keys: string[] } } }>;

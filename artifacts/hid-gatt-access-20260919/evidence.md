@@ -578,3 +578,13 @@ Rust观察/执行隔离与生命周期3项、IPC序列化1项、按键页24项�
 真实Explorer启动App33900（00:46:33.1357045，TokenElevation=0）、自动恢复启动Helper20952（00:46:35.0582986，TokenElevation=1），两者实际映像均在既有 `D:\Program Files\无线麦 SayAll`。run3de91823590d4970a38831f3ffa05e16在00:46:36.188完成mask0配置回执，bound为pending_per_request，尚无新物理报告，不能表述来源/执行器已就绪。安装前最新button-mappings/settings基线在安装后与启动后完全一致，保留用户本轮新增选择，没有按更早备份回滚。
 
 真实无配置高亮待用户操作：现有程序关联不含Windows资源管理器、Chrome或Edge；先自然进入未绑定程序再回SayAll按键页，分别按放三键，后续按日志确认实际mask0及观察/执行次数。页面编辑“通用”不代表当前实际生效通用；不要求初始化键，不把首份可信DOWN丢弃。旧语音/Menu/布局组仍pending。测试/编译完整日志与配置hash基线复用target/dev/rc003-three-key，仅留本次缺陷对照与唯一交付包，未新建台账或清理无关历史产物。
+
+同日用户明确要求“提交当前状态→清理中间文件→修改按键页四操作固定底栏”。严格按此顺序执行：fetch origin main与cargo fmt --all -- --check通过，原6份暂存工程文档提交为 `d94f6f7713a7eedc388f1bfb48117f2f462810cc`；累计121项源码/测试/必要证据候选提交为 `7d9b068d23f7fe56f686162a194c3e7094ab61fa`，明确实机待验，85fffc84仍为祖先。仅本地提交，无push；个人配置、二进制、原始现场与236份本地产物不入提交且保留。提交门禁发现3处空白，限定修正后diff --check通过，不改变产品逻辑。
+
+提交后仅将target/dev/rc003-three-key中10份已汇总成功构建stdout与7份空检查载体移入系统回收站，共17文件/70,354字节；逐文件核精确边界、非reparse、未受管、无占用及文档无直接引用，原位置剩余0。保留当前包/缓存、当前运行日志、用户配置恢复依据、0x9F及来源/恢复失败唯一材料。未清理其他任务历史。
+
+随后局部修改ButtonsPage/App与样式：只在按键页使主内容为有界高度的flex容器，页面为可滚正文与独立操作行两行grid；四操作复用原处理器，自动换行，监听和锁定留在正文，不使用全局fixed覆盖侧栏或对话框。既有24项按键页与1项导航通过；首轮旧测试查找原footer导致6项失败，只将动作查找定位改为新操作区后25/25通过。未加后端或HID复测，未将DOM测试当真实视觉通过。新UI保持未提交，等待本地包安装与用户实际滚动观察；先前按键/语音/Menu未回复组不因截图自动通过。
+
+底栏最终构建75323 exit0（含前端生产构建），唯一0.2.5包 `target/release/bundle/nsis/无线麦 SayAll_0.2.5_x64-setup.exe`，2026-09-27T01:21:00.2441426+08:00，26,291,469字节，SHA256 `ff8f8f6cdb3a431a1756b04b978bcc166c522deca8c4843b855fbb56ba5fcb99`。01:16:57旧App33900/Helper20952经既有托盘命令1001正常退出，overall passed/failed_stages0/156ms、Helper清理四终态均code0。管理员原目录覆盖exit0；installed App SHA256 `b6dc1237b0dca7c1915e8eca7e01bb1b5128ab237aa2078641e933af2c53cd17`，与release仅标准NSIS标记差异，HID Helper b6044e9b…未变。
+
+真实Explorer新App39028创建01:22:11.1625948、TokenElevation=0，自动Helper37924创建01:22:15.2421179、TokenElevation=1；公开QueryFullProcessImageName确认二者均为既有D盘安装目录对应映像。最新配置在退出前/安装后/新启动后完全一致，不回滚Menu或UI偏好。受影响源码/测试和本段文档保持未提交；没有第二次UI提交、push、设备按键/无线电/电源操作，也未重试旧失败UIA或截图路线。随后用户明确反馈“已经能看到这4个按钮在底部了”，据此仅确认安装版四操作底部可见；滚动全位置、窄窗/遮挡/弹窗、切页与实际保存动作仍未获得对应观察，不外推passed。新过程输出仅fixed-actions-ui.log、fixed-actions-release.log与配置hash基线，复用既有主题目录，保留用于本次交付与待验对照。
