@@ -1,6 +1,6 @@
 # TODO
 
-- [ ] 2026-09-27 Windows 上游整合：本地 checkpoint `bd2349b` / `f32ae1b` 已保存，`test/windows-upstream-integration` 正逐块合并固定 `74230bf`（115 个上游提交）。共享自动同步仅本仓库条目已停用（控制仓库 PR #1）；保留全部本地 ancestry/用户配置、纯直接模板与严格增强来源。源码冲突标记已闭合，项目7步预检通过（前端169、Rust331passed/17ignored）；合并候选729d14d / 0.2.6包0a15fd2f已正常安装、Explorer普通启动且用户三份配置字节保持；受影响实机等待用户反馈，准备push test与draft PR/CI，main尚不得合入，不把上游历史 passed 作为本候选结论。
+- [ ] 2026-09-27 Windows 上游整合：本地 checkpoint `bd2349b` / `f32ae1b` 已保存，`test/windows-upstream-integration` 正逐块合并固定 `74230bf`（115 个上游提交）。共享自动同步仅本仓库条目已停用（控制仓库 PR #1）；保留全部本地 ancestry/用户配置、纯直接模板与严格增强来源。源码冲突标记已闭合，项目7步预检通过（前端169、Rust331passed/17ignored）；合并候选729d14d / 0.2.6包0a15fd2f已正常安装、Explorer普通启动且用户三份配置字节保持；受影响实机等待用户反馈；test已推送、draft PR #1已建立。首轮CI在正常退出测试旧日志断言处失败（实际完整清理85ms/failed_stages0），测试契约已修正并以14项针对性断言验证；新CI待验证，main尚不得合入，不把上游历史 passed 作为本候选结论。
 
 ## v1 决策（2026-09-04）
 
