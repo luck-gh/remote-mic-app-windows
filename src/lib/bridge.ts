@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
@@ -136,7 +137,84 @@ export interface ButtonActions {
 export interface ButtonMappings {
   enabled: boolean;
   actions: Partial<Record<RemoteButton, ButtonActions>>;
-  applications?: CustomAppPick[];
+  applications?: AppLibraryEntry[];
+}
+
+export interface CaptureInputSettings {
+  enabled: boolean;
+  endpointId: string | null;
+  endpointName: string | null;
+}
+export interface CaptureInputSnapshot {
+  settings: CaptureInputSettings;
+  phase: string;
+  recoveryPending: boolean;
+  lastError: string | null;
+}
+export async function getCaptureInput(): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) return { settings: { enabled: false, endpointId: null, endpointName: null }, phase: "unsupported", recoveryPending: false, lastError: null };
+  return invoke<CaptureInputSnapshot>("get_capture_input");
+}
+export async function listCaptureInputs(): Promise<AudioEndpoint[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<AudioEndpoint[]>("list_capture_inputs");
+}
+export async function setCaptureInput(config: CaptureInputSettings): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) throw new Error("请在 Windows 应用中设置会话输入设备");
+  return invoke<CaptureInputSnapshot>("set_capture_input", { config });
+}
+export async function resolveCaptureRecovery(restore: boolean): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) throw new Error("请在 Windows 应用中恢复输入设备");
+  return invoke<CaptureInputSnapshot>("resolve_capture_recovery", { restore });
+}
+export interface RunningAppInfo { applicationId: string; name: string; preset: boolean; }
+
+export interface MappingTemplate { id: string; name: string; mappings: ButtonMappings; }
+export type ButtonMappingTemplate = MappingTemplate;
+export interface ApplicationBinding { applicationId: string; templateId: string; menuOrder: number; launchTarget?: string | null; }
+export interface TemplateCatalogEntry { id: string; name: string; kind: "direct"; readOnly: boolean; buttonMappings: ButtonMappings | null; }
+export interface MappingConfiguration {
+  menuUpdateDefault?: boolean;
+  menuTemplateSwitchEnabled: boolean;
+  mappingNoticeEnabled: boolean;
+  commonMappings: ButtonMappings;
+  templates: MappingTemplate[];
+  applicationBindings: ApplicationBinding[];
+  buttonMappingFollowEnabled: boolean;
+}
+export interface MappingConfigurationImportPreview { token: string; sourceToken: string | null; formatVersion: number; configuration: MappingConfiguration; builtinTemplateIds: string[]; templateNameConflicts: string[]; unresolvedApplicationIds: string[]; }
+export interface SceneMenuItem { applicationId:string|null; templateId:string; label:string; running:boolean; }
+export interface MappingNotice { kind:string; templateId:string|null; name:string|null; actionsAvailable:boolean; defaultSaveStatus?:string|null; }
+export interface SceneSnapshot { mappingNoticeEnabled:boolean; mappingNotice:MappingNotice|null; mappingNoticeRevision:number; enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; panel:"template"|null; updateDefault:boolean; preferencePending?:boolean; preferenceError?:boolean; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; status:string|null; }
+export type SceneEvent =
+  | { type:"mapping_notice_enabled"; enabled:boolean }
+  | { type:"snapshot"; snapshot:SceneSnapshot }
+  | { type:"mapping_applied"; notice:MappingNotice; revision:number }
+  | { type:"default_template_persistence_requested"; requestId:number; applicationId:string; templateId:string };
+export interface TemplateImportRequest { templateIds: string[]; resolvedNames: Record<string,string>; replaceApplicationBindings: boolean; }
+export interface TemplateImportPreview { token:string; templates:Array<{sourceTemplateId:string;template:MappingTemplate}>; addedApplicationBindings:ApplicationBinding[]; replacedApplicationIds:string[]; skippedApplicationIds:string[]; unresolvedApplicationIds:string[]; }
+export type ComponentKind = "hid_enhancement" | "vb_cable";
+export type ComponentAction = "install" | "repair" | "remove" | "open_vendor_wizard";
+export type InstallationState = "unknown" | "not_installed" | "installed_not_loaded" | "available" | "restart_required" | "incompatible" | "failed" | "not_implemented";
+export type PackageState = "missing" | "trusted" | "signature_missing" | "authorization_missing" | "incompatible" | "failed" | "download_available";
+export type ComponentReason =
+  | "ready" | "not_installed" | "service_not_loaded" | "audio_endpoints_missing" | "identity_unavailable"
+  | "package_missing" | "signing_policy_missing" | "authorization_missing" | "uninstall_package_missing"
+  | "unsupported_platform" | "unsupported_architecture" | "detection_failed" | "access_denied"
+  | "restart_required" | "path_rejected" | "hash_mismatch" | "signature_invalid" | "publisher_mismatch"
+  | "version_mismatch" | "invalid_package" | "uac_cancelled" | "uac_denied" | "helper_unavailable"
+  | "helper_timed_out" | "helper_failed" | "verification_failed" | "operation_unsupported" | "operation_in_progress"
+  | "not_implemented" | "official_wizard_required" | "download_failed" | "wizard_closed";
+export type ComponentOperationOutcome = "blocked" | "cancelled" | "denied" | "timed_out" | "restart_required" | "failed" | "completed" | "wizard_closed";
+export interface ComponentStatus {
+  component: ComponentKind; installation: InstallationState; package: PackageState;
+  installedVersion: string | null; serviceInstalled: boolean | null; loaded: boolean | null;
+  bound: boolean | null; audioEndpointsReady: boolean | null; restartRequired: boolean;
+  reason: ComponentReason; blockers: ComponentReason[]; allowedActions: ComponentAction[];
+}
+export interface ComponentOperation {
+  component: ComponentKind; action: ComponentAction; outcome: ComponentOperationOutcome;
+  reason: ComponentReason; status: ComponentStatus;
 }
 
 export interface FiredGesture {
@@ -145,6 +223,7 @@ export interface FiredGesture {
 }
 
 export interface ButtonMappingSnapshot {
+  observedButtons: RemoteButton[];
   enabled: boolean;
   gateActive: boolean;
   listenerActive: boolean;
@@ -347,6 +426,7 @@ const browserSnapshot: RuntimeSnapshot = {
     buttonMapping: {
       enabled: true,
       gateActive: false,
+      observedButtons: [],
       listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
@@ -547,6 +627,67 @@ export async function getButtonMappings(): Promise<ButtonMappings> {
   return invoke<ButtonMappings>("get_button_mappings");
 }
 
+export async function openBluetoothSettings(): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开 Windows 蓝牙设置");
+  await invoke("open_bluetooth_settings");
+}
+
+export async function getMappingConfiguration(): Promise<MappingConfiguration> {
+  if (!isTauriRuntime()) return { menuTemplateSwitchEnabled: false, mappingNoticeEnabled: true, commonMappings: { enabled: true, actions: {} }, templates: [], applicationBindings: [], buttonMappingFollowEnabled: false };
+  return invoke<MappingConfiguration>("get_mapping_configuration");
+}
+export async function saveMappingConfiguration(configuration: MappingConfiguration): Promise<MappingConfiguration> {
+  return invoke<MappingConfiguration>("save_mapping_configuration", { configuration });
+}
+export async function setMappingNoticeEnabled(enabled: boolean): Promise<MappingConfiguration> {
+  return invoke("set_mapping_notice_enabled", { enabled });
+}
+export async function setButtonMappingFollowEnabled(enabled: boolean): Promise<MappingConfiguration> {
+  return invoke<MappingConfiguration>("set_button_mapping_follow_enabled", { enabled });
+}
+export async function createMappingTemplate(name: string): Promise<MappingTemplate> { return invoke("create_mapping_template", { name }); }
+export async function saveButtonMappingTemplate(name: string, mappings: ButtonMappings): Promise<ButtonMappingTemplate> { return invoke("save_button_mapping_template", { name, mappings }); }
+export async function duplicateButtonMappingTemplate(templateId: string, name: string): Promise<ButtonMappingTemplate> { return invoke("duplicate_button_mapping_template", { templateId, name }); }
+export async function updateButtonMappingTemplate(templateId: string, mappings: ButtonMappings): Promise<ButtonMappingTemplate> { return invoke("update_button_mapping_template", { templateId, mappings }); }
+export async function reorderApplicationAssociations(applicationIds: string[]): Promise<MappingConfiguration> { return invoke("reorder_application_associations", { applicationIds }); }
+export async function duplicateMappingTemplate(templateId: string, name: string): Promise<MappingTemplate> { return invoke("duplicate_mapping_template", { templateId, name }); }
+export async function renameMappingTemplate(templateId: string, name: string): Promise<MappingConfiguration> { return invoke("rename_mapping_template", { templateId, name }); }
+export async function deleteMappingTemplate(templateId: string, replacementTemplateId: string | null, unbindApplications = false): Promise<MappingConfiguration> { return invoke("delete_mapping_template", { templateId, replacementTemplateId, unbindApplications }); }
+export async function upsertApplicationBinding(binding: ApplicationBinding): Promise<MappingConfiguration> { return invoke("upsert_application_binding", { binding }); }
+export async function removeApplicationBinding(applicationId: string): Promise<MappingConfiguration> { return invoke("remove_application_binding", { applicationId }); }
+export async function exportMappingConfiguration(templateIds: string[] | null = null): Promise<boolean> { return invoke("export_mapping_configuration", { templateIds }); }
+export async function previewMappingConfigurationImport(): Promise<MappingConfigurationImportPreview | null> { return invoke("preview_mapping_configuration_import"); }
+export async function applyMappingConfigurationImport(token: string): Promise<MappingConfiguration> { return invoke("apply_mapping_configuration_import", { token }); }
+export async function previewTemplateImport(sourceToken:string, request:TemplateImportRequest):Promise<TemplateImportPreview>{return invoke("preview_template_import",{sourceToken,request});}
+export async function getTemplateCatalog():Promise<TemplateCatalogEntry[]>{return invoke("get_template_catalog");}
+export async function copyTemplateCatalogEntry(templateId:string,name:string):Promise<TemplateCatalogEntry>{return invoke("copy_template_catalog_entry",{templateId,name});}
+export async function getSceneSnapshot():Promise<SceneSnapshot|null>{return invoke("get_scene_snapshot");}
+export async function subscribeSceneEvents(callback:(event:SceneEvent)=>void):Promise<()=>void>{const unlisten=await listen<SceneEvent>("scene-event",event=>callback(event.payload));return unlisten;}
+export async function getComponentStatus(): Promise<ComponentStatus[]> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法检测组件状态");
+  return invoke<ComponentStatus[]>("get_component_status");
+}
+export async function performComponentAction(component: ComponentKind, action: ComponentAction): Promise<ComponentOperation> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法执行组件操作");
+  return invoke<ComponentOperation>("perform_component_action", { component, action });
+}
+
+export async function startHidHostEnhancement(): Promise<string> {
+  return invoke<string>("start_hid_host_enhancement");
+}
+export async function getHidHostStatus(): Promise<string> {
+  return invoke<string>("get_hid_host_status");
+}
+export async function setMenuTemplateSwitchEnabled(enabled: boolean): Promise<MappingConfiguration> {
+  return invoke("set_menu_template_switch_enabled", { enabled });
+}
+export async function getHidHostAutoRestore(): Promise<boolean> {
+  return invoke<boolean>("get_hid_host_auto_restore");
+}
+export async function setHidHostAutoRestore(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_hid_host_auto_restore", { enabled });
+}
+
 export async function saveButtonMappings(mappings: ButtonMappings): Promise<ButtonMappings> {
   if (!isTauriRuntime()) {
     throw new Error("当前是浏览器预览，无法保存按键映射");
@@ -561,21 +702,6 @@ export async function resetButtonMappings(): Promise<ButtonMappings> {
   return invoke<ButtonMappings>("reset_button_mappings");
 }
 
-/** 返回 false 表示用户在系统文件选择器中取消。 */
-export async function exportButtonMappingConfiguration(): Promise<boolean> {
-  if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法导出按键映射配置");
-  }
-  return invoke<boolean>("export_button_mapping_configuration");
-}
-
-/** 返回 null 表示用户在系统文件选择器中取消。 */
-export async function importButtonMappingConfiguration(): Promise<ButtonMappings | null> {
-  if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法导入按键映射配置");
-  }
-  return invoke<ButtonMappings | null>("import_button_mapping_configuration");
-}
 
 export async function testButtonMapping(
   button: RemoteButton,
@@ -592,8 +718,10 @@ export async function listPresetApps(): Promise<PresetAppInfo[]> {
     // 浏览器预览：展示完整预设表（仅渲染验证）。
     return [
       { id: "sayall", name: "无线麦", installed: true },
+      { id: "codex", name: "Codex", installed: true },
       { id: "wechat", name: "微信", installed: true },
       { id: "edge", name: "Edge 浏览器", installed: true },
+      { id: "chrome", name: "Chrome 浏览器", installed: true },
       { id: "chrome", name: "Chrome 浏览器", installed: true },
       { id: "notepad", name: "记事本", installed: true },
       { id: "calc", name: "计算器", installed: true },
@@ -604,11 +732,20 @@ export async function listPresetApps(): Promise<PresetAppInfo[]> {
   return invoke<PresetAppInfo[]>("list_preset_apps");
 }
 
+export async function listRunningApps(): Promise<RunningAppInfo[]> {
+  if (!isTauriRuntime()) return [
+    { applicationId: "edge", name: "Edge 浏览器", preset: true },
+    { applicationId: "c:\\tools\\reader.exe", name: "Reader", preset: false },
+  ];
+  return invoke<RunningAppInfo[]>("list_running_apps");
+}
+
 export async function getButtonMappingSnapshot(): Promise<ButtonMappingSnapshot> {
   if (!isTauriRuntime()) {
     return {
       enabled: true,
       gateActive: false,
+      observedButtons: [],
       listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
@@ -904,15 +1041,10 @@ export type ShortcutCapability = "all" | "identity" | "none";
  * - **identity**（武装族常见物理 VK：确定/方向）：孤立冷首按原始键
  *   必泄漏（结构性武装死锁，公开 API 内不可根除）→ 同键映射由泄漏对冲
  *   保证单响应，其他映射"配置动作正常执行 + 冷首按附带一次原生动作"；
- * - **none**：TV（OEM_3 `~/~，同键映射不可表达）与返回/音量±（RC003
- *   输入栈不可见；RC001 虽可达但 2026-09-07 起全型号禁用——格子禁用，
- *   见 ButtonsPage 的 UNMAPPABLE_BUTTONS）。
+ * - **none**：普通输入路径没有同键单响应保证；不是禁止保存配置。
  *
- * 2026-09-07 增补（方案 C"遥控器优先"落地，key_gate 常驻抑制族）：
- * Home/TV 已配置映射且遥控器连接期间原生按键被接管——任意按压（含孤立
- * 冷首按）严格单响应，本矩阵的 identity/none 标注对这两键仅剩编辑参考
- * 意义（见 ButtonsPage capabilityNote 的接管提示）。左键自 2026-09-08
- * 起恢复为与上/下/右/确定相同的逐键武装与泄漏对冲机制。
+ * RC003 返回/音量±/TV/Home 的报告增强能力由后端实时门禁决定，
+ * 编辑器针对这五键显示增强提示，不以本矩阵推断来源或已通过实机验收。
  */
 export function shortcutCapability(
   button: RemoteButton,
@@ -928,7 +1060,7 @@ export function shortcutCapability(
     button === "volume_down" ||
     button === "tv"
   ) {
-    // 返回/音量±全型号禁用（2026-09-07 用户决策）；TV 无同键映射可表达。
+    // 普通输入路径无保证；增强路径的实时能力不在此静态矩阵中。
     return "none";
   }
   // 武装族（确定/方向）：单击可配同键映射（对冲单响应）。
@@ -1014,11 +1146,14 @@ export function actionSummary(action: ButtonAction | undefined): string {
 export interface CustomAppPick {
   name: string;
   path: string;
+  applicationId: string;
 }
 
-export async function scanRegisteredApps(): Promise<CustomAppPick[]> {
+export type AppLibraryEntry = Pick<CustomAppPick, "name" | "path">;
+
+export async function scanRegisteredApps(): Promise<AppLibraryEntry[]> {
   if (!isTauriRuntime()) throw new Error("应用扫描需要在 Windows 客户端中使用");
-  return invoke<CustomAppPick[]>("scan_registered_apps");
+  return invoke<AppLibraryEntry[]>("scan_registered_apps");
 }
 
 /**

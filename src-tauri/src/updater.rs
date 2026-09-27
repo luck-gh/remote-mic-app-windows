@@ -269,22 +269,22 @@ async fn resolve_update_endpoint(include_prereleases: bool) -> Result<UpdateEndp
 /// 构建更新器：注册安装前清理回调 + 端点覆盖 + 检查超时。
 fn build_updater(
     app: &AppHandle,
-    platform: Arc<dyn crate::platform::PlatformRuntime>,
+    exit_cleanup: crate::ExitCleanup,
     runtime_endpoint: Option<reqwest::Url>,
 ) -> Result<tauri_plugin_updater::Updater, String> {
     let mut builder = app.updater_builder().timeout(CHECK_TIMEOUT);
     // on_before_exit 在安装器启动前、std::process::exit(0) 前同步执行：
-    // 显式断开 BLE 链路（正常断开序列 CCCD 退订/服务释放），避免残留
-    // 未关闭的 GATT 会话把链路留成僵死状态。
+    // 执行与托盘退出一致的完整、有界、幂等清理，避免只断开 BLE 而让
+    // Raw Input 监督线程、映射按住状态或监听器继续存活到 process::exit。
     builder = builder.on_before_exit(move || {
         let started = Instant::now();
-        let outcome = if platform.disconnect_remote().is_ok() {
+        let outcome = if exit_cleanup.shutdown_blocking() {
             "ok"
         } else {
             "err"
         };
         note(format!(
-            "install.before_exit disconnect={outcome} took_ms={}",
+            "install.before_exit cleanup={outcome} took_ms={}",
             elapsed_ms(started)
         ));
     });
@@ -333,12 +333,12 @@ pub async fn check_app_update(
             date: None,
         });
     }
-    let platform = Arc::clone(&state.platform);
+    let exit_cleanup = state.exit_cleanup.clone();
     let runtime_endpoint = match endpoint {
         UpdateEndpoint::Runtime(url) => Some(url),
         UpdateEndpoint::ConfiguredStable | UpdateEndpoint::NoPublishedPreview => None,
     };
-    let updater = build_updater(&app, platform, runtime_endpoint)?;
+    let updater = build_updater(&app, exit_cleanup, runtime_endpoint)?;
     match updater.check().await {
         Ok(Some(update)) => {
             let info = AppUpdateInfo {
@@ -686,18 +686,34 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn updater_notes_land_in_diagnostic_log() {
-        let path = std::env::temp_dir().join(format!(
-            "sayall-updater-note-test-{}.log",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        // 本测试二进制内无其他代码先初始化 gatt_sink（OnceLock 首次调用生效）。
-        // SAFETY: 测试进程内单线程操作该环境变量，其余测试不读取它。
-        unsafe { std::env::set_var("SAYALL_GATT_LOG", &path) };
+        const CHILD: &str = "SAYALL_UPDATER_LOG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The production sink is process-wide and other tests legitimately use it.
+            // Set the child's environment before startup, never race OnceLock/env in this process.
+            let path = std::env::temp_dir().join(format!(
+                "sayall-updater-note-test-{}-{}.log",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "updater::tests::updater_notes_land_in_diagnostic_log",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("SAYALL_GATT_LOG", &path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated diagnostic sink test failed");
+            return;
+        }
+        let path = std::path::PathBuf::from(std::env::var_os("SAYALL_GATT_LOG").unwrap());
         note("check.fail stage=endpoint_override_parse error_domain=url error_code=parse_failed reason=invalid_override retryable=false".to_owned());
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
-        unsafe { std::env::remove_var("SAYALL_GATT_LOG") };
-        let _ = std::fs::remove_file(&path);
         assert!(
             contents.contains("updater.check.fail stage=endpoint_override_parse")
                 && contents.contains("error_code=parse_failed")

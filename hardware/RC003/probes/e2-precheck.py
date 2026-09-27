@@ -67,7 +67,7 @@ p()
 
 # 4. 目标设备 presence
 cmd = (
- "$t='HID\\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4';"
+ "$t='REDACTED_device_12"
  "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | ForEach-Object {"
  "  $ids=(Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_HardwareIds "
  "-ErrorAction SilentlyContinue).Data;"

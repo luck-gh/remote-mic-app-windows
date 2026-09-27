@@ -30,9 +30,9 @@
       2026-09-22T09:51:58.127Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input_listener action=start phase=requested
       2026-09-22T09:51:58.172Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input_listener action=start phase=completed termi
   [binding_initial] 1 条
-      2026-09-22T09:51:58.171Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input binding_initial selected_path=\\?\hid#{0000
+      2026-09-22T09:51:58.171Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input binding_initial selected_path=REDACTED_device_43
   [matched_device_count] 3 条
-      2026-09-22T09:51:58.171Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input binding_initial selected_path=\\?\hid#{0000
+      2026-09-22T09:51:58.171Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input binding_initial selected_path=REDACTED_device_43
       2026-09-22T09:51:58.172Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input device_change action=device_arrived phase=r
       2026-09-22T09:51:58.172Z pid=3124 ver=0.2.6 build=unknown source_revision=2d949f417b7f54cd79248097a0ab687299fbdb7d build_channel=unknown release_tag=unknown raw_input_listener action=start phase=completed termi
 

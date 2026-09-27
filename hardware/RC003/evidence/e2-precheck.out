@@ -10,7 +10,7 @@ E2-1 前置核查  (2026-09-22T18:29:00)
 
 4. 目标设备（RC003 父节点）present:
      （未找到 —— 遥控器可能未连接/休眠）
-   stderr: EXC:Command '['powershell', '-NoProfile', '-Command', '$t=\'HID\\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4\';Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Fo
+   stderr: EXC:Command '['powershell', '-NoProfile', '-Command', '$t=\'REDACTED_device_84 -PresentOnly -ErrorAction SilentlyContinue | Fo
 
 4b. 所有 2717/32b8 相关 present 设备:
      OK|Bluetooth|蓝牙 LE 通用属性服务

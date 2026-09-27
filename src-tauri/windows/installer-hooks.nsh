@@ -35,7 +35,7 @@
 ;
 ; 本宏在 `NSIS_HOOK_PREINSTALL` / `NSIS_HOOK_PREUNINSTALL` 中执行，而 Tauri 的
 ; `CheckIfAppIsRunning` 在 `Section Install` 里**紧随其后**才跑。因此应用只要能
-; 在这段宽限期内自行退出，后续检测自然落空、连弹窗都不会出现；超时才落回原有行为。
+; 在这段宽限期内自行退出，后续检测自然落空、连弹窗都不会出现；超时则中止，不进入 Tauri 强杀分支。
 ;
 ; 信号用**会话内**命名事件：非提权进程没有 `SeCreateGlobalPrivilege`，无法创建
 ; `Global\` 命名对象；而安装器与应用同处一个登录会话，`Local\` 命名空间对两者
@@ -101,6 +101,12 @@
         ${If} $R9 > 0
           Goto sayall_wait_${_uid}
         ${EndIf}
+      sayall_timeout_${_uid}:
+        SetErrorLevel ${SAYALL_LEGACY_RUNNING_ERROR_LEVEL}
+        ${IfNot} ${Silent}
+          MessageBox MB_ICONINFORMATION|MB_OK "无线麦仍在完成退出清理，本次安装已停止。请待应用正常退出后重试。$\r$\nSayAll is still cleaning up. Installation has stopped without terminating it."
+        ${EndIf}
+        Abort
       sayall_done_${_uid}:
     ${Else}
       ; 进程在跑但事件打不开 = 运行的是没有监听线程的旧版（0.2.10 及更早）。

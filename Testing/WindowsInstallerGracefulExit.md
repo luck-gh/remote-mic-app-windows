@@ -89,20 +89,26 @@ pnpm tauri build --bundles nsis
 
 | 场景 | 步骤 | 判据 |
 | --- | --- | --- |
-| 安装覆盖运行中的应用 | `/S` 安装 → 启动应用 → 等 `reason=listening` → `/S /UPDATE` 覆盖安装 | 新增日志含 `reason=installer_requested_exit`、`ble_session_shutdown … terminal_result=passed`、`platform_shutdown … terminal_result=passed`；进程在 **8s 内**（安装器强杀时刻之前）自行消失 |
+| 安装覆盖运行中的应用 | `/S` 安装 → 启动应用 → 等 `reason=listening` → `/S /UPDATE` 覆盖安装 | 新增日志含 `reason=installer_requested_exit`、`app_shutdown` 的 supervisor/input/RawInput/BLE/capture 全阶段 passed 及 overall passed/failed_stages=0；进程在 NSIS 实际等待预算（当前 **21.5s**）内自行消失；超时安装中止 |
 | 卸载运行中的应用 | 启动应用 → 等 `reason=listening` → 静默卸载 | 同上，走 `NSIS_HOOK_PREUNINSTALL` 路径 |
 
-脚本自身的收尾**不再强杀**：先请求优雅退出，仍不退才强杀并打印告警。
+脚本自身收尾只请求正常退出；仍存活则保留进程和安装并报告失败，不强杀、不继续卸载。
 
 手工复核（等价判据，安装过程中随时可看）：
 
 ```bash
 LOG="%LOCALAPPDATA%\SayAll\Logs\sayall-diagnostic.log"
-grep -aE "app_exit " "$LOG" | tail -5
+rg "app_exit |app_shutdown " "$LOG"
 # 期望顺序：reason=listening → reason=installer_requested_exit
-#          → ble_session_shutdown phase=completed terminal_result=passed
-#          → platform_shutdown phase=completed terminal_result=passed
+#          → app_shutdown 各资源阶段 passed
+#          → app_shutdown stage=overall phase=completed terminal_result=passed failed_stages=0
 ```
+
+## 2026-09-27 整合候选的 CI 契约修正
+
+[CI run 36266247769](https://github.com/luck-gh/remote-mic-app-windows/actions/runs/36266247769) 的覆盖安装实际收到正常退出请求，统一 `ExitCleanup` 的全部资源阶段 passed，整体 85ms、failed_stages=0；原验收脚本却仍要求已移除的上游双清理器日志，因而失败。脚本现使用当前完整清理标记，拒绝缺阶段或任何清理失败，并从 NSIS 定义读取等待预算；没有放宽为只看进程消失。
+
+纯断言验证 14 项 passed（冻结 CI 实际日志、逐个缺失标记、失败阶段、未退出及预算边界、无强杀收尾）；未在用户主机执行安装/卸载测试。新一轮 GitHub CI 与受影响硬件验收仍待完成；旧 CI 未执行到卸载场景，不能将其记为 passed。产品二进制未变化，沿用已安装候选。
 
 ## 现场结果
 

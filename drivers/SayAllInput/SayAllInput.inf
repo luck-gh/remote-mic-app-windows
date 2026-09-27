@@ -1,0 +1,47 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Extension
+ClassGuid={e2f84ce7-8efa-411c-aa69-97454ca4cb57}
+Provider=%Provider%
+ExtensionId={6d1b9973-57f4-43e1-b678-4c5c2f2a1c92}
+DriverVer=09/14/2026,0.1.0.0
+CatalogFile=SayAllInput.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+[SourceDisksNames]
+1=%Disk%,,,""
+[SourceDisksFiles]
+SayAllInput.sys=1
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...17763
+[Models.NTamd64.10.0...17763]
+; Exact upstream RC003 revision. RC001 is intentionally NOT inferred from VID/PID.
+%Device%=Install,HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4
+[Install]
+CopyFiles=CopyDriver
+[Install.HW]
+AddReg=LowerFilter
+[LowerFilter]
+; Public device-specific append form supports 1809 and preserves other filters.
+HKR,,LowerFilters,0x00010008,"SayAllInput"
+[Install.Services]
+AddService=SayAllInput,,Service
+[Service]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\SayAllInput.sys
+[Install.Wdf]
+KmdfService=SayAllInput,Wdf
+[Wdf]
+KmdfLibraryVersion=1.15
+[CopyDriver]
+SayAllInput.sys
+[Strings]
+Provider="GetSayAll"
+Disk="SayAll Input Enhancement"
+Device="SayAll remote three-key input channel"
+ServiceName="SayAll Remote Input Filter"

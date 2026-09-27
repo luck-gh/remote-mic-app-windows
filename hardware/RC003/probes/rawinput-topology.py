@@ -6,7 +6,7 @@ RIDI_DEVICEINFO 也报 KEYBOARD，与该设备只有键盘页 TLC 的结论一�
 本版补最后一步：确认系统里**根本不存在**该设备的 HID 类型 Raw Input 条目。
 方法（纯注册表读取，不提权、不编译）：
 
-  1. HKLM\\SYSTEM\\CurrentControlSet\\Enum\\HID\\ 下找 VID_2717 / PID_32B8 的所有实例
+  1. HKLM\\SYSTEM\\CurrentControlSet\\Enum\\REDACTED_device_35 下找 VID_2717 / PID_32B8 的所有实例
      -> 该设备注册了几个 HID 实例、各自 UpperFilters / Service
   2. 每个实例的 Device Parameters 里有没有 UsagePage / Usage
   3. 交叉：Raw Input 列表里该设备只出现 1 次（前两版已证），

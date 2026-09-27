@@ -34,7 +34,7 @@ def ps_script(script, timeout=90):
         return "", "EXC:" + str(e), -1
     return dec(r.stdout), dec(r.stderr), r.returncode
 
-TARGET = r"HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4"
+TARGET = r"REDACTED_device_15"
 
 p("E2-1 前置核查（补正版）")
 p("=" * 62)
@@ -44,7 +44,7 @@ p()
 
 # --- A. 目标设备匹配（与 install-driver.ps1 第 15-18 行同逻辑）---
 script = '''
-$t = 'HID\\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4'
+$t = 'REDACTED_device_89
 Write-Output "=== A. 与 install-driver.ps1 相同逻辑的匹配 ==="
 $found = $false
 Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | ForEach-Object {

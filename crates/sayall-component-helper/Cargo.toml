@@ -1,0 +1,9 @@
+[package]
+name = "sayall-component-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sayall-windows = { path = "../sayall-windows" }
+serde_json.workspace = true

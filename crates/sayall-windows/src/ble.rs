@@ -1,9 +1,12 @@
 use crate::wetype_revive::{response_since, wetype_mic_observation, MicObservation, MicResponse};
 use crate::{
-    audio::AudioRuntime, power::PowerNotifications, reconnect::ReconnectBackoff,
-    remote_model_from_model_number, remote_model_from_name, send_input::KeyChord,
-    send_input_windows::SendInputRuntime, ConnectionPhase, ConnectionSnapshot, PlatformError,
-    RemoteModel, UsageCounters,
+    audio::{AudioBeginGuard, AudioRuntime},
+    power::PowerNotifications,
+    reconnect::ReconnectBackoff,
+    remote_model_from_model_number, remote_model_from_name,
+    send_input::KeyChord,
+    send_input_windows::SendInputRuntime,
+    ConnectionPhase, ConnectionSnapshot, PlatformError, RemoteModel, UsageCounters,
 };
 use sayall_core::{AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
 use std::future::IntoFuture;
@@ -44,11 +47,107 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// 续期，2.5s 间隔留足余量。
 const MICROPHONE_EXTEND_INTERVAL: Duration = Duration::from_millis(2500);
 
+type ConnectionContextCallback = Arc<dyn Fn(RemoteModel, bool) + Send + Sync>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PublishedConnectionContext {
+    phase: ConnectionPhase,
+    model: RemoteModel,
+    connected: bool,
+}
+
+#[derive(Default)]
+struct ConnectionContextPublisher {
+    last: Option<PublishedConnectionContext>,
+    stopped: bool,
+}
+
+impl ConnectionContextPublisher {
+    fn publish(&mut self, snapshot: &ConnectionSnapshot, callback: &ConnectionContextCallback) {
+        if self.stopped {
+            return;
+        }
+        let current = PublishedConnectionContext {
+            phase: snapshot.phase,
+            model: snapshot.remote_model,
+            connected: input_execution_connected(snapshot.phase),
+        };
+        if self.last == Some(current) {
+            return;
+        }
+        let context_changed = self
+            .last
+            .is_none_or(|last| last.model != current.model || last.connected != current.connected);
+        let started = Instant::now();
+        if context_changed {
+            callback(current.model, current.connected);
+        }
+        gatt_note(format!(
+            "input_context_sync phase={} model={} connected={} apply_result={} terminal_result=passed elapsed_ms={}",
+            connection_phase_name(current.phase),
+            remote_model_name(current.model),
+            current.connected,
+            if context_changed {
+                "applied"
+            } else {
+                "unchanged"
+            },
+            started.elapsed().as_millis()
+        ));
+        self.last = Some(current);
+    }
+
+    fn stop(&mut self, callback: &ConnectionContextCallback) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        let started = Instant::now();
+        callback(RemoteModel::Unknown, false);
+        gatt_note(format!(
+            "input_context_sync phase=shutdown model=unknown connected=false apply_result=applied terminal_result=passed elapsed_ms={}",
+            started.elapsed().as_millis()
+        ));
+    }
+}
+
+fn input_execution_connected(phase: ConnectionPhase) -> bool {
+    matches!(
+        phase,
+        ConnectionPhase::Ready | ConnectionPhase::Streaming | ConnectionPhase::Draining
+    )
+}
+
+fn connection_phase_name(phase: ConnectionPhase) -> &'static str {
+    match phase {
+        ConnectionPhase::Idle => "idle",
+        ConnectionPhase::Connecting => "connecting",
+        ConnectionPhase::Discovering => "discovering",
+        ConnectionPhase::AwaitingCapabilities => "awaiting_capabilities",
+        ConnectionPhase::Ready => "ready",
+        ConnectionPhase::Streaming => "streaming",
+        ConnectionPhase::Draining => "draining",
+        ConnectionPhase::Reconnecting => "reconnecting",
+        ConnectionPhase::Suspended => "suspended",
+        ConnectionPhase::Disconnected => "disconnected",
+        ConnectionPhase::Failed => "failed",
+    }
+}
+
+fn remote_model_name(model: RemoteModel) -> &'static str {
+    match model {
+        RemoteModel::Rc001 => "rc001",
+        RemoteModel::Rc003 => "rc003",
+        RemoteModel::Unknown => "unknown",
+    }
+}
+
 pub struct BleRuntime {
     sender: Sender<WorkerMessage>,
     state: Arc<Mutex<ConnectionSnapshot>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     power_notifications: Mutex<Option<PowerNotifications>>,
+    audio_lifecycle_epoch: Arc<AtomicU64>,
 }
 
 impl BleRuntime {
@@ -57,11 +156,13 @@ impl BleRuntime {
         usage: Arc<UsageCounters>,
         send_input: Arc<SendInputRuntime>,
         voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
+        connection_context: ConnectionContextCallback,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ConnectionSnapshot::default()));
         let worker_state = Arc::clone(&state);
         let worker_sender = sender.clone();
+        let audio_lifecycle_epoch = Arc::clone(&audio.lifecycle_epoch);
         let worker = thread::Builder::new()
             .name("sayall-ble".to_owned())
             .spawn(move || {
@@ -73,17 +174,23 @@ impl BleRuntime {
                     usage,
                     send_input,
                     voice_hold_hotkey,
+                    connection_context,
                 )
             });
 
         match worker {
             Ok(worker) => {
-                let power_notifications = PowerNotifications::register(sender.clone()).ok();
+                let power_notifications = PowerNotifications::register(
+                    sender.clone(),
+                    Arc::clone(&audio_lifecycle_epoch),
+                )
+                .ok();
                 Self {
                     sender,
                     state,
                     worker: Mutex::new(Some(worker)),
                     power_notifications: Mutex::new(power_notifications),
+                    audio_lifecycle_epoch,
                 }
             }
             Err(error) => {
@@ -93,6 +200,7 @@ impl BleRuntime {
                     state,
                     worker: Mutex::new(None),
                     power_notifications: Mutex::new(None),
+                    audio_lifecycle_epoch,
                 }
             }
         }
@@ -103,14 +211,17 @@ impl BleRuntime {
     }
 
     pub fn connect(&self, device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
+        self.audio_lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         self.request(|reply| WorkerMessage::Connect { device_id, reply })
     }
 
     pub fn disconnect(&self) -> Result<ConnectionSnapshot, PlatformError> {
+        self.audio_lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         self.request(|reply| WorkerMessage::Disconnect { reply })
     }
 
     pub fn restore(&self, device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
+        self.audio_lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         self.request(|reply| WorkerMessage::Restore { device_id, reply })
     }
 
@@ -132,50 +243,6 @@ impl BleRuntime {
     /// 退避重连（用户侧零介入）。
     pub fn notify_remote_device_arrived(&self) {
         let _ = self.sender.send(WorkerMessage::RemoteDeviceArrived);
-    }
-
-    /// 退出前的优雅关闭（2026-09-16）：请求工作线程关闭会话，并在**有界时间**内
-    /// 等待其完成（`ble_session_cleanup` 落盘）后才返回。
-    ///
-    /// 为什么不能只靠 `Drop`：Tauri v2 的 `App::run()` 结束时会直接
-    /// `std::process::exit`（`tauri/src/app.rs` 文档原文："the process is exited
-    /// directly using `std::process::exit`"），而它**不执行 Rust 析构**——所以
-    /// `Drop` 里的 `Shutdown` 从不出现在进程结束路径上（现场证据：全日志 21 条
-    /// `ble_session_cleanup` 无一条位于进程结束处）。退出路径必须显式调用本方法。
-    ///
-    /// 有界等待（AGENTS.md「归因线程、钩子线程等后台机制的偶发迟到要按必然事件
-    /// 设计」）：超时是常态路径之一而非错误路径——超时只落日志并让调用方继续
-    /// 退出，绝不无限等待。
-    pub fn shutdown_blocking(&self, timeout: Duration) -> Result<(), PlatformError> {
-        let started = Instant::now();
-        gatt_note(format!(
-            "app_exit ble_session_shutdown phase=requested timeout_ms={}",
-            timeout.as_millis()
-        ));
-        let (ack_sender, ack_receiver) = mpsc::channel();
-        let sent = self.sender.send(WorkerMessage::Shutdown {
-            ack: Some(ack_sender),
-        });
-        let outcome = if sent.is_err() {
-            Err(PlatformError::WorkerUnavailable)
-        } else {
-            match ack_receiver.recv_timeout(timeout) {
-                Ok(()) => Ok(()),
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(PlatformError::OperationTimedOut),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(PlatformError::WorkerUnavailable),
-            }
-        };
-        gatt_note(format!(
-            "app_exit ble_session_shutdown phase=completed terminal_result={} error_code={} elapsed_ms={}",
-            if outcome.is_ok() { "passed" } else { "failed" },
-            match &outcome {
-                Ok(()) => "none",
-                Err(PlatformError::OperationTimedOut) => "shutdown_timeout",
-                Err(_) => "worker_unavailable",
-            },
-            started.elapsed().as_millis()
-        ));
-        outcome
     }
 
     fn request(
@@ -206,9 +273,9 @@ impl BleRuntime {
 
 impl Drop for BleRuntime {
     fn drop(&mut self) {
+        self.audio_lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         lock(&self.power_notifications).take();
-        // ack: None —— 析构路径不阻塞等待（可能根本不会被执行：见 shutdown_blocking）。
-        let _ = self.sender.send(WorkerMessage::Shutdown { ack: None });
+        let _ = self.sender.send(WorkerMessage::Shutdown);
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
         }
@@ -256,15 +323,19 @@ pub(crate) enum WorkerMessage {
     },
     Control {
         connection_generation: u64,
+        begin_guard: Option<AudioBeginGuard>,
+        stamp: CallbackStamp,
         bytes: Vec<u8>,
     },
     Audio {
         connection_generation: u64,
+        stamp: CallbackStamp,
         bytes: Vec<u8>,
     },
     ConnectionChanged {
         connection_generation: u64,
         status: BluetoothConnectionStatus,
+        observed_at: Instant,
     },
     CallbackError {
         connection_generation: u64,
@@ -275,9 +346,7 @@ pub(crate) enum WorkerMessage {
     /// 关闭工作线程。`ack` 用于让退出路径**有界等待**会话清理真正完成
     /// （2026-09-16）：`Drop` 里的收尾走 `ack: None`（不阻塞析构），
     /// 应用退出路径走 `Some(..)` 以便落日志并确认 `ble_session_cleanup` 已执行。
-    Shutdown {
-        ack: Option<Sender<()>>,
-    },
+    Shutdown,
 }
 
 /// 以"一次重连尝试"为粒度驱动资源探针（2026-09-16）：进入资源耗尽轮次、
@@ -302,7 +371,9 @@ fn worker_loop(
     usage: Arc<UsageCounters>,
     send_input: Arc<SendInputRuntime>,
     voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
+    connection_context: ConnectionContextCallback,
 ) {
+    let mut context_publisher = ConnectionContextPublisher::default();
     // 进程级资源基线（2026-09-16）：与后续 episode_start / system_resume 对比，
     // 区分"资源由本进程累积"与"进程一启动系统即已被占满"。
     gatt_note(crate::resource_probe::resource_probe_note(
@@ -311,6 +382,9 @@ fn worker_loop(
     ));
     if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
         *lock(&state) = failed_snapshot(format!("WinRT 初始化失败：{error}"));
+        let snapshot = lock(&state).clone();
+        context_publisher.publish(&snapshot, &connection_context);
+        context_publisher.stop(&connection_context);
         return;
     }
     let _apartment = WinRtApartment;
@@ -340,6 +414,8 @@ fn worker_loop(
     let mut resource_probe = crate::resource_probe::ResourceProbe::default();
 
     loop {
+        let snapshot = lock(&state).clone();
+        context_publisher.publish(&snapshot, &connection_context);
         let deadline = nearest_deadline(
             nearest_deadline(capabilities_deadline, reconnect_deadline),
             extend_deadline,
@@ -630,7 +706,6 @@ fn worker_loop(
                     Ok(()) => {
                         let snapshot = ConnectionSnapshot::default();
                         *lock(&state) = snapshot.clone();
-                        apply_input_connection_phase(snapshot.phase);
                         let _ = reply.send(Ok(snapshot));
                     }
                     Err(error) => {
@@ -667,7 +742,6 @@ fn worker_loop(
                     }
                 };
                 *lock(&state) = snapshot.clone();
-                apply_input_connection_phase(snapshot.phase);
                 let _ = reply.send(Ok(snapshot));
             }
             WorkerMessage::WakeReconnect => {
@@ -750,8 +824,8 @@ fn worker_loop(
                         }
                         Err(_) => {
                             gatt_note(format!(
-                                    "chord_retry result=err attempt={attempt} epoch={epoch} error_domain=send_input error_code=retry_failed reason=injection_failed retryable=true"
-                                ));
+                                "chord_retry result=err attempt={attempt} epoch={epoch} error_domain=send_input error_code=retry_failed reason=injection_failed retryable=true"
+                            ));
                         }
                     }
                 } else {
@@ -760,6 +834,8 @@ fn worker_loop(
             }
             WorkerMessage::Control {
                 connection_generation: message_generation,
+                begin_guard,
+                stamp,
                 bytes,
             } => {
                 if message_generation == connection_generation {
@@ -776,6 +852,8 @@ fn worker_loop(
                         &mut extend_deadline,
                         &sender,
                         &voice_session_epoch,
+                        begin_guard,
+                        stamp,
                         &bytes,
                     );
                     let phase = lock(&state).phase;
@@ -822,6 +900,7 @@ fn worker_loop(
             }
             WorkerMessage::Audio {
                 connection_generation: message_generation,
+                stamp,
                 bytes,
             } => {
                 if message_generation == connection_generation {
@@ -833,6 +912,7 @@ fn worker_loop(
                         &send_input,
                         &mut held_hotkey,
                         &mut active_voice_samples,
+                        stamp,
                         &bytes,
                     );
                 }
@@ -840,19 +920,45 @@ fn worker_loop(
             WorkerMessage::ConnectionChanged {
                 connection_generation: message_generation,
                 status,
+                observed_at,
             } => {
                 if message_generation == connection_generation
                     && status == BluetoothConnectionStatus::Disconnected
                 {
                     capabilities_deadline = None;
-                    if let Err(error) = invalidate_connection(
+                    // Publish the known link loss before any blocking cleanup.
+                    // UI/input snapshots must not keep advertising Ready while
+                    // Windows is completing remote GATT teardown.
+                    publish_disconnected(
+                        &state,
+                        preferred_device_id.is_some() && !system_suspended,
+                    );
+                    if let Some(connected) = session.as_mut() {
+                        connected.link_disconnected = true;
+                    }
+                    gatt_note(format!(
+                        "ble_disconnect phase=published connection_generation={message_generation} event_queue_ms={} cleanup_pending=true",
+                        observed_at.elapsed().as_millis()
+                    ));
+                    let cleanup_started = Instant::now();
+                    let cleanup_result = invalidate_connection(
                         &mut session,
                         &mut pipeline,
                         &audio,
                         &send_input,
                         &mut held_hotkey,
                         &mut connection_generation,
-                    ) {
+                    );
+                    gatt_note(format!(
+                        "ble_disconnect phase=cleanup_completed result={} elapsed_ms={}",
+                        if cleanup_result.is_ok() {
+                            "passed"
+                        } else {
+                            "failed"
+                        },
+                        cleanup_started.elapsed().as_millis()
+                    ));
+                    if let Err(error) = cleanup_result {
                         keep_reconnecting_after_cleanup_failure(
                             &state,
                             &mut preferred_device_id,
@@ -872,7 +978,6 @@ fn worker_loop(
                     } else {
                         let mut snapshot = lock(&state);
                         snapshot.phase = ConnectionPhase::Disconnected;
-                        apply_input_connection_phase(snapshot.phase);
                         snapshot.voice_state = VoiceSessionState::Idle;
                         snapshot.last_error = Some("小米语音遥控器蓝牙连接已断开".to_owned());
                     }
@@ -912,7 +1017,6 @@ fn worker_loop(
                         );
                     } else {
                         *lock(&state) = failed_snapshot(error);
-                        apply_input_connection_phase(ConnectionPhase::Failed);
                     }
                 }
             }
@@ -969,7 +1073,6 @@ fn worker_loop(
                     last_error: Some("Windows 已进入睡眠，小米语音遥控器资源已释放".to_owned()),
                     ..ConnectionSnapshot::default()
                 };
-                apply_input_connection_phase(ConnectionPhase::Suspended);
             }
             WorkerMessage::SystemResumed => {
                 // 无条件记录本次唤醒（含"未配对到 suspend"的情形，如应用在
@@ -995,59 +1098,20 @@ fn worker_loop(
                         last_error: Some("Windows 已恢复，正在重新连接小米语音遥控器".to_owned()),
                         ..ConnectionSnapshot::default()
                     };
-                    apply_input_connection_phase(ConnectionPhase::Reconnecting);
                 } else {
                     *lock(&state) = ConnectionSnapshot::default();
-                    apply_input_connection_phase(ConnectionPhase::Idle);
                 }
             }
-            WorkerMessage::Shutdown { ack } => {
+            WorkerMessage::Shutdown => {
+                context_publisher.stop(&connection_context);
                 release_voice_hold_hotkey(&send_input, &mut held_hotkey);
                 let _ = audio.interrupt_session();
                 let _ = close_session(&mut session);
                 pipeline.interrupt();
-                // 回执放在清理之后：退出路径据此确认 `ble_session_cleanup` 已落盘。
-                if let Some(ack) = ack {
-                    let _ = ack.send(());
-                }
                 break;
             }
         }
     }
-}
-
-/// 连接相位 → 门控"遥控器在线"判定：常驻抑制键（Home/TV"遥控器优先"，
-/// key_gate.rs）仅在线时接管原生输入；离线（含 Connecting/Discovering 建
-/// 链途中、Failed、Disconnected、Suspended）恢复物理键盘原生透传。
-/// Reconnecting 视为在线：短暂断链期间保持接管稳定，避免遥控器按压在
-/// 重连间隙退回双响应（2026-09-07 方案 C 落地决策）。
-fn gate_remote_connected(phase: ConnectionPhase) -> bool {
-    matches!(
-        phase,
-        ConnectionPhase::AwaitingCapabilities
-            | ConnectionPhase::Ready
-            | ConnectionPhase::Streaming
-            | ConnectionPhase::Draining
-            | ConnectionPhase::Reconnecting
-    )
-}
-
-/// 同步连接相位到普通按键门控与语音 F5 保护。语音保护只覆盖可能收到
-/// 遥控器原生 F5、但 ATVV 会话尚未就绪的短暂建链窗口；稳定在线后继续由
-/// GATT 0x04 前置信号精确武装，失败/挂起/主动断开时不占用实体键盘 F5。
-fn apply_input_connection_phase(phase: ConnectionPhase) {
-    crate::key_gate::set_remote_connected(gate_remote_connected(phase));
-    crate::key_suppressor::set_link_guard_active(voice_link_guard_active(phase));
-}
-
-fn voice_link_guard_active(phase: ConnectionPhase) -> bool {
-    matches!(
-        phase,
-        ConnectionPhase::Connecting
-            | ConnectionPhase::Discovering
-            | ConnectionPhase::AwaitingCapabilities
-            | ConnectionPhase::Reconnecting
-    )
 }
 
 fn nearest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
@@ -1101,17 +1165,13 @@ fn attempt_connection(
         reconnect_attempt,
         ..ConnectionSnapshot::default()
     };
-    apply_input_connection_phase(if reconnecting {
-        ConnectionPhase::Reconnecting
-    } else {
-        ConnectionPhase::Connecting
-    });
 
     let connected = match BleSession::connect(
         device_id,
         sender.clone(),
         state,
         *connection_generation,
+        Arc::clone(&audio.lifecycle_epoch),
         reconnecting,
         reconnect_attempt,
     ) {
@@ -1134,7 +1194,6 @@ fn attempt_connection(
         ..ConnectionSnapshot::default()
     };
     *lock(state) = snapshot.clone();
-    apply_input_connection_phase(snapshot.phase);
     *session = Some(connected);
     *capabilities_deadline = Some(Instant::now() + CAPABILITIES_TIMEOUT);
     gatt_note(format!(
@@ -1294,7 +1353,6 @@ fn keep_reconnecting_after_cleanup_failure(
     } else {
         *reconnect_deadline = None;
         *lock(state) = failed_snapshot(user_facing_connection_error(error, false));
-        apply_input_connection_phase(ConnectionPhase::Failed);
     }
 }
 
@@ -1355,8 +1413,7 @@ fn user_facing_connection_error(error: &PlatformError, reconnecting: bool) -> St
 fn default_connection_error_text(error: &PlatformError, reconnecting: bool) -> String {
     match error {
         PlatformError::VoiceServiceMissing | PlatformError::VoiceCharacteristicMissing(_) => {
-            "小米语音遥控器的语音服务不完整。请在应用中断开重连一次遥控器；若仍失败，可能需要在 Windows 设置中移除配对后重新配对。"
-                .to_owned()
+            "小米语音遥控器的语音服务暂未就绪，正在自动重新发现并重试…".to_owned()
         }
         PlatformError::OperationTimedOut => {
             "连接小米语音遥控器的操作超时，正在自动重试…".to_owned()
@@ -1382,8 +1439,8 @@ fn schedule_reconnect(
     *reconnect_deadline = Some(Instant::now() + delay);
     let mut snapshot = lock(state);
     snapshot.phase = ConnectionPhase::Reconnecting;
-    apply_input_connection_phase(snapshot.phase);
     snapshot.capabilities = None;
+    snapshot.battery_level = None;
     snapshot.voice_state = VoiceSessionState::Idle;
     snapshot.generation = 0;
     snapshot.reconnect_attempt = attempt;
@@ -1391,6 +1448,20 @@ fn schedule_reconnect(
         "{reason}；将在 {} 秒后进行第 {attempt} 次重连",
         delay.as_secs()
     ));
+}
+
+fn publish_disconnected(state: &Arc<Mutex<ConnectionSnapshot>>, reconnecting: bool) {
+    let mut snapshot = lock(state);
+    snapshot.phase = if reconnecting {
+        ConnectionPhase::Reconnecting
+    } else {
+        ConnectionPhase::Disconnected
+    };
+    snapshot.capabilities = None;
+    snapshot.battery_level = None;
+    snapshot.voice_state = VoiceSessionState::Idle;
+    snapshot.generation = 0;
+    snapshot.last_error = Some("小米语音遥控器蓝牙连接已断开".to_owned());
 }
 
 /// 是否应当把下一次重连**立即提前**（纯判定）。
@@ -1508,10 +1579,17 @@ fn handle_control(
     extend_deadline: &mut Option<Instant>,
     sender: &Sender<WorkerMessage>,
     voice_session_epoch: &Arc<AtomicU64>,
+    begin_guard: Option<AudioBeginGuard>,
+    stamp: CallbackStamp,
     bytes: &[u8],
 ) {
     if bytes.first() == Some(&0x00) && pipeline.state() == VoiceSessionState::Idle {
         return;
+    }
+    if bytes.first() == Some(&0x00) {
+        if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.as_mut()) {
+            flow.stop = Some((stamp.at, bytes.get(1).copied()));
+        }
     }
     let output = match pipeline.handle_control(bytes) {
         Ok(output) => output,
@@ -1520,7 +1598,6 @@ fn handle_control(
             snapshot.last_error = Some(error.to_string());
             if snapshot.phase == ConnectionPhase::AwaitingCapabilities {
                 snapshot.phase = ConnectionPhase::Failed;
-                apply_input_connection_phase(ConnectionPhase::Failed);
                 snapshot.voice_state = VoiceSessionState::Idle;
             }
             return;
@@ -1531,7 +1608,6 @@ fn handle_control(
         PipelineOutput::Ready(capabilities) => {
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Ready;
-            apply_input_connection_phase(snapshot.phase);
             snapshot.capabilities = Some(capabilities);
             snapshot.voice_state = VoiceSessionState::Idle;
             snapshot.last_error = None;
@@ -1557,32 +1633,89 @@ fn handle_control(
             session_id,
             generation,
         } => {
+            if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
+                abort_voice_session(
+                    session,
+                    pipeline,
+                    state,
+                    audio,
+                    send_input,
+                    held_hotkey,
+                    active_voice_samples,
+                    Some(session_id),
+                    "语音按下在处理前已释放或取消".to_owned(),
+                );
+                return;
+            }
+            // ATVV CONTROL 0x04 is the existing, device-attributed voice DOWN
+            // boundary. Notify the scene before any hotkey/audio work so a
+            // visible menu closes without adding latency to the voice path.
+            crate::scene_control::notify_voice_activity(true);
             // 语音会话纪元 +1：本轮 wetype_check 阶梯以此为 armed 纪元，
             // 后续新会话会使旧阶梯的核对失效（防跨会话误伤）。
             let epoch = voice_session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
             *active_voice_samples = 0;
             if let Some(session) = session {
                 session.microphone_opened = true;
+                if let Some(previous) = session.voice_flow.take() {
+                    previous.emit("superseded");
+                }
+                session.voice_flow = Some(VoiceFlow::new(generation, stamp));
             }
             // 排定 MIC_EXTEND 续期节拍：遥控器固件只给约 5-6 秒免费音频窗口，
             // 未续期即停止推流（RC003 长按实测掐断，RC001 短按不触窗）。
-            *extend_deadline = Some(Instant::now() + MICROPHONE_EXTEND_INTERVAL);
             // 遥控器语音键同时以 HID 键盘 F5 上报，会让微信输入法的语音和弦
             // 因“额外按键”被拒绝：会话期间武装 F5 抑制器（见 key_suppressor）。
             // 注意：必须武装 key_suppressor（lib.rs 实际启动的抑制器）；
             // 2026-09-04 曾因误接未启动的 voice_key_suppressor 模块导致 F5
             // 泄漏进和弦、微信输入法拒绝触发（evidence/p 复盘）。
-            crate::key_suppressor::set_session_active(true);
+
             // F5 解粘保险（2026-09-05 21:08 实证链路）：断连重连场景下
             // 首个 F5 D 在 0x04 之前泄漏进 OS（重连需 ~3s，武装不可能
             // 提前），其 UP 沿若丢失则 OS 键态 F5 永久按下——后续和弦
             // 全部变成 F5+Ctrl+Win 三键被拒。注入一个 F5 UP 清理：
             // 干净场景（本抑制器全吞）下该 UP 也会被吞（配对规则），
             // 仅在确有泄漏时放行到 OS——恰好只在需要时生效。
+            if let Err(error) = audio.begin_session(generation, begin_guard.clone()) {
+                gatt_note(format!(
+                    "audio_begin result=err session={session_id} error_domain=audio error_code=begin_failed reason=wasapi_rejected retryable=true"
+                ));
+                abort_voice_session(
+                    session,
+                    pipeline,
+                    state,
+                    audio,
+                    send_input,
+                    held_hotkey,
+                    active_voice_samples,
+                    Some(session_id),
+                    error.to_string(),
+                );
+                return;
+            }
+            // Audio notifications remain queued on this BLE worker while routing
+            // is prepared. No decoded PCM reaches WASAPI before the target hotkey.
+            let route_permit = match audio.capture.begin(generation, begin_guard.clone()) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        format!("临时输入设备准备失败：{error}"),
+                    );
+                    return;
+                }
+            };
             send_input.release_stuck_f5();
             std::thread::sleep(Duration::from_millis(20));
             // 按住说话快捷键（参考 ZSTDJan/Voice_VibeCoding）：先注入快捷键
-            // DOWN，再开始音频会话；注入失败直接中止本次会话并统一释放。
+            // DOWN；WASAPI 准备已完成，注入失败直接中止并统一释放。
             if let Some(chord) = lock(voice_hold_hotkey).clone() {
                 let mic_baseline = wetype_mic_observation();
                 // 会话级激活微信输入法：其语音热键只在自身为当前会话活动
@@ -1591,6 +1724,22 @@ fn handle_control(
                 // 行为注入（不比现状更差）。
                 if let Err(error) = crate::ime::activate_wetype_session() {
                     lock(state).last_error = Some(error);
+                }
+                if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
+                    || route_permit.as_ref().is_some_and(|p| p.cancelled())
+                {
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        "语音启动准备已释放或取消".to_owned(),
+                    );
+                    return;
                 }
                 if let Err(error) = send_input.press(&chord) {
                     gatt_note(format!(
@@ -1606,6 +1755,24 @@ fn handle_control(
                         active_voice_samples,
                         Some(session_id),
                         format!("按住说话快捷键注入失败：{error}"),
+                    );
+                    return;
+                }
+                if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
+                    || route_permit.as_ref().is_some_and(|p| p.cancelled())
+                {
+                    *held_hotkey = Some(chord);
+                    release_voice_hold_hotkey(send_input, held_hotkey);
+                    abort_voice_session(
+                        session,
+                        pipeline,
+                        state,
+                        audio,
+                        send_input,
+                        held_hotkey,
+                        active_voice_samples,
+                        Some(session_id),
+                        "语音启动准备已释放或取消".to_owned(),
                     );
                     return;
                 }
@@ -1632,10 +1799,9 @@ fn handle_control(
                     "chord_press result=skipped session={session_id} reason=no_hotkey"
                 ));
             }
-            if let Err(error) = audio.begin_session(generation) {
-                gatt_note(format!(
-                    "audio_begin result=err session={session_id} error_domain=audio error_code=begin_failed reason=wasapi_rejected retryable=true"
-                ));
+            if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
+                || route_permit.as_ref().is_some_and(|p| p.cancelled())
+            {
                 abort_voice_session(
                     session,
                     pipeline,
@@ -1645,13 +1811,14 @@ fn handle_control(
                     held_hotkey,
                     active_voice_samples,
                     Some(session_id),
-                    error.to_string(),
+                    "语音启动准备已释放或取消".to_owned(),
                 );
                 return;
             }
+            crate::key_suppressor::set_session_active(true);
+            *extend_deadline = Some(Instant::now() + MICROPHONE_EXTEND_INTERVAL);
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Streaming;
-            apply_input_connection_phase(ConnectionPhase::Streaming);
             snapshot.voice_state = VoiceSessionState::Streaming;
             snapshot.generation = generation;
             snapshot.last_error = None;
@@ -1668,7 +1835,6 @@ fn handle_control(
             {
                 let mut snapshot = lock(state);
                 snapshot.phase = ConnectionPhase::Draining;
-                apply_input_connection_phase(ConnectionPhase::Draining);
                 snapshot.voice_state = VoiceSessionState::Draining;
             }
             if let Err(error) = audio.finish_session(generation) {
@@ -1685,6 +1851,9 @@ fn handle_control(
                 );
                 return;
             }
+            if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.take()) {
+                flow.emit("control_stop");
+            }
             if let Err(error) = pipeline.complete_drain(generation) {
                 lock(state).last_error = Some(error.to_string());
                 return;
@@ -1693,7 +1862,6 @@ fn handle_control(
             *active_voice_samples = 0;
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Ready;
-            apply_input_connection_phase(snapshot.phase);
             snapshot.voice_state = VoiceSessionState::Idle;
         }
         PipelineOutput::DecoderSynchronized { .. }
@@ -1710,6 +1878,7 @@ fn handle_audio(
     send_input: &SendInputRuntime,
     held_hotkey: &mut Option<KeyChord>,
     active_voice_samples: &mut u64,
+    stamp: CallbackStamp,
     bytes: &[u8],
 ) {
     if pipeline.state() != VoiceSessionState::Streaming {
@@ -1729,12 +1898,28 @@ fn handle_audio(
         );
         return;
     }
+    let callback_attributed = session
+        .as_mut()
+        .and_then(|s| s.voice_flow.as_mut())
+        .map(|flow| {
+            let attributed =
+                stamp.release_epoch == flow.start.release_epoch && stamp.at >= flow.start.at;
+            flow.observe(stamp, bytes.len(), 0, Instant::now());
+            attributed
+        });
     match pipeline.handle_audio(bytes) {
         Ok(PipelineOutput::Samples {
             generation,
             samples,
         }) => {
             let sample_count = samples.len();
+            if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.as_mut()) {
+                if callback_attributed == Some(true) {
+                    flow.decoded += sample_count as u64;
+                } else {
+                    flow.unattributed_decoded += sample_count as u64;
+                }
+            }
             if let Err(error) = audio.enqueue_samples(generation, samples) {
                 abort_voice_session(
                     session,
@@ -1756,6 +1941,9 @@ fn handle_audio(
         }
         Ok(_) => {}
         Err(error) => {
+            if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.as_mut()) {
+                flow.decode_errors += 1;
+            }
             lock(state).last_error = Some(error.to_string());
         }
     }
@@ -1779,6 +1967,9 @@ fn abort_voice_session(
         let _ = connected.request_microphone_close(capabilities.version, session_id);
     }
     let _ = audio.interrupt_session();
+    if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.take()) {
+        flow.emit("abort");
+    }
     pipeline.interrupt();
     *active_voice_samples = 0;
     let mut snapshot = lock(state);
@@ -1787,7 +1978,6 @@ fn abort_voice_session(
     } else {
         ConnectionPhase::Failed
     };
-    apply_input_connection_phase(snapshot.phase);
     snapshot.voice_state = VoiceSessionState::Idle;
     snapshot.last_error = Some(error);
 }
@@ -1797,6 +1987,9 @@ fn abort_voice_session(
 /// 释放失败会记录在 SendInput 快照的 last_error 中，由诊断摘要呈现。
 /// 同时解除语音键 F5 抑制器的会话武装（覆盖停止/中止/断连/退出全部路径）。
 fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+    // This helper is the existing common cleanup boundary for normal stop,
+    // abort, disconnect, sleep and shutdown. The notification is idempotent.
+    crate::scene_control::notify_voice_activity(false);
     crate::key_suppressor::set_session_active(false);
     if let Some(chord) = held_hotkey.take() {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。
@@ -1828,6 +2021,220 @@ fn close_session(session: &mut Option<BleSession>) -> Result<(), PlatformError> 
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CallbackStamp {
+    at: Instant,
+    release_epoch: u64,
+}
+
+struct VoiceFlow {
+    generation: u64,
+    start: CallbackStamp,
+    packets: u64,
+    bytes: u64,
+    decoded: u64,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    max_gap: Duration,
+    max_queue_delay: Duration,
+    unattributed_packets: u64,
+    unattributed_decoded: u64,
+    reordered_callbacks: u64,
+    decode_errors: u64,
+    stop: Option<(Instant, Option<u8>)>,
+}
+impl VoiceFlow {
+    fn new(generation: u64, start: CallbackStamp) -> Self {
+        Self {
+            generation,
+            start,
+            packets: 0,
+            bytes: 0,
+            decoded: 0,
+            first: None,
+            last: None,
+            max_gap: Duration::ZERO,
+            max_queue_delay: Duration::ZERO,
+            unattributed_packets: 0,
+            unattributed_decoded: 0,
+            reordered_callbacks: 0,
+            decode_errors: 0,
+            stop: None,
+        }
+    }
+    fn observe(&mut self, stamp: CallbackStamp, bytes: usize, decoded: usize, now: Instant) {
+        // An old callback can enqueue after a new START. Do not attribute its
+        // metadata to the new generation. This diagnostic does not filter audio.
+        if stamp.release_epoch != self.start.release_epoch || stamp.at < self.start.at {
+            self.unattributed_packets += 1;
+            self.unattributed_decoded += decoded as u64;
+            return;
+        }
+        self.packets += 1;
+        self.bytes += bytes as u64;
+        self.decoded += decoded as u64;
+        self.first = Some(self.first.map_or(stamp.at, |t| t.min(stamp.at)));
+        if let Some(last) = self.last {
+            if stamp.at < last {
+                self.reordered_callbacks += 1;
+            } else {
+                self.max_gap = self.max_gap.max(stamp.at.duration_since(last));
+            }
+        }
+        self.last = Some(self.last.map_or(stamp.at, |t| t.max(stamp.at)));
+        self.max_queue_delay = self
+            .max_queue_delay
+            .max(now.saturating_duration_since(stamp.at));
+    }
+    fn emit(self, terminal: &'static str) {
+        let end = self.stop.map_or_else(Instant::now, |s| s.0);
+        let ms = |t: Option<Instant>| {
+            t.map(|t| {
+                t.saturating_duration_since(self.start.at)
+                    .as_millis()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "none".to_owned())
+        };
+        let raw = self
+            .stop
+            .and_then(|s| s.1)
+            .map(|b| format!("{b:02X}"))
+            .unwrap_or_else(|| "none".to_owned());
+        // raw reason is authoritative; a remote claim is not physical key proof.
+        gatt_note(format!("voice_flow generation={} terminal={terminal} elapsed_ms={} callback_packets={} callback_bytes={} decoded_samples={} first_callback_ms={} last_callback_ms={} last_callback_age_ms={} max_callback_gap_ms={} max_worker_queue_delay_ms={} reordered_callbacks={} decode_errors={} unattributed_packets={} unattributed_decoded_samples={} stop_opcode={} stop_reason_raw={raw}",
+            self.generation, end.saturating_duration_since(self.start.at).as_millis(), self.packets, self.bytes, self.decoded,
+            ms(self.first), ms(self.last), self.last.map(|t| end.saturating_duration_since(t).as_millis().to_string()).unwrap_or_else(|| "none".to_owned()),
+            self.max_gap.as_millis(), self.max_queue_delay.as_millis(), self.reordered_callbacks, self.decode_errors, self.unattributed_packets,
+            self.unattributed_decoded, if self.stop.is_some() { "00" } else { "none" }));
+    }
+}
+
+#[cfg(test)]
+mod voice_flow_tests {
+    use super::{CallbackStamp, VoiceFlow};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn consecutive_session_does_not_attribute_old_callbacks() {
+        let at = Instant::now();
+        let mut first = VoiceFlow::new(
+            1,
+            CallbackStamp {
+                at,
+                release_epoch: 7,
+            },
+        );
+        first.observe(
+            CallbackStamp {
+                at: at + Duration::from_millis(10),
+                release_epoch: 7,
+            },
+            120,
+            240,
+            at + Duration::from_millis(15),
+        );
+        let mut second = VoiceFlow::new(
+            2,
+            CallbackStamp {
+                at: at + Duration::from_secs(1),
+                release_epoch: 8,
+            },
+        );
+        second.observe(
+            CallbackStamp {
+                at: at + Duration::from_millis(20),
+                release_epoch: 7,
+            },
+            120,
+            240,
+            at + Duration::from_secs(1),
+        );
+        second.observe(
+            CallbackStamp {
+                at: at + Duration::from_millis(1010),
+                release_epoch: 8,
+            },
+            120,
+            240,
+            at + Duration::from_millis(1012),
+        );
+        assert_eq!((first.generation, first.decoded), (1, 240));
+        assert_eq!(
+            (second.generation, second.packets, second.decoded),
+            (2, 1, 240)
+        );
+        assert_eq!(
+            (second.unattributed_packets, second.unattributed_decoded),
+            (1, 240)
+        );
+        assert_eq!(second.max_queue_delay, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn abort_then_new_start_rejects_pre_start_metadata_even_same_epoch() {
+        let at = Instant::now();
+        let prior = VoiceFlow::new(
+            1,
+            CallbackStamp {
+                at,
+                release_epoch: 3,
+            },
+        );
+        drop(prior); // Abort retires the aggregate; no statistics carry to next generation.
+        let mut next = VoiceFlow::new(
+            2,
+            CallbackStamp {
+                at: at + Duration::from_secs(1),
+                release_epoch: 3,
+            },
+        );
+        next.observe(
+            CallbackStamp {
+                at,
+                release_epoch: 3,
+            },
+            120,
+            240,
+            at + Duration::from_secs(1),
+        );
+        assert_eq!((next.packets, next.bytes, next.decoded), (0, 0, 0));
+        assert!(next.first.is_none() && next.last.is_none());
+        assert_eq!(next.unattributed_packets, 1);
+    }
+
+    #[test]
+    fn reordered_callbacks_preserve_first_last_and_do_not_invent_gap() {
+        let at = Instant::now();
+        let mut flow = VoiceFlow::new(
+            1,
+            CallbackStamp {
+                at,
+                release_epoch: 0,
+            },
+        );
+        for millis in [30, 10, 50] {
+            flow.observe(
+                CallbackStamp {
+                    at: at + Duration::from_millis(millis),
+                    release_epoch: 0,
+                },
+                120,
+                240,
+                at + Duration::from_millis(60),
+            );
+        }
+        assert_eq!(flow.first, Some(at + Duration::from_millis(10)));
+        assert_eq!(flow.last, Some(at + Duration::from_millis(50)));
+        assert_eq!(
+            (flow.packets, flow.decoded, flow.reordered_callbacks),
+            (3, 720, 1)
+        );
+        assert_eq!(flow.max_gap, Duration::from_millis(20));
+        assert_eq!(flow.max_queue_delay, Duration::from_millis(50));
+    }
+}
+
 struct BleSession {
     battery_monitor: Option<crate::battery::BatteryMonitor>,
     name: String,
@@ -1843,7 +2250,10 @@ struct BleSession {
     /// ThroughputOptimized 连接参数请求（2026-09-07 新增）：持有以维持偏好
     /// 生效；Windows 11 前的宿主上请求失败时为 None（降级默认参数）。
     params_request: Option<BluetoothLEPreferredConnectionParametersRequest>,
+    release_epoch: Arc<AtomicU64>,
     microphone_opened: bool,
+    voice_flow: Option<VoiceFlow>,
+    link_disconnected: bool,
     cleanup_started: bool,
     service_closed: bool,
     device_closed: bool,
@@ -1905,7 +2315,12 @@ impl PendingBleConnection {
             .expect("pending control characteristic is owned")
     }
 
-    fn finish(mut self, name: String, model: RemoteModel) -> BleSession {
+    fn finish(
+        mut self,
+        name: String,
+        model: RemoteModel,
+        release_epoch: Arc<AtomicU64>,
+    ) -> BleSession {
         BleSession {
             battery_monitor: None,
             name,
@@ -1937,6 +2352,9 @@ impl PendingBleConnection {
                 .take()
                 .expect("pending connection subscription is owned"),
             params_request: self.params_request.take(),
+            release_epoch,
+            voice_flow: None,
+            link_disconnected: false,
             microphone_opened: false,
             cleanup_started: false,
             service_closed: false,
@@ -2022,6 +2440,7 @@ impl BleSession {
         sender: Sender<WorkerMessage>,
         state: &Arc<Mutex<ConnectionSnapshot>>,
         connection_generation: u64,
+        lifecycle_epoch: Arc<AtomicU64>,
         reconnecting: bool,
         reconnect_attempt: u32,
     ) -> Result<Self, PlatformError> {
@@ -2096,7 +2515,6 @@ impl BleSession {
         {
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Discovering;
-            apply_input_connection_phase(snapshot.phase);
             snapshot.remote_name = Some(name.clone());
             snapshot.remote_model = model;
             snapshot.last_error = None;
@@ -2126,6 +2544,7 @@ impl BleSession {
             || find_characteristic(pending.service(), CONTROL_UUID, "control"),
         )?);
 
+        let release_epoch = Arc::new(AtomicU64::new(0));
         pending.audio_token = Some(connect_stage(
             reconnecting,
             reconnect_attempt,
@@ -2136,6 +2555,8 @@ impl BleSession {
                     sender.clone(),
                     WorkerChannel::Audio,
                     connection_generation,
+                    Arc::clone(&release_epoch),
+                    Arc::clone(&lifecycle_epoch),
                 )
             },
         )?);
@@ -2149,18 +2570,27 @@ impl BleSession {
                     sender.clone(),
                     WorkerChannel::Control,
                     connection_generation,
+                    Arc::clone(&release_epoch),
+                    Arc::clone(&lifecycle_epoch),
                 )
             },
         )?);
         let battery_sender = sender.clone();
+        let disconnected_epoch = Arc::clone(&release_epoch);
         let connection_handler =
             TypedEventHandler::<BluetoothLEDevice, windows::core::IInspectable>::new(
                 move |device, _| {
                     if let Some(device) = device.as_ref() {
                         if let Ok(status) = device.ConnectionStatus() {
+                            let observed_at = Instant::now();
+                            if status == BluetoothConnectionStatus::Disconnected {
+                                disconnected_epoch.fetch_add(1, Ordering::SeqCst);
+                                gatt_note(format!("ble_disconnect phase=callback connection_generation={connection_generation}"));
+                            }
                             let _ = sender.send(WorkerMessage::ConnectionChanged {
                                 connection_generation,
                                 status,
+                                observed_at,
                             });
                         }
                     }
@@ -2179,7 +2609,7 @@ impl BleSession {
             },
         )?);
 
-        let mut connected = pending.finish(name, model);
+        let mut connected = pending.finish(name, model, release_epoch);
         connect_stage(
             reconnecting,
             reconnect_attempt,
@@ -2259,6 +2689,7 @@ impl BleSession {
         ));
         if !self.cleanup_started {
             self.cleanup_started = true;
+            self.release_epoch.fetch_add(1, Ordering::SeqCst);
             self.battery_monitor.take();
             let mut best_effort_failures = 0u32;
             if self.audio.RemoveValueChanged(self.audio_token).is_err() {
@@ -2274,14 +2705,19 @@ impl BleSession {
             {
                 best_effort_failures += 1;
             }
-            // The remote CCCD can no longer be written after a physical
-            // disconnect. Handler removal and object Close are the ownership
-            // boundary; notification disable is best-effort in that state.
-            if disable_notifications(&self.audio).is_err() {
-                best_effort_failures += 1;
-            }
-            if disable_notifications(&self.control).is_err() {
-                best_effort_failures += 1;
+            let link_disconnected = self.link_disconnected
+                || self.device.ConnectionStatus().ok()
+                    == Some(BluetoothConnectionStatus::Disconnected);
+            if link_disconnected {
+                gatt_note("ble_cleanup phase=remote_cccd action=skipped reason=link_disconnected local_close_required=true".to_owned());
+            } else {
+                let started = Instant::now();
+                let audio_result = disable_notifications(&self.audio);
+                let control_result = disable_notifications(&self.control);
+                gatt_note(format!(
+                    "ble_cleanup phase=remote_cccd action=attempted audio_ok={} control_ok={} elapsed_ms={}",
+                    audio_result.is_ok(), control_result.is_ok(), started.elapsed().as_millis()
+                ));
             }
             if let Some(request) = self.params_request.take() {
                 if request.Close().is_err() {
@@ -2312,6 +2748,9 @@ impl BleSession {
             }
         }
         self.closed = self.service_closed && self.device_closed;
+        if let Some(flow) = self.voice_flow.take() {
+            flow.emit("connection_close");
+        }
         if errors.is_empty() {
             gatt_note(format!(
                 "ble_session_cleanup phase=completed terminal_result=passed retrying={retrying}"
@@ -2483,11 +2922,21 @@ pub fn gatt_note(note: String) {
                 file,
                 "{timestamp} pid={} ver={} build={} source_revision={} build_channel={} release_tag={} {note}",
                 std::process::id(),
-                metadata.map(|value| value.app_version.as_str()).unwrap_or("unknown"),
-                metadata.map(|value| value.app_build.as_str()).unwrap_or("unknown"),
-                metadata.map(|value| value.source_revision.as_str()).unwrap_or("unknown"),
-                metadata.map(|value| value.build_channel.as_str()).unwrap_or("unknown"),
-                metadata.map(|value| value.release_tag.as_str()).unwrap_or("unknown"),
+                metadata
+                    .map(|value| value.app_version.as_str())
+                    .unwrap_or("unknown"),
+                metadata
+                    .map(|value| value.app_build.as_str())
+                    .unwrap_or("unknown"),
+                metadata
+                    .map(|value| value.source_revision.as_str())
+                    .unwrap_or("unknown"),
+                metadata
+                    .map(|value| value.build_channel.as_str())
+                    .unwrap_or("unknown"),
+                metadata
+                    .map(|value| value.release_tag.as_str())
+                    .unwrap_or("unknown"),
             );
             let _ = file.flush();
         }
@@ -2659,15 +3108,28 @@ fn spawn_wetype_check(
         .ok();
 }
 
+fn invalidate_control_callback(channel: WorkerChannel, release_epoch: &AtomicU64) {
+    if matches!(channel, WorkerChannel::Control) {
+        release_epoch.fetch_add(1, Ordering::SeqCst);
+        gatt_note("voice_prepare action=invalidate reason=control_callback_error".to_owned());
+    }
+}
+
 fn subscribe(
     characteristic: &GattCharacteristic,
     sender: Sender<WorkerMessage>,
     channel: WorkerChannel,
     connection_generation: u64,
+    release_epoch: Arc<AtomicU64>,
+    lifecycle_epoch: Arc<AtomicU64>,
 ) -> Result<i64, PlatformError> {
     let callback_sender = sender.clone();
     let handler =
         TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(move |_, args| {
+            let stamp = CallbackStamp {
+                at: Instant::now(),
+                release_epoch: release_epoch.load(Ordering::SeqCst),
+            };
             let result = args
                 .ok()
                 .and_then(|args| args.CharacteristicValue())
@@ -2692,19 +3154,44 @@ fn subscribe(
                     if matches!(channel, WorkerChannel::Control) {
                         crate::key_suppressor::arm_grace();
                     }
+                    let begin_guard = if matches!(channel, WorkerChannel::Control) {
+                        match sayall_core::AtvvControlEvent::parse(&bytes) {
+                            Ok(sayall_core::AtvvControlEvent::StreamStopped) => {
+                                release_epoch.fetch_add(1, Ordering::SeqCst);
+                                gatt_note(
+                                    "voice_prepare action=invalidate reason=control_stop"
+                                        .to_owned(),
+                                );
+                                None
+                            }
+                            Ok(sayall_core::AtvvControlEvent::StreamStarted { .. }) => {
+                                Some(AudioBeginGuard::new(
+                                    Arc::clone(&release_epoch),
+                                    Arc::clone(&lifecycle_epoch),
+                                ))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     let message = match channel {
                         WorkerChannel::Audio => WorkerMessage::Audio {
                             connection_generation,
+                            stamp,
                             bytes,
                         },
                         WorkerChannel::Control => WorkerMessage::Control {
                             connection_generation,
+                            begin_guard,
+                            stamp,
                             bytes,
                         },
                     };
                     let _ = callback_sender.send(message);
                 }
                 Err(error) => {
+                    invalidate_control_callback(channel, &release_epoch);
                     let _ = callback_sender.send(WorkerMessage::CallbackError {
                         connection_generation,
                         error: format!("读取 GATT 通知失败：{error}"),
@@ -3006,6 +3493,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_callback_error_invalidates_before_worker_dispatch() {
+        let release = Arc::new(AtomicU64::new(0));
+        let guard = AudioBeginGuard::new(release.clone(), Arc::new(AtomicU64::new(0)));
+        invalidate_control_callback(WorkerChannel::Audio, &release);
+        assert!(!guard.cancelled());
+        invalidate_control_callback(WorkerChannel::Control, &release);
+        assert!(guard.cancelled());
+    }
+
+    #[test]
+    fn connection_context_tracks_background_lifecycle_and_stays_off_after_shutdown() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback: ConnectionContextCallback = Arc::new({
+            let observed = Arc::clone(&observed);
+            move |model, connected| lock(&observed).push((model, connected))
+        });
+        let mut publisher = ConnectionContextPublisher::default();
+        let snapshot = |phase, remote_model| ConnectionSnapshot {
+            phase,
+            remote_model,
+            ..ConnectionSnapshot::default()
+        };
+
+        publisher.publish(
+            &snapshot(ConnectionPhase::AwaitingCapabilities, RemoteModel::Rc001),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::AwaitingCapabilities, RemoteModel::Rc001),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::Ready, RemoteModel::Rc001),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::Streaming, RemoteModel::Rc001),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::Disconnected, RemoteModel::Rc001),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::Reconnecting, RemoteModel::Rc001),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::AwaitingCapabilities, RemoteModel::Rc003),
+            &callback,
+        );
+        publisher.publish(
+            &snapshot(ConnectionPhase::Ready, RemoteModel::Rc003),
+            &callback,
+        );
+        publisher.stop(&callback);
+        publisher.publish(
+            &snapshot(ConnectionPhase::Ready, RemoteModel::Rc001),
+            &callback,
+        );
+
+        assert_eq!(
+            *lock(&observed),
+            vec![
+                (RemoteModel::Rc001, false),
+                (RemoteModel::Rc001, true),
+                (RemoteModel::Rc001, false),
+                (RemoteModel::Rc003, false),
+                (RemoteModel::Rc003, true),
+                (RemoteModel::Unknown, false),
+            ]
+        );
+    }
+
+    #[test]
     fn paired_device_id_uses_the_last_embedded_address_as_the_peer() {
         let device_id = "BluetoothLE#BluetoothLE00:11:22:33:44:55-66:77:88:99:AA:BB";
         assert_eq!(
@@ -3250,6 +3812,49 @@ mod tests {
     }
 
     #[test]
+    fn physical_disconnect_snapshot_is_not_ready_while_cleanup_is_pending() {
+        for reconnecting in [false, true] {
+            let state = Arc::new(Mutex::new(ConnectionSnapshot {
+                phase: ConnectionPhase::Streaming,
+                remote_model: RemoteModel::Rc003,
+                remote_name: Some("test-remote".to_owned()),
+                generation: 42,
+                voice_state: VoiceSessionState::Streaming,
+                ..ConnectionSnapshot::default()
+            }));
+            publish_disconnected(&state, reconnecting);
+            // A separate snapshot reader remains usable before teardown finishes.
+            let reader = Arc::clone(&state);
+            let snapshot = std::thread::spawn(move || lock(&reader).clone())
+                .join()
+                .unwrap();
+            assert!(!input_execution_connected(snapshot.phase));
+            assert_eq!(
+                snapshot.phase,
+                if reconnecting {
+                    ConnectionPhase::Reconnecting
+                } else {
+                    ConnectionPhase::Disconnected
+                }
+            );
+            assert_eq!(snapshot.remote_model, RemoteModel::Rc003);
+            assert_eq!(snapshot.remote_name.as_deref(), Some("test-remote"));
+            assert_eq!(snapshot.voice_state, VoiceSessionState::Idle);
+            assert_eq!(snapshot.generation, 0);
+            assert!(snapshot.capabilities.is_none());
+            // Finishing cleanup may schedule retry but cannot make the stale
+            // Ready snapshot visible again.
+            if reconnecting {
+                let mut backoff = ReconnectBackoff::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
+                let mut deadline = None;
+                schedule_reconnect(&state, &mut backoff, &mut deadline, "test-disconnect");
+                assert!(!input_execution_connected(lock(&state).phase));
+                assert!(deadline.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn reconnect_schedule_reports_attempt_and_exponential_delay() {
         let state = Arc::new(Mutex::new(ConnectionSnapshot::default()));
         let mut backoff = ReconnectBackoff::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
@@ -3266,35 +3871,6 @@ mod tests {
         let second = lock(&state).clone();
         assert_eq!(second.reconnect_attempt, 2);
         assert!(second.last_error.unwrap().contains("4 秒后"));
-    }
-
-    #[test]
-    fn voice_f5_guard_only_covers_link_establishment() {
-        for phase in [
-            ConnectionPhase::Connecting,
-            ConnectionPhase::Discovering,
-            ConnectionPhase::AwaitingCapabilities,
-            ConnectionPhase::Reconnecting,
-        ] {
-            assert!(
-                voice_link_guard_active(phase),
-                "expected guard for {phase:?}"
-            );
-        }
-        for phase in [
-            ConnectionPhase::Idle,
-            ConnectionPhase::Ready,
-            ConnectionPhase::Streaming,
-            ConnectionPhase::Draining,
-            ConnectionPhase::Disconnected,
-            ConnectionPhase::Suspended,
-            ConnectionPhase::Failed,
-        ] {
-            assert!(
-                !voice_link_guard_active(phase),
-                "unexpected guard for {phase:?}"
-            );
-        }
     }
 
     #[test]

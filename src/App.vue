@@ -16,7 +16,9 @@ import {
 import AboutPage from "./pages/AboutPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
+import DriverGuidePage from "./pages/DriverGuidePage.vue";
 import PermissionsPage from "./pages/PermissionsPage.vue";
+import TemplatesPage from "./pages/TemplatesPage.vue";
 
 const activePage = ref<PageId>(loadPersistedPage() ?? "buttons");
 watch(activePage, (page) => persistActivePage(page));
@@ -48,7 +50,9 @@ function handleWindowKeydown(event: KeyboardEvent): void {
 }
 
 const activeComponent = computed(() => ({
+  drivers: DriverGuidePage,
   buttons: ButtonsPage,
+  templates: TemplatesPage,
   connection: ConnectionPage,
   permissions: PermissionsPage,
   about: AboutPage,
@@ -123,7 +127,7 @@ onUnmounted(() => {
 <template>
   <div class="app-shell">
     <Sidebar :active-page="activePage" @select="activePage = $event" />
-    <main class="content">
+    <main class="content" :class="{ 'content-buttons': activePage === 'buttons' }">
       <div v-if="loadError" class="error-banner">无法读取运行状态：{{ loadError }}</div>
       <div v-if="updateBannerVisible" class="update-banner">
         <span>发现新版本 {{ updateInfo?.version }}</span>

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
 pub mod app_launcher;
+pub mod application_control;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
@@ -21,10 +22,14 @@ mod bluetooth_radio;
 pub use bluetooth_radio::prepare_bluetooth_radio_recovery;
 mod button_gestures;
 pub mod button_mapping;
+pub mod capture_input;
 pub mod compatibility;
+pub mod component_support;
 pub mod file_dialog;
 #[cfg(windows)]
 pub mod graceful_exit;
+pub mod hid_host;
+mod input_driver;
 pub mod registered_apps;
 #[cfg(windows)]
 pub use ble::{
@@ -46,11 +51,13 @@ mod raw_input_windows;
 mod reconnect;
 #[cfg(windows)]
 mod resource_probe;
+pub mod scene_control;
 pub mod send_input;
 /// 真实注入运行时（2026-09-06 起 pub：预设注入链路真机验证探针
 /// examples/preset_inject_probe.rs 需复用与映射引擎完全相同的管线）。
 #[cfg(windows)]
 pub mod send_input_windows;
+pub mod templates;
 #[cfg(windows)]
 mod wetype_revive;
 
@@ -227,6 +234,7 @@ pub struct WindowsPlatform {
     usage: Arc<UsageCounters>,
     voice_hold_hotkey: Arc<Mutex<Option<send_input::KeyChord>>>,
     button_mapping: Arc<ButtonMappingRuntime>,
+    scene_control: Arc<scene_control::SceneController>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
     // 抑制器与门控句柄"持有即运行"：字段本身不被读取，随平台生命周期保活
     //（Drop 时停止钩子线程）。
@@ -268,6 +276,34 @@ impl MappingInjector for UnsupportedInjector {
     }
 }
 
+fn subscribe_button_profile(
+    scene: &Arc<scene_control::SceneController>,
+    runtime: &Arc<ButtonMappingRuntime>,
+) {
+    let weak_scene = Arc::downgrade(scene);
+    let runtime = Arc::clone(runtime);
+    scene.subscribe(Arc::new(move |event| {
+        if matches!(event, scene_control::SceneEvent::Snapshot { .. }) {
+            if let Some(scene) = weak_scene.upgrade() {
+                let (profile, semantic, generation, foreground, notice) =
+                    scene.application_mapping_update();
+                runtime.set_application_mappings(profile, semantic);
+                let weak = Arc::downgrade(&scene);
+                runtime.publish_mapping_notice(move |available| {
+                    if let Some(scene) = weak.upgrade() {
+                        scene.confirm_mapping_notice(
+                            generation,
+                            foreground,
+                            notice.clone(),
+                            available,
+                        );
+                    }
+                });
+            }
+        }
+    }));
+}
+
 impl Default for WindowsPlatform {
     fn default() -> Self {
         let usage = Arc::new(UsageCounters::default());
@@ -289,6 +325,17 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
             ));
+            let scene_control = scene_control::SceneController::new();
+            scene_control::register_voice_scene(&scene_control);
+            subscribe_button_profile(&scene_control, &button_mapping);
+            button_mapping.set_gesture_handler(Some(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |gesture| scene.handle_gesture(gesture)
+            })));
+            button_mapping.subscribe_button_edges(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |edge| scene.handle_edge(edge)
+            }));
             // 语音键 F5 抑制器与 BLE 工作线程通过模块级静态状态协作，
             // 这里只负责随平台生命周期启动/停止。
             let voice_key_suppressor = Arc::new(key_suppressor::VoiceKeySuppressor::start());
@@ -299,10 +346,15 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&send_input),
                 Arc::clone(&voice_hold_hotkey),
+                Arc::new({
+                    let button_mapping = Arc::clone(&button_mapping);
+                    move |model, connected| button_mapping.set_input_context(model, connected)
+                }),
             ));
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
                 button_mapping.sender(),
+                Some(Arc::clone(&button_mapping)),
             ));
             // 遥控器 HID 活动通知接线（断连时遥控器醒来按键 → 立即重连）。
             let wake_runtime = Arc::clone(&runtime);
@@ -320,6 +372,7 @@ impl Default for WindowsPlatform {
                 usage,
                 voice_hold_hotkey,
                 button_mapping,
+                scene_control,
                 raw_input_snapshot,
                 voice_key_suppressor,
                 key_gate,
@@ -340,10 +393,22 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
             ));
+            let scene_control = scene_control::SceneController::new();
+            scene_control::register_voice_scene(&scene_control);
+            subscribe_button_profile(&scene_control, &button_mapping);
+            button_mapping.set_gesture_handler(Some(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |gesture| scene.handle_gesture(gesture)
+            })));
+            button_mapping.subscribe_button_edges(Arc::new({
+                let scene = Arc::clone(&scene_control);
+                move |edge| scene.handle_edge(edge)
+            }));
             Self {
                 usage,
                 voice_hold_hotkey,
                 button_mapping,
+                scene_control,
                 raw_input_snapshot,
             }
         }
@@ -351,27 +416,96 @@ impl Default for WindowsPlatform {
 }
 
 impl WindowsPlatform {
+    pub fn capture_config_gate(&self) -> Arc<Mutex<()>> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.config_gate.clone()
+        }
+        #[cfg(not(windows))]
+        {
+            Arc::new(Mutex::new(()))
+        }
+    }
+    pub fn shutdown_capture_input(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.shutdown()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+    pub fn capture_input_snapshot(&self) -> capture_input::CaptureInputSnapshot {
+        #[cfg(windows)]
+        {
+            self.audio.capture.snapshot()
+        }
+        #[cfg(not(windows))]
+        {
+            capture_input::CaptureInputSnapshot {
+                phase: "unsupported".into(),
+                ..Default::default()
+            }
+        }
+    }
+    pub fn initialize_capture_input(
+        &self,
+        journal: std::path::PathBuf,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.initialize(journal, settings)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (journal, settings);
+            Ok(())
+        }
+    }
+    pub fn list_capture_inputs(&self) -> Result<Vec<AudioEndpoint>, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.list()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
+    pub fn configure_capture_input(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<capture_input::CaptureInputSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.configure(settings)?;
+            Ok(self.audio.capture.snapshot())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = settings;
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
+    pub fn resolve_capture_recovery(
+        &self,
+        restore: bool,
+    ) -> Result<capture_input::CaptureInputSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.recover(restore)?;
+            Ok(self.audio.capture.snapshot())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = restore;
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
     pub fn usage_counters(&self) -> Arc<UsageCounters> {
         Arc::clone(&self.usage)
-    }
-
-    /// 退出前的优雅关闭（2026-09-16）：关闭 BLE 会话并**在有界时间内等待其完成**
-    /// （`ble_session_cleanup` 落盘）后才返回。
-    ///
-    /// 必须在 `app.exit()` / 进程结束**之前**调用：Tauri v2 的 `run()` 收尾是
-    /// `std::process::exit`，不执行析构，因此 `BleRuntime::drop` 的清理不会发生
-    /// （见 `graceful_exit` 模块头部的证据）。
-    #[cfg(windows)]
-    pub fn shutdown_ble_for_exit(&self, timeout: std::time::Duration) -> Result<(), PlatformError> {
-        self.runtime.shutdown_blocking(timeout)
-    }
-
-    #[cfg(not(windows))]
-    pub fn shutdown_ble_for_exit(
-        &self,
-        _timeout: std::time::Duration,
-    ) -> Result<(), PlatformError> {
-        Ok(())
     }
 
     pub fn test_scroll(
@@ -498,6 +632,92 @@ impl WindowsPlatform {
         self.button_mapping.set_mappings(mappings);
     }
 
+    /// Apply the complete persisted mapping state in one host callback.
+    /// This method never calls persistence callbacks and is safe under the
+    /// settings transaction lock.
+    pub fn set_mapping_configuration(&self, configuration: templates::MappingConfiguration) {
+        ble::gatt_note(format!("template_configuration result=applied program_defaults_enabled={} third_party_ui_query=false", configuration.button_mapping_follow_enabled));
+        let common = configuration.common_mappings.clone();
+        self.button_mapping.set_mappings(common);
+        let _ = self.scene_control.set_configuration(configuration);
+    }
+
+    pub fn scene_snapshot(&self) -> scene_control::SceneSnapshot {
+        self.scene_control.snapshot()
+    }
+
+    pub fn set_template_menu_focus(&self, focused: bool) {
+        self.scene_control.set_template_menu_focus(focused);
+    }
+
+    pub fn template_menu_key(
+        &self,
+        generation: u64,
+        button: raw_input::RemoteButton,
+        down: bool,
+    ) -> bool {
+        self.scene_control
+            .template_menu_key(generation, button, down)
+    }
+
+    pub fn set_template_menu_update_default(&self, generation: u64, enabled: bool) -> bool {
+        self.scene_control.set_update_default(generation, enabled)
+    }
+    pub fn complete_template_default_save(&self, request_id: u64, saved: bool) {
+        self.scene_control.complete_default_save(request_id, saved);
+    }
+    pub fn complete_menu_preference_save(&self, request_id: u64, saved: bool) {
+        self.scene_control
+            .complete_menu_preference_save(request_id, saved);
+    }
+
+    pub fn prepare_template_menu_exit(&self) -> bool {
+        self.scene_control.prepare_template_menu_exit()
+    }
+
+    pub fn restore_template_menu_target(&self) -> bool {
+        self.scene_control.restore_target_foreground().is_ok()
+    }
+
+    pub fn template_menu_restore_failed(&self) {
+        self.scene_control.template_menu_restore_failed();
+    }
+
+    pub fn set_mapping_notice_enabled(&self, enabled: bool) {
+        self.scene_control.set_mapping_notice_enabled(enabled);
+    }
+
+    pub fn subscribe_scene_events(&self, callback: scene_control::SceneEventCallback) {
+        self.scene_control.subscribe(callback);
+    }
+
+    pub fn notify_scene_voice_active(&self, active: bool) {
+        self.scene_control.notify_voice_active(active);
+    }
+
+    /// Synchronize the identified connection at the same transition that owns it.
+    pub fn set_input_context(&self, model: RemoteModel, connected: bool) {
+        self.button_mapping.set_input_context(model, connected);
+    }
+
+    /// Disable input execution and wait until all held mapping and scene state
+    /// has been cancelled. The barrier is bounded so normal exit cannot wait
+    /// forever for the mapping worker.
+    pub fn quiesce_input(&self) -> Result<(), PlatformError> {
+        self.button_mapping
+            .set_input_context(RemoteModel::Unknown, false);
+        if self
+            .button_mapping
+            .wait_for_idle(std::time::Duration::from_secs(2))
+        {
+            Ok(())
+        } else {
+            Err(PlatformError::WindowsApi(
+                "button mapping shutdown barrier timed out".to_owned(),
+            ))
+        }
+    }
+
     pub fn button_mappings(&self) -> send_input::ButtonMappings {
         self.button_mapping.mappings()
     }
@@ -508,7 +728,7 @@ impl WindowsPlatform {
 
     /// 订阅语义按键边沿（画布高亮数据源）。
     pub fn subscribe_button_edges(&self, callback: button_mapping::ButtonEdgeCallback) {
-        self.button_mapping.subscribe_button_edges(callback);
+        self.button_mapping.subscribe_button_observations(callback);
     }
 
     /// 订阅已触发手势（单击/双击/长按反馈）。
@@ -835,6 +1055,10 @@ pub enum PlatformError {
     AudioOperationTimedOut,
     #[error("select an output endpoint before starting voice")]
     AudioEndpointNotSelected,
+    #[error(
+        "the selected audio endpoint is temporarily unavailable; its saved selection is retained"
+    )]
+    AudioSinkUnavailable,
     #[error("WASAPI output is busy with an active voice session")]
     AudioBusy,
     #[error("WASAPI audio belongs to another voice session")]

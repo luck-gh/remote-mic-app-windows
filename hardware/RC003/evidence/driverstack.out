@@ -3,104 +3,104 @@
 ======================================================================
 
 ### 1.1 Enum\HID 下匹配的键（子节点：kbdhid）
-匹配: ['{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>']
+匹配: ['{00001812-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>']
 --- HID 子节点实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\9&1748ac9e&0&0000
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_52
     Address                  = 1
     Capabilities             = 160
-    ClassGUID                = {4d36e96b-e325-11ce-bfc1-08002be10318}
-    CompatibleIDs            = 
+    ClassGUID                = {4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}
+    CompatibleIDs            =
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
     DeviceDesc               = @keyboard.inf,%hid.keyboarddevice%;HID Keyboard Device
-    Driver                   = {4d36e96b-e325-11ce-bfc1-08002be10318}\0004
-    HardwareID               = HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | HID\{00001812-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002 | HID\VID_2717&UP:0001_U:0006 | HID_DEVICE_SYSTEM_KEYBOARD | HID_DEVICE_UP:0001_U:0006 | HID_DEVICE
+    Driver                   = {4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}\0004
+    HardwareID               = REDACTED_device_15 | REDACTED_device_40 | REDACTED_device_4 | REDACTED_device_71 | HID_DEVICE_SYSTEM_KEYBOARD | HID_DEVICE_UP:0001_U:0006 | HID_DEVICE
     Mfg                      = @keyboard.inf,%std-keyboards%;(Standard keyboards)
     Service                  = kbdhid
 
 
 ### 1.2 Enum\BTHLEDEVICE 下匹配的键（父节点）
-BTHLEDEVICE -> 子键 28, 匹配 ['{000001bf-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{00001800-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{00001801-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{0000180a-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{0000180f-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{0000fe59-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{8a7a0001-2c42-c2a2-0f36-41928c259b78}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{ab5e0001-5a21-4f05-bc7d-af01f617b664}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>']
+BTHLEDEVICE -> 子键 28, 匹配 ['{000001bf-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{00001800-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{00001801-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{0000180a-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{0000180f-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{00001812-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{0000fe59-0000-1000-8000-REDACTED_peer_105}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{8a7a0001-2c42-c2a2-0f36-REDACTED_peer_110}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>', '{ab5e0001-5a21-4f05-bc7d-REDACTED_peer_104}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>']
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{000001bf-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&0800
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_83
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{000001bf-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_93 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\genericattservice%;Bluetooth LE Generic Attribute Service
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0014
-    HardwareID               = BTHLEDevice\{000001bf-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{000001bf-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{000001bf-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_56 LE Generic Attribute Service
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0014
+    HardwareID               = REDACTED_device_87 | REDACTED_device_50 | REDACTED_device_21
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{00001800-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&001d
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_64
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{00001800-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_63 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\{00001800-0000-1000-8000-00805f9b34fb}%;Generic Access Profile
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0009
-    HardwareID               = BTHLEDevice\{00001800-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{00001800-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{00001800-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_68 Access Profile
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0009
+    HardwareID               = REDACTED_device_58 | REDACTED_device_99 | REDACTED_device_14
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{00001801-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&0001
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_22
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{00001801-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_73 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\{00001801-0000-1000-8000-00805f9b34fb}%;Generic Attribute Profile
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0008
-    HardwareID               = BTHLEDevice\{00001801-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{00001801-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{00001801-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_26 Attribute Profile
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0008
+    HardwareID               = REDACTED_device_24 | REDACTED_device_32 | REDACTED_device_66
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{0000180a-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&003a
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_61
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{0000180a-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_69 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\{0000180a-0000-1000-8000-00805f9b34fb}%;Device Information Service
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0011
-    HardwareID               = BTHLEDevice\{0000180a-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{0000180a-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{0000180a-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_85 Information Service
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0011
+    HardwareID               = REDACTED_device_41 | REDACTED_device_23 | REDACTED_device_47
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{0000180f-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&002e
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_7
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{0000180f-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_103 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\genericattservice%;Bluetooth LE Generic Attribute Service
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0010
-    HardwareID               = BTHLEDevice\{0000180f-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{0000180f-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{0000180f-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_56 LE Generic Attribute Service
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0010
+    HardwareID               = REDACTED_device_74 | REDACTED_device_16 | REDACTED_device_5
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&0055
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_72
     Capabilities             = 128
-    ClassGUID                = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
-    CompatibleIDs            = BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {745a17a0-74d3-11d0-b6fe-REDACTED_peer_106}
+    CompatibleIDs            = REDACTED_device_80 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @hidbthle.inf,%bthledevice\{00001812-0000-1000-8000-00805f9b34fb}%;Bluetooth Low Energy GATT compliant HID device
-    Driver                   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}\0022
-    HardwareID               = BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @hidbthle.inf,%REDACTED_device_25 Low Energy GATT compliant HID device
+    Driver                   = {745a17a0-74d3-11d0-b6fe-REDACTED_peer_106}\0022
+    HardwareID               = REDACTED_device_38 | REDACTED_device_102 | REDACTED_device_76
     LocationInformation      = Bluetooth LE Device
     LowerFilters             = WUDFRd
     Mfg                      = @hidbthle.inf,%mfgname%;Microsoft
@@ -108,43 +108,43 @@ BTHLEDEVICE -> 子键 28, 匹配 ['{000001bf-0000-1000-8000-00805f9b34fb}_Dev_VI
     Service                  = mshidumdf
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{0000fe59-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&0804
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_27
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{0000fe59-0000-1000-8000-00805f9b34fb} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_1 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\genericattservice%;Bluetooth LE Generic Attribute Service
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0015
-    HardwareID               = BTHLEDevice\{0000fe59-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{0000fe59-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{0000fe59-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_56 LE Generic Attribute Service
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0015
+    HardwareID               = REDACTED_device_30 | REDACTED_device_34 | REDACTED_device_13
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{8a7a0001-2c42-c2a2-0f36-41928c259b78}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&0500
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_11
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{8a7a0001-2c42-c2a2-0f36-41928c259b78} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_54 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\genericattservice%;Bluetooth LE Generic Attribute Service
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0013
-    HardwareID               = BTHLEDevice\{8a7a0001-2c42-c2a2-0f36-41928c259b78}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{8a7a0001-2c42-c2a2-0f36-41928c259b78}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{8a7a0001-2c42-c2a2-0f36-41928c259b78}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_56 LE Generic Attribute Service
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0013
+    HardwareID               = REDACTED_device_90 | REDACTED_device_75 | REDACTED_device_78
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
 
 --- BTHLEDEVICE 实例
-    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\BTHLEDEVICE\{ab5e0001-5a21-4f05-bc7d-af01f617b664}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>\8&14b2359b&b&0300
+    KEY: HKLM\SYSTEM\CurrentControlSet\Enum\REDACTED_device_29
     Capabilities             = 128
-    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
-    CompatibleIDs            = BTHLEDevice\{ab5e0001-5a21-4f05-bc7d-af01f617b664} | BTHLEDevice\GenericATTService
+    ClassGUID                = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}
+    CompatibleIDs            = REDACTED_device_49 | REDACTED_device_91
     ConfigFlags              = 0
-    ContainerID              = {51e99db4-cb97-5cef-99f0-5778db02368d}
-    DeviceDesc               = @bthleenum.inf,%bthledevice\genericattservice%;Bluetooth LE Generic Attribute Service
-    Driver                   = {e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\0012
-    HardwareID               = BTHLEDevice\{ab5e0001-5a21-4f05-bc7d-af01f617b664}_Dev_VID&012717_PID&32b8_REV&00a4 | BTHLEDevice\{ab5e0001-5a21-4f05-bc7d-af01f617b664}_Dev_VID&012717_PID&32b8 | BTHLEDevice\{ab5e0001-5a21-4f05-bc7d-af01f617b664}_LOCALMFG&0002
+    ContainerID              = {51e99db4-cb97-5cef-99f0-REDACTED_peer_107}
+    DeviceDesc               = @bthleenum.inf,%REDACTED_device_56 LE Generic Attribute Service
+    Driver                   = {e0cbf06c-cd8b-4647-bb8a-REDACTED_peer_108}\0012
+    HardwareID               = REDACTED_device_92 | REDACTED_device_37 | REDACTED_device_57
     LocationInformation      = Bluetooth LE Device
     Mfg                      = @bthleenum.inf,%microsoft%;Microsoft
     Service                  = UmPass
@@ -157,7 +157,7 @@ BTHENUM -> 子键 4, 匹配 []
 ======================================================================
 
 --- Keyboard 类键 {4d36e96b}
-    KEY: HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-08002be10318}
+    KEY: HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}
     Class                    = Keyboard
     ClassDesc                = @%SystemRoot%\System32\SysClass.Dll,-3002
     IconPath                 = %SystemRoot%\System32\setupapi.dll,-3
@@ -166,7 +166,7 @@ BTHENUM -> 子键 4, 匹配 []
     UpperFilters             = kbdclass
 
 --- HIDClass 类键 {745a17a0}
-    KEY: HKLM\SYSTEM\CurrentControlSet\Control\Class\{745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+    KEY: HKLM\SYSTEM\CurrentControlSet\Control\Class\{745a17a0-74d3-11d0-b6fe-REDACTED_peer_106}
     Class                    = HIDClass
     ClassDesc                = @%SystemRoot%\System32\hid.dll,-101
     IconPath                 = %SystemRoot%\system32\setupapi.dll,-24
@@ -174,7 +174,7 @@ BTHENUM -> 子键 4, 匹配 []
     NoInstallClass           = 1
 
 --- Keyboard 类键 Properties（含 ConnectMultiplePorts）
-    KEY: HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-08002be10318}\Properties
+    KEY: HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}\Properties
     [不可读] [WinError 5] 拒绝访问。
 
 --- Keyboard Layout 全局
@@ -192,7 +192,7 @@ BTHENUM -> 子键 4, 匹配 []
     KEY: HKLM\SYSTEM\CurrentControlSet\Services\kbdhid
     DisplayName              = @keyboard.inf,%KBDHID.SvcDesc%;Keyboard HID Driver
     ErrorControl             = 0
-    Group                    = 
+    Group                    =
     ImagePath                = \SystemRoot\System32\drivers\kbdhid.sys
     Owners                   = keyboard.inf | hidirkbd.inf
     Start                    = 3
@@ -202,7 +202,7 @@ BTHENUM -> 子键 4, 匹配 []
     KEY: HKLM\SYSTEM\CurrentControlSet\Services\kbdclass
     DisplayName              = @keyboard.inf,%kbdclass.SvcDesc%;Keyboard Class Driver
     ErrorControl             = 1
-    Group                    = 
+    Group                    =
     ImagePath                = \SystemRoot\System32\drivers\kbdclass.sys
     Owners                   = whyperkbd.inf | termkbd.inf | keyboard.inf | hidirkbd.inf
     Start                    = 3

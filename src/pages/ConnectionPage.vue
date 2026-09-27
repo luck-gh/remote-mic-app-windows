@@ -4,6 +4,7 @@ import BatteryIndicator from "../components/BatteryIndicator.vue";
 import type {
   AudioEndpoint,
   AudioSnapshot,
+  CaptureInputSnapshot,
   ConnectionSnapshot,
   KeyChord,
   PairedRemote,
@@ -16,6 +17,10 @@ import {
   connectionPhaseLabel,
   disconnectRemote,
   getAudioSnapshot,
+  getCaptureInput,
+  listCaptureInputs,
+  setCaptureInput,
+  resolveCaptureRecovery,
   getConnectionSnapshot,
   getVoiceHoldHotkey,
   isRecommendedVoiceEndpoint,
@@ -60,6 +65,41 @@ const emptyAudio = (): AudioSnapshot => ({
 
 const connection = ref<ConnectionSnapshot>(emptyConnection());
 const audio = ref<AudioSnapshot>(emptyAudio());
+const captureInput = ref<CaptureInputSnapshot>({ settings: { enabled: false, endpointId: null, endpointName: null }, phase: "disabled", recoveryPending: false, lastError: null });
+const captureEndpoints = ref<AudioEndpoint[]>([]);
+const captureBusy = ref(false);
+let captureRevision = 0;
+const captureMessage = ref("");
+const capturePhase = computed(() => ({ active: "本次说话正在使用所选输入设备", relinquished: "检测到外部改选，本次已让出控制", recovery_required: "上次会话未完整恢复，请选择如何处理", failed: "输入设备服务不可用", unsupported: "仅 Windows 应用支持" }[captureInput.value.phase] ?? (captureInput.value.settings.enabled ? "已开启，仅在遥控器说话期间切换" : "已关闭")));
+async function refreshCaptureInput() {
+  if (captureBusy.value) return;
+  const revision = captureRevision;
+  try { const snapshot = await getCaptureInput(); if (revision === captureRevision && !captureBusy.value) captureInput.value = snapshot; }
+  catch (error) { if (revision === captureRevision) captureMessage.value = String(error); }
+}
+async function scanCaptureInputs() {
+  captureBusy.value = true;
+  try { captureEndpoints.value = await listCaptureInputs(); }
+  catch (error) { captureMessage.value = String(error); }
+  finally { captureBusy.value = false; }
+}
+async function changeCaptureInput(enabled: boolean, endpointId = captureInput.value.settings.endpointId) {
+  const endpoint = captureEndpoints.value.find(e => e.id === endpointId);
+  const revision = ++captureRevision;
+  captureBusy.value = true; captureMessage.value = "";
+  try {
+    const result = await setCaptureInput({ enabled, endpointId, endpointName: endpointId ? (endpoint?.name ?? captureInput.value.settings.endpointName) : null });
+    if (revision === captureRevision) captureInput.value = result;
+  } catch (error) { captureMessage.value = String(error); await refreshCaptureInput(); }
+  finally { captureBusy.value = false; }
+}
+async function recoverCaptureInput(restore: boolean) {
+  const revision = ++captureRevision;
+  captureBusy.value = true; captureMessage.value = "";
+  try { const result = await resolveCaptureRecovery(restore); if (revision === captureRevision) captureInput.value = result; }
+  catch (error) { captureMessage.value = String(error); }
+  finally { captureBusy.value = false; }
+}
 const scanning = ref(false);
 const connectingDeviceId = ref("");
 const disconnecting = ref(false);
@@ -431,11 +471,13 @@ async function initializeAudio() {
 }
 
 onMounted(async () => {
+  void refreshCaptureInput();
   window.addEventListener("blur", handleVoiceCaptureBlur);
   void refreshConnection();
   void initializeAudio();
   void refreshVoiceHotkey();
   pollTimer = setInterval(() => {
+    void refreshCaptureInput();
     void refreshConnection();
     void refreshAudio();
   }, 1_000);
@@ -637,6 +679,35 @@ onUnmounted(() => {
         </div>
 
         <p class="muted scan-summary">{{ audioMessage }}</p>
+        <section class="info-callout capture-input-settings" aria-label="会话麦克风输入">
+          <label class="setting-row">
+            <span>遥控器说话时临时锁定麦克风输入</span>
+            <input type="checkbox" :checked="captureInput.settings.enabled"
+              :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || !captureInput.settings.endpointId || captureInput.recoveryPending"
+              @change="changeCaptureInput(($event.target as HTMLInputElement).checked)" />
+          </label>
+          <p class="muted">选择目标软件采集的设备，VB-CABLE 请选 CABLE Output。松开后恢复；检测到耳机或其他应用改选后让出，保留新选择。软件自行指定的麦克风不受系统默认切换控制。</p>
+          <label for="capture-input-target">目标麦克风输入</label>
+          <div class="button-row">
+            <select id="capture-input-target" :value="captureInput.settings.endpointId ?? ''" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending"
+              @change="changeCaptureInput(captureInput.settings.enabled, ($event.target as HTMLSelectElement).value || null)">
+              <option value="">请选择输入设备</option>
+              <option v-if="captureInput.settings.endpointId && !captureEndpoints.some(e => e.id === captureInput.settings.endpointId)" :value="captureInput.settings.endpointId">{{ captureInput.settings.endpointName }}</option>
+              <option v-for="endpoint in captureEndpoints" :key="endpoint.id" :value="endpoint.id">{{ endpoint.name }}</option>
+            </select>
+            <button type="button" class="secondary-button" :disabled="captureBusy || !runtime?.platform.windowsApiAvailable" @click="scanCaptureInputs">读取输入设备</button>
+          </div>
+          <p aria-live="polite">{{ capturePhase }}</p>
+          <p v-if="audioBusy" class="muted">请松开语音键后更改会话输入设备。</p>
+          <p v-if="captureMessage || captureInput.lastError" role="status">{{ (captureMessage || captureInput.lastError) === "normal_roles_split" ? "普通输入的两个系统角色指向不同设备，无法保证原样恢复，本次未切换。请先在 Windows 声音设置中统一默认输入设备。" : (captureMessage || captureInput.lastError) }}</p>
+          <div v-if="captureInput.recoveryPending" class="info-callout warning">
+            <p>上次退出未能确认输入设备恢复。如果此后改过麦克风，请保留当前选择。恢复只处理仍符合原会话记录的设备。</p>
+            <div class="button-row">
+              <button type="button" :disabled="captureBusy" @click="recoverCaptureInput(false)">保留当前选择</button>
+              <button type="button" class="secondary-button" :disabled="captureBusy" @click="recoverCaptureInput(true)">尝试恢复会话前设备</button>
+            </div>
+          </div>
+        </section>
         <div v-if="audioEndpoints.length" class="endpoint-select-row">
           <button
             class="secondary-button"

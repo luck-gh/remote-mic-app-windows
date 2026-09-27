@@ -465,7 +465,7 @@ pub struct ButtonMappings {
     pub enabled: bool,
     pub actions: BTreeMap<RemoteButton, ButtonActions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub applications: Vec<crate::app_launcher::CustomAppPick>,
+    pub applications: Vec<crate::registered_apps::AppLibraryEntry>,
 }
 
 fn default_enabled() -> bool {
@@ -493,7 +493,7 @@ impl<'de> serde::Deserialize<'de> for ButtonMappings {
             enabled: bool,
             actions: Option<BTreeMap<RemoteButton, ButtonActionsWire>>,
             #[serde(default)]
-            applications: Vec<crate::app_launcher::CustomAppPick>,
+            applications: Vec<crate::registered_apps::AppLibraryEntry>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let actions = wire
@@ -511,25 +511,9 @@ impl<'de> serde::Deserialize<'de> for ButtonMappings {
 }
 
 impl ButtonMappings {
-    /// 策略性不支持自定义的按键（全型号一致）：
-    /// - 返回/音量±：RC003 输入栈不可见（配置无法生效）；RC001 虽以
-    ///   VK 0xFF 厂商键可达且可直接归因，为保持两型号行为一致而不开放。
-    ///
-    /// 持久化层（[`Self::normalized`]）与引擎层（button_mapping 的
-    /// `set_mappings`）双重剥离，存量配置在加载/保存时自动清除。
-    pub(crate) fn without_unsupported_buttons(mut self) -> Self {
-        for button in [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-        ] {
-            self.actions.remove(&button);
-        }
-        self
-    }
-
     pub fn normalized(self) -> Result<Self, SendInputError> {
-        let mut this = self.without_unsupported_buttons();
+        // Device capability controls execution, never the user's saved mappings.
+        let mut this = self;
         this.applications = crate::registered_apps::normalize_library(this.applications)
             .map_err(SendInputError::Backend)?;
         for actions in this.actions.values_mut() {
@@ -881,7 +865,7 @@ mod tests {
     #[test]
     fn application_library_round_trips_without_adding_button_bindings() {
         let mut mappings = ButtonMappings::default();
-        let app = crate::app_launcher::CustomAppPick {
+        let app = crate::registered_apps::AppLibraryEntry {
             name: "Example".into(),
             path: "shell:AppsFolder\\Example!App".into(),
         };
@@ -1229,9 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_strips_unsupported_button_customization() {
-        // 策略性不支持的按键：normalized() 在持久化层剥离返回/音量±配置；
-        // 左键自 2026-09-08 起与其余方向键同样允许映射，不得再被剥离。
+    fn normalized_preserves_unavailable_button_customization() {
         let mut mappings = ButtonMappings::default();
         let single_escape = ButtonActions {
             single: ButtonAction::Shortcut {
@@ -1269,14 +1251,21 @@ mod tests {
             RemoteButton::VolumeDown,
         ] {
             assert!(
-                !normalized.actions.contains_key(&button),
-                "{button:?} 自定义必须被策略剥离"
+                normalized.actions.contains_key(&button),
+                "{button:?} 配置必须保留，与当前设备能力无关"
             );
         }
         assert!(normalized.actions.contains_key(&RemoteButton::Tv));
         assert_eq!(
             normalized.mapped_mask(),
-            (1u64 << RemoteButton::Left.ordinal()) | (1u64 << RemoteButton::Tv.ordinal())
+            (1u64 << RemoteButton::Left.ordinal())
+                | (1u64 << RemoteButton::Tv.ordinal())
+                | (1u64 << RemoteButton::Back.ordinal())
+                | (1u64 << RemoteButton::VolumeUp.ordinal())
+                | (1u64 << RemoteButton::VolumeDown.ordinal())
         );
+        let encoded = serde_json::to_string(&normalized).unwrap();
+        let restored: ButtonMappings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.normalized().unwrap(), normalized);
     }
 }

@@ -55,7 +55,7 @@ const runtime: RuntimeSnapshot = {
     buttonMapping: {
       enabled: true,
       gateActive: false,
-      listenerActive: false,
+      observedButtons: [], listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
       firedGestures: 0,
@@ -73,6 +73,7 @@ const cableEndpoint: AudioEndpoint = {
 
 const mocks = vi.hoisted(() => ({
   endpoints: [] as AudioEndpoint[],
+  getCaptureInput: vi.fn(), listCaptureInputs: vi.fn(), setCaptureInput: vi.fn(), resolveCaptureRecovery: vi.fn(),
   captureEdgeHandler: null as ShortcutCaptureHandler | null,
   getConnectionSnapshot: vi.fn(),
   getAudioSnapshot: vi.fn(),
@@ -90,6 +91,8 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/bridge")>();
   return {
     ...original,
+    getCaptureInput: mocks.getCaptureInput, listCaptureInputs: mocks.listCaptureInputs,
+    setCaptureInput: mocks.setCaptureInput, resolveCaptureRecovery: mocks.resolveCaptureRecovery,
     getConnectionSnapshot: mocks.getConnectionSnapshot,
     getAudioSnapshot: mocks.getAudioSnapshot,
     listAudioEndpoints: mocks.listAudioEndpoints,
@@ -106,6 +109,10 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 describe("VB-CABLE first-launch guidance", () => {
   beforeEach(() => {
     mocks.endpoints = [];
+    mocks.getCaptureInput.mockResolvedValue({ settings: { enabled: false, endpointId: null, endpointName: null }, phase: "disabled", recoveryPending: false, lastError: null });
+    mocks.listCaptureInputs.mockResolvedValue([{ id: "capture", name: "CABLE Output", isVirtualCableCandidate: true }]);
+    mocks.setCaptureInput.mockImplementation(async settings => ({ settings, phase: "idle", recoveryPending: false, lastError: null }));
+    mocks.resolveCaptureRecovery.mockResolvedValue({ settings: { enabled: false, endpointId: null, endpointName: null }, phase: "idle", recoveryPending: false, lastError: null });
     mocks.captureEdgeHandler = null;
     mocks.getConnectionSnapshot.mockResolvedValue(emptyConnection);
     mocks.getAudioSnapshot.mockResolvedValue(emptyAudio);
@@ -202,6 +209,26 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(mocks.openVbCableDownloadPage).toHaveBeenCalledOnce();
     wrapper.unmount();
   });
+  it("keeps capture locking disabled and requires a separate capture selection", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+    expect(wrapper.get('.capture-input-settings input[type="checkbox"]').attributes("disabled")).toBeDefined();
+    await wrapper.get('.capture-input-settings .button-row button').trigger('click'); await flushPromises();
+    await wrapper.get('#capture-input-target').setValue('capture'); await flushPromises();
+    expect(mocks.setCaptureInput).toHaveBeenLastCalledWith({ enabled: false, endpointId: 'capture', endpointName: 'CABLE Output' });
+    await wrapper.get('.capture-input-settings input[type="checkbox"]').setValue(true); await flushPromises();
+    expect(mocks.setCaptureInput).toHaveBeenLastCalledWith({ enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' });
+    wrapper.unmount();
+  });
+  it("does not silently restore a crash journal", async () => {
+    mocks.getCaptureInput.mockResolvedValue({ settings: { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' }, phase: 'recovery_required', recoveryPending: true, lastError: null });
+    const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
+    expect(mocks.resolveCaptureRecovery).not.toHaveBeenCalled();
+    const keep = wrapper.findAll('.capture-input-settings button').find(b => b.text() === '保留当前选择')!;
+    await keep.trigger('click'); await flushPromises(); expect(mocks.resolveCaptureRecovery).toHaveBeenCalledWith(false);
+    wrapper.unmount();
+  });
+
 
   it("recommends only the standard VB-Audio CABLE Input, never the other endpoints", async () => {
     const cableA: AudioEndpoint = {

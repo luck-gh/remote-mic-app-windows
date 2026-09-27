@@ -11,6 +11,9 @@ const emit = defineEmits<{ select: [page: PageId] }>();
  * info.circle）。Windows 无 SF Symbols，用同形 SVG 还原。
  */
 const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
+  driver: {
+    strokes: ["M7 3.5h10v4.2H7z", "M5.2 9.2h13.6a1.8 1.8 0 0 1 1.8 1.8v7.2a1.8 1.8 0 0 1-1.8 1.8H5.2A1.8 1.8 0 0 1 3.4 18.2V11a1.8 1.8 0 0 1 1.8-1.8z", "M8 14.6h.01M12 14.6h.01M16 14.6h.01"],
+  },
   keyboard: {
     // SF "keyboard"：圆角键盘轮廓 + 功能行点阵 + 底部长条
     strokes: [
@@ -18,6 +21,9 @@ const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
       "M7 10.2h.01M10.4 10.2h.01M13.8 10.2h.01M17.2 10.2h.01",
       "M7.6 13.6h8.8",
     ],
+  },
+  template: {
+    strokes: ["M5 3.8h11l3 3v13.4H5z", "M16 3.8v3.5h3", "M8.2 11h7.6", "M8.2 14.5h7.6", "M8.2 18h4.6"],
   },
   link: {
     // SF "link"：两段互扣链环（对角）

@@ -1,23 +1,23 @@
 E2-1 前置核查（注册表直读版）
 ==================================================================
 
-目标 HardwareID: HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4
+目标 HardwareID: REDACTED_device_15
 
 === A. RC003 父节点（HIDClass / mshidumdf）===
   instance   : 8&14b2359b&b&0055
-  ClassGUID  : {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+  ClassGUID  : {745a17a0-74d3-11d0-b6fe-REDACTED_peer_106}
   Service    : mshidumdf
   LowerFilters: WUDFRd
   HardwareID :
-      BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4
-      BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8
-      BTHLEDevice\{00001812-0000-1000-8000-00805f9b34fb}_LOCALMFG&0002
+      REDACTED_device_38
+      REDACTED_device_102
+      REDACTED_device_76
   => 含目标 HardwareID: 否（会抛 not present）
 
 === B. RC003 子节点（Keyboard / kbdhid）===
   instance : 9&1748ac9e&0&0000
   Service  : kbdhid
-  ClassGUID: {4d36e96b-e325-11ce-bfc1-08002be10318}
+  ClassGUID: {4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}
 
 === C. 当前系统状态汇总 ===
   driver store 有 MiRemoteHidFilter : 否（见 e2-precheck.out 第 5 项）

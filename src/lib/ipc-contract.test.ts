@@ -159,6 +159,7 @@ describe("Rust and TypeScript IPC contract", () => {
       "staleRemoteEventCount",
     ]);
     expectExactKeys(platformSnapshot.buttonMapping, [
+      "observedButtons",
       "enabled",
       "gateActive",
       "listenerActive",

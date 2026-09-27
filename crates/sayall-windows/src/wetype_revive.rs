@@ -8,8 +8,7 @@ use windows::Win32::System::Registry::{
     REG_QWORD, REG_VALUE_TYPE,
 };
 
-const CONSENT_NONPACKAGED: &str =
-    "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\NonPackaged";
+const CONSENT_NONPACKAGED: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\NonPackaged";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MicObservation {

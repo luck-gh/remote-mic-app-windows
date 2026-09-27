@@ -22,16 +22,43 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_MUTE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 static AUDIO_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone)]
+pub(crate) struct AudioBeginGuard {
+    release_epoch: Arc<AtomicU64>,
+    release_at_start: u64,
+    lifecycle_epoch: Arc<AtomicU64>,
+    lifecycle_at_start: u64,
+}
+
+impl AudioBeginGuard {
+    pub(crate) fn new(release_epoch: Arc<AtomicU64>, lifecycle_epoch: Arc<AtomicU64>) -> Self {
+        Self {
+            release_at_start: release_epoch.load(Ordering::SeqCst),
+            lifecycle_at_start: lifecycle_epoch.load(Ordering::SeqCst),
+            release_epoch,
+            lifecycle_epoch,
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.release_epoch.load(Ordering::SeqCst) != self.release_at_start
+            || self.lifecycle_epoch.load(Ordering::SeqCst) != self.lifecycle_at_start
+    }
+}
+
 pub struct AudioRuntime {
+    pub(crate) capture: crate::capture_input::CaptureInputRuntime,
     sender: SyncSender<AudioMessage>,
     state: Arc<Mutex<AudioSnapshot>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) lifecycle_epoch: Arc<AtomicU64>,
 }
 
 impl AudioRuntime {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::sync_channel(MESSAGE_QUEUE_CAPACITY);
         let state = Arc::new(Mutex::new(AudioSnapshot::default()));
+        let lifecycle_epoch = Arc::new(AtomicU64::new(0));
         let worker_state = Arc::clone(&state);
         let worker = thread::Builder::new()
             .name("sayall-wasapi".to_owned())
@@ -39,16 +66,20 @@ impl AudioRuntime {
 
         match worker {
             Ok(worker) => Self {
+                capture: crate::capture_input::CaptureInputRuntime::new(),
                 sender,
                 state,
                 worker: Mutex::new(Some(worker)),
+                lifecycle_epoch,
             },
             Err(error) => {
                 *lock(&state) = failed_snapshot(format!("无法启动 WASAPI 工作线程：{error}"));
                 Self {
+                    capture: crate::capture_input::CaptureInputRuntime::new(),
                     sender,
                     state,
                     worker: Mutex::new(None),
+                    lifecycle_epoch,
                 }
             }
         }
@@ -97,9 +128,14 @@ impl AudioRuntime {
         })
     }
 
-    pub fn begin_session(&self, generation: u64) -> Result<AudioSnapshot, PlatformError> {
+    pub fn begin_session(
+        &self,
+        generation: u64,
+        guard: Option<AudioBeginGuard>,
+    ) -> Result<AudioSnapshot, PlatformError> {
         self.request(REQUEST_TIMEOUT, |reply| AudioMessage::BeginSession {
             generation,
+            guard,
             reply,
         })
     }
@@ -111,12 +147,16 @@ impl AudioRuntime {
                 samples,
             })
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => PlatformError::AudioQueueOverflow,
+                mpsc::TrySendError::Full(_) => {
+                    crate::ble::gatt_note(format!("audio_pipeline generation={generation} event=failure failure_origin=message_channel error_code=queue_overflow"));
+                    PlatformError::AudioQueueOverflow
+                },
                 mpsc::TrySendError::Disconnected(_) => PlatformError::AudioWorkerUnavailable,
             })
     }
 
     pub fn finish_session(&self, generation: u64) -> Result<AudioSnapshot, PlatformError> {
+        self.capture.end();
         self.request(DRAIN_TIMEOUT, |reply| AudioMessage::FinishSession {
             generation,
             reply,
@@ -124,6 +164,7 @@ impl AudioRuntime {
     }
 
     pub fn interrupt_session(&self) -> Result<AudioSnapshot, PlatformError> {
+        self.capture.end();
         self.request(REQUEST_TIMEOUT, |reply| AudioMessage::Interrupt { reply })
     }
 
@@ -147,6 +188,7 @@ impl AudioRuntime {
 
 impl Drop for AudioRuntime {
     fn drop(&mut self) {
+        self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         let _ = self.sender.send(AudioMessage::Shutdown);
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
@@ -169,6 +211,7 @@ enum AudioMessage {
     },
     BeginSession {
         generation: u64,
+        guard: Option<AudioBeginGuard>,
         reply: Sender<Result<AudioSnapshot, PlatformError>>,
     },
     Samples {
@@ -231,7 +274,9 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                                 .count();
                             let bluetooth_count = endpoints
                                 .iter()
-                                .filter(|endpoint| endpoint_kind(&endpoint.id, &endpoint.name) == "bluetooth")
+                                .filter(|endpoint| {
+                                    endpoint_kind(&endpoint.id, &endpoint.name) == "bluetooth"
+                                })
                                 .count();
                             let inactive_counts = render_endpoint_inactive_counts().ok();
                             let (disabled_count, unplugged_count, not_present_count) =
@@ -239,7 +284,9 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                             crate::ble::gatt_note(format!(
                                 "audio_endpoint action=list phase=completed terminal_result=passed active_count={} active_virtual_cable_count={cable_count} active_bluetooth_count={bluetooth_count} active_other_count={} inactive_state_observed={} disabled_count={disabled_count} unplugged_count={unplugged_count} not_present_count={not_present_count} elapsed_ms={}",
                                 endpoints.len(),
-                                endpoints.len().saturating_sub(cable_count + bluetooth_count),
+                                endpoints
+                                    .len()
+                                    .saturating_sub(cable_count + bluetooth_count),
                                 inactive_counts.is_some(),
                                 started.elapsed().as_millis()
                             ));
@@ -313,12 +360,82 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                     let snapshot = restore_endpoint(&mut sink, &state, endpoint_id, expected_name);
                     let _ = reply.send(Ok(snapshot));
                 }
-                AudioMessage::BeginSession { generation, reply } => {
+                AudioMessage::BeginSession {
+                    generation,
+                    guard,
+                    reply,
+                } => {
                     let started = Instant::now();
                     crate::ble::gatt_note(format!(
                         "audio_session generation={generation} action=begin phase=requested"
                     ));
-                    let result = begin_session(&mut sink, &mut queue, &state, generation);
+                    let reopen = |id: &str, name: &str, attempt_id: u64| {
+                        let endpoints = list_endpoints().map_err(|error| {
+                            crate::ble::gatt_note(format!("audio_endpoint attempt_id={attempt_id} action=rebuild phase=enumerate result=failed error_code=enumeration_failed"));
+                            error
+                        })?;
+                        if validate_restored_endpoint(&endpoints, id, name).is_err() {
+                            crate::ble::gatt_note(format!("audio_endpoint attempt_id={attempt_id} action=rebuild phase=identity_validation result=failed error_code=endpoint_identity_mismatch endpoint_present={}", endpoints.iter().any(|endpoint| endpoint.id == id)));
+                            return Err(PlatformError::AudioSinkUnavailable);
+                        }
+                        let opened = AudioSink::open(id, attempt_id)?;
+                        // Enumeration and opening can straddle a device change.
+                        if opened.name != name {
+                            crate::ble::gatt_note(format!("audio_endpoint attempt_id={attempt_id} action=rebuild phase=identity_validation result=failed error_code=opened_endpoint_identity_changed"));
+                            return Err(PlatformError::AudioSinkUnavailable);
+                        }
+                        Ok(opened)
+                    };
+                    let had_sink = sink.is_some();
+                    let result = (|| {
+                        if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
+                            return Err(PlatformError::AudioSessionInterrupted);
+                        }
+                        rebuild_selected_sink(&mut sink, &state, reopen)?;
+                        if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
+                            return Err(PlatformError::AudioSessionInterrupted);
+                        }
+                        let first = begin_session(&mut sink, &mut queue, &state, generation);
+                        if had_sink && matches!(first, Err(PlatformError::Audio(_))) {
+                            // A still-present client can become invalid during sleep.
+                            // Retire it fully, then try the same identity once on this
+                            // new request; no retry can survive a release/cancellation.
+                            fail_audio(
+                                &mut sink,
+                                &mut queue,
+                                &state,
+                                first.clone().unwrap_err(),
+                                &mut pending_drain,
+                            );
+                            interrupt(&mut sink, &mut queue, &state)?;
+                            if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
+                                return Err(PlatformError::AudioSessionInterrupted);
+                            }
+                            rebuild_selected_sink(&mut sink, &state, reopen)?;
+                            if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
+                                return Err(PlatformError::AudioSessionInterrupted);
+                            }
+                            begin_session(&mut sink, &mut queue, &state, generation)
+                        } else {
+                            first
+                        }
+                    })();
+                    let result = if result.is_ok()
+                        && guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
+                    {
+                        if let Err(error) = interrupt(&mut sink, &mut queue, &state) {
+                            fail_cancel_cleanup(
+                                &mut sink,
+                                &mut queue,
+                                &state,
+                                error,
+                                &mut pending_drain,
+                            );
+                        }
+                        Err(PlatformError::AudioSessionInterrupted)
+                    } else {
+                        result
+                    };
                     if let Err(error @ PlatformError::Audio(_)) = &result {
                         fail_audio(
                             &mut sink,
@@ -345,12 +462,21 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                 AudioMessage::Samples {
                     generation,
                     samples,
-                } => match enqueue_samples(&mut queue, &state, generation, samples) {
-                    Ok(()) | Err(PlatformError::AudioSessionMismatch) => {}
-                    Err(error) => {
-                        fail_audio(&mut sink, &mut queue, &state, error, &mut pending_drain);
+                } => {
+                    let accepted = samples.len() as u64;
+                    match enqueue_samples(&mut queue, &state, generation, samples) {
+                        Ok(()) => {
+                            if let Some(sink) = sink.as_mut() {
+                                sink.accepted_samples =
+                                    sink.accepted_samples.saturating_add(accepted);
+                            }
+                        }
+                        Err(PlatformError::AudioSessionMismatch) => {}
+                        Err(error) => {
+                            fail_audio(&mut sink, &mut queue, &state, error, &mut pending_drain);
+                        }
                     }
-                },
+                }
                 AudioMessage::FinishSession { generation, reply } => {
                     crate::ble::gatt_note(format!(
                         "audio_session generation={generation} action=finish phase=requested queued_samples={} submitted_samples={}",
@@ -507,6 +633,7 @@ fn endpoint_kind(endpoint_id: &str, name: &str) -> &'static str {
 fn audio_error_code(error: &PlatformError) -> &'static str {
     match error {
         PlatformError::AudioEndpointNotSelected => "endpoint_not_selected",
+        PlatformError::AudioSinkUnavailable => "sink_unavailable",
         PlatformError::AudioBusy => "audio_busy",
         PlatformError::AudioQueueOverflow => "queue_overflow",
         PlatformError::AudioWorkerUnavailable => "worker_unavailable",
@@ -687,6 +814,63 @@ fn configured_failure_snapshot(
     }
 }
 
+// Only the audio worker mutates this state. Rebuild resources on a new begin
+// request after the failed session was interrupted; never restart its stream.
+// The closure is the existing WASAPI open/identity check, replaceable by a
+// deterministic backend in lifecycle tests without touching real endpoints.
+fn rebuild_selected_sink<T>(
+    sink: &mut Option<T>,
+    state: &Arc<Mutex<AudioSnapshot>>,
+    reopen: impl FnOnce(&str, &str, u64) -> Result<T, PlatformError>,
+) -> Result<(), PlatformError> {
+    if sink.is_some() {
+        return Ok(());
+    }
+    let before = lock(state).clone();
+    if matches!(before.phase, AudioPhase::Streaming | AudioPhase::Draining)
+        || before.generation != 0
+    {
+        return Err(PlatformError::AudioBusy);
+    }
+    let (Some(id), Some(name)) = (
+        before.selected_endpoint_id.as_ref(),
+        before.selected_endpoint_name.as_ref(),
+    ) else {
+        return Err(
+            if before.selected_endpoint_id.is_none() && before.selected_endpoint_name.is_none() {
+                PlatformError::AudioEndpointNotSelected
+            } else {
+                PlatformError::AudioSinkUnavailable
+            },
+        );
+    };
+    let attempt_id = AUDIO_ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    crate::ble::gatt_note(format!(
+        "audio_endpoint attempt_id={attempt_id} action=rebuild phase=requested source=retained_selection prior_phase={} prior_generation={} old_session_restarted=false",
+        audio_phase_name(before.phase), before.generation
+    ));
+    match reopen(id, name, attempt_id) {
+        Ok(opened) => {
+            *sink = Some(opened);
+            *lock(state) = ready_snapshot(id.clone(), name.clone());
+            crate::ble::gatt_note(format!(
+                "audio_endpoint attempt_id={attempt_id} action=rebuild phase=completed terminal_result=passed endpoint_kind={} next_phase=ready old_session_restarted=false elapsed_ms={}",
+                endpoint_kind(id, name), started.elapsed().as_millis()
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            *lock(state) = configured_failure_snapshot(id.clone(), name.clone(), error.to_string());
+            crate::ble::gatt_note(format!(
+                "audio_endpoint attempt_id={attempt_id} action=rebuild phase=completed terminal_result=failed error_domain=audio error_code={} reason=selected_endpoint_rebuild_failed retryable=true selection_retained=true elapsed_ms={}",
+                audio_error_code(&error), started.elapsed().as_millis()
+            ));
+            Err(PlatformError::AudioSinkUnavailable)
+        }
+    }
+}
+
 fn begin_session(
     sink: &mut Option<AudioSink>,
     queue: &mut VecDeque<i16>,
@@ -694,7 +878,11 @@ fn begin_session(
     generation: u64,
 ) -> Result<AudioSnapshot, PlatformError> {
     let Some(active_sink) = sink.as_mut() else {
-        return Err(PlatformError::AudioEndpointNotSelected);
+        return Err(if lock(state).selected_endpoint_id.is_some() {
+            PlatformError::AudioSinkUnavailable
+        } else {
+            PlatformError::AudioEndpointNotSelected
+        });
     };
     if matches!(
         lock(state).phase,
@@ -707,6 +895,13 @@ fn begin_session(
         .reset()
         .map_err(|error| audio_error("重置 WASAPI 会话", error))?;
     queue.clear();
+    active_sink.session_started_at = Instant::now();
+    active_sink.accepted_samples = 0;
+    active_sink.first_nonzero_submit = None;
+    active_sink.last_nonzero_submit = None;
+    active_sink.zero_available_count = 0;
+    active_sink.zero_available_since = None;
+    active_sink.zero_available_elapsed = Duration::ZERO;
     let mut snapshot = lock(state);
     snapshot.phase = AudioPhase::Streaming;
     snapshot.queued_samples = 0;
@@ -756,7 +951,13 @@ fn finish_drain(
     snapshot.phase = AudioPhase::Ready;
     snapshot.queued_samples = 0;
     snapshot.last_error = None;
-    Ok(snapshot.clone())
+    let result = snapshot.clone();
+    drop(snapshot);
+    crate::ble::gatt_note(format!("audio_flow generation={generation} terminal=normal_finish accepted_samples={} submitted_samples={} queued_samples={} elapsed_ms={} first_submit_ms={} last_submit_age_ms={}",
+        active_sink.accepted_samples, result.submitted_samples, result.queued_samples, active_sink.session_started_at.elapsed().as_millis(),
+        active_sink.first_nonzero_submit.map(|t| t.saturating_duration_since(active_sink.session_started_at).as_millis().to_string()).unwrap_or_else(|| "none".to_owned()),
+        active_sink.last_nonzero_submit.map(|t| t.elapsed().as_millis().to_string()).unwrap_or_else(|| "none".to_owned())));
+    Ok(result)
 }
 
 fn interrupt(
@@ -784,6 +985,20 @@ fn interrupt(
     Ok(snapshot.clone())
 }
 
+fn fail_cancel_cleanup(
+    sink: &mut Option<AudioSink>,
+    queue: &mut VecDeque<i16>,
+    state: &Arc<Mutex<AudioSnapshot>>,
+    error: PlatformError,
+    pending_drain: &mut Option<(u64, Sender<Result<AudioSnapshot, PlatformError>>)>,
+) {
+    crate::ble::gatt_note(format!("audio_session generation={} action=cancel phase=cleanup result=failed reason=cancel_cleanup_failed error_code={}", lock(state).generation, audio_error_code(&error)));
+    fail_audio(sink, queue, state, error, pending_drain);
+    // No WASAPI client remains; retire the cancelled generation without retrying
+    // the failed external reset, while retaining the user's endpoint selection.
+    let _ = interrupt(sink, queue, state);
+}
+
 fn fail_audio(
     sink: &mut Option<AudioSink>,
     queue: &mut VecDeque<i16>,
@@ -792,6 +1007,19 @@ fn fail_audio(
     pending_drain: &mut Option<(u64, Sender<Result<AudioSnapshot, PlatformError>>)>,
 ) {
     let snapshot_before = lock(state).clone();
+    let origin = if matches!(error, PlatformError::AudioQueueOverflow) {
+        "worker_pcm_queue"
+    } else {
+        "wasapi_pipeline"
+    };
+    if let Some(sink) = sink.as_ref() {
+        let zero_elapsed = sink.zero_available_elapsed
+            + sink
+                .zero_available_since
+                .map(|time| time.elapsed())
+                .unwrap_or_default();
+        crate::ble::gatt_note(format!("audio_flow generation={} failure_origin={origin} accepted_samples={} submitted_samples={} queued_samples={} elapsed_ms={} last_nonzero_submit_age_ms={} zero_available_count={} zero_available_elapsed_ms={}", snapshot_before.generation, sink.accepted_samples, snapshot_before.submitted_samples, queue.len(), sink.session_started_at.elapsed().as_millis(), sink.last_nonzero_submit.map(|time| time.elapsed().as_millis().to_string()).unwrap_or_else(|| "none".to_owned()), sink.zero_available_count, zero_elapsed.as_millis()));
+    }
     if matches!(
         snapshot_before.phase,
         AudioPhase::Streaming | AudioPhase::Draining
@@ -829,6 +1057,13 @@ struct AudioSink {
     is_virtual_cable: bool,
     started: bool,
     last_session_mute_check: Instant,
+    session_started_at: Instant,
+    accepted_samples: u64,
+    first_nonzero_submit: Option<Instant>,
+    last_nonzero_submit: Option<Instant>,
+    zero_available_count: u64,
+    zero_available_since: Option<Instant>,
+    zero_available_elapsed: Duration,
 }
 
 impl AudioSink {
@@ -895,6 +1130,13 @@ impl AudioSink {
             is_virtual_cable,
             started: false,
             last_session_mute_check: Instant::now(),
+            session_started_at: Instant::now(),
+            accepted_samples: 0,
+            first_nonzero_submit: None,
+            last_nonzero_submit: None,
+            zero_available_count: 0,
+            zero_available_since: None,
+            zero_available_elapsed: Duration::ZERO,
         };
         sink.ensure_session_unmuted("open", true)?;
         Ok(sink)
@@ -985,6 +1227,12 @@ impl AudioSink {
             self.client
                 .get_available_space_in_frames()
                 .map_err(|error| audio_error("读取 WASAPI 可写空间", error))? as usize;
+        if available == 0 && !queue.is_empty() {
+            self.zero_available_count += 1;
+            self.zero_available_since.get_or_insert_with(Instant::now);
+        } else if let Some(since) = self.zero_available_since.take() {
+            self.zero_available_elapsed += since.elapsed();
+        }
         let frames = available.min(queue.len());
         if frames == 0 {
             return Ok(0);
@@ -1007,6 +1255,9 @@ impl AudioSink {
             ));
             self.ensure_session_unmuted("after_start", true)?;
         }
+        let submitted_at = Instant::now();
+        self.first_nonzero_submit.get_or_insert(submitted_at);
+        self.last_nonzero_submit = Some(submitted_at);
         Ok(frames)
     }
 
@@ -1305,6 +1556,284 @@ mod tests {
     }
 
     #[test]
+    fn audio_rebuild_follows_failure_and_interrupt_without_reviving_old_samples() {
+        let state = Arc::new(Mutex::new(ready_snapshot(
+            "selected".into(),
+            "CABLE Input".into(),
+        )));
+        lock(&state).phase = AudioPhase::Streaming;
+        lock(&state).generation = 7;
+        let mut queue = VecDeque::from(vec![1; MAX_QUEUE_SAMPLES]);
+        let (reply, response) = mpsc::channel();
+        let mut drain = Some((7, reply));
+        let mut real_sink = None;
+        fail_audio(
+            &mut real_sink,
+            &mut queue,
+            &state,
+            PlatformError::AudioQueueOverflow,
+            &mut drain,
+        );
+        assert_eq!(
+            response.recv().unwrap(),
+            Err(PlatformError::AudioQueueOverflow)
+        );
+        assert!(queue.is_empty());
+        let mut fake_sink: Option<()> = None;
+        assert_eq!(
+            rebuild_selected_sink(&mut fake_sink, &state, |_, _, _| panic!(
+                "old session still owns generation"
+            )),
+            Err(PlatformError::AudioBusy)
+        );
+        interrupt(&mut real_sink, &mut queue, &state).unwrap();
+        rebuild_selected_sink(&mut fake_sink, &state, |id, name, _| {
+            assert_eq!((id, name), ("selected", "CABLE Input"));
+            Ok(())
+        })
+        .unwrap();
+        let snapshot = lock(&state).clone();
+        assert_eq!(snapshot.phase, AudioPhase::Ready);
+        assert_eq!(snapshot.generation, 0);
+        assert_eq!(snapshot.submitted_samples, 0);
+        assert_eq!(
+            enqueue_samples(&mut queue, &state, 7, vec![1]),
+            Err(PlatformError::AudioSessionMismatch)
+        );
+        rebuild_selected_sink(&mut fake_sink, &state, |_, _, _| {
+            panic!("healthy sink must not reopen")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn audio_rebuild_failure_retains_selection_for_a_later_new_session() {
+        let state = Arc::new(Mutex::new(configured_failure_snapshot(
+            "selected".into(),
+            "CABLE Input".into(),
+            "original failure".into(),
+        )));
+        let mut sink: Option<()> = None;
+        assert_eq!(
+            rebuild_selected_sink(&mut sink, &state, |_, _, _| Err(PlatformError::Audio(
+                "open failed".into()
+            ))),
+            Err(PlatformError::AudioSinkUnavailable)
+        );
+        assert!(sink.is_none());
+        assert_eq!(
+            lock(&state).selected_endpoint_id.as_deref(),
+            Some("selected")
+        );
+        assert_eq!(lock(&state).phase, AudioPhase::Failed);
+        rebuild_selected_sink(&mut sink, &state, |_, _, _| Ok(())).unwrap();
+        assert_eq!(lock(&state).phase, AudioPhase::Ready);
+    }
+
+    #[test]
+    fn audio_rebuild_never_selects_an_unconfigured_or_partial_identity() {
+        let state = Arc::new(Mutex::new(AudioSnapshot::default()));
+        let mut sink: Option<()> = None;
+        assert_eq!(
+            rebuild_selected_sink(&mut sink, &state, |_, _, _| panic!(
+                "must not guess an endpoint"
+            )),
+            Err(PlatformError::AudioEndpointNotSelected)
+        );
+        lock(&state).selected_endpoint_id = Some("selected".into());
+        assert_eq!(
+            rebuild_selected_sink(&mut sink, &state, |_, _, _| panic!("incomplete identity")),
+            Err(PlatformError::AudioSinkUnavailable)
+        );
+    }
+
+    #[test]
+    fn audio_rebuild_rejects_missing_or_replaced_endpoints_without_fallback() {
+        for endpoints in [
+            vec![],
+            vec![AudioEndpoint {
+                id: "replacement".into(),
+                name: "CABLE Input".into(),
+                is_virtual_cable_candidate: true,
+            }],
+            vec![AudioEndpoint {
+                id: "selected".into(),
+                name: "Renamed output".into(),
+                is_virtual_cable_candidate: true,
+            }],
+        ] {
+            let state = Arc::new(Mutex::new(configured_failure_snapshot(
+                "selected".into(),
+                "CABLE Input".into(),
+                "failed".into(),
+            )));
+            let mut sink: Option<()> = None;
+            assert_eq!(
+                rebuild_selected_sink(&mut sink, &state, |id, name, _| {
+                    validate_restored_endpoint(&endpoints, id, name)
+                        .map_err(PlatformError::Audio)?;
+                    panic!("must not open a missing or replaced endpoint")
+                }),
+                Err(PlatformError::AudioSinkUnavailable)
+            );
+            assert!(sink.is_none());
+            assert_eq!(
+                lock(&state).selected_endpoint_id.as_deref(),
+                Some("selected")
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_begin_reset_failure_retires_generation_and_retains_selection() {
+        let state = Arc::new(Mutex::new(ready_snapshot(
+            "selected".into(),
+            "saved".into(),
+        )));
+        lock(&state).phase = AudioPhase::Streaming;
+        lock(&state).generation = 31;
+        let mut queue = VecDeque::from([1, 2]);
+        let (reply, response) = mpsc::channel();
+        let mut pending = Some((31, reply));
+        let mut sink = None;
+        fail_cancel_cleanup(
+            &mut sink,
+            &mut queue,
+            &state,
+            PlatformError::Audio("reset fault fixture".into()),
+            &mut pending,
+        );
+        assert_eq!(lock(&state).phase, AudioPhase::Failed);
+        assert_eq!(lock(&state).generation, 0);
+        assert!(queue.is_empty());
+        assert!(pending.is_none());
+        assert!(response.recv().unwrap().is_err());
+        assert!(lock(&state)
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("reset fault fixture"));
+        let mut fake_sink: Option<()> = None;
+        rebuild_selected_sink(&mut fake_sink, &state, |id, name, _| {
+            assert_eq!(id, "selected");
+            assert_eq!(name, "saved");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lock(&state).phase, AudioPhase::Ready);
+    }
+
+    #[test]
+    fn source_release_cancels_only_its_connection_preparation() {
+        let lifecycle = Arc::new(AtomicU64::new(0));
+        let old_release = Arc::new(AtomicU64::new(0));
+        let new_release = Arc::new(AtomicU64::new(0));
+        let old = AudioBeginGuard::new(old_release.clone(), lifecycle.clone());
+        let new = AudioBeginGuard::new(new_release, lifecycle.clone());
+        old_release.fetch_add(1, Ordering::SeqCst);
+        assert!(old.cancelled());
+        assert!(!new.cancelled());
+        lifecycle.fetch_add(1, Ordering::SeqCst);
+        assert!(new.cancelled());
+    }
+
+    #[test]
+    fn release_during_blocked_endpoint_preparation_invalidates_commit() {
+        let release = Arc::new(AtomicU64::new(0));
+        let guard = AudioBeginGuard::new(release.clone(), Arc::new(AtomicU64::new(0)));
+        let (entered, wait) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let state = Arc::new(Mutex::new(ready_snapshot(
+                "selected".into(),
+                "saved".into(),
+            )));
+            let mut sink: Option<()> = None;
+            rebuild_selected_sink(&mut sink, &state, |_, _, _| {
+                entered.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+            assert!(guard.cancelled());
+            assert_eq!(lock(&state).generation, 0);
+            assert_eq!(lock(&state).phase, AudioPhase::Ready);
+        });
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        release.fetch_add(1, Ordering::SeqCst);
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_begin_does_not_open_an_endpoint_or_revive_a_session() {
+        let runtime = AudioRuntime::new();
+        let release = Arc::new(AtomicU64::new(0));
+        let guard = AudioBeginGuard::new(release.clone(), runtime.lifecycle_epoch.clone());
+        release.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            runtime.begin_session(19, Some(guard)),
+            Err(PlatformError::AudioSessionInterrupted)
+        );
+        assert_eq!(runtime.snapshot().phase, AudioPhase::Unconfigured);
+        assert_eq!(runtime.snapshot().generation, 0);
+    }
+
+    #[test]
+    #[ignore = "explicit saved endpoint ID/name required; sends silence through real WASAPI without changing saved configuration"]
+    fn saved_endpoint_recovers_after_real_worker_queue_failure_and_consumes_silence() {
+        let id =
+            std::env::var("SAYALL_TEST_CABLE_ENDPOINT_ID").expect("explicit endpoint ID required");
+        let name = std::env::var("SAYALL_TEST_CABLE_ENDPOINT_NAME")
+            .expect("explicit saved endpoint name required");
+        wasapi::initialize_mta().ok().expect("COM apartment");
+        let _apartment = WasapiApartment;
+        assert!(
+            !endpoint_muted(&id).expect("endpoint mute query"),
+            "test refuses an already-muted endpoint"
+        );
+        let runtime = AudioRuntime::new();
+        runtime
+            .restore_endpoint(id.clone(), name.clone())
+            .expect("restore exact saved endpoint");
+        assert_eq!(runtime.snapshot().phase, AudioPhase::Ready);
+        runtime.begin_session(20, None).unwrap();
+        runtime
+            .enqueue_samples(20, vec![0; MAX_QUEUE_SAMPLES + 1])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.snapshot().phase != AudioPhase::Failed && Instant::now() < deadline {
+            thread::sleep(POLL_INTERVAL);
+        }
+        assert_eq!(runtime.snapshot().phase, AudioPhase::Failed);
+        assert!(runtime.failure().is_some());
+        runtime.interrupt_session().unwrap();
+        // This is the first new session after failure; no manual reselect or retry.
+        for generation in [21, 22] {
+            runtime
+                .begin_session(generation, None)
+                .expect("new session rebuilds original endpoint");
+            runtime.enqueue_samples(generation, vec![0; 1600]).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while runtime.snapshot().submitted_samples < 1600 && Instant::now() < deadline {
+                thread::sleep(POLL_INTERVAL);
+            }
+            let submitted = runtime.snapshot().submitted_samples;
+            assert_eq!(
+                submitted, 1600,
+                "real render client must consume all silence samples"
+            );
+            let ended = runtime
+                .finish_session(generation)
+                .expect("real WASAPI padding drains");
+            assert_eq!(ended.phase, AudioPhase::Ready);
+            assert_eq!(ended.selected_endpoint_id.as_deref(), Some(id.as_str()));
+            assert_eq!(ended.selected_endpoint_name.as_deref(), Some(name.as_str()));
+            println!("real_audio_recovery generation={generation} submitted_samples={submitted} drained=true selection_preserved=true");
+        }
+    }
+
+    #[test]
     fn endpoint_logging_classifies_bluetooth_without_returning_identity() {
         assert_eq!(
             endpoint_kind("{0.0.0.00000000}.bthenum-device", "Headphones"),
@@ -1400,7 +1929,7 @@ mod tests {
 
         set_endpoint_muted(&endpoint_id, true).expect("mute endpoint after it is already open");
         runtime
-            .begin_session(1)
+            .begin_session(1, None)
             .expect("beginning a session should self-heal endpoint and session mute");
         assert!(!endpoint_muted(&endpoint_id).expect("read mute after begin_session"));
         assert!(

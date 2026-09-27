@@ -200,6 +200,7 @@ mod tests {
             button_mapping: sayall_windows::button_mapping::ButtonMappingSnapshot {
                 enabled: true,
                 gate_active: true,
+                observed_buttons: Vec::new(),
                 listener_active: true,
                 swallowed_edges: 3,
                 leaked_downs: 1,
