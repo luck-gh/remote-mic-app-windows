@@ -1,3 +1,4 @@
+use sayall_core::VoiceInputTool;
 use sayall_windows::raw_input::RawInputSnapshot;
 use sayall_windows::send_input::{ButtonAction, KeyChord, ScrollDirection, SendInputSnapshot};
 use sayall_windows::{
@@ -75,6 +76,9 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn open_bluetooth_settings(&self) -> Result<(), PlatformError>;
     fn voice_hold_hotkey(&self) -> Option<KeyChord>;
     fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>);
+    /// 「你在用的输入工具」：BLE 工作线程在语音会话开始前按它决定把哪个
+    /// 输入法切进当前会话（`ime::ensure_session_ime`）。
+    fn set_voice_input_tool(&self, _tool: Option<VoiceInputTool>) {}
     fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings;
     fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings);
     fn set_mapping_configuration(
@@ -256,6 +260,10 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::set_voice_hold_hotkey(self, hotkey)
     }
 
+    fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+        WindowsPlatform::set_voice_input_tool(self, tool)
+    }
+
     fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings {
         WindowsPlatform::button_mappings(self)
     }
@@ -374,6 +382,7 @@ mod simulation {
         usage: Arc<UsageCounters>,
         state: Mutex<SimulationState>,
         voice_hold_hotkey: Mutex<Option<KeyChord>>,
+        voice_input_tool: Mutex<Option<VoiceInputTool>>,
         button_mappings: Mutex<sayall_windows::send_input::ButtonMappings>,
     }
 
@@ -645,6 +654,10 @@ mod simulation {
 
         fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>) {
             *lock(&self.voice_hold_hotkey) = hotkey;
+        }
+
+        fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+            *lock(&self.voice_input_tool) = tool;
         }
 
         fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings {

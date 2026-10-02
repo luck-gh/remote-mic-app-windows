@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   actionSummary,
@@ -6,9 +7,13 @@ import {
   chordLabel,
   connectionPhaseLabel,
   formatDiagnosticReport,
+  GITHUB_REPOSITORY_URL,
   identityShortcutByButton,
   isRecommendedVoiceEndpoint,
+  OFFICIAL_WEBSITE_URL,
+  openGitHubRepository,
   openLogDirectory,
+  openOfficialWebsite,
   openVbCableDownloadPage,
   remoteModelLabel,
   shortcutCapability,
@@ -19,6 +24,7 @@ import {
 } from "./bridge";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 describe("mouse actions", () => {
   it("summarizes clicks, movement, and wheel amounts", () => {
@@ -50,13 +56,11 @@ describe("mapping capability matrix（单响应判定，用于信息提示）", 
   it("TV 与返回/音量±不从普通输入路径推断单响应保证", () => {
     expect(shortcutCapability("tv", "single", "rc003")).toBe("none");
     expect(shortcutCapability("tv", "long", "rc001")).toBe("none");
-    expect(shortcutCapability("back", "single", "rc003")).toBe("none");
-    expect(shortcutCapability("volume_up", "single", "rc003")).toBe("none");
-    expect(shortcutCapability("volume_down", "single", "unknown")).toBe("none");
-    expect(shortcutCapability("back", "single", "unknown")).toBe("none");
-    expect(shortcutCapability("back", "single", "rc001")).toBe("none");
-    expect(shortcutCapability("volume_up", "long", "rc001")).toBe("none");
-    expect(shortcutCapability("volume_down", "double", "rc001")).toBe("none");
+    for (const button of ["back", "volume_up", "volume_down"] as const) {
+      expect(shortcutCapability(button, "single", "rc003")).toBe("none");
+      expect(shortcutCapability(button, "double", "rc001")).toBe("none");
+      expect(shortcutCapability(button, "long", "unknown")).toBe("none");
+    }
   });
 
   it("identityShortcutByButton 对齐 Rust native_key（泄漏对冲判定依据）", () => {
@@ -128,8 +132,8 @@ describe("connection phase presentation", () => {
   });
 
   it("展示 RC001、RC003 和未知型号", () => {
-    expect(remoteModelLabel("rc001")).toBe("小米蓝牙遥控器 2");
-    expect(remoteModelLabel("rc003")).toBe("小米蓝牙遥控器 2 Pro");
+    expect(remoteModelLabel("rc001")).toBe("小米蓝牙语音遥控器 2");
+    expect(remoteModelLabel("rc003")).toBe("小米蓝牙语音遥控器 2 Pro");
     expect(remoteModelLabel("unknown")).toBe("连接后显示");
   });
 
@@ -230,6 +234,46 @@ describe("VB-CABLE download guidance", () => {
 
     expect(open).toHaveBeenCalledWith(VB_CABLE_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
     open.mockRestore();
+  });
+});
+
+describe("设置页外部入口（官网 / GitHub）", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(openUrl).mockReset();
+  });
+
+  it("指向已确认的官网与 Windows 仓库地址", () => {
+    // 2026-10-02 用户指定：官网入口带 `?from=win` 来源标记，便于官网区分来客。
+    expect(OFFICIAL_WEBSITE_URL).toBe("https://sayall.app/?from=win");
+    expect(GITHUB_REPOSITORY_URL).toBe("https://github.com/GetSayAll/remote-mic-app-windows");
+  });
+
+  it("浏览器预览下用新标签打开，不调用 Tauri opener", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+
+    await openOfficialWebsite();
+    await openGitHubRepository();
+
+    expect(open).toHaveBeenNthCalledWith(1, OFFICIAL_WEBSITE_URL, "_blank", "noopener,noreferrer");
+    expect(open).toHaveBeenNthCalledWith(2, GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer");
+    expect(openUrl).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("Tauri 运行时交给 opener 插件，地址必须与 capability 白名单逐字一致", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    vi.mocked(openUrl).mockResolvedValue(undefined);
+
+    await openOfficialWebsite();
+    await openGitHubRepository();
+
+    // 传出的字符串与 src-tauri/capabilities/default.json 的 allow 列表是同一份
+    // 契约：多一个字符、少一个尾斜杠都会被插件判为 ForbiddenUrl。
+    expect(vi.mocked(openUrl).mock.calls.map(([url]) => url)).toEqual([
+      OFFICIAL_WEBSITE_URL,
+      GITHUB_REPOSITORY_URL,
+    ]);
   });
 });
 

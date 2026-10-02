@@ -1,11 +1,11 @@
-export type PageId = "drivers" | "buttons" | "templates" | "connection" | "permissions" | "about";
+export type PageId = "drivers" | "buttons" | "templates" | "connection" | "permissions" | "settings";
 
-export type NavIcon = "driver" | "keyboard" | "template" | "link" | "shield" | "info";
+export type NavIcon = "driver" | "keyboard" | "template" | "link" | "shield" | "gear";
 
 export interface NavigationItem {
   id: PageId;
   label: string;
-  /** 侧栏图标（形状对齐 macOS SF Symbols：keyboard/link/shield/info.circle）。 */
+  /** 侧栏图标（形状对齐 macOS SF Symbols：keyboard/link/shield.lefthalf.filled/gearshape）。 */
   icon: NavIcon;
 }
 
@@ -15,7 +15,9 @@ export const navigationItems: NavigationItem[] = [
   { id: "templates", label: "模板", icon: "template" },
   { id: "connection", label: "连接与语音", icon: "link" },
   { id: "permissions", label: "权限", icon: "shield" },
-  { id: "about", label: "关于", icon: "info" },
+  // 2026-10-02 用户指定：原「关于」页改名「设置」，图标对齐 Mac main
+  // SettingsSection.about 的 "gearshape"。
+  { id: "settings", label: "设置", icon: "gear" },
 ];
 
 const ACTIVE_PAGE_STORAGE_KEY = "sayall.activePage";

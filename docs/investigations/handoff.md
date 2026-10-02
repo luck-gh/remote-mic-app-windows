@@ -1,5 +1,7 @@
 # 交接文档（handoff）——驱动签名规避调查后续
 
+> 当前阅读边界（2026-10-02）：本文是历史调查记录，当前方向与授权以 [PLAN](../PLAN.md) 为准，任务与验收以 [TODO](../../TODO.md) 为准。上游 2026-09-23 Gadget/计划任务路线的交接记录可在[固定上游提交](https://github.com/GetSayAll/remote-mic-app-windows/blob/c81308e011a757dc22d22f2861b687ef787d295e/docs/investigations/handoff.md)查阅；该路线未被本地采用，其用户操作、运行进程与 passed 均不是当前本机状态或本轮操作指令。
+
 目的：新代理 10 分钟内接手。日期：2026-09-04。调查已闭环（R5 终审 PASS），本文件指引后续执行。
 
 ## 当前系统状态（接手前必读）

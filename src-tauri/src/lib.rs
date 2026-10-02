@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock, Weak};
 use tauri::{Emitter, Manager};
 
+mod accent;
+mod app_icon;
 mod diagnostics;
 mod platform;
 mod settings;
@@ -20,7 +22,7 @@ mod updater;
 
 use diagnostics::DiagnosticReport;
 use platform::PlatformRuntime;
-use sayall_core::ThemePreference;
+use sayall_core::{AppIconIdentifier, ThemePreference, VoiceInputTool};
 use updater::{
     check_app_update, get_app_update_preferences, install_app_update, set_app_update_preferences,
 };
@@ -393,6 +395,36 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// 读取 Windows 系统强调色（设置 > 个性化 > 颜色）。前端用返回的 RGB 派生
+/// `--accent*` 变量族，让选中态等 UI 跟随系统主题色而非硬编码品牌色。
+/// 读取在一次性 STA 线程上进行（UISettings 要求 COM apartment）；失败返回
+/// None，前端保留 styles.css 内置默认色，不阻塞启动。
+#[tauri::command]
+async fn get_system_accent_color() -> Option<accent::AccentColor> {
+    let result = tauri::async_runtime::spawn_blocking(accent::read_system_accent_color).await;
+    match result {
+        Ok(color) => {
+            sayall_windows::gatt_note(format!(
+                "accent_color action=frontend_read phase=completed terminal_result={} reason={}",
+                if color.is_some() { "passed" } else { "failed" },
+                if color.is_some() {
+                    "accent_read"
+                } else {
+                    "accent_unavailable"
+                },
+            ));
+            color
+        }
+        Err(error) => {
+            sayall_windows::gatt_note(format!(
+                "accent_color action=frontend_read phase=completed terminal_result=failed error_domain=task error_code=join_failed retryable=true reason=blocking_task_panicked"
+            ));
+            let _ = error;
+            None
+        }
+    }
+}
+
 #[tauri::command]
 fn get_runtime_snapshot(
     app: tauri::AppHandle,
@@ -426,7 +458,8 @@ fn get_diagnostic_report(
 ///
 /// 路径来自日志初始化的**实际**落盘路径，不接受前端传入：否则等于把"用
 /// ShellExecuteW 打开任意路径"的能力交给 WebView，与本仓库 capabilities 的
-/// 最小权限设计（opener 仅放行 VB-CABLE 官网一个 URL）直接冲突。
+/// 最小权限设计（opener 只放行 VB-CABLE 官网、产品官网与源码仓库三个固定
+/// URL，见 capabilities/default.json）直接冲突。
 ///
 /// 目录不存在时先创建：日志初始化理论上已建好父目录（`create_dir_all`），
 /// 但 `SAYALL_GATT_LOG` 覆盖或初始化失败的场景下可能缺失，而资源管理器对
@@ -487,6 +520,25 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
         started.elapsed().as_millis()
     ));
     result
+}
+
+/// 设置页「应用图标」的当前选择（默认内置应用图标）。
+#[tauri::command]
+fn get_app_icon(state: tauri::State<'_, AppState>) -> Result<AppIconIdentifier, String> {
+    state.settings.load().map(|settings| settings.app_icon)
+}
+
+/// 切换应用图标：先落盘，再应用到主窗口（任务栏 / Alt-Tab）与托盘图标；
+/// 认不出的 ID 与资产缺失都在应用层回落 `standard` 并落日志。
+#[tauri::command]
+fn set_app_icon(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    identifier: AppIconIdentifier,
+) -> Result<AppIconIdentifier, String> {
+    state.settings.save_app_icon(identifier)?;
+    let applied = app_icon::apply(&app, identifier);
+    Ok(applied)
 }
 
 #[tauri::command]
@@ -1412,33 +1464,105 @@ fn get_button_mapping_snapshot(
     state.platform.button_mapping_snapshot()
 }
 
+/// 在应用主线程（= 录入窗口所在线程）上执行输入区域让位/恢复并取回日志片段。
+/// 输入区域按线程生效，必须在窗口线程调用；有界等待防卡命令线程。
+fn run_ime_yield_on_window_thread(app: &tauri::AppHandle, task: fn() -> String) -> Option<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(task());
+    })
+    .ok()?;
+    receiver
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .ok()
+}
+
+/// 录入会话开始前微信输入法麦克风的观测基线：start 时取样，stop 时对比，判定
+/// "微信输入法语音是否在录入期间被触发"。其语音热键组成键的物理边沿在 RIT 层
+/// 即被吞（对低级钩子、Raw Input、GetAsyncKeyState 均不可见，见 2026-09-27 诊断），
+/// 语音被触发是零/半截边沿会话中推断用户按了其热键的唯一旁证。
+static CAPTURE_MIC_BASELINE: std::sync::OnceLock<std::sync::Mutex<Option<u64>>> =
+    std::sync::OnceLock::new();
+
+fn capture_mic_baseline_slot() -> &'static std::sync::Mutex<Option<u64>> {
+    CAPTURE_MIC_BASELINE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 #[tauri::command]
-fn start_shortcut_capture() -> Result<(), String> {
+fn start_shortcut_capture(
+    app: tauri::AppHandle,
+) -> Result<Vec<sayall_windows::send_input::KeyCode>, String> {
     let started = std::time::Instant::now();
-    sayall_windows::gatt_note(
-        "shortcut_capture action=start phase=requested suppression=global_paired_edges capture_mode=main_key_only".to_owned(),
-    );
+    let mic_baseline = sayall_windows::capture_mic_baseline();
+    match capture_mic_baseline_slot().lock() {
+        Ok(mut guard) => *guard = mic_baseline,
+        Err(poisoned) => *poisoned.into_inner() = mic_baseline,
+    }
+    sayall_windows::gatt_note(format!(
+        "shortcut_capture action=start phase=requested suppression=global_paired_edges capture_mode=main_key_only ime_yield=pending mic_baseline={mic_baseline:?}",
+    ));
+    // 录入期让位（路线①）：LL 钩子链为 FIFO，输入法钩子先于本应用安装，其语音和弦
+    // 的物理边沿到不了本钩子（见 docs/investigations/2026-09-27-ll-hook-chain-order-fifo.md）。
+    // 先把录入窗口线程的输入区域切到非 IME 布局，让输入法的和弦判定失效，物理边沿
+    // 得以直达本钩子；录入结束（stop）恢复。
+    match run_ime_yield_on_window_thread(&app, sayall_windows::suspend_input_method_for_capture) {
+        Some(note) => sayall_windows::gatt_note(note),
+        None => sayall_windows::gatt_note(
+            "capture_ime_yield outcome=unavailable reason=window_thread_timeout".to_owned(),
+        ),
+    }
     if !sayall_windows::key_gate::set_shortcut_capture_active(true) {
+        // 让位已发生但门控不可用：立即恢复布局，避免留下非 IME 输入区域。
+        if let Some(note) =
+            run_ime_yield_on_window_thread(&app, sayall_windows::restore_input_method_after_capture)
+        {
+            sayall_windows::gatt_note(note);
+        }
         sayall_windows::gatt_note(format!(
             "shortcut_capture action=start phase=completed terminal_result=failed error_domain=keyboard_hook error_code=gate_unavailable reason=hook_not_active retryable=true elapsed_ms={}",
             started.elapsed().as_millis()
         ));
         return Err("键盘保护钩子尚未就绪，请稍后重试".to_owned());
     }
+    let preheld = sayall_windows::key_gate::take_preheld_capture_keys();
     sayall_windows::gatt_note(format!(
-        "shortcut_capture action=start phase=completed terminal_result=passed capture_mode=main_key_only elapsed_ms={}",
-        started.elapsed().as_millis()
+        "shortcut_capture action=start phase=completed terminal_result=passed capture_mode=main_key_only preheld_count={} elapsed_ms={} {}",
+        preheld.len(),
+        started.elapsed().as_millis(),
+        sayall_windows::key_gate::capture_diagnostics_summary()
     ));
-    Ok(())
+    Ok(preheld)
+}
+
+/// stop_shortcut_capture 的返回值：前端据此在零/半截边沿会话中推断用户按的是
+/// 微信输入法语音热键并引导落盘（"observed" = 触发；"not_observed" = 确认未触发；
+/// "unknown" = 观测不可用，不得推断）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShortcutCaptureStopResult {
+    wetype_voice: &'static str,
 }
 
 #[tauri::command]
-fn stop_shortcut_capture() {
+fn stop_shortcut_capture(app: tauri::AppHandle) -> ShortcutCaptureStopResult {
+    let mic_baseline = match capture_mic_baseline_slot().lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    let wetype_voice = sayall_windows::capture_mic_verdict(mic_baseline);
     let _ = sayall_windows::key_gate::set_shortcut_capture_active(false);
-    sayall_windows::gatt_note(
-        "shortcut_capture action=stop phase=completed terminal_result=passed pending_key_ups=paired"
-            .to_owned(),
-    );
+    // 恢复录入前的输入区域布局（让位撤销，输入法回到该窗口会话）。
+    match run_ime_yield_on_window_thread(&app, sayall_windows::restore_input_method_after_capture) {
+        Some(note) => sayall_windows::gatt_note(note),
+        None => sayall_windows::gatt_note(
+            "capture_ime_restore outcome=unavailable reason=window_thread_timeout".to_owned(),
+        ),
+    }
+    sayall_windows::gatt_note(format!(
+        "shortcut_capture action=stop phase=completed terminal_result=passed pending_key_ups=paired wetype_voice={wetype_voice} {}",
+        sayall_windows::key_gate::capture_diagnostics_summary()
+    ));
+    ShortcutCaptureStopResult { wetype_voice }
 }
 
 #[tauri::command]
@@ -1489,6 +1613,194 @@ async fn set_voice_hold_hotkey(
             "shortcut_settings feature=voice_hold action=save phase=completed terminal_result=failed enabled={enabled} key_count={key_count} error_domain=settings error_code=save_failed reason=validation_or_persistence_failed retryable=true elapsed_ms={}",
             started.elapsed().as_millis()
         ),
+    });
+    result
+}
+
+/// 连接页选择的输入工具（微信输入法 / 豆包输入法 / 其他工具）。
+///
+/// `None` = 用户从未选择过：界面按当前快捷键推断一次后落存（老配置升级路径）。
+/// 它不是语音路径的开关——真正生效的永远是"按住说话快捷键"本身，
+/// 这个值只决定连接页展示哪一套引导与开关。
+#[tauri::command]
+async fn get_voice_input_tool(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<VoiceInputTool>, String> {
+    let settings = state.settings.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        settings.load().map(|settings| settings.voice_input_tool)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("读取输入工具设置任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(tool) => format!(
+            "shortcut_settings feature=voice_input_tool action=load phase=completed terminal_result=passed tool={}",
+            voice_input_tool_name(*tool)
+        ),
+        Err(_) => "shortcut_settings feature=voice_input_tool action=load phase=completed terminal_result=failed error_domain=settings error_code=load_failed reason=settings_load_failed retryable=true".to_owned(),
+    });
+    result
+}
+
+#[tauri::command]
+async fn set_voice_input_tool(
+    tool: Option<VoiceInputTool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<VoiceInputTool>, String> {
+    let started = std::time::Instant::now();
+    let settings = state.settings.clone();
+    let platform = state.platform.clone();
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=voice_input_tool action=save phase=requested tool={}",
+        voice_input_tool_name(tool)
+    ));
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        settings.save_voice_input_tool(tool)?;
+        // 推给平台：BLE 工作线程在**按住语音键**的那一刻按它决定切哪个输入法
+        //（唯一切换时机；不做聚焦/离开窗口时的预切，2026-10-01 Andy 要求）。
+        platform.set_voice_input_tool(tool);
+        Ok(tool)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("保存输入工具设置任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(saved) => format!(
+            "shortcut_settings feature=voice_input_tool action=save phase=completed terminal_result=passed tool={} elapsed_ms={}",
+            voice_input_tool_name(*saved),
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "shortcut_settings feature=voice_input_tool action=save phase=completed terminal_result=failed tool={} error_domain=settings error_code=save_failed reason=settings_save_failed retryable=true elapsed_ms={}",
+            voice_input_tool_name(tool),
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+/// Vokie 安装检测的返回体（连接页用它决定显示官网入口还是“没有运行”提示）。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VokieInstallationSnapshot {
+    installed: bool,
+    running: bool,
+}
+
+fn voice_input_tool_name(tool: Option<VoiceInputTool>) -> &'static str {
+    match tool {
+        Some(VoiceInputTool::Wechat) => "wechat",
+        Some(VoiceInputTool::Doubao) => "doubao",
+        Some(VoiceInputTool::Vokie) => "vokie",
+        Some(VoiceInputTool::Other) => "other",
+        None => "unset",
+    }
+}
+
+/// Vokie 安装 / 运行检测（连接页“选择输入工具”→“Vokie”卡片）。
+///
+/// `installed` 决定显示官网入口，`running` 决定提示“没有运行”——右键 Alt 冲突的
+/// 判据是“在跑”（没运行就不会响应遥控器按键，2026-10-01 Andy 提出的冲突点）。
+///
+/// 只读：不启动 Vokie、不读它的配置。日志只记结果与命中的判据标签（source），
+/// **绝不记路径**（隐私红线）。
+#[tauri::command]
+async fn get_vokie_installation() -> VokieInstallationSnapshot {
+    let result = match tauri::async_runtime::spawn_blocking(sayall_windows::vokie::detect).await {
+        Ok(installation) => installation,
+        Err(_) => {
+            sayall_windows::gatt_note(
+                "voice_input_tool feature=vokie_install action=detect phase=completed terminal_result=failed installed=false source=task_failed error_domain=task error_code=join_failed retryable=true"
+                    .to_owned(),
+            );
+            return VokieInstallationSnapshot {
+                installed: false,
+                running: false,
+            };
+        }
+    };
+    sayall_windows::gatt_note(format!(
+        "voice_input_tool feature=vokie_install action=detect phase=completed terminal_result=passed installed={} running={} source={}",
+        result.installed,
+        result.running,
+        result.source_label()
+    ));
+    VokieInstallationSnapshot {
+        installed: result.installed,
+        running: result.running,
+    }
+}
+
+/// 打开 Vokie（连接页第 ② 步「打开 Vokie」按钮，2026-10-01 Andy 需求：
+/// 装了但没运行时，让用户一键把它叫起来）。
+///
+/// 只启动、不改它的配置；只记结果、**不记路径**（隐私红线）。
+#[tauri::command]
+async fn launch_vokie() -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(sayall_windows::vokie::launch)
+        .await
+        .map_err(|error| format!("打开 Vokie 任务失败：{error}"))
+        .and_then(|inner| inner);
+    sayall_windows::gatt_note(match &result {
+        Ok(()) => "voice_input_tool feature=vokie_launch action=launch phase=completed terminal_result=passed trigger=connection_page".to_owned(),
+        Err(_) => "voice_input_tool feature=vokie_launch action=launch phase=completed terminal_result=failed error_domain=process error_code=launch_failed retryable=true".to_owned(),
+    });
+    result
+}
+
+/// 「其他工具」面板记住的按键（2026-10-01 Andy 反馈：选了「不按键 / 左 Alt」
+/// 后切去豆包再切回「其他工具」，会退回默认右 Alt）。
+///
+/// 返回 `null` = 从未选过（调用方保持现状）；`[]` = 明确选了「不按键」。
+#[tauri::command]
+async fn get_other_voice_hotkey(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<Vec<sayall_windows::send_input::KeyCode>>, String> {
+    let settings = state.settings.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        settings.load_other_voice_hotkey()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("读取「其他工具」按键记忆任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(keys) => format!(
+            "shortcut_settings feature=other_voice_hotkey action=load phase=completed terminal_result=passed chosen={} key_count={}",
+            keys.is_some(),
+            keys.as_ref().map(|keys| keys.len()).unwrap_or(0)
+        ),
+        Err(_) => "shortcut_settings feature=other_voice_hotkey action=load phase=completed terminal_result=failed error_domain=settings error_code=load_failed reason=settings_load_failed retryable=true".to_owned(),
+    });
+    result
+}
+
+#[tauri::command]
+async fn set_other_voice_hotkey(
+    keys: Option<Vec<sayall_windows::send_input::KeyCode>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<Vec<sayall_windows::send_input::KeyCode>>, String> {
+    let settings = state.settings.clone();
+    let result =
+        match tauri::async_runtime::spawn_blocking(move || settings.save_other_voice_hotkey(keys))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(format!("保存「其他工具」按键记忆任务失败：{error}")),
+        };
+    sayall_windows::gatt_note(match &result {
+        Ok(keys) => format!(
+            "shortcut_settings feature=other_voice_hotkey action=save phase=completed terminal_result=passed chosen={} key_count={}",
+            keys.is_some(),
+            keys.as_ref().map(|keys| keys.len()).unwrap_or(0)
+        ),
+        Err(_) => "shortcut_settings feature=other_voice_hotkey action=save phase=completed terminal_result=failed error_domain=settings error_code=save_failed reason=settings_save_failed retryable=true".to_owned(),
     });
     result
 }
@@ -2362,12 +2674,26 @@ fn register_shortcut_capture_events(app: tauri::AppHandle) {
         .spawn(move || {
             while let Ok(edge) = receiver.recv() {
                 sayall_windows::gatt_note(format!(
-                    "shortcut_capture action=edge phase=observed key={:?} edge={} delivery=webview",
+                    "shortcut_capture action=edge phase=observed key={:?} edge={} source={} delivery=webview",
                     edge.key,
-                    if edge.is_pressed { "down" } else { "up" }
+                    if edge.is_pressed { "down" } else { "up" },
+                    edge.source.as_str()
                 ));
                 let _ = app.emit("shortcut-capture-edge", &edge);
             }
+        })
+        .ok();
+    // 10s 诊断心跳（临时排查设施，PR 前移除）：把钩子健康度基线（calls_total /
+    // capture_active 等）周期落盘，便于在无需界面交互的情况下用外部注入对照，
+    // 区分"钩子没被系统调用"与"钩子被调用但事件被上层吞掉/过滤"。只读原子。
+    std::thread::Builder::new()
+        .name("sayall-shortcut-capture-diag".to_owned())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            sayall_windows::gatt_note(format!(
+                "shortcut_capture action=diag phase=heartbeat {}",
+                sayall_windows::key_gate::capture_diagnostics_summary()
+            ));
         })
         .ok();
 }
@@ -2563,10 +2889,15 @@ pub fn run() {
         .join("SayAll")
         .join("Logs")
         .join("sayall-diagnostic.log");
+    // 版本号唯一来源是 tauri.conf.json 的 `version`（安装包名、exe 版本资源、关于页
+    // 显示都取自它）。这里提前构建 context 并读同一个 package_info，日志里的
+    // app_version 才与用户安装的版本严格一致（此前用编译期 CARGO_PKG_VERSION，
+    // Cargo crate 版本是占位值 0.0.0，会写出与实际安装版本无关的版本号）。
+    let context = tauri::generate_context!();
     let log_ready = sayall_windows::initialize_diagnostic_log(
         log_path,
         sayall_windows::DiagnosticLogMetadata {
-            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            app_version: context.package_info().version.to_string(),
             app_build: option_env!("SAYALL_APP_BUILD")
                 .unwrap_or("unknown")
                 .to_owned(),
@@ -2668,7 +2999,7 @@ pub fn run() {
                 let icon = app.default_window_icon().cloned().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::NotFound, "缺少应用图标，无法创建托盘")
                 })?;
-                TrayIconBuilder::with_id("sayall-tray")
+                TrayIconBuilder::with_id(app_icon::TRAY_ID)
                     .icon(icon)
                     .menu(&menu)
                     .show_menu_on_left_click(false)
@@ -2730,6 +3061,10 @@ pub fn run() {
                     Default::default()
                 }
             };
+            // 应用图标（2026-10-02）：托盘刚用内置图标建成，这里按持久化选择把
+            // 主窗口（任务栏 / Alt-Tab）与托盘图标一起换成用户选的那一个。
+            #[cfg(windows)]
+            app_icon::apply(app.handle(), saved_settings.app_icon);
             // 启动时把持久化偏好同步到 Windows 当前用户登录启动项；失败只记录，
             // 不阻断主程序启动，用户可在“关于”页重试。
             #[cfg(windows)]
@@ -2817,6 +3152,25 @@ pub fn run() {
                 }
             }
 
+            // 选的输入工具同样要推给平台（2026-10-01）：语音会话开始前决定把哪个
+            // 输入法切进当前会话。启动只推状态、不主动切——避免应用一启动就改用户
+            // 当前的输入法；真正切换发生在"选中工具"与"按下语音键"两个时机。
+            match settings.load() {
+                Ok(loaded) => {
+                    sayall_windows::gatt_note(format!(
+                        "shortcut_settings feature=voice_input_tool action=restore phase=completed terminal_result=passed tool={}",
+                        voice_input_tool_name(loaded.voice_input_tool)
+                    ));
+                    platform.set_voice_input_tool(loaded.voice_input_tool);
+                }
+                Err(error) => {
+                    sayall_windows::gatt_note(
+                        "shortcut_settings feature=voice_input_tool action=restore phase=completed terminal_result=failed error_domain=settings error_code=load_failed reason=cold_start_fallback retryable=true".to_owned(),
+                    );
+                    eprintln!("{error}");
+                }
+            }
+
             #[cfg(not(windows))]
             let _ = saved_settings;
 
@@ -2825,6 +3179,27 @@ pub fn run() {
             register_button_events(&platform, app.handle().clone());
             register_scene_events(&platform, settings.clone(), app.handle().clone())?;
             register_shortcut_capture_events(app.handle().clone());
+
+            // 系统强调色实时跟随（2026-09-27）：Rust 侧 message-only 窗口监听
+            // WM_SETTINGCHANGE("ImmersiveColorSet")，去抖后经事件推送前端重新
+            // 派生 --accent* 变量；用户在系统设置里换强调色无需重启应用。注册
+            // 失败只记日志：实时跟随不可用但首次读取仍有效，不影响语音链路。
+            {
+                let accent_handle = app.handle().clone();
+                let watcher_registered =
+                    accent::spawn_change_watcher(Arc::new(move |color| {
+                        let _ = accent_handle.emit("system-accent-changed", color);
+                    }));
+                sayall_windows::gatt_note(format!(
+                    "accent_color action=watcher_register phase=completed terminal_result={} reason={}",
+                    if watcher_registered { "passed" } else { "failed" },
+                    if watcher_registered {
+                        "watcher_started"
+                    } else {
+                        "watcher_unavailable"
+                    },
+                ));
+            }
 
             // Raw Input 监听自愈：启动即尝试，失败（遥控器休眠/未连接）进入
             // 10 秒重试循环；用户在按键页显式停止（Stopped）时不重试。
@@ -2900,6 +3275,7 @@ pub fn run() {
         set_capture_input,
         resolve_capture_recovery,
         get_runtime_snapshot,
+        get_system_accent_color,
         get_diagnostic_report,
         open_log_directory,
         hide_main_window,
@@ -2962,11 +3338,19 @@ pub fn run() {
         get_send_input_snapshot,
         get_voice_hold_hotkey,
         set_voice_hold_hotkey,
+        get_voice_input_tool,
+        set_voice_input_tool,
+        get_vokie_installation,
+        launch_vokie,
+        get_other_voice_hotkey,
+        set_other_voice_hotkey,
         get_theme_preference,
         set_theme_preference,
         get_launch_at_login,
         set_launch_at_login,
         report_theme_result,
+        get_app_icon,
+        set_app_icon,
         get_app_update_preferences,
         set_app_update_preferences,
         check_app_update,
@@ -2982,6 +3366,7 @@ pub fn run() {
         set_capture_input,
         resolve_capture_recovery,
         get_runtime_snapshot,
+        get_system_accent_color,
         get_diagnostic_report,
         open_log_directory,
         hide_main_window,
@@ -3044,11 +3429,19 @@ pub fn run() {
         get_send_input_snapshot,
         get_voice_hold_hotkey,
         set_voice_hold_hotkey,
+        get_voice_input_tool,
+        set_voice_input_tool,
+        get_vokie_installation,
+        launch_vokie,
+        get_other_voice_hotkey,
+        set_other_voice_hotkey,
         get_theme_preference,
         set_theme_preference,
         get_launch_at_login,
         set_launch_at_login,
         report_theme_result,
+        get_app_icon,
+        set_app_icon,
         get_app_update_preferences,
         set_app_update_preferences,
         check_app_update,
@@ -3056,7 +3449,7 @@ pub fn run() {
         report_frontend_event
     ]);
 
-    let app = builder.build(tauri::generate_context!()).unwrap_or_else(|_| {
+    let app = builder.build(context).unwrap_or_else(|_| {
         sayall_windows::gatt_note(
             "app_lifecycle event=event_loop phase=completed terminal_result=failed error_domain=tauri error_code=build_failed reason=application_build_failed retryable=false".to_owned(),
         );
@@ -3530,6 +3923,23 @@ mod tests {
     /// 安装器从未实现）。
     const INSTALLER_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 
+    /// 版本号唯一来源（2026-09-30 收敛）：安装包名、exe 版本资源、关于页显示、
+    /// 更新器比较和诊断日志全部取自 `src-tauri/tauri.conf.json` 的 `version`。
+    /// 运行期 `package_info().version` 必须与它一致——把版本号写回 Cargo.toml
+    /// 或把 config 的 `version` 删掉都会静默改变产物版本，这里在构建期钉住。
+    #[test]
+    fn app_version_comes_from_tauri_config() {
+        let config_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json");
+        let raw = std::fs::read_to_string(config_path).expect("read tauri.conf.json");
+        let config: serde_json::Value = serde_json::from_str(&raw).expect("parse tauri.conf.json");
+        let configured = config["version"]
+            .as_str()
+            .expect("tauri.conf.json 必须显式带 version 字段（版本号唯一来源）");
+        // 运行期类型在这里由注解固定（生产路径由 `builder.build(context)` 推断）。
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        assert_eq!(context.package_info().version.to_string(), configured);
+    }
+
     /// 去掉 NSIS 注释（`;` 到行尾）：注释里会引用被禁用的 API 名做说明，
     /// 负向断言必须在正文上做。
     fn strip_comments(source: &str) -> String {
@@ -3604,6 +4014,32 @@ mod tests {
             .expect("success label");
         assert!(request[timeout..timeout + done].contains("Abort"));
     }
+
+    /// 授权语义（2026-09-28 Andy 拍板）：升级/覆盖安装保留授权，卸载撤销，
+    /// 卸载后的重装回落为关闭。实现要点：
+    ///
+    /// 1. 安装路径停助手用 revoke=0，不写标记；卸载路径 revoke=1 写标记
+    ///    （内容 = 卸载时刻 GetTickCount），且不删任务（普通权限删不掉）。
+    /// 2. PREINSTALL 只删除「新鲜」标记——交互升级的旧卸载器先于本钩子运行、
+    ///    秒级前刚写下标记；卸载后重装到达本钩子时的系统状态与升级完全一致，
+    ///    唯一判据是新鲜度，所以删除必须走 SayAllClearFreshReauthMarker
+    ///    （fresh/legacy 才删），**不得**在 PREINSTALL 里无条件 Delete。
+    ///    开关意图由 AppSettings 承载、启动对账回落——安装器不碰设置。
+    /// 3. 维护模式卸载（双击安装包 → 已安装页选「卸载」，与升级共用原位
+    ///    调用形态）写待决文件，PREINSTALL 按版本裁决：同版本（维护卸载
+    ///    后重装）→ 写撤销凭证；不同版本（升级）→ 删待决、授权保留——
+    ///    见 installer_resolves_maintenance_uninstall_via_pending_file。
+
+    /// 提权 Helper 可能不被普通权限安装器的 `FindProcessCurrentUser` 枚举到。
+    /// 只看进程就继续覆盖会落进 NSIS 自带的“无法打开要写入的文件”弹窗；
+    /// StopHelper 必须再以安装目标本身的写锁作为最终外部判据。
+
+    /// 维护模式卸载（双击安装包 → 已安装页选「卸载」）在生成的 installer.nsi
+    /// 里与升级共用同一原位调用形态（PageLeaveReinstall → reinst_uninstall，
+    /// `_?=$INSTDIR`），且卸载成功后向导**继续走安装节**（不退出）。撤销只能
+    /// 由 PREINSTALL 裁决：待决版本 == 本版本（维护卸载 → 重装）→ 写撤销
+    /// 凭证；不同版本（升级）→ 删待决、授权保留（2026-09-28 Andy 现场报告
+    /// 「设置 → 应用卸载可以了，维护模式不行」的修复）。
 
     /// `FindProcessCurrentUser` 只按**进程名**匹配：传全路径时它永远返回 1
     /// （"没有在跑"），整段等待逻辑会被静默跳过，直接落到 Tauri 的强杀弹窗。

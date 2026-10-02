@@ -1,5 +1,7 @@
 # TODO
 
+- [ ] 2026-10-02 Windows 上游增量同步：用户要求检查并拉取合并原仓库更新；固定来源 `GetSayAll/remote-mic-app-windows` 的 `c81308e011a757dc22d22f2861b687ef787d295e`，从已整合的 `74230bf` 新增 154 个提交。继续在已有整合分支逐块融合，保留本地未提交工作及全部待验状态。三键/TV/Home 继续使用当前逐报告 WDF/PDO 来源与独立 Helper；不采用上游第二增强链的最高权限计划任务、共享宿主 usage 推断来源、自动强杀 WUDFHost、常驻 Gadget 或语音报告合成。固定按键模板、普通主程序、正常退出与用户配置契约不变。冲突已逐块闭合，基础合并候选已通过前端测试与构建、Rust 工作区测试/check、fmt 和 runtime-simulation 编译；旧配置首用与读取失败回归已验证；保留自定义语音快捷键入口，前端 222 项全通过，原有 41 个文件修改已恢复并保持未提交，叠加后的前端 241 项、Rust 工作区全量测试、check、fmt 和 runtime-simulation 编译全部 passed。Debug 仿真构建 passed；实际运行被现有安装版的单实例保护拒绝（single_instance / existing_instance），未生成验收报告，不能记作 WebView 通过。Windows WebView 完整运行、RC001/RC003 冷态首用、连续会话与第三方实际行为保持 deferred；本次 target/dev/upstream-sync 中的最终测试日志及单实例拒绝现场仅留作未完成运行验收的对照，运行验收闭合或被新候选替代后回收。上游实验和历史 passed 不作为本候选或 RC001/RC003 本机验收。来源与排除边界见 [ATTRIBUTION](ATTRIBUTION.md#windows-官方上游整合2026-09-27)。
+
 - [ ] 2026-09-27 Windows 上游整合：本地 checkpoint `bd2349b` / `f32ae1b` 已保存，`test/windows-upstream-integration` 正逐块合并固定 `74230bf`（115 个上游提交）。共享自动同步仅本仓库条目已停用（控制仓库 PR #1）；保留全部本地 ancestry/用户配置、纯直接模板与严格增强来源。源码冲突标记已闭合，项目7步预检通过（前端169、Rust331passed/17ignored）；合并候选729d14d / 0.2.6包0a15fd2f已正常安装、Explorer普通启动且用户三份配置字节保持；受影响实机等待用户反馈；test已推送、draft PR #1已建立。首轮CI在正常退出测试旧日志断言处失败（实际完整清理85ms/failed_stages0），测试契约已修正并以14项针对性断言验证；新CI待验证，main尚不得合入，不把上游历史 passed 作为本候选结论。
 
 ## v1 决策（2026-09-04）

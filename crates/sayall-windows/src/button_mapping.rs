@@ -1389,9 +1389,10 @@ mod tests {
     use crate::raw_input::RemoteButton;
     use crate::send_input::{ButtonAction, ButtonActions, KeyCode};
     use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
 
     // Production has one process-wide gate; test runtimes must own it exclusively.
-    static GATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    use crate::key_gate::GATE_TEST_LOCK;
 
     #[test]
     fn observed_host_hold_survives_mapping_cancel_without_duplicate_edges() {
@@ -1577,7 +1578,6 @@ mod tests {
         assert_eq!(merger.apply_driver_button_edge(up), vec![up]);
         assert!(ignore_host_owned_keyboard(home_keyboard(false), &merger));
     }
-    use std::time::Duration;
 
     fn flush(runtime: &ButtonMappingRuntime) {
         assert!(runtime.wait_for_idle(Duration::from_secs(2)));
@@ -2419,6 +2419,25 @@ mod tests {
     const KEYDOWN: u32 = 0x0100;
     const KEYUP: u32 = 0x0101;
 
+    /// 轮询等待谓词成立（真时钟测试的统一等待原语），预算内不成立返回 false。
+    ///
+    /// 为什么不用固定 sleep：引擎是单线程循环，消息处理与连发/双击定时器共用
+    /// 一条队列，CI 慢机或全量并行下排队延迟可达本地的数倍——固定 sleep 是
+    /// 「本地刚好够、CI 必然压线」的 flaky 来源（2026-09-28 `leak_suppression_suite`
+    /// 实证：700ms 窗口断言 4 拍连发，负载下第 4 拍在窗口后才到）。轮询把
+    /// 「断言时机」换成「条件成立」，判据不变、余量放大；超时后由调用处的
+    /// assert 以实际状态给出可诊断的失败。
+    fn wait_until(mut pred: impl FnMut() -> bool, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pred()
+    }
+
     /// 泄漏对冲套件（2026-09-06 调查档案修复记录）：泄漏路径
     /// （[`EngineMessage::Keyboard`]，监听器按设备路径过滤=遥控器专用）的
     /// 按压边沿把该键标记为"原生已交付"——同键映射（上→上）的 Single
@@ -2510,16 +2529,17 @@ mod tests {
 
         // 场景 2（对照）：门控路径的同键映射（右→右）照常注入。
         assert!(crate::key_gate::is_gate_thread_alive());
+        let base = taps().len();
         sender
             .send(EngineMessage::GateEdge(ButtonEdge {
                 button: RemoteButton::Right,
                 is_pressed: true,
             }))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        wait_until(|| taps().len() > base, Duration::from_millis(600));
         assert_eq!(
-            taps().as_slice(),
-            &[KeyChord {
+            taps()[base..].to_vec(),
+            vec![KeyChord {
                 keys: vec![KeyCode::Right]
             }],
             "门控路径（已吞键）的同键映射必须注入"
@@ -2535,20 +2555,16 @@ mod tests {
         // 场景 3：泄漏路径的不同键映射（左→退格）照常注入。冷首按会
         // 同时包含原生左移，这是与上/下/右/确定相同的结构性边界。
         assert!(crate::key_gate::is_gate_thread_alive());
+        let base = taps().len();
         sender
             .send(EngineMessage::Keyboard(keyboard_event(0x25, KEYDOWN)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(120));
+        wait_until(|| taps().len() > base, Duration::from_millis(600));
         assert_eq!(
-            taps().as_slice(),
-            &[
-                KeyChord {
-                    keys: vec![KeyCode::Right]
-                },
-                KeyChord {
-                    keys: vec![KeyCode::Backspace]
-                },
-            ],
+            taps()[base..].to_vec(),
+            vec![KeyChord {
+                keys: vec![KeyCode::Backspace]
+            }],
             "泄漏路径的左键不同键映射必须注入"
         );
         sender
@@ -2558,6 +2574,7 @@ mod tests {
 
         // 场景 4：泄漏路径的双击窗口补发单击（确定→Enter）由原生覆盖，不注入。
         assert!(crate::key_gate::is_gate_thread_alive());
+        let base = taps().len();
         sender
             .send(EngineMessage::Keyboard(keyboard_event(0x0D, KEYDOWN)))
             .unwrap();
@@ -2565,23 +2582,23 @@ mod tests {
         sender
             .send(EngineMessage::Keyboard(keyboard_event(0x0D, KEYUP)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(450));
-        let after_window = taps();
-        assert_eq!(
-            after_window.len(),
-            2,
+        std::thread::sleep(Duration::from_millis(650));
+        let after_window = &taps()[base..];
+        assert!(
+            after_window.is_empty(),
             "双击窗口超时补发的同键单击应由原生覆盖：{after_window:?}"
         );
 
         // 场景 5：泄漏按住的连发照常注入（遥控器不自动重复，连发由引擎交付）。
         assert!(crate::key_gate::is_gate_thread_alive());
+        let base = taps().len();
         sender
             .send(EngineMessage::Keyboard(keyboard_event(0x26, KEYDOWN)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(700));
-        let count = taps().len();
+        let got_four = wait_until(|| taps().len() >= base + 4, Duration::from_millis(2000));
+        let count = taps().len() - base;
         assert!(
-            count >= 4,
+            got_four,
             "泄漏按住的连发应注入（350/450/550/650ms），实际 {count} 次"
         );
         sender
@@ -2601,7 +2618,9 @@ mod tests {
                     is_pressed: true,
                 }))
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(50));
+            // 「按住期间不锁屏」是否定性断言：观察窗从 50ms 拉长到 150ms，
+            // 给引擎更充分的时间证明"没有发生"（越久越强，且仍远小于测试预算）。
+            std::thread::sleep(Duration::from_millis(150));
             assert_eq!(
                 taps().len(),
                 before_press,
@@ -2613,7 +2632,7 @@ mod tests {
                     is_pressed: false,
                 }))
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(50));
+            wait_until(|| taps().len() > before_press, Duration::from_millis(600));
             assert_eq!(
                 taps().len(),
                 before_press + 1,
@@ -2894,17 +2913,21 @@ mod tests {
                 ..ButtonActions::default()
             },
         );
-        mappings.actions.insert(
-            RemoteButton::Back,
-            ButtonActions {
-                single: ButtonAction::Shortcut {
-                    chord: KeyChord {
-                        keys: vec![KeyCode::Escape],
-                    },
+        let escape_action = ButtonActions {
+            single: ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Escape],
                 },
-                ..ButtonActions::default()
             },
-        );
+            ..ButtonActions::default()
+        };
+        for button in [
+            RemoteButton::Back,
+            RemoteButton::VolumeUp,
+            RemoteButton::VolumeDown,
+        ] {
+            mappings.actions.insert(button, escape_action.clone());
+        }
         mappings.actions.insert(
             RemoteButton::Tv,
             ButtonActions {
@@ -2942,9 +2965,13 @@ mod tests {
                 },
             },
         );
-        assert_ne!(
+        assert_eq!(
             effective.action_for(RemoteButton::Back, ButtonTrigger::Single),
-            ButtonAction::Disabled,
+            ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Escape],
+                },
+            },
         );
     }
 }

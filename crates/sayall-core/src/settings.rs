@@ -26,6 +26,43 @@ pub struct CaptureInputSettings {
     pub endpoint_name: Option<String>,
 }
 
+/// 用户在连接页选择的输入工具（决定"按住说话快捷键"的默认组合与引导步骤）。
+///
+/// `None` 表示用户尚未选择；页面可按当前快捷键显示初始选项，
+/// 只有用户显式选择才持久化。既有默认快捷键的运行行为由平台层保持。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceInputTool {
+    Wechat,
+    Doubao,
+    Vokie,
+    Other,
+}
+
+/// 应用图标（设置页「应用图标」，2026-10-02 用户指定）。
+///
+/// 对齐 Mac main `Sources/RemoteMic/AppIconController.swift` 的 `AppIconIdentifier`：
+/// 稳定语义 ID（`standard` 是内置应用图标，`faceted-duck` 来自 Mac
+/// `Resources/AppIcons/faceted-duck.png`），未知 ID 一律回落到 `standard`
+/// （Mac `AppIconCatalog.resolvedIdentifier(for:)` 同款语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppIconIdentifier {
+    #[default]
+    Standard,
+    FacetedDuck,
+}
+
+impl AppIconIdentifier {
+    /// 用户可见名称（对齐 Mac `about.preferences.app_icon_*` 文案）。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Standard => "默认",
+            Self::FacetedDuck => "几何鸭",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -37,12 +74,26 @@ pub struct AppSettings {
     pub capture_input: CaptureInputSettings,
     pub gain_db: f32,
     pub voice_trigger_mode: VoiceTriggerMode,
+    /// 连接页选择的输入工具（微信输入法 / 豆包输入法 / 其他工具）。
+    pub voice_input_tool: Option<VoiceInputTool>,
     pub launch_at_login: bool,
     pub open_window_at_launch: bool,
     pub restore_hid_enhancement: bool,
     pub check_prerelease_updates: bool,
     pub theme_preference: ThemePreference,
+    /// 应用图标；老配置没有这个字段时落回内置默认图标。
+    #[serde(default, deserialize_with = "deserialize_app_icon")]
+    pub app_icon: AppIconIdentifier,
     pub usage_statistics: UsageStatistics,
+}
+
+/// 认不出的应用图标 ID（更早/更新版本写下的值）回落 `standard`，不让一个
+/// 图标名把整份设置打成默认值（Mac `AppIconCatalog.resolvedIdentifier` 同款语义）。
+fn deserialize_app_icon<'de, D>(deserializer: D) -> Result<AppIconIdentifier, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(AppIconIdentifier::deserialize(deserializer).unwrap_or_default())
 }
 
 impl Default for AppSettings {
@@ -56,11 +107,13 @@ impl Default for AppSettings {
             capture_input: CaptureInputSettings::default(),
             gain_db: 0.0,
             voice_trigger_mode: VoiceTriggerMode::Hold,
+            voice_input_tool: None,
             launch_at_login: false,
             open_window_at_launch: true,
             restore_hid_enhancement: false,
             check_prerelease_updates: false,
             theme_preference: ThemePreference::System,
+            app_icon: AppIconIdentifier::Standard,
             usage_statistics: UsageStatistics::default(),
         }
     }
@@ -158,5 +211,69 @@ mod tests {
             let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded.normalized().theme_preference, preference);
         }
+    }
+
+    #[test]
+    fn voice_input_tool_defaults_to_none_and_round_trips() {
+        // 老配置没有这个字段：必须落成 None（由界面按当前快捷键推断一次），
+        // 不能在 Rust 侧替用户猜成某个工具。
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.voice_input_tool, None);
+
+        for tool in [
+            VoiceInputTool::Wechat,
+            VoiceInputTool::Doubao,
+            VoiceInputTool::Vokie,
+            VoiceInputTool::Other,
+        ] {
+            let settings = AppSettings {
+                voice_input_tool: Some(tool),
+                ..AppSettings::default()
+            };
+            let encoded = serde_json::to_string(&settings).unwrap();
+            assert!(encoded.contains("\"voice_input_tool\""));
+            let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.voice_input_tool, Some(tool));
+        }
+    }
+
+    #[test]
+    fn app_icon_defaults_to_standard_and_round_trips() {
+        // 老配置 / 新装：没有这个字段时落回内置默认图标（Mac 的 standard）。
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.app_icon, AppIconIdentifier::Standard);
+
+        for icon in [AppIconIdentifier::Standard, AppIconIdentifier::FacetedDuck] {
+            let settings = AppSettings {
+                app_icon: icon,
+                ..AppSettings::default()
+            };
+            let encoded = serde_json::to_string(&settings).unwrap();
+            assert!(encoded.contains("\"app_icon\""));
+            let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.normalized().app_icon, icon);
+        }
+
+        // 磁盘上的原始值是 Mac 同源的稳定语义 ID。
+        let encoded = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(encoded.contains("\"app_icon\":\"standard\""));
+        assert_eq!(AppIconIdentifier::FacetedDuck.display_name(), "几何鸭");
+    }
+
+    #[test]
+    fn unknown_app_icon_identifier_falls_back_to_standard() {
+        // 更早/更新版本写下的图标 ID：只回落图标选择，不把整份设置打成默认值。
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"schema_version":3,"gain_db":12.0,"voice_trigger_mode":"hold","app_icon":"neon-duck"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.app_icon, AppIconIdentifier::Standard);
+        assert_eq!(settings.gain_db, 12.0);
     }
 }

@@ -4,6 +4,27 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
 
+/**
+ * 设置页“问题反馈”的外部入口（2026-10-01 用户指定，2026-10-02 官网地址改为
+ * 带 `?from=win` 的来源标记，便于官网区分 Windows 版来客）：官网首页与 Windows
+ * 版源码仓库。
+ *
+ * 这两个字符串同时是 `src-tauri/capabilities/default.json` 里 opener 白名单的
+ * 键——改这里必须同步改那里，否则真机上点击会被插件判为 ForbiddenUrl
+ * （`bridge.test.ts` 逐字锁定了这份契约，runtime simulation 另行断言不在真机
+ * 上被拒绝）。
+ */
+export const OFFICIAL_WEBSITE_URL = "https://sayall.app/?from=win";
+export const GITHUB_REPOSITORY_URL = "https://github.com/GetSayAll/remote-mic-app-windows";
+
+/**
+ * Vokie 官网（2026-10-01 Andy 提供）。
+ *
+ * 同样是 opener 白名单的键：新增 URL 必须同步
+ * `src-tauri/capabilities/default.json` 与 `bridge.test.ts` 的白名单断言。
+ */
+export const VOKIE_HOMEPAGE_URL = "https://vokie.com/";
+
 export type ConnectionPhase =
   | "idle"
   | "connecting"
@@ -86,6 +107,8 @@ export interface ButtonEdge {
 export interface ShortcutCaptureEdge {
   key: KeyCode;
   isPressed: boolean;
+  /** 边沿来源：real = 物理事件；injected = 外部钩子（输入法）吞下后重放的副本。 */
+  source?: "real" | "injected";
 }
 
 export interface RawInputSnapshot {
@@ -364,6 +387,33 @@ export interface AppUpdatePreferences {
 
 export type ThemePreference = "system" | "light" | "dark";
 
+/** Windows 系统强调色（设置 > 个性化 > 颜色），Rust accent 命令契约。 */
+export interface AccentRgb {
+  r: number;
+  g: number;
+  b: number;
+}
+
+export async function getSystemAccentColor(): Promise<AccentRgb | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<AccentRgb | null>("get_system_accent_color");
+}
+
+export async function subscribeAccentChanges(
+  handler: (color: AccentRgb) => void,
+): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<AccentRgb>("system-accent-changed", (event) =>
+    handler(event.payload),
+  );
+  return () => {
+    void unlisten();
+  };
+}
+
 export async function getLaunchAtLogin(): Promise<boolean> {
   if (!isTauriRuntime()) return false;
   return invoke<boolean>("get_launch_at_login");
@@ -381,7 +431,9 @@ export interface AppUpdateProgress {
 }
 
 const browserSnapshot: RuntimeSnapshot = {
-  appVersion: "0.1.0",
+  // 浏览器预览没有安装包可读，这里跟随当前应用版本：它是预览里"设置页版本号"
+  // 与侧栏底部的唯一来源，写死旧值会让预览显示一个不存在的版本。
+  appVersion: "0.5.0",
   platform: {
     platform: "browser-preview",
     windowsApiAvailable: false,
@@ -522,7 +574,8 @@ export function formatDiagnosticReport(
  * 打开诊断日志目录（关于页入口）。返回实际打开的目录供界面显示。
  *
  * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径——
- * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网一个 URL）。
+ * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网、产品官网与
+ * 源码仓库三个固定 URL）。
  */
 export async function openLogDirectory(): Promise<string> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开日志目录");
@@ -597,6 +650,75 @@ export async function openVbCableDownloadPage(): Promise<void> {
     return;
   }
   await openUrl(VB_CABLE_DOWNLOAD_URL);
+}
+
+/**
+ * 外部链接的统一出口：浏览器预览开新标签，Tauri 运行时交给 opener 插件
+ * （插件只放行 capabilities 白名单内的 URL，前端不做过滤，也不拼接参数）。
+ */
+async function openExternalUrl(url: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  await openUrl(url);
+}
+
+/** 设置页顶部“官网”入口。 */
+export async function openOfficialWebsite(): Promise<void> {
+  await openExternalUrl(OFFICIAL_WEBSITE_URL);
+}
+
+/** 设置页“问题反馈”里的“GitHub”入口。 */
+export async function openGitHubRepository(): Promise<void> {
+  await openExternalUrl(GITHUB_REPOSITORY_URL);
+}
+
+/** 连接页“Vokie 未安装”提示里的官网入口（2026-10-01）。 */
+export async function openVokieHomepage(): Promise<void> {
+  await openExternalUrl(VOKIE_HOMEPAGE_URL);
+}
+
+/** Vokie 检测结果：未安装时连接页显示官网入口；已安装但没运行时提示先启动它。 */
+export interface VokieInstallation {
+  installed: boolean;
+  running: boolean;
+}
+
+export async function getVokieInstallation(): Promise<VokieInstallation> {
+  if (!isTauriRuntime()) {
+    return { installed: false, running: false };
+  }
+  return invoke<VokieInstallation>("get_vokie_installation");
+}
+
+/**
+ * 打开 Vokie（连接页第 ② 步「打开 Vokie」按钮）：装了但没运行时一键叫起来。
+ * 失败时抛错（调用方把原因显示给用户）。
+ */
+export async function launchVokie(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  return invoke<void>("launch_vokie");
+}
+
+/**
+ * 「其他工具」面板记住的按键：`null` = 从未选过（保持现状），`[]` = 明确选了
+ * 「不按键」。选中「其他工具」时恢复它，用户改选时写回。
+ */
+export async function getOtherVoiceHotkey(): Promise<KeyCode[] | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<KeyCode[] | null>("get_other_voice_hotkey");
+}
+
+export async function setOtherVoiceHotkey(keys: KeyCode[]): Promise<KeyCode[] | null> {
+  if (!isTauriRuntime()) {
+    return keys;
+  }
+  return invoke<KeyCode[] | null>("set_other_voice_hotkey", { keys });
 }
 
 export async function getRawInputSnapshot(): Promise<RawInputSnapshot> {
@@ -722,11 +844,18 @@ export async function listPresetApps(): Promise<PresetAppInfo[]> {
       { id: "wechat", name: "微信", installed: true },
       { id: "edge", name: "Edge 浏览器", installed: true },
       { id: "chrome", name: "Chrome 浏览器", installed: true },
-      { id: "chrome", name: "Chrome 浏览器", installed: true },
       { id: "notepad", name: "记事本", installed: true },
       { id: "calc", name: "计算器", installed: true },
       { id: "explorer", name: "文件资源管理器", installed: true },
       { id: "netease_music", name: "网易云音乐", installed: true },
+      // 2026-10-02 扩充的预设（与 Rust PRESET_APPS 同步，仅浏览器预览用）。
+      { id: "vokie", name: "Vokie", installed: true },
+      { id: "vscode", name: "Visual Studio Code", installed: true },
+      { id: "cursor", name: "Cursor", installed: true },
+      { id: "dimagent", name: "DimAgent", installed: true },
+      { id: "qq", name: "QQ", installed: true },
+      { id: "feishu", name: "飞书", installed: true },
+      { id: "hermes", name: "Hermes", installed: true },
     ];
   }
   return invoke<PresetAppInfo[]>("list_preset_apps");
@@ -785,14 +914,28 @@ export async function subscribeButtonGestures(
   };
 }
 
-export async function startShortcutCapture(): Promise<void> {
-  if (!isTauriRuntime()) return;
-  await invoke("start_shortcut_capture");
+/** 开始 OS 级快捷键录入；返回录入开始时仍被按住的键（preheld）。
+ *  preheld 键的边沿对录入不可见（防粘键：其 DOWN 已进 OS，UP 必须放行），
+ *  后端会等它们全部松开后才开始投递边沿——前端据此提示用户先松手，
+ *  避免"按住中打开录入"被静默截断成半截组合。 */
+export async function startShortcutCapture(): Promise<KeyCode[]> {
+  if (!isTauriRuntime()) return [];
+  const preheld = await invoke<KeyCode[]>("start_shortcut_capture");
+  return preheld ?? [];
 }
 
-export async function stopShortcutCapture(): Promise<void> {
-  if (!isTauriRuntime()) return;
-  await invoke("stop_shortcut_capture");
+/** 微信输入法语音是否在录入会话期间被触发（观测其麦克风 ConsentStore）。 */
+export type WetypeVoiceVerdict = "observed" | "not_observed" | "unknown";
+
+export interface ShortcutCaptureStopResult {
+  /** "unknown" 表示观测不可用，调用方不得据此推断用户按了什么。 */
+  wetypeVoice: WetypeVoiceVerdict;
+}
+
+export async function stopShortcutCapture(): Promise<ShortcutCaptureStopResult | null> {
+  if (!isTauriRuntime()) return null;
+  const result = await invoke<ShortcutCaptureStopResult | null>("stop_shortcut_capture");
+  return result ?? null;
 }
 
 /** 原生低级钩子录入边沿；Win+L 等系统组合在到达 Shell 前已成对吞下。 */
@@ -828,6 +971,30 @@ export async function setVoiceHoldHotkey(hotkey: KeyChord | null): Promise<KeyCh
     throw new Error("当前是浏览器预览，无法保存按住说话快捷键");
   }
   return invoke<KeyChord | null>("set_voice_hold_hotkey", { hotkey });
+}
+
+/**
+ * 连接页选择的输入工具（2026-09-30 设计稿 v3）。
+ *
+ * 它决定连接页展示的快捷键建议与准备清单；基础语音仍使用成对的
+ * 按住说话快捷键，不依赖可选按键增强 Helper。
+ * `null` = 用户从未选择过：界面仅按当前快捷键展示引导，显式选择后才落存。
+ */
+export type VoiceInputTool = "wechat" | "doubao" | "vokie" | "other";
+
+export async function getVoiceInputTool(): Promise<VoiceInputTool | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<VoiceInputTool | null>("get_voice_input_tool");
+}
+
+export async function setVoiceInputTool(tool: VoiceInputTool): Promise<VoiceInputTool> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法保存输入工具设置");
+  }
+  const saved = await invoke<VoiceInputTool | null>("set_voice_input_tool", { tool });
+  return saved ?? tool;
 }
 
 /** 检查应用更新；浏览器预览下返回"无更新"占位（不发起网络请求）。 */
@@ -894,6 +1061,28 @@ export interface ThemeResultReport {
 export async function reportThemeResult(report: ThemeResultReport): Promise<void> {
   if (!isTauriRuntime()) return;
   await invoke("report_theme_result", { report });
+}
+
+/**
+ * 应用图标（2026-10-02 用户指定；对齐 Mac main `AppIconController`/`AppIconCatalog`）：
+ *
+ * - `standard`：内置应用图标（默认，也是老配置的落点）；
+ * - `faceted-duck`：来自 Mac `Resources/AppIcons/faceted-duck.png` 的「几何鸭」。
+ *
+ * 切换后由 Rust 同时更换**主窗口图标（任务栏 / Alt-Tab / 标题栏）与托盘图标**；
+ * 设置页顶部标识与选项预览用同一 ID 实时渲染。安装包与开始菜单快捷方式的图标
+ * 属于安装产物，运行期不变（Mac 的 bundle 图标同样不变）。
+ */
+export type AppIconIdentifier = "standard" | "faceted-duck";
+
+export async function getAppIcon(): Promise<AppIconIdentifier> {
+  if (!isTauriRuntime()) return "standard";
+  return invoke<AppIconIdentifier>("get_app_icon");
+}
+
+export async function setAppIcon(identifier: AppIconIdentifier): Promise<AppIconIdentifier> {
+  if (!isTauriRuntime()) return identifier;
+  return invoke<AppIconIdentifier>("set_app_icon", { identifier });
 }
 
 /** 下载并安装已检查到的更新（Windows 上安装成功时应用会退出并由安装器重启）。 */
@@ -970,8 +1159,8 @@ export function connectionPhaseLabel(phase: ConnectionPhase): string {
 
 export function remoteModelLabel(model: RemoteModel): string {
   return {
-    rc001: "小米蓝牙遥控器 2",
-    rc003: "小米蓝牙遥控器 2 Pro",
+    rc001: "小米蓝牙语音遥控器 2",
+    rc003: "小米蓝牙语音遥控器 2 Pro",
     unknown: "连接后显示",
   }[model];
 }

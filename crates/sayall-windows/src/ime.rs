@@ -29,10 +29,16 @@
 //! 全部同线程内完成，无跨套间封送、无需消息泵），通信走 channel 有界
 //! 等待（500ms）防卡 BLE 工作线程；仅在配置了按住说话快捷键的语音会话上
 //! 调用。
+//!
+//! 2026-10-01 泛化：目标不再写死 WeType，而是按**用户选的输入工具**
+//! （`AppSettings.voice_input_tool`）决定——豆包输入法同款配方（STA +
+//! `TF_IPPMF_FORSESSION` + 冷路径重绑等待），GUID 由 `examples/doubao_ime_probe.rs`
+//! 真机取得并读回验证。Vokie / 「其他工具」不切输入法（`NotRequired`）。
 
 use std::sync::mpsc;
 use std::time::Duration;
 
+use sayall_core::settings::VoiceInputTool;
 use windows::core::GUID;
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
@@ -48,21 +54,61 @@ const CLSID_TF_INPUT_PROCESSOR_PROFILES: GUID =
 /// 来自本机输入法列表 `0804:{86598FB9-…}{607FDF85-…}`，2.1.3.18 实测）。
 const WETYPE_CLSID: GUID = GUID::from_u128(0x86598fb9_66a2_463e_b9c2_aeb906d477ad);
 const WETYPE_PROFILE: GUID = GUID::from_u128(0x607fdf85_fcc8_4dbd_a365_41296f980c9c);
+/// 豆包输入法的 TSF CLSID 与 Profile GUID（2026-10-01 探针实测：
+/// `examples/doubao_ime_probe.rs`；同一把 0804 配置，registry Description=豆包输入法，
+/// Enable=1；激活后 GetActiveProfile 读回即为该组合，非仅 S_OK）。
+const DOUBAO_CLSID: GUID = GUID::from_u128(0x9d2b2e2b_3c93_4d2f_9d35_6eeb85f0d2b0);
+const DOUBAO_PROFILE: GUID = GUID::from_u128(0x2b4d4b3a_4d4f_4c0a_8e66_7f771a2b9c10);
 const LANGID_ZH_CN: u16 = 0x0804;
+
+/// 一个语音工具对应的 TSF 会话级目标输入法配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImeProfile {
+    clsid: GUID,
+    guid_profile: GUID,
+    /// 日志标签（不落 GUID、不落路径）。
+    pub label: &'static str,
+}
+
+const WETYPE_IME: ImeProfile = ImeProfile {
+    clsid: WETYPE_CLSID,
+    guid_profile: WETYPE_PROFILE,
+    label: "wechat",
+};
+const DOUBAO_IME: ImeProfile = ImeProfile {
+    clsid: DOUBAO_CLSID,
+    guid_profile: DOUBAO_PROFILE,
+    label: "doubao",
+};
+
+/// 工具 → 需要确保为当前会话活动输入法的目标。
+///
+/// 只有"自身是输入法"的工具才需要切：Vokie 是桌面程序（不受输入法影响），
+/// 「其他工具」由用户自备输入法，两者都返回 `None`——**绝不**替它们切输入法
+/// （2026-09-29 真机实证：误切会让豆包路径被切成微信输入法）。
+pub fn ime_target_for(tool: VoiceInputTool) -> Option<ImeProfile> {
+    match tool {
+        VoiceInputTool::Wechat => Some(WETYPE_IME),
+        VoiceInputTool::Doubao => Some(DOUBAO_IME),
+        VoiceInputTool::Vokie | VoiceInputTool::Other => None,
+    }
+}
 /// STA 激活线程的有界等待：正常 <10ms，500ms 只是防卡上限。
 const ACTIVATION_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// 冷切换后的会话重绑等待：`ActivateProfile` 返回 ≠ 目标应用完成输入法
 /// 重绑（2026-09-05 首按失败实证）；热路径不付此代价。
 const SESSION_REBIND_SETTLE: Duration = Duration::from_millis(50);
 
-/// 激活结果：AlreadyActive = 会话已是 WeType（调用方可零延迟注入）；
+/// 激活结果：AlreadyActive = 会话已是目标输入法（调用方可零延迟注入）；
 /// Switched = 本次执行了会话切换（含重绑等待）；
-/// SkippedSelfForeground = 前台是 SayAll 自身窗口，已跳过激活。
+/// SkippedSelfForeground = 前台是 SayAll 自身窗口，已跳过激活；
+/// NotRequired = 该工具不需要切输入法（Vokie / 其他工具）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WeTypeActivation {
+pub enum ImeActivation {
     AlreadyActive,
     Switched,
     SkippedSelfForeground,
+    NotRequired,
 }
 
 /// 前台窗口是否属于 SayAll 自身进程。
@@ -84,29 +130,41 @@ fn foreground_is_self() -> bool {
     }
 }
 
-/// 确保微信输入法是当前会话的活动输入法（幂等）。
+/// 确保 `tool` 对应的输入法是当前会话的活动输入法（幂等）。
 ///
 /// 必须在 STA 线程上执行（MTA 调用返回 S_OK 但不生效，见模块注释）；
 /// 本函数自行创建临时 STA 线程并经 channel 有界等待结果，对调用方
 /// （BLE 工作线程，MTA）透明。返回 Err 时调用方记录提示后仍按原行为
 /// 注入——激活失败不阻断语音。
-pub fn activate_wetype_session() -> Result<WeTypeActivation, String> {
+///
+/// `tool` 由"用户选的输入工具"决定（不是按和弦猜）：选豆包却把和弦配成
+/// Ctrl+Win 时，旧实现会把输入法切成微信（2026-10-01 语义缺口）。
+pub fn ensure_session_ime(tool: VoiceInputTool) -> Result<ImeActivation, String> {
     let started = std::time::Instant::now();
+    let Some(target) = ime_target_for(tool) else {
+        // 功能点日志：Vokie / 其他工具明确"不切输入法"也是决策，要能从日志看出
+        // 是"没轮到切"还是"切失败"（2026-09-29 真机曾把豆包路径误切成微信）。
+        crate::ble::gatt_note(
+            "ime_activation tool=none outcome=not_required elapsed_ms=0 reason=unsupported_tool"
+                .to_owned(),
+        );
+        return Ok(ImeActivation::NotRequired);
+    };
     // 前台是自身 WebView 时跳过激活：TSF 会话切换实证会触发 WebView2
     // 整页重载（Bugs/2026-09-12），且此时注入的和弦也落在自己窗口上，
     // 激活没有任何收益。返回 Ok——这不是错误，不应置 UI last_error。
     if foreground_is_self() {
-        crate::ble::gatt_note(
-            "ime_activation outcome=skipped_self_foreground elapsed_ms=0 foreground_observed=true error_domain=none error_code=foreground_is_self retryable=false"
-                .to_owned(),
-        );
-        return Ok(WeTypeActivation::SkippedSelfForeground);
+        crate::ble::gatt_note(format!(
+            "ime_activation tool={} outcome=skipped_self_foreground elapsed_ms=0 foreground_observed=true error_domain=none error_code=foreground_is_self retryable=false",
+            target.label,
+        ));
+        return Ok(ImeActivation::SkippedSelfForeground);
     }
     let (sender, receiver) = mpsc::channel();
     std::thread::Builder::new()
         .name("sayall-ime-activate".to_owned())
         .spawn(move || {
-            let outcome = sta_ensure_wetype();
+            let outcome = sta_ensure_ime(target);
             let _ = sender.send(outcome);
         })
         .map_err(|error| format!("创建激活线程失败：{error}"))?;
@@ -114,19 +172,22 @@ pub fn activate_wetype_session() -> Result<WeTypeActivation, String> {
     // 线程在后台自然结束（若激活迟到，惠及下一次按键）。
     let result = match receiver.recv_timeout(ACTIVATION_JOIN_TIMEOUT) {
         Ok(result) => result,
-        Err(_) => Err("激活微信输入法超时（500ms）".to_owned()),
+        Err(_) => Err(format!("激活 {} 超时（500ms）", target.label)),
     };
     // 功能点日志（AGENTS.md）：决策结果 + 耗时 + 前台进程，报障时一次
     // 日志拉取即可定位是热/冷路径、查询、激活还是等待环节。
     let outcome = match &result {
-        Ok(WeTypeActivation::AlreadyActive) => "already_active",
-        Ok(WeTypeActivation::Switched) => "switched",
-        Ok(WeTypeActivation::SkippedSelfForeground) => "skipped_self_foreground",
+        Ok(ImeActivation::AlreadyActive) => "already_active",
+        Ok(ImeActivation::Switched) => "switched",
+        Ok(ImeActivation::SkippedSelfForeground) => "skipped_self_foreground",
+        Ok(ImeActivation::NotRequired) => "not_required",
         Err(_) => "failed",
     };
     crate::ble::gatt_note(format!(
-        "ime_activation outcome={outcome} elapsed_ms={} foreground_observed={} error_domain={} error_code={} retryable={}",
+        "ime_activation tool={} outcome={outcome} elapsed_ms={} last_switch_age_ms={} foreground_observed={} error_domain={} error_code={} retryable={}",
+        target.label,
         started.elapsed().as_millis(),
+        last_switch_age_ms().map(|age| age.to_string()).unwrap_or_else(|| "never".to_owned()),
         foreground_process_name().is_some(),
         if result.is_ok() { "none" } else { "tsf" },
         if result.is_ok() {
@@ -281,10 +342,29 @@ fn foreground_process_name() -> Option<String> {
     }
 }
 
+/// 最近一次真正执行了会话切换（Switched）的时刻：用于把"首次按下没反应"
+/// 与"刚刚切过输入法"关联起来（2026-10-01：Andy 实测记事本里第一次按下
+/// 右 Alt 漏进记事本变成菜单助记符，说明目标应用的输入法会话还没接上）。
+static LAST_SWITCH_AT: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
+fn note_switch_happened() {
+    let slot = LAST_SWITCH_AT.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(std::time::Instant::now());
+}
+
+/// 距离最近一次会话切换过去了多少毫秒；从未切过返回 None。
+pub fn last_switch_age_ms() -> Option<u64> {
+    let slot = LAST_SWITCH_AT.get_or_init(|| std::sync::Mutex::new(None));
+    let guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.map(|instant| instant.elapsed().as_millis() as u64)
+}
+
 /// 临时 STA 线程体：CoInitializeEx(STA) → 查询活动输入法 →
 /// （需要时）ActivateProfile + 重绑等待 → CoUninitialize。
 /// 全部调用在本线程内完成（无跨套间封送，无需消息泵）。
-fn sta_ensure_wetype() -> Result<WeTypeActivation, String> {
+fn sta_ensure_ime(target: ImeProfile) -> Result<ImeActivation, String> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
@@ -304,34 +384,252 @@ fn sta_ensure_wetype() -> Result<WeTypeActivation, String> {
             .map_err(|error| format!("创建 TSF 配置管理器失败：{error}"))?;
             let mut profile = TF_INPUTPROCESSORPROFILE::default();
             let query = manager.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut profile);
-            let active_is_wetype = match &query {
-                Ok(()) => profile.clsid == WETYPE_CLSID && profile.guidProfile == WETYPE_PROFILE,
+            let active_is_target = match &query {
+                Ok(()) => {
+                    profile.clsid == target.clsid && profile.guidProfile == target.guid_profile
+                }
                 Err(_) => false,
             };
             // 功能点日志：只记录冷/热判定，不落盘输入法 GUID 或前台应用身份。
             crate::ble::gatt_note(format!(
-                "ime_query ok={} active_is_wetype={active_is_wetype} active_profile_present={}",
+                "ime_query tool={} ok={} active_is_target={active_is_target} active_profile_present={}",
+                target.label,
                 query.is_ok(),
                 profile.clsid != GUID::from_u128(0),
             ));
-            if active_is_wetype {
-                return Ok(WeTypeActivation::AlreadyActive);
+            if active_is_target {
+                return Ok(ImeActivation::AlreadyActive);
             }
             manager
                 .ActivateProfile(
                     TF_PROFILETYPE_INPUTPROCESSOR,
                     LANGID_ZH_CN,
-                    &WETYPE_CLSID,
-                    &WETYPE_PROFILE,
+                    &target.clsid,
+                    &target.guid_profile,
                     HKL::default(),
                     TF_IPPMF_FORSESSION,
                 )
-                .map_err(|error| format!("激活微信输入法会话失败：{error}"))?;
+                .map_err(|error| format!("激活 {} 会话失败：{error}", target.label))?;
             // 冷切换：等目标应用完成输入法会话重绑再放行注入。
             std::thread::sleep(SESSION_REBIND_SETTLE);
-            Ok(WeTypeActivation::Switched)
+            note_switch_happened();
+            Ok(ImeActivation::Switched)
         })();
         CoUninitialize();
         result
+    }
+}
+// ─── 录入期"输入法让位"（路线①，2026-09-27）───────────────────────────────
+//
+// 背景：LL 键盘钩子链为 FIFO（最早安装最先调用，见
+// docs/investigations/2026-09-27-ll-hook-chain-order-fifo.md）。微信输入法随
+// 登录先于本应用安装钩子，其语音和弦（= 用户在「按住说话快捷键」中配置的组合）
+// 的物理边沿在到达本应用录入钩子之前就被它吞掉，表现为"已配置的组合录不进去"。
+//
+// 本模块头（2026-09-05 实验）已实锤：输入法的语音热键**只有当它是当前会话的
+// 活动输入法时才生效**。因此录入期间把录入窗口所在线程的输入区域临时切到
+// 非 IME 布局，其和弦判定即失效，物理边沿直达本应用钩子；录入结束恢复。
+// 布局按线程生效且只作用于本应用窗口，不影响其他应用的输入法状态。
+//
+// 已知风险（需真机确认）：TSF/输入区域变更在本仓库曾出现"前台是自身 WebView
+// 时整页重载"（Bugs/2026-09-12）；本实现用 ActivateKeyboardLayout（非 TSF 配置
+// 切换），是否触发重载待实测。
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use windows::Win32::UI::Input::Ime::ImmIsIME;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ActivateKeyboardLayout, GetKeyboardLayoutList, LoadKeyboardLayoutW,
+    ACTIVATE_KEYBOARD_LAYOUT_FLAGS, KLF_ACTIVATE,
+};
+
+/// 让位计划（纯逻辑，供单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YieldPlan {
+    /// 当前布局不是 IME（或未知）——无需让位。
+    NotNeeded,
+    /// 切到该非 IME 布局。
+    SwitchTo(usize),
+    /// 系统里没有非 IME 布局，且加载 en-US 也失败。
+    NoCandidate,
+}
+
+/// 选择录入期让位方案：当前布局是 IME 时，从候选里挑第一个非 IME 布局。
+pub fn plan_input_method_yield(
+    current: usize,
+    candidates: &[usize],
+    is_ime: impl Fn(usize) -> bool,
+) -> YieldPlan {
+    if current == 0 || !is_ime(current) {
+        return YieldPlan::NotNeeded;
+    }
+    match candidates
+        .iter()
+        .copied()
+        .find(|hkl| *hkl != current && !is_ime(*hkl))
+    {
+        Some(hkl) => YieldPlan::SwitchTo(hkl),
+        None => YieldPlan::NoCandidate,
+    }
+}
+
+/// 录入前的原始布局（0 = 无让位进行中）。
+static CAPTURE_ORIGINAL_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+
+fn hkl_to_usize(hkl: HKL) -> usize {
+    hkl.0 as usize
+}
+
+/// 录入开始时调用。
+///
+/// **必须在录入窗口所在线程上执行**（输入区域按线程生效；应用里即主线程）。
+/// 返回结构化日志片段（调用方写入诊断日志）。让位失败不阻断录入——只是该
+/// 组合可能仍被输入法吞掉，日志里可归因。
+pub fn suspend_input_method_for_capture() -> String {
+    unsafe {
+        let current = current_thread_layout();
+        let mut list = [HKL::default(); 32];
+        let count = GetKeyboardLayoutList(Some(&mut list));
+        let candidates: Vec<usize> = list[..(count.max(0) as usize)]
+            .iter()
+            .map(|hkl| hkl_to_usize(*hkl))
+            .collect();
+        let plan = plan_input_method_yield(current, &candidates, |hkl| {
+            ImmIsIME(HKL(hkl as *mut core::ffi::c_void)).as_bool()
+        });
+        match plan {
+            YieldPlan::NotNeeded => {
+                return format!(
+                    "capture_ime_yield outcome=not_needed current_hkl=0x{:04X}",
+                    current & 0xFFFF
+                );
+            }
+            YieldPlan::NoCandidate => {
+                // 兜底：加载 en-US（标准布局，系统随时可加载）。
+                match LoadKeyboardLayoutW(windows::core::w!("00000409"), KLF_ACTIVATE) {
+                    Ok(hkl) => apply_yield(hkl_to_usize(hkl), current),
+                    Err(_) => "capture_ime_yield outcome=no_candidate".to_owned(),
+                }
+            }
+            YieldPlan::SwitchTo(target) => apply_yield(target, current),
+        }
+    }
+}
+
+fn apply_yield(target: usize, original: usize) -> String {
+    unsafe {
+        let activated = ActivateKeyboardLayout(
+            HKL(target as *mut core::ffi::c_void),
+            ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0),
+        );
+        let observed = current_thread_layout();
+        CAPTURE_ORIGINAL_LAYOUT.store(original, Ordering::Relaxed);
+        format!(
+            "capture_ime_yield outcome={} activated={} original_hkl=0x{:04X} target_hkl=0x{:04X} observed_hkl=0x{:04X} switched={}",
+            if observed == target { "switched" } else { "not_switched" },
+            activated.is_ok(),
+            original & 0xFFFF,
+            target & 0xFFFF,
+            observed & 0xFFFF,
+            observed == target
+        )
+    }
+}
+
+/// 录入结束时调用（同样必须在录入窗口所在线程上执行）：恢复原布局。
+pub fn restore_input_method_after_capture() -> String {
+    let original = CAPTURE_ORIGINAL_LAYOUT.swap(0, Ordering::Relaxed);
+    if original == 0 {
+        return "capture_ime_restore outcome=not_needed".to_owned();
+    }
+    unsafe {
+        let restored = ActivateKeyboardLayout(
+            HKL(original as *mut core::ffi::c_void),
+            ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0),
+        );
+        let observed = current_thread_layout();
+        format!(
+            "capture_ime_restore outcome={} restored={} target_hkl=0x{:04X} observed_hkl=0x{:04X}",
+            if observed == original {
+                "restored"
+            } else {
+                "not_restored"
+            },
+            restored.is_ok(),
+            original & 0xFFFF,
+            observed & 0xFFFF
+        )
+    }
+}
+
+/// 调用线程当前的输入区域布局（0 = 线程尚无输入上下文）。
+fn current_thread_layout() -> usize {
+    unsafe { hkl_to_usize(windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(0)) }
+}
+
+#[cfg(test)]
+mod yield_plan_tests {
+    use super::{plan_input_method_yield, YieldPlan};
+
+    #[test]
+    fn yields_only_when_current_layout_is_an_ime() {
+        let is_ime = |hkl: usize| hkl == 0x0804;
+        // 当前是 IME（0x0804），候选里有非 IME（0x0409）→ 切换。
+        assert_eq!(
+            plan_input_method_yield(0x0804, &[0x0804, 0x0409], is_ime),
+            YieldPlan::SwitchTo(0x0409)
+        );
+        // 当前不是 IME → 不动（不影响普通键盘布局）。
+        assert_eq!(
+            plan_input_method_yield(0x0409, &[0x0804, 0x0409], is_ime),
+            YieldPlan::NotNeeded
+        );
+        // 无线索（0）→ 不动。
+        assert_eq!(
+            plan_input_method_yield(0, &[0x0804], is_ime),
+            YieldPlan::NotNeeded
+        );
+        // 全是 IME → 交由调用方兜底加载 en-US。
+        let both_are_ime = |hkl: usize| hkl == 0x0804 || hkl == 0x0411;
+        assert_eq!(
+            plan_input_method_yield(0x0804, &[0x0804, 0x0411], both_are_ime),
+            YieldPlan::NoCandidate
+        );
+    }
+}
+
+#[cfg(test)]
+mod ime_target_tests {
+    use super::{ime_target_for, DOUBAO_CLSID, DOUBAO_PROFILE, WETYPE_CLSID, WETYPE_PROFILE};
+    use sayall_core::settings::VoiceInputTool;
+
+    /// 工具 → 目标输入法映射：输入法类工具要有目标，桌面程序/其他工具必须没有
+    /// （给 Vokie 切输入法会破坏它，且 2026-09-29 真机回归过"豆包路径被切成微信"）。
+    #[test]
+    fn maps_only_input_method_tools() {
+        let wechat = ime_target_for(VoiceInputTool::Wechat).expect("wechat target");
+        assert_eq!(wechat.label, "wechat");
+        let doubao = ime_target_for(VoiceInputTool::Doubao).expect("doubao target");
+        assert_eq!(doubao.label, "doubao");
+        assert!(ime_target_for(VoiceInputTool::Vokie).is_none());
+        assert!(ime_target_for(VoiceInputTool::Other).is_none());
+        // 身份必须是两套不同的 GUID（复制粘贴写错会在这里失败）。
+        assert_ne!(WETYPE_CLSID, DOUBAO_CLSID);
+        assert_ne!(WETYPE_PROFILE, DOUBAO_PROFILE);
+        assert_ne!(
+            ime_target_for(VoiceInputTool::Wechat),
+            ime_target_for(VoiceInputTool::Doubao)
+        );
+    }
+
+    /// Vokie（桌面程序）与「其他工具」绝不能被切输入法：整条链路必须原样返回
+    /// NotRequired，不碰 TSF（2026-09-29 真机回归过"豆包路径被切成微信"）。
+    #[test]
+    fn vokie_and_other_do_not_touch_input_methods() {
+        for tool in [VoiceInputTool::Vokie, VoiceInputTool::Other] {
+            assert_eq!(
+                super::ensure_session_ime(tool),
+                Ok(super::ImeActivation::NotRequired)
+            );
+        }
     }
 }

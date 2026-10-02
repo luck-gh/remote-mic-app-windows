@@ -35,8 +35,6 @@
 
 视频作者：[可乐不甜的跑焦日记](https://space.bilibili.com/327214328)
 
-> 同作者制作的小米蓝牙遥控器 2 Pro 3D 打印外壳：[在 MakerWorld 查看](https://makerworld.com.cn/zh/models/2965815-vibegrip-ma-shang-wo-wei-vibe-coding-zuo-de-xiao-m?appSharePlatform=sayall.app)
-
 无线麦 SayAll Windows 版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
 
 参考源码仓库：[HD838A/remote-mic-app](https://github.com/HD838A/remote-mic-app)（macOS 版）。Windows 版保持独立的平台实现，仅参考其公开的产品行为、协议经验和测试边界，不回填 macOS 代码。

@@ -1,13 +1,17 @@
-use crate::wetype_revive::{response_since, wetype_mic_observation, MicObservation, MicResponse};
+use crate::wetype_revive::{
+    reaction_verdict, response_since, wetype_mic_observation, MicObservation, MicResponse,
+    WetypeReaction,
+};
 use crate::{
     audio::{AudioBeginGuard, AudioRuntime},
     power::PowerNotifications,
     reconnect::ReconnectBackoff,
     remote_model_from_model_number, remote_model_from_name,
-    send_input::KeyChord,
+    send_input::{KeyChord, KeyCode},
     send_input_windows::SendInputRuntime,
     ConnectionPhase, ConnectionSnapshot, PlatformError, RemoteModel, UsageCounters,
 };
+use sayall_core::settings::VoiceInputTool;
 use sayall_core::{AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
 use std::future::IntoFuture;
 use std::sync::{
@@ -37,6 +41,11 @@ const AUDIO_UUID: GUID = GUID::from_u128(0xab5e00035a214f05bc7daf01f617b664);
 const CONTROL_UUID: GUID = GUID::from_u128(0xab5e00045a214f05bc7daf01f617b664);
 const DEVICE_INFORMATION_SERVICE_UUID: GUID = GUID::from_u128(0x0000180a00001000800000805f9b34fb);
 const MODEL_NUMBER_UUID: GUID = GUID::from_u128(0x00002a2400001000800000805f9b34fb);
+/// 标准 Battery Service（0x180F）与 Battery Level（0x2A19）。真机证据：RC003
+/// 0x2A19 props=read|notify，订阅后 0.5s 内即推送当前电量
+/// （hardware/RC003/evidence/gatt-probe-listen1.log）。
+const BATTERY_SERVICE_UUID: GUID = GUID::from_u128(0x0000180f00001000800000805f9b34fb);
+const BATTERY_LEVEL_UUID: GUID = GUID::from_u128(0x00002a1900001000800000805f9b34fb);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
@@ -46,6 +55,29 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// 恰为免费窗口；RC001 短按从不触窗）。宿主须周期发送 MIC_EXTEND(0x0E)
 /// 续期，2.5s 间隔留足余量。
 const MICROPHONE_EXTEND_INTERVAL: Duration = Duration::from_millis(2500);
+
+/// 微信输入法专属的会话激活/休眠恢复只能用于它自己的默认语音热键。
+///
+/// 其它输入工具（尤其豆包的 RightAlt）即使在报告层合成暂时不可用、回落到
+/// SendInput，也只能发送用户配置的快捷键，绝不能顺带切换当前输入法。顺序无关，
+/// 但键集合必须精确相等；多一个键也不进入微信专属路径。
+fn is_wetype_voice_hotkey(chord: &KeyChord) -> bool {
+    chord.keys.len() == 2
+        && chord.keys.contains(&KeyCode::LeftControl)
+        && chord.keys.contains(&KeyCode::LeftWindows)
+}
+
+/// Resolve only the session IME target; this never modifies saved preferences.
+fn voice_session_ime_tool(
+    configured: Option<VoiceInputTool>,
+    chord: &KeyChord,
+) -> Option<VoiceInputTool> {
+    match configured {
+        Some(VoiceInputTool::Wechat | VoiceInputTool::Doubao) => configured,
+        None if is_wetype_voice_hotkey(chord) => Some(VoiceInputTool::Wechat),
+        _ => None,
+    }
+}
 
 type ConnectionContextCallback = Arc<dyn Fn(RemoteModel, bool) + Send + Sync>;
 
@@ -157,6 +189,7 @@ impl BleRuntime {
         send_input: Arc<SendInputRuntime>,
         voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
         connection_context: ConnectionContextCallback,
+        voice_input_tool: Arc<Mutex<Option<VoiceInputTool>>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ConnectionSnapshot::default()));
@@ -175,6 +208,7 @@ impl BleRuntime {
                     send_input,
                     voice_hold_hotkey,
                     connection_context,
+                    voice_input_tool,
                 )
             });
 
@@ -316,10 +350,15 @@ pub(crate) enum WorkerMessage {
     /// 串行执行，与会话结束路径无竞态。`attempt` 为本次重注入对应的
     /// 检测轮次（1 起）；`epoch` 为 armed 时的语音会话纪元（防跨会话
     /// 误伤，见 worker_loop 中 voice_session_epoch 注释）。
+    ///
+    /// `marker_baseline` 是**本会话**按下前的存活标记计数（不是本轮新取），
+    /// 使"微信输入法曾响应过本次按住"的正面证据在整个按住期间持续生效；
+    /// 本轮新的开麦基线在重注入前重新取样。
     RetryVoiceChord {
         attempt: u32,
         epoch: u64,
         baseline: Option<MicObservation>,
+        marker_baseline: u64,
     },
     Control {
         connection_generation: u64,
@@ -372,6 +411,7 @@ fn worker_loop(
     send_input: Arc<SendInputRuntime>,
     voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
     connection_context: ConnectionContextCallback,
+    voice_input_tool: Arc<Mutex<Option<VoiceInputTool>>>,
 ) {
     let mut context_publisher = ConnectionContextPublisher::default();
     // 进程级资源基线（2026-09-16）：与后续 episode_start / system_resume 对比，
@@ -778,6 +818,7 @@ fn worker_loop(
                 attempt,
                 epoch,
                 baseline,
+                marker_baseline,
             } => {
                 // 微信输入法热键休眠的自动重试（同一次按住内完成）：
                 // 释放旧和弦边沿 → 重注入。在工作线程内串行执行，与
@@ -791,15 +832,31 @@ fn worker_loop(
                     gatt_note(format!("chord_retry skipped reason=stale epoch={epoch}"));
                     continue;
                 }
-                let retry_baseline = wetype_mic_observation();
-                if response_since(baseline, retry_baseline) != MicResponse::NotObserved {
+                let (verdict, evidence, mic) = wetype_reaction(baseline, marker_baseline);
+                if verdict != WetypeReaction::NotReacted {
                     gatt_note(format!(
-                        "chord_retry skipped reason=mic_active_or_unknown epoch={epoch}"
+                        "chord_retry skipped reason={} evidence={evidence} mic={} attempt={attempt} epoch={epoch}",
+                        if verdict == WetypeReaction::Reacted {
+                            "wetype_alive"
+                        } else {
+                            "observation_unavailable"
+                        },
+                        mic.as_log_str()
                     ));
                     continue;
                 }
+                let retry_mic_baseline = wetype_mic_observation();
                 let chord_configured = lock(&voice_hold_hotkey).clone();
                 if let (Some(chord), Some(old)) = (chord_configured, held_hotkey.as_ref()) {
+                    if voice_session_ime_tool(*lock(&voice_input_tool), &chord)
+                        != Some(VoiceInputTool::Wechat)
+                        || !is_wetype_voice_hotkey(&chord)
+                    {
+                        gatt_note(format!(
+                            "chord_retry skipped reason=hotkey_not_wetype epoch={epoch}"
+                        ));
+                        continue;
+                    }
                     if send_input.release(old).is_err() {
                         gatt_note(format!(
                             "chord_retry result=err reason=release_failed epoch={epoch}"
@@ -819,7 +876,8 @@ fn worker_loop(
                                 attempt,
                                 epoch,
                                 &voice_session_epoch,
-                                retry_baseline,
+                                retry_mic_baseline,
+                                marker_baseline,
                             );
                         }
                         Err(_) => {
@@ -846,6 +904,7 @@ fn worker_loop(
                         &audio,
                         &send_input,
                         &voice_hold_hotkey,
+                        &voice_input_tool,
                         &mut held_hotkey,
                         &usage,
                         &mut active_voice_samples,
@@ -1573,6 +1632,7 @@ fn handle_control(
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
     voice_hold_hotkey: &Mutex<Option<KeyChord>>,
+    voice_input_tool: &Mutex<Option<VoiceInputTool>>,
     held_hotkey: &mut Option<KeyChord>,
     usage: &UsageCounters,
     active_voice_samples: &mut u64,
@@ -1717,13 +1777,34 @@ fn handle_control(
             // 按住说话快捷键（参考 ZSTDJan/Voice_VibeCoding）：先注入快捷键
             // DOWN；WASAPI 准备已完成，注入失败直接中止并统一释放。
             if let Some(chord) = lock(voice_hold_hotkey).clone() {
-                let mic_baseline = wetype_mic_observation();
-                // 会话级激活微信输入法：其语音热键只在自身为当前会话活动
-                // 输入法时生效（2026-09-05 持锁实验，evidence/p）；激活后零
-                // 延迟注入 3/3 触发，不增加按键延迟。失败仅记录提示，按原
-                // 行为注入（不比现状更差）。
-                if let Err(error) = crate::ime::activate_wetype_session() {
-                    lock(state).last_error = Some(error);
+                let configured_tool = *lock(voice_input_tool);
+                let session_ime_tool = voice_session_ime_tool(configured_tool, &chord);
+                let wetype_hotkey = session_ime_tool == Some(VoiceInputTool::Wechat)
+                    && is_wetype_voice_hotkey(&chord);
+                gatt_note(format!(
+                    "voice_input_tool phase=session_target configured={} target={} wetype_recovery={wetype_hotkey}",
+                    configured_tool.is_some(),
+                    session_ime_tool
+                        .and_then(crate::ime::ime_target_for)
+                        .map_or("none", |target| target.label)
+                ));
+                let mic_baseline = wetype_hotkey.then(wetype_mic_observation).flatten();
+                // 存活标记基线必须与开麦基线同在注入之前取样，否则本次和弦
+                // 自己的标记会被算成“基线内”而漏掉否决。非微信快捷键不会
+                // 启动恢复阶梯，但统一取样可保持该临界区没有额外分支时序。
+                let marker_baseline = crate::key_suppressor::wetype_marker_count();
+                // 会话级激活目标输入法：语音热键只在自身为当前会话活动输入法
+                // 时生效（2026-09-05 持锁实验，evidence/p）；激活后零延迟注入
+                // 3/3 触发，不增加按键延迟。目标按**用户选的工具**决定
+                // （2026-10-01：不再按和弦猜——选豆包却把和弦配成 Ctrl+Win 时，
+                // 旧实现会把输入法切成微信）。失败仅记录提示，按原行为注入
+                // （不比现状更差）；Vokie / 其他工具返回 NotRequired，不切输入法。
+                // An unset preference keeps the established default Ctrl+Win path;
+                // explicit tools win, and arbitrary custom chords imply no IME.
+                if let Some(tool) = session_ime_tool {
+                    if let Err(error) = crate::ime::ensure_session_ime(tool) {
+                        lock(state).last_error = Some(error);
+                    }
                 }
                 if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
                     || route_permit.as_ref().is_some_and(|p| p.cancelled())
@@ -1782,17 +1863,20 @@ fn handle_control(
                     crate::send_input::HOLD_CHORD_EVENT_GAP.as_millis(),
                 ));
                 *held_hotkey = Some(chord);
-                // WeType 热键休眠检测与自动恢复（见 spawn_wetype_check）。
-                // 纪元在 StreamStarted 顶部已递增并捕获（见上），连同引用
-                // 传入，防旧阶梯跨会话误伤新会话的和弦。
-                spawn_wetype_check(
-                    state,
-                    sender.clone(),
-                    0,
-                    epoch,
-                    voice_session_epoch,
-                    mic_baseline,
-                );
+                if wetype_hotkey {
+                    // WeType 热键休眠检测与自动恢复（见 spawn_wetype_check）。
+                    // 纪元在 StreamStarted 顶部已递增并捕获（见上），连同引用
+                    // 传入，防旧阶梯跨会话误伤新会话的和弦。
+                    spawn_wetype_check(
+                        state,
+                        sender.clone(),
+                        0,
+                        epoch,
+                        voice_session_epoch,
+                        mic_baseline,
+                        marker_baseline,
+                    );
+                }
             } else {
                 // 功能点日志：会话开始但未配置按住说话快捷键（无注入环节）。
                 gatt_note(format!(
@@ -2247,6 +2331,12 @@ struct BleSession {
     audio_token: i64,
     control_token: i64,
     connection_token: i64,
+    /// GATT 电量订阅（0x180F/0x2A19，可选增强）：订阅成功时持有三件套并在
+    /// cleanup 成对释放；失败或设备无 BAS 时为 None，由 60s 缓存轮询兜底。
+    battery_service: Option<GattDeviceService>,
+    battery_characteristic: Option<GattCharacteristic>,
+    battery_token: Option<i64>,
+    battery_service_closed: bool,
     /// ThroughputOptimized 连接参数请求（2026-09-07 新增）：持有以维持偏好
     /// 生效；Windows 11 前的宿主上请求失败时为 None（降级默认参数）。
     params_request: Option<BluetoothLEPreferredConnectionParametersRequest>,
@@ -2327,6 +2417,10 @@ impl PendingBleConnection {
             model,
             device: self.device.take().expect("pending BLE device is owned"),
             service: self.service.take().expect("pending GATT service is owned"),
+            battery_service: None,
+            battery_characteristic: None,
+            battery_token: None,
+            battery_service_closed: true,
             transmit: self
                 .transmit
                 .take()
@@ -2622,8 +2716,21 @@ impl BleSession {
                 )
             },
         )?;
-        connected.battery_monitor =
-            crate::battery::BatteryMonitor::start(address, battery_sender, connection_generation);
+        // 电量数据路径：GATT 0x2A19 notify 实时订阅优先（best-effort，内部
+        // 已含完整回滚与日志）；订阅失败或设备无 BAS 时回退 60 秒 Windows
+        // 属性缓存轮询兜底（use_cache_monitor 决策，battery.rs 单测覆盖）。
+        let battery_notify_ready = connected.setup_battery_notify(
+            battery_sender.clone(),
+            connection_generation,
+            Arc::clone(&lifecycle_epoch),
+        );
+        if crate::battery::use_cache_monitor(battery_notify_ready) {
+            connected.battery_monitor = crate::battery::BatteryMonitor::start(
+                address,
+                battery_sender,
+                connection_generation,
+            );
+        }
         Ok(connected)
     }
 
@@ -2648,6 +2755,73 @@ impl BleSession {
         }
         .map_err(windows_error)?;
         require_success(block_on(operation)?, "写入 ATVV 控制命令")
+    }
+
+    /// 订阅 GATT Battery Service（0x180F/0x2A19）电量通知。可选增强、
+    /// best-effort：任何一步失败都清理本函数已获取的对象并返回 false，
+    /// 由调用方回退到 60 秒 Windows 缓存轮询；绝不向上传播错误——电量
+    /// 是锦上添花，不能影响语音主路径（AGENTS.md 架构边界）。
+    fn setup_battery_notify(
+        &mut self,
+        sender: Sender<WorkerMessage>,
+        connection_generation: u64,
+        lifecycle_epoch: Arc<AtomicU64>,
+    ) -> bool {
+        gatt_note("remote_battery phase=gatt_subscribe_start".to_owned());
+        let Some(service) = find_battery_service(&self.device) else {
+            gatt_note(
+                "remote_battery phase=gatt_subscribe result=fallback reason=battery_service_missing"
+                    .to_owned(),
+            );
+            return false;
+        };
+        self.battery_service = Some(service.clone());
+        self.battery_service_closed = false;
+        let characteristic = match find_characteristic(
+            &service,
+            BATTERY_LEVEL_UUID,
+            "battery_level",
+        ) {
+            Ok(characteristic) => characteristic,
+            Err(error) => {
+                gatt_note(format!(
+                        "remote_battery phase=gatt_subscribe result=fallback reason=characteristic_missing error={error}"
+                    ));
+                return false;
+            }
+        };
+        let token = match subscribe(
+            &characteristic,
+            sender.clone(),
+            WorkerChannel::Battery,
+            connection_generation,
+            Arc::clone(&self.release_epoch),
+            lifecycle_epoch,
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                gatt_note(format!(
+                    "remote_battery phase=gatt_subscribe result=fallback reason=subscribe_failed error={error}"
+                ));
+                return false;
+            }
+        };
+        self.battery_characteristic = Some(characteristic);
+        self.battery_token = Some(token);
+        // 订阅成功后立即读一次初始值：多数设备订阅时也会推一次，重复到达
+        // 无害（同一电量幂等覆盖）；个别设备只在变化时推送，这一读保证 UI
+        // 不必等到第一次变化才显示电量。
+        read_battery_level_initial(
+            self.battery_characteristic
+                .as_ref()
+                .expect("battery characteristic is owned"),
+            &sender,
+            connection_generation,
+        );
+        gatt_note(
+            "remote_battery phase=gatt_subscribe result=passed source=gatt_notify".to_owned(),
+        );
+        true
     }
 
     fn request_microphone_open(&mut self, version: u16, codec: u8) -> Result<(), PlatformError> {
@@ -2735,32 +2909,62 @@ impl BleSession {
         }
 
         let mut errors = Vec::new();
+        if let (Some(characteristic), Some(token)) =
+            (&self.battery_characteristic, self.battery_token)
+        {
+            match characteristic.RemoveValueChanged(token) {
+                Ok(()) => self.battery_token = None,
+                Err(error) => errors.push(format!("取消电量通知回调：{error}")),
+            }
+        }
+        if !self.battery_service_closed && self.battery_token.is_none() {
+            if !retrying && !self.link_disconnected {
+                if let Some(characteristic) = &self.battery_characteristic {
+                    let result = disable_notifications(characteristic);
+                    gatt_note(format!(
+                        "remote_battery phase=unsubscribe remote_cccd_ok={} local_close_required=true",
+                        result.is_ok()
+                    ));
+                }
+            }
+            if let Some(service) = &self.battery_service {
+                match service.Close() {
+                    Ok(()) => {
+                        self.battery_service_closed = true;
+                        self.battery_service = None;
+                        self.battery_characteristic = None;
+                    }
+                    Err(error) => errors.push(format!("关闭电量 GATT service：{error}")),
+                }
+            }
+        }
         if !self.service_closed {
             match self.service.Close() {
                 Ok(()) => self.service_closed = true,
                 Err(error) => errors.push(format!("关闭 GATT service：{error}")),
             }
         }
-        if !self.device_closed {
+        if !self.device_closed && self.battery_service_closed {
             match self.device.Close() {
                 Ok(()) => self.device_closed = true,
                 Err(error) => errors.push(format!("关闭蓝牙设备：{error}")),
             }
         }
-        self.closed = self.service_closed && self.device_closed;
+        self.closed = self.service_closed && self.device_closed && self.battery_service_closed;
         if let Some(flow) = self.voice_flow.take() {
             flow.emit("connection_close");
         }
         if errors.is_empty() {
             gatt_note(format!(
-                "ble_session_cleanup phase=completed terminal_result=passed retrying={retrying}"
+                "ble_session_cleanup phase=completed terminal_result=passed retrying={retrying} battery_service_closed={}",
+                self.battery_service_closed
             ));
             Ok(())
         } else {
             let error = errors.join("；");
             gatt_note(format!(
-                "ble_session_cleanup phase=completed terminal_result=failed retrying={retrying} service_closed={} device_closed={} retryable=true",
-                self.service_closed, self.device_closed
+                "ble_session_cleanup phase=completed terminal_result=failed retrying={retrying} service_closed={} device_closed={} battery_service_closed={} retryable=true",
+                self.service_closed, self.device_closed, self.battery_service_closed
             ));
             Err(PlatformError::BleCleanup(error))
         }
@@ -2806,6 +3010,9 @@ impl Drop for BleSession {
 enum WorkerChannel {
     Audio,
     Control,
+    /// GATT Battery Service 0x2A19 电量通知：回调内解析为百分比后复用
+    /// BatteryRead 消息（纪元 + phase 校验与缓存轮询路径完全一致）。
+    Battery,
 }
 
 #[derive(Debug, Clone)]
@@ -3003,6 +3210,37 @@ const WETYPE_RETRY_SETTLE_MS: [u64; 3] = [2000, 3000, 5000];
 /// 最大重注入轮次（检测共 attempt 0..=3 四轮）。
 const WETYPE_RETRY_MAX_ATTEMPT: u32 = 3;
 
+/// 合并微信输入法"本次按住是否已被触发"的两个独立判据，返回
+/// （裁决，证据来源，开麦判据结果）。
+///
+/// 证据来源只用于日志归因：`marker` = 钩子层看到微信输入法自注入的存活标记
+/// （0xFC break key，与版本解耦）；`mic` = ConsentStore 开麦观测；`unavailable`
+/// = 观测不可用；`none` = 两个判据都确认未触发（可执行恢复阶梯）。
+///
+/// 第三个返回值**始终**记录开麦判据自身的结果：`evidence=marker mic=not_observed`
+/// 就是 issue #118 的盲判形态（微信输入法在录音但 ConsentStore 没写），
+/// 而 `evidence=marker mic=observed` 说明两条通道同时命中——修复是否承重，
+/// 靠这一个字段即可在复现窗口判定。
+///
+/// 背景（2026-09-23 issue #118）：微信输入法 2.1.4.6 起录音不再写 ConsentStore，
+/// 单靠开麦观测会把"其实已在录音"判成未响应，随后重放和弦拆掉进行中的会话。
+/// 存活标记是正面证据，出现即否决恢复；判据缺失时退化为原行为，不比现状更差。
+fn wetype_reaction(
+    baseline: Option<MicObservation>,
+    marker_baseline: u64,
+) -> (WetypeReaction, &'static str, MicResponse) {
+    let mic = response_since(baseline, wetype_mic_observation());
+    let marker_now = crate::key_suppressor::wetype_marker_count();
+    let verdict = reaction_verdict(mic, marker_baseline, marker_now);
+    let evidence = match verdict {
+        WetypeReaction::Reacted if marker_now > marker_baseline => "marker",
+        WetypeReaction::Reacted => "mic",
+        WetypeReaction::Unknown => "unavailable",
+        WetypeReaction::NotReacted => "none",
+    };
+    (verdict, evidence, mic)
+}
+
 fn spawn_wetype_check(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     sender: Sender<WorkerMessage>,
@@ -3010,11 +3248,12 @@ fn spawn_wetype_check(
     epoch: u64,
     epoch_ref: &Arc<AtomicU64>,
     baseline: Option<MicObservation>,
+    marker_baseline: u64,
 ) {
     let state = Arc::clone(state);
     let epoch_ref = Arc::clone(epoch_ref);
     gatt_note(format!(
-        "wetype_check armed attempt={attempt} epoch={epoch} baseline_available={}",
+        "wetype_check armed attempt={attempt} epoch={epoch} baseline_available={} marker_baseline={marker_baseline}",
         baseline.is_some()
     ));
     std::thread::Builder::new()
@@ -3038,20 +3277,26 @@ fn spawn_wetype_check(
                 });
                 return;
             }
-            match response_since(baseline, wetype_mic_observation()) {
-                MicResponse::Observed => {
+            match wetype_reaction(baseline, marker_baseline) {
+                (WetypeReaction::Reacted, evidence, mic) => {
+                    // marker_extra 是目标程序自定义的魔数（WeType = "WTYP"），
+                    // 只用于真机归因，不含用户数据。mic= 记录开麦判据自身结果，
+                    // 用于区分"盲判"与"两条通道同时命中"。
                     gatt_note(format!(
-                        "wetype_check reacted=true attempt={attempt} epoch={epoch}"
+                        "wetype_check reacted=true attempt={attempt} epoch={epoch} evidence={evidence} mic={} marker_extra={:#X}",
+                        mic.as_log_str(),
+                        crate::key_suppressor::wetype_marker_last_extra()
                     ));
                     return;
                 }
-                MicResponse::Unknown => {
+                (WetypeReaction::Unknown, _, mic) => {
                     gatt_note(format!(
-                        "wetype_check skipped reason=observation_unavailable attempt={attempt} epoch={epoch}"
+                        "wetype_check skipped reason=observation_unavailable attempt={attempt} epoch={epoch} mic={}",
+                        mic.as_log_str()
                     ));
                     return;
                 }
-                MicResponse::NotObserved => {}
+                (WetypeReaction::NotReacted, _, _) => {}
             }
             if attempt >= WETYPE_RETRY_MAX_ATTEMPT {
                 // 最后一轮仍未响应：放弃自动恢复，提示人工（唯一兜底）。
@@ -3092,9 +3337,16 @@ fn spawn_wetype_check(
                 });
                 return;
             }
-            if response_since(baseline, wetype_mic_observation()) != MicResponse::NotObserved {
+            let (verdict, evidence, mic) = wetype_reaction(baseline, marker_baseline);
+            if verdict != WetypeReaction::NotReacted {
                 gatt_note(format!(
-                    "wetype_check skipped_retry reason=mic_active_or_unknown attempt={attempt} epoch={epoch}"
+                    "wetype_check skipped_retry reason={} evidence={evidence} mic={} attempt={attempt} epoch={epoch}",
+                    if verdict == WetypeReaction::Reacted {
+                        "wetype_alive"
+                    } else {
+                        "observation_unavailable"
+                    },
+                    mic.as_log_str()
                 ));
                 return;
             }
@@ -3103,6 +3355,7 @@ fn spawn_wetype_check(
                 attempt: next_attempt,
                 epoch,
                 baseline,
+                marker_baseline,
             });
         })
         .ok();
@@ -3124,8 +3377,8 @@ fn subscribe(
     lifecycle_epoch: Arc<AtomicU64>,
 ) -> Result<i64, PlatformError> {
     let callback_sender = sender.clone();
-    let handler =
-        TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(move |_, args| {
+    let handler = TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(
+        move |_, args| {
             let stamp = CallbackStamp {
                 at: Instant::now(),
                 release_epoch: release_epoch.load(Ordering::SeqCst),
@@ -3136,13 +3389,17 @@ fn subscribe(
                 .and_then(|buffer| buffer_to_vec(&buffer));
             match result {
                 Ok(bytes) => {
-                    gatt_log(
-                        match channel {
-                            WorkerChannel::Audio => "A",
-                            WorkerChannel::Control => "C",
-                        },
-                        &bytes,
-                    );
+                    // 电量通知低频且单字节，走结构化 note，不落原始包。
+                    if !matches!(channel, WorkerChannel::Battery) {
+                        gatt_log(
+                            match channel {
+                                WorkerChannel::Audio => "A",
+                                WorkerChannel::Control => "C",
+                                WorkerChannel::Battery => unreachable!(),
+                            },
+                            &bytes,
+                        );
+                    }
                     // 控制通知（遥控器按键活动，含语音会话 0x04）：在此刻
                     // ——GATT 回调线程，刚被事件唤醒、不经工作线程队列——
                     // 直接武装 F5 抑制宽限。遥控器闲置后首按时应用自身被
@@ -3187,19 +3444,42 @@ fn subscribe(
                             stamp,
                             bytes,
                         },
+                        WorkerChannel::Battery => {
+                            let reading = crate::battery::gatt_level_reading(&bytes, "gatt_notify");
+                            gatt_note(format!(
+                                "remote_battery phase=notify source={} reason={} level={} connection_generation={}",
+                                reading.source,
+                                reading.reason,
+                                reading
+                                    .level
+                                    .map_or_else(|| "unknown".to_owned(), |level| level.to_string()),
+                                connection_generation,
+                            ));
+                            WorkerMessage::BatteryRead {
+                                connection_generation,
+                                reading,
+                            }
+                        }
                     };
                     let _ = callback_sender.send(message);
                 }
                 Err(error) => {
-                    invalidate_control_callback(channel, &release_epoch);
-                    let _ = callback_sender.send(WorkerMessage::CallbackError {
-                        connection_generation,
-                        error: format!("读取 GATT 通知失败：{error}"),
-                    });
+                    if matches!(channel, WorkerChannel::Battery) {
+                        gatt_note(format!(
+                            "remote_battery phase=notify result=failed reason=read_failed connection_generation={connection_generation} error={error}"
+                        ));
+                    } else {
+                        invalidate_control_callback(channel, &release_epoch);
+                        let _ = callback_sender.send(WorkerMessage::CallbackError {
+                            connection_generation,
+                            error: format!("读取 GATT 通知失败：{error}"),
+                        });
+                    }
                 }
             }
             Ok(())
-        });
+        },
+    );
     let token = characteristic
         .ValueChanged(&handler)
         .map_err(windows_error)?;
@@ -3264,6 +3544,68 @@ fn find_service(
         return Err(PlatformError::VoiceServiceMissing);
     }
     services.GetAt(0).map_err(windows_error)
+}
+
+/// best-effort 定位标准 Battery Service（0x180F）。设备固件没有 BAS、
+/// 服务数量异常或查询失败都返回 None，由调用方回退缓存轮询。
+fn find_battery_service(device: &BluetoothLEDevice) -> Option<GattDeviceService> {
+    let result = block_on(
+        device
+            .GetGattServicesForUuidWithCacheModeAsync(
+                BATTERY_SERVICE_UUID,
+                BluetoothCacheMode::Uncached,
+            )
+            .ok()?,
+    )
+    .ok()?;
+    if result.Status().ok()? != GattCommunicationStatus::Success {
+        return None;
+    }
+    let services = result.Services().ok()?;
+    if services.Size().ok()? != 1 {
+        return None;
+    }
+    services.GetAt(0).ok()
+}
+
+/// 订阅成功后读一次当前电量作为初始值（best-effort，失败仅记录）。
+fn read_battery_level_initial(
+    characteristic: &GattCharacteristic,
+    sender: &Sender<WorkerMessage>,
+    connection_generation: u64,
+) {
+    let started = Instant::now();
+    let outcome = (|| -> Option<crate::battery::BatteryReading> {
+        let result = block_on(characteristic.ReadValueAsync().ok()?).ok()?;
+        if result.Status().ok()? != GattCommunicationStatus::Success {
+            return None;
+        }
+        let bytes = buffer_to_vec(&result.Value().ok()?).ok()?;
+        Some(crate::battery::gatt_level_reading(&bytes, "gatt_read"))
+    })();
+    match outcome {
+        Some(reading) => {
+            gatt_note(format!(
+                "remote_battery phase=initial_read source={} reason={} level={} elapsed_ms={} connection_generation={}",
+                reading.source,
+                reading.reason,
+                reading
+                    .level
+                    .map_or_else(|| "unknown".to_owned(), |level| level.to_string()),
+                started.elapsed().as_millis(),
+                connection_generation,
+            ));
+            let _ = sender.send(WorkerMessage::BatteryRead {
+                connection_generation,
+                reading,
+            });
+        }
+        None => gatt_note(format!(
+            "remote_battery phase=initial_read result=failed elapsed_ms={} connection_generation={}",
+            started.elapsed().as_millis(),
+            connection_generation,
+        )),
+    }
 }
 
 fn find_characteristic(
@@ -3491,6 +3833,73 @@ impl Drop for WinRtApartment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_input_tool_unset_preserves_default_wetype_session_activation() {
+        for keys in [
+            vec![KeyCode::LeftControl, KeyCode::LeftWindows],
+            vec![KeyCode::LeftWindows, KeyCode::LeftControl],
+        ] {
+            assert_eq!(
+                voice_session_ime_tool(None, &KeyChord { keys }),
+                Some(VoiceInputTool::Wechat),
+                "an unset tool with the existing default hotkey must activate WeType without opening the connection page"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_input_tool_explicit_choice_controls_the_session_ime() {
+        let chord = KeyChord {
+            keys: vec![KeyCode::LeftControl, KeyCode::LeftWindows],
+        };
+        for tool in [VoiceInputTool::Wechat, VoiceInputTool::Doubao] {
+            assert_eq!(voice_session_ime_tool(Some(tool), &chord), Some(tool));
+        }
+        for tool in [VoiceInputTool::Other, VoiceInputTool::Vokie] {
+            assert_eq!(voice_session_ime_tool(Some(tool), &chord), None);
+        }
+    }
+
+    #[test]
+    fn voice_input_tool_unset_does_not_infer_from_custom_chords() {
+        for keys in [
+            vec![KeyCode::RightAlt],
+            vec![KeyCode::LeftControl, KeyCode::RightWindows],
+            vec![KeyCode::LeftControl, KeyCode::LeftWindows, KeyCode::A],
+            vec![KeyCode::A],
+            Vec::new(),
+        ] {
+            assert_eq!(voice_session_ime_tool(None, &KeyChord { keys }), None);
+        }
+    }
+
+    #[test]
+    fn wetype_activation_is_limited_to_the_wetype_default_hotkey() {
+        let chord = |keys| KeyChord { keys };
+
+        assert!(is_wetype_voice_hotkey(&chord(vec![
+            KeyCode::LeftControl,
+            KeyCode::LeftWindows,
+        ])));
+        assert!(is_wetype_voice_hotkey(&chord(vec![
+            KeyCode::LeftWindows,
+            KeyCode::LeftControl,
+        ])));
+        assert!(
+            !is_wetype_voice_hotkey(&chord(vec![KeyCode::RightAlt])),
+            "豆包右 Alt 路径不得激活或复活微信输入法"
+        );
+        assert!(!is_wetype_voice_hotkey(&chord(vec![
+            KeyCode::LeftControl,
+            KeyCode::RightWindows,
+        ])));
+        assert!(!is_wetype_voice_hotkey(&chord(vec![
+            KeyCode::LeftControl,
+            KeyCode::LeftWindows,
+            KeyCode::A,
+        ])));
+    }
 
     #[test]
     fn control_callback_error_invalidates_before_worker_dispatch() {

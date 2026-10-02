@@ -1,5 +1,7 @@
-use sayall_core::{AppSettings, ThemePreference, UsageStatistics};
-use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord};
+use sayall_core::{
+    AppIconIdentifier, AppSettings, ThemePreference, UsageStatistics, VoiceInputTool,
+};
+use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord, KeyCode};
 use sayall_windows::templates::{
     new_template_id, ApplicationBinding, ImportedTemplatePreview, MappingConfiguration,
     MappingConfigurationImportPreview, MappingTemplate, TemplateImportPreview,
@@ -165,6 +167,20 @@ impl SettingsStore {
     ) -> Result<(), String> {
         self.update("保存界面偏好", |settings| {
             settings.ui_preferences.set(field, enabled)
+        })
+    }
+
+    /// 应用图标（设置页「应用图标」，2026-10-02）。
+    pub fn save_app_icon(&self, identifier: AppIconIdentifier) -> Result<(), String> {
+        self.update("保存应用图标设置", move |settings| {
+            settings.app_icon = identifier;
+        })
+    }
+
+    /// 连接页显式选择的输入工具；None 保持未选择，不因初始化或读取失败写盘。
+    pub fn save_voice_input_tool(&self, tool: Option<VoiceInputTool>) -> Result<(), String> {
+        self.update("保存输入工具设置", move |settings| {
+            settings.voice_input_tool = tool;
         })
     }
 
@@ -685,12 +701,56 @@ impl SettingsStore {
         Ok(hotkey)
     }
 
+    /// 「其他工具」面板记住的按键（2026-10-01 Andy 反馈：选了「不按键 / 左 Alt」
+    /// 之后切去豆包再切回来，会退回默认的右 Alt——因为选中别的工具会改写
+    /// 按住说话快捷键，而「其他工具」没有自己的记忆）。
+    ///
+    /// `None` = 从未选过（保持现状）；`Some(vec![])` = 明确选了「不按键」。
+    pub fn load_other_voice_hotkey(&self) -> Result<Option<Vec<KeyCode>>, String> {
+        let _guard = lock(&self.access);
+        let path = self.other_voice_hotkey_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("读取「其他工具」按键记忆失败：{error}")),
+        };
+        serde_json::from_str::<Option<Vec<KeyCode>>>(&contents)
+            .map_err(|error| format!("解析「其他工具」按键记忆失败：{error}"))
+    }
+
+    pub fn save_other_voice_hotkey(
+        &self,
+        keys: Option<Vec<KeyCode>>,
+    ) -> Result<Option<Vec<KeyCode>>, String> {
+        let _guard = lock(&self.access);
+        if let Some(keys) = &keys {
+            if !keys.is_empty() {
+                KeyChord { keys: keys.clone() }
+                    .validated()
+                    .map_err(|error| format!("「其他工具」按键无效：{error}"))?;
+            }
+        }
+        let path = self.other_voice_hotkey_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
+        }
+        let contents = serde_json::to_vec_pretty(&keys)
+            .map_err(|error| format!("序列化「其他工具」按键记忆失败：{error}"))?;
+        fs::write(path, contents)
+            .map_err(|error| format!("保存「其他工具」按键记忆失败：{error}"))?;
+        Ok(keys)
+    }
+
     fn button_mappings_path(&self) -> PathBuf {
         self.path.with_file_name("button-mappings.json")
     }
 
     fn voice_hold_hotkey_path(&self) -> PathBuf {
         self.path.with_file_name("voice-hold-hotkey.json")
+    }
+
+    fn other_voice_hotkey_path(&self) -> PathBuf {
+        self.path.with_file_name("other-voice-hotkey.json")
     }
 
     fn update(&self, operation: &str, update: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
@@ -1584,6 +1644,22 @@ mod tests {
     }
 
     #[test]
+    fn other_voice_hotkey_memory_distinguishes_never_chosen_from_no_key() {
+        // 「其他工具」的记忆必须能区分「从未选过」（None）与「明确选了不按键」（Some(vec![])）。
+        let store = SettingsStore::new(std::env::temp_dir().join("sayall-other-hotkey-test.json"));
+        assert_eq!(store.load_other_voice_hotkey().unwrap(), None);
+        assert_eq!(
+            store.save_other_voice_hotkey(Some(Vec::new())).unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(store.load_other_voice_hotkey().unwrap(), Some(Vec::new()));
+        let keys = vec![KeyCode::LeftAlt];
+        store.save_other_voice_hotkey(Some(keys.clone())).unwrap();
+        assert_eq!(store.load_other_voice_hotkey().unwrap(), Some(keys));
+        let _ = std::fs::remove_file(store.path.with_file_name("other-voice-hotkey.json"));
+    }
+
+    #[test]
     fn settings_round_trip_preserves_stable_endpoint_identity() {
         let mut usage_statistics = UsageStatistics::default();
         usage_statistics.record_button_presses("2026-09-01", 3);
@@ -1656,6 +1732,35 @@ mod tests {
         assert!(!store.load().unwrap().check_prerelease_updates);
         store.save_check_prerelease_updates(true).unwrap();
         assert!(store.load().unwrap().check_prerelease_updates);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn voice_input_tool_defaults_to_unset_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-voice-input-tool-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        // 老配置 / 新装：未选择过 → None（界面据此推断一次，不替用户猜）。
+        assert_eq!(store.load().unwrap().voice_input_tool, None);
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Doubao))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Doubao)
+        );
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Other))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Other)
+        );
 
         let _ = std::fs::remove_file(path);
     }

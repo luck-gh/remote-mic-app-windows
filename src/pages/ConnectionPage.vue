@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
+import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import type {
   AudioEndpoint,
   AudioSnapshot,
@@ -9,6 +10,7 @@ import type {
   KeyChord,
   PairedRemote,
   RuntimeSnapshot,
+  VoiceInputTool,
 } from "../lib/bridge";
 import {
   audioPhaseLabel,
@@ -22,14 +24,21 @@ import {
   setCaptureInput,
   resolveCaptureRecovery,
   getConnectionSnapshot,
+  getOtherVoiceHotkey,
   getVoiceHoldHotkey,
+  getVoiceInputTool,
+  getVokieInstallation,
   isRecommendedVoiceEndpoint,
   listAudioEndpoints,
   openVbCableDownloadPage,
+  launchVokie,
+  openVokieHomepage,
   remoteModelLabel,
   scanPairedRemotes,
   selectAudioEndpoint,
+  setOtherVoiceHotkey,
   setVoiceHoldHotkey,
+  setVoiceInputTool,
   startShortcutCapture,
   stopShortcutCapture,
   subscribeShortcutCaptureEdges,
@@ -104,7 +113,7 @@ const scanning = ref(false);
 const connectingDeviceId = ref("");
 const disconnecting = ref(false);
 const devices = ref<PairedRemote[]>([]);
-const scanMessage = ref("尚未扫描");
+const scanMessage = ref("");
 const operationMessage = ref("");
 const audioEndpoints = ref<AudioEndpoint[]>([]);
 const showEndpointList = ref(false);
@@ -112,23 +121,82 @@ const scanningAudio = ref(false);
 const audioScanComplete = ref(false);
 const selectingEndpointId = ref("");
 const openingVbCablePage = ref(false);
-const audioMessage = ref("尚未读取语音设备");
+const audioMessage = ref("");
 const voiceHotkey = ref<KeyChord | null>(null);
 const savingVoiceHotkey = ref(false);
-const voiceHotkeyMessage = ref("尚未读取快捷键设置");
+const voiceHotkeyMessage = ref("");
 const capturingVoiceHotkey = ref(false);
 const captureStartingVoiceHotkey = ref(false);
+/** 录入开始时仍有 preheld 键按住：后端吞键但不投递边沿，直到全部松开。 */
+const waitingPreheldRelease = ref(false);
 const voiceCaptureDisplay = ref<KeyCode[]>([]);
+/** 当前选择的输入工具；null = 尚未读取（或从未选择过，正在推断）。 */
+const voiceInputTool = ref<VoiceInputTool | null>(null);
+const savingVoiceInputTool = ref(false);
+/**
+ * 正在为哪个工具落"按住说话快捷键"（含两段 IPC 全程）。见 toolChordPill：
+ * 这期间状态胶囊按乐观态显示，避免切换工具的瞬间闪一帧"未同步"黄标。
+ */
+const applyingTool = ref<VoiceInputTool | null>(null);
+/**
+ * Vokie 检测状态（2026-10-01 Andy 需求 + 快捷键冲突处理）：
+ * - `installed === false`：Vokie 面板显示官网入口；
+ * - 已安装但没运行：提示“没有运行”——没运行就不会响应右 Alt；
+ * - `running === true`：豆包面板给出冲突提示（两者都用右 Alt）。
+ * 检测在 Rust 侧只读完成（卸载表 / 开始菜单 / App Paths + 进程名），只回布尔值、不回路径。
+ */
+const vokieInstalled = ref<boolean | null>(null);
+const vokieRunning = ref<boolean | null>(null);
+const checkingVokie = ref(false);
+const openingVokiePage = ref(false);
+const launchingVokie = ref(false);
+const vokieCheckMessage = ref("");
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 let unlistenVoiceCapture: (() => void) | null = null;
 let voiceCaptureTimeout: number | null = null;
+/**
+ * 落盘稳定窗口：外部钩子（微信输入法等）会吞掉完成键的物理边沿、随后把整个
+ * 组合以注入副本重放（见 Bugs/2026-09-27-ime-chord-hook-eats-active-hotkey-capture.md）。
+ * 副本可能晚于用户物理松开到达，因此"全部松开"后不立即落盘，先等一个短窗口；
+ * 窗口内又出现按下沿则取消并重新等待。
+ */
+let voiceCaptureSettleTimeout: number | null = null;
 let voiceCaptureRequestId = 0;
 let unmounted = false;
 const voiceCapturePressed = new Set<KeyCode>();
+/** 本次录入会话按过的全部按键（按首次按下顺序，去重）。 */
+const voiceCaptureEverPressed: KeyCode[] = [];
 let voiceCapturedKeys: KeyCode[] | null = null;
 
 /** 按住说话快捷键默认值（v1 固定，适配微信输入法的默认语音热键）。 */
 const DEFAULT_VOICE_HOTKEY_KEYS: KeyCode[] = ["left_control", "left_windows"];
+
+/**
+ * 输入工具 → "按住说话快捷键"（2026-09-30 连接页改版的设计契约）：
+ * 选工具即自动落这个组合，用户不需要理解快捷键本身。
+ * `other` 不预设——由用户在"其他工具"面板里自己选（右 Alt / 左 Alt / 不按键）。
+ */
+const VOICE_TOOL_CHORDS: Record<VoiceInputTool, KeyCode[] | null> = {
+  doubao: ["right_alt"],
+  wechat: [...DEFAULT_VOICE_HOTKEY_KEYS],
+  vokie: ["right_alt"],
+  other: null,
+};
+
+/** 工具卡片顺序：豆包第一（2026-09-30 Andy 要求），Vokie 在“其他工具”之前（2026-10-01 新增）。 */
+const TOOL_CARDS: Array<{ id: VoiceInputTool; name: string; note: string }> = [
+  { id: "doubao", name: "豆包输入法", note: "使用右 Alt 语音键" },
+  { id: "wechat", name: "微信输入法", note: "用默认语音键，最省事" },
+  { id: "vokie", name: "Vokie", note: "流式显示，智能整理，不占用输入法" },
+  { id: "other", name: "其他工具", note: "自己指定按键" },
+];
+
+/** "其他工具"提供的快捷键；不按键时只接收语音。 */
+const OTHER_CHORD_OPTIONS: Array<{ id: string; keys: KeyCode[]; label: string }> = [
+  { id: "right_alt", keys: ["right_alt"], label: "右 Alt" },
+  { id: "left_alt", keys: ["left_alt"], label: "左 Alt" },
+  { id: "none", keys: [], label: "不按键" },
+];
 
 const CAPTURE_MODIFIER_KEYS: ReadonlySet<KeyCode> = new Set<KeyCode>([
   "left_control",
@@ -145,8 +213,152 @@ const activeVoiceHotkeyKeys = computed(() =>
   voiceHotkey.value ? [...voiceHotkey.value.keys].sort().join("+") : "",
 );
 
-function presetIsActive(keys: string[]): boolean {
+function chordKeysActive(keys: string[]): boolean {
   return [...keys].sort().join("+") === activeVoiceHotkeyKeys.value;
+}
+
+function otherChordActive(option: { keys: KeyCode[] }): boolean {
+  return option.keys.length ? chordKeysActive(option.keys) : activeVoiceHotkeyKeys.value === "";
+}
+
+/** 工具卡片/豆包面板显示的"已自动设置"判据：当前快捷键 == 该工具要求的组合。 */
+function toolChordActive(tool: VoiceInputTool): boolean {
+  const keys = VOICE_TOOL_CHORDS[tool];
+  return keys !== null && chordKeysActive(keys);
+}
+
+/**
+ * 状态胶囊（"已自动设置 / 未同步，点左侧卡片重设"）的判据。
+ *
+ * 切换工具是两段异步 IPC（落工具选择 → 写按住说话快捷键），期间 `voiceHotkey`
+ * 还是上一代的组合——纯按 `toolChordActive` 判定会闪一帧"未同步"黄标
+ * （2026-10-01 Andy 实测：快速在微信/豆包之间切换时黄标闪现）。正在为这个工具
+ * 落快捷键时按乐观态显示"已自动设置"；失败时 applyingTool 清空，回到真实判定
+ * （写失败的真实状态由 voiceHotkeyMessage + 重新读取的 voiceHotkey 呈现）。
+ */
+function toolChordPill(tool: VoiceInputTool): { ok: boolean; label: string } {
+  if (applyingTool.value === tool) {
+    return { ok: true, label: "已自动设置" };
+  }
+  return toolChordActive(tool)
+    ? { ok: true, label: "已自动设置" }
+    : { ok: false, label: "未同步，点左侧卡片重设" };
+}
+
+/**
+ * 老配置（从未选过工具）按当前快捷键推断一次：左 Ctrl + 左 Win = 微信、
+ * 右 Alt = 豆包（Vokie 与豆包用同一个组合，只能靠已保存的工具区分）、
+ * 其余（左 Alt / 不按键 / 自定义组合）= 其他工具。
+ */
+function deriveToolFromChord(chord: KeyChord | null): VoiceInputTool {
+  const normalized = chord ? [...chord.keys].sort().join("+") : "";
+  if (normalized === [...DEFAULT_VOICE_HOTKEY_KEYS].sort().join("+")) return "wechat";
+  if (normalized === "right_alt") return "doubao";
+  return "other";
+}
+
+/**
+ * 选择输入工具：立即把该工具要求的"按住说话快捷键"落盘（用户不需要理解快捷键），
+ * 并把工具选择持久化（决定下次进页展示哪套引导）。
+ */
+async function selectVoiceInputTool(tool: VoiceInputTool): Promise<void> {
+  if (savingVoiceInputTool.value) return;
+  if (capturingVoiceHotkey.value) {
+    await finishVoiceHotkeyCapture("已切换输入工具，已取消录入");
+  }
+  const previous = voiceInputTool.value;
+  savingVoiceInputTool.value = true;
+  // 乐观态窗口：工具已切、快捷键还在写盘路上，期间状态胶囊不许判成"未同步"。
+  applyingTool.value = tool;
+  voiceHotkeyMessage.value = "";
+  voiceInputTool.value = tool;
+  try {
+    await setVoiceInputTool(tool);
+  } catch (error) {
+    voiceInputTool.value = previous;
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+    savingVoiceInputTool.value = false;
+    applyingTool.value = null;
+    return;
+  }
+  savingVoiceInputTool.value = false;
+  const keys = VOICE_TOOL_CHORDS[tool];
+  try {
+    if (keys) {
+      await applyVoiceHotkey([...keys]);
+    } else if (tool === "other") {
+      // 「其他工具」有自己的记忆：切去豆包/微信会改写"按住说话快捷键"，
+      // 切回来时按用户上次选的恢复（never = 从未选过 → 保持现状）。
+      const remembered = await getOtherVoiceHotkey();
+      if (remembered) {
+        await applyVoiceHotkey([...remembered]);
+      }
+    }
+  } finally {
+    applyingTool.value = null;
+  }
+  // Vokie：每次选中都重查一次安装状态（用户可能刚装好就回来选）。
+  if (tool === "vokie") {
+    void refreshVokieInstallation();
+  }
+}
+
+/** 「其他工具」记住用户选的按键：写失败不影响本次生效（只是下次不恢复）。 */
+async function rememberOtherVoiceHotkey(keys: string[]): Promise<void> {
+  try {
+    await setOtherVoiceHotkey([...keys]);
+  } catch (error) {
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+/** 「其他工具」面板里选按键：先生效，再记住（切去豆包/微信再切回来时恢复）。 */
+async function applyOtherChord(keys: string[]): Promise<void> {
+  await applyVoiceHotkey([...keys]);
+  await rememberOtherVoiceHotkey(keys);
+}
+
+/** Vokie 检测；失败保持 null，不把"检测失败"当成"没装/没运行"。 */
+async function refreshVokieInstallation(): Promise<void> {
+  if (checkingVokie.value) return;
+  checkingVokie.value = true;
+  try {
+    const status = await getVokieInstallation();
+    vokieInstalled.value = status.installed;
+    vokieRunning.value = status.running;
+    vokieCheckMessage.value = "";
+  } catch (error) {
+    vokieInstalled.value = null;
+    vokieRunning.value = null;
+    vokieCheckMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    checkingVokie.value = false;
+  }
+}
+
+async function openVokiePage(): Promise<void> {
+  openingVokiePage.value = true;
+  try {
+    await openVokieHomepage();
+    vokieCheckMessage.value = "已打开 Vokie 官网；安装后点“重新检测”。";
+  } catch (error) {
+    vokieCheckMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    openingVokiePage.value = false;
+  }
+}
+
+/** 打开 Vokie（装了但没运行时）：启动后提示用户点「重新检测」确认在运行。 */
+async function launchVokieApp(): Promise<void> {
+  launchingVokie.value = true;
+  try {
+    await launchVokie();
+    vokieCheckMessage.value = "已打开 Vokie；等它启动完成后点“重新检测”。";
+  } catch (error) {
+    vokieCheckMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    launchingVokie.value = false;
+  }
 }
 
 async function applyVoiceHotkey(keys: string[]) {
@@ -173,22 +385,35 @@ async function applyVoiceHotkey(keys: string[]) {
  * 真的锁屏。保存点放在"全部按键松开"之后，避免录入完成但物理键尚未松开
  * 时被系统补执行。Esc（未按修饰键）取消；15 秒未完成自动结束，此时已录到
  * 的组合不再丢弃。
+ *
+ * 入口在"其他工具"面板；微信 / 豆包
+ * 两个工具的快捷键是固定组合，选择即自动设置。
  */
 async function beginVoiceHotkeyCapture(): Promise<void> {
   if (capturingVoiceHotkey.value || captureStartingVoiceHotkey.value) return;
   const requestId = ++voiceCaptureRequestId;
   captureStartingVoiceHotkey.value = true;
   voiceHotkeyMessage.value = "";
+  cancelVoiceCaptureSettle();
   try {
-    await startShortcutCapture();
+    const preheld = await startShortcutCapture();
     if (unmounted || requestId !== voiceCaptureRequestId) {
       await stopShortcutCapture().catch(() => undefined);
       return;
     }
     voiceCapturePressed.clear();
+    voiceCaptureEverPressed.length = 0;
     voiceCapturedKeys = null;
     voiceCaptureDisplay.value = [];
     capturingVoiceHotkey.value = true;
+    // preheld 键的边沿对录入不可见（其 DOWN 已进 OS，UP 必须放行），
+    // 后端等它们全部松开后才开始投递边沿；提示用户先松手，避免把
+    // "按住中打开录入"截断成半截组合。
+    waitingPreheldRelease.value = preheld.length > 0;
+    if (preheld.length > 0) {
+      voiceHotkeyMessage.value =
+        "检测到仍有按住的按键，请先松开所有按键；松开后即可按新组合，录入将自动开始";
+    }
     if (voiceCaptureTimeout !== null) window.clearTimeout(voiceCaptureTimeout);
     voiceCaptureTimeout = window.setTimeout(() => {
       void finishVoiceHotkeyCapture("录入已超时，请重新录入");
@@ -200,54 +425,136 @@ async function beginVoiceHotkeyCapture(): Promise<void> {
   }
 }
 
-/** 结束录入：已录到组合则落盘生效，否则只显示传入的取消原因。 */
+/**
+ * 结束录入：已录到组合则落盘生效；零/半截边沿时结合微信输入法语音观测推断
+ * （见 applyVoiceHotkey 上方的推断说明）；否则只显示传入的取消原因。
+ */
 async function finishVoiceHotkeyCapture(cancelMessage?: string): Promise<void> {
   voiceCaptureRequestId += 1;
   captureStartingVoiceHotkey.value = false;
   capturingVoiceHotkey.value = false;
+  waitingPreheldRelease.value = false;
+  cancelVoiceCaptureSettle();
   if (voiceCaptureTimeout !== null) window.clearTimeout(voiceCaptureTimeout);
   voiceCaptureTimeout = null;
   voiceCapturePressed.clear();
+  // 推断判定在清空前取样：会话内见到的边沿数（0 = 全吞，1 = 半截）。
+  const seenKeyCount = voiceCaptureEverPressed.length;
+  voiceCaptureEverPressed.length = 0;
   const keys = voiceCapturedKeys;
   voiceCapturedKeys = null;
   voiceCaptureDisplay.value = [];
-  await stopShortcutCapture().catch(() => undefined);
-  if (keys) {
-    await applyVoiceHotkey([...keys]);
+  const stop = await stopShortcutCapture().catch(() => null);
+  const wetypeVoice = stop?.wetypeVoice ?? "unknown";
+  // 半截会话（scheduleVoiceCaptureFinish 在稳定窗口到期时已把唯一修饰键写进
+  // keys）与零边沿会话同样走推断：微信输入法吞键发生在 RIT 层，唯一旁证是其
+  // 语音被触发。单主键（如 D）不推断——按主键不会触发微信输入法语音。
+  const shouldInferWetypeChord =
+    wetypeVoice === "observed" &&
+    (keys === null
+      ? seenKeyCount <= 1
+      : keys.length === 1 && CAPTURE_MODIFIER_KEYS.has(keys[0]));
+  if (shouldInferWetypeChord) {
+    await applyVoiceHotkey([...DEFAULT_VOICE_HOTKEY_KEYS]);
+    // applyVoiceHotkey 成功会覆写消息，推断说明必须在其后写入；失败时保留错误信息。
+    if (voiceHotkey.value) {
+      voiceHotkeyMessage.value =
+        "你按下的组合触发了微信输入法的语音（按键被其拦截，内容无法读取），已按微信输入法语音键默认值 左 Ctrl + 左 Win 生效。此快捷键需与微信输入法语音键一致；若你修改过微信输入法的语音键，请在微信输入法设置中查看后重新录入对应组合";
+    }
     return;
   }
-  if (cancelMessage) voiceHotkeyMessage.value = cancelMessage;
+  if (keys && keys.length > 0) {
+    await applyVoiceHotkey([...keys]);
+    if (voiceInputTool.value === "other") {
+      await rememberOtherVoiceHotkey([...keys]);
+    }
+    appendWetypeChordNotice([...keys]);
+    return;
+  }
+  if (cancelMessage) {
+    voiceHotkeyMessage.value = cancelMessage;
+    return;
+  }
+  voiceHotkeyMessage.value =
+    "本次未捕获到任何按键。微信输入法会拦截它自己的语音键（默认 左 Ctrl + 左 Win），本次也未观测到语音被触发；请重试，或直接选择上方工具卡片使用固定组合";
+}
+
+/**
+ * 落盘组合不是微信输入法语音键（默认 左 Ctrl + 左 Win）时提醒：按住说话会把
+ * 该组合注入系统来唤起微信输入法语音，组合不一致则按住说话无法生效——这正是
+ * "能录上 Win+右 Ctrl 反而没用"的原因。默认组合与推断落盘不需要这句提醒。
+ */
+function appendWetypeChordNotice(keys: KeyCode[]): void {
+  if (!voiceHotkeyMessage.value.startsWith("按住说话快捷键已设为")) return;
+  const normalized = [...keys].sort().join("+");
+  if ([...DEFAULT_VOICE_HOTKEY_KEYS].sort().join("+") === normalized) return;
+  voiceHotkeyMessage.value +=
+    "。注意：按住说话会把该组合注入系统来唤起微信输入法语音，若与微信输入法语音键不一致将无法生效";
+}
+
+/** 落盘稳定窗口时长：外部钩子重放的注入副本通常在物理边沿的同一输入批次内到达。 */
+const VOICE_CAPTURE_SETTLE_MS = 200;
+
+/** 取消待执行的落盘稳定窗口（新按下沿到来时需要重新计时）。 */
+function cancelVoiceCaptureSettle(): void {
+  if (voiceCaptureSettleTimeout !== null) window.clearTimeout(voiceCaptureSettleTimeout);
+  voiceCaptureSettleTimeout = null;
+}
+
+/**
+ * 全部按键松开后延迟定稿：外部钩子吞掉完成键的物理边沿后会以注入副本重放
+ * 整个组合，副本可能晚于物理松开到达；立即落盘会把组合截断成"只剩第一个键"
+ * （Bugs/2026-09-27）。窗口内若再出现按下沿，cancelVoiceCaptureSettle 会取消
+ * 本次计时并重新等待。
+ */
+function scheduleVoiceCaptureFinish(): void {
+  cancelVoiceCaptureSettle();
+  voiceCaptureSettleTimeout = window.setTimeout(() => {
+    voiceCaptureSettleTimeout = null;
+    if (!capturingVoiceHotkey.value || voiceCapturePressed.size > 0) return;
+    if (!voiceCapturedKeys && voiceCaptureEverPressed.length > 0) {
+      voiceCapturedKeys = [...voiceCaptureEverPressed];
+    }
+    void finishVoiceHotkeyCapture();
+  }, VOICE_CAPTURE_SETTLE_MS);
 }
 
 async function acceptVoiceCaptureEdge(edge: ShortcutCaptureEdge): Promise<void> {
   if (!capturingVoiceHotkey.value) return;
+  // 后端只在 preheld 键全部松开后才开始投递边沿：第一条边沿即已武装。
+  if (waitingPreheldRelease.value) {
+    waitingPreheldRelease.value = false;
+    voiceHotkeyMessage.value = "";
+  }
   const { key, isPressed } = edge;
   if (!isPressed) {
-    const wasPressed = voiceCapturePressed.delete(key);
+    voiceCapturePressed.delete(key);
     if (voiceCapturedKeys) {
       voiceCaptureDisplay.value = voiceCapturedKeys;
-      if (voiceCapturePressed.size === 0) await finishVoiceHotkeyCapture();
+      if (voiceCapturePressed.size === 0) scheduleVoiceCaptureFinish();
       return;
     }
-    // 单独按下并松开一个修饰键本身就是一个合法快捷键（豆包输入法即"长按右
-    // Alt"），在没有任何主键参与时按它落盘；录入结果同时显示在页面上，
-    // 误触可再次录入或选回默认。
-    if (wasPressed && CAPTURE_MODIFIER_KEYS.has(key) && voiceCapturePressed.size === 0) {
-      voiceCapturedKeys = [key];
-      voiceCaptureDisplay.value = voiceCapturedKeys;
-      await finishVoiceHotkeyCapture();
-      return;
+    // 组合里没有主键时（默认的 左 Ctrl + 左 Win、豆包的"长按右 Alt"都是这种），
+    // 在最后一个按键松开时按本次会话按过的全部修饰键落盘。不能只看最后松开
+    // 的那个键：Ctrl+Win 先松 Win 会把组合截断成只剩 Ctrl（Bugs/2026-09-27）。
+    // 能走到这里说明会话里没有主键（主键按下时即成组），故全部是修饰键。
+    // 定稿延后到稳定窗口（见 scheduleVoiceCaptureFinish）：被吞掉的完成键只
+    // 会以输入法重放的注入副本形式稍后到达，立即落盘会把它丢掉。
+    if (voiceCapturePressed.size === 0 && voiceCaptureEverPressed.length > 0) {
+      voiceCaptureDisplay.value = [...voiceCaptureEverPressed];
+      scheduleVoiceCaptureFinish();
     }
-    voiceCaptureDisplay.value = [...voiceCapturePressed];
     return;
   }
   // 已经拿到终止键后继续保持原生拦截，直到本次组合的所有 DOWN 都收到配对 UP。
   if (voiceCapturedKeys) return;
+  cancelVoiceCaptureSettle();
   if (key === "escape" && voiceCapturePressed.size === 0) {
     await finishVoiceHotkeyCapture("已取消录入");
     return;
   }
   voiceCapturePressed.add(key);
+  if (!voiceCaptureEverPressed.includes(key)) voiceCaptureEverPressed.push(key);
   if (CAPTURE_MODIFIER_KEYS.has(key)) {
     voiceCaptureDisplay.value = [...voiceCapturePressed];
     return;
@@ -268,6 +575,36 @@ async function refreshVoiceHotkey() {
   } catch (error) {
     voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
   }
+}
+
+/**
+ * 初始化只读快捷键与输入工具。工具缺失时按快捷键展示建议引导，不写配置：
+ * 右 Alt 无法区分豆包、Vokie 与其他工具，持久化只来自用户显式选择。
+ */
+async function initializeShortcutSettings(): Promise<void> {
+  const [chord, storedTool] = await Promise.all([
+    getVoiceHoldHotkey().catch((error) => {
+      voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+      return null;
+    }),
+    getVoiceInputTool().catch((error) => {
+      voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+      reportFrontendEvent({
+        event: "voice_input_tool_load",
+        phase: "completed",
+        result: "failed",
+        reason: "read_failed_configuration_preserved",
+      });
+      return null;
+    }),
+  ]);
+  voiceHotkey.value = chord;
+  if (storedTool) {
+    voiceInputTool.value = storedTool;
+    return;
+  }
+  const derived = deriveToolFromChord(chord);
+  voiceInputTool.value = derived;
 }
 
 watch(
@@ -325,8 +662,19 @@ const phaseTone = computed(() => {
 
 const phaseDetail = computed(() => {
   if (connection.value.lastError) return connection.value.lastError;
-  if (connection.value.capabilities) return "语音功能已确认，可以按住遥控器语音键说话";
+  if (connection.value.capabilities) return "语音功能已就绪，按住遥控器语音键就能说话";
   return "连接后即可使用遥控器语音键";
+});
+
+/**
+ * 状态条标题：已识别型号时显示型号（2026-10-01 Andy 要求——RC001 = 小米蓝牙语音遥控器 2、
+ * RC003 = 小米蓝牙语音遥控器 2 Pro）。型号未识别（GATT 2A24 还没读回）或未连接时退回
+ * 蓝牙广播名 / 阶段文案，避免把"连接后显示"这类占位当标题。
+ */
+const connectionTitle = computed(() => {
+  const model = connection.value.remoteModel;
+  if (connectionActive.value && model !== "unknown") return remoteModelLabel(model);
+  return connection.value.remoteName ?? connectionPhaseLabel(connection.value.phase);
 });
 
 const audioTone = computed(() => {
@@ -475,7 +823,8 @@ onMounted(async () => {
   window.addEventListener("blur", handleVoiceCaptureBlur);
   void refreshConnection();
   void initializeAudio();
-  void refreshVoiceHotkey();
+  void initializeShortcutSettings();
+  void refreshVokieInstallation();
   pollTimer = setInterval(() => {
     void refreshCaptureInput();
     void refreshConnection();
@@ -495,6 +844,7 @@ onUnmounted(() => {
   unmounted = true;
   window.removeEventListener("blur", handleVoiceCaptureBlur);
   if (pollTimer) clearInterval(pollTimer);
+  cancelVoiceCaptureSettle();
   if (voiceCaptureTimeout !== null) window.clearTimeout(voiceCaptureTimeout);
   voiceCaptureTimeout = null;
   unlistenVoiceCapture?.();
@@ -512,12 +862,12 @@ onUnmounted(() => {
       <span class="badge" :class="phaseTone">{{ connectionPhaseLabel(connection.phase) }}</span>
     </header>
 
-    <div class="two-column">
+    <!-- ============ 设备：遥控器 + 语音设备 ============ -->
+    <div class="device-row">
       <article class="card">
         <div class="card-title-row">
           <div>
             <h2>遥控器连接</h2>
-            <p class="muted">连接已配对的小米遥控器。</p>
           </div>
           <button
             class="primary-button"
@@ -533,7 +883,7 @@ onUnmounted(() => {
           <div class="status-copy">
             <div class="status-heading">
               <span class="status-dot" :class="phaseTone"></span>
-              <strong>{{ connection.remoteName ?? connectionPhaseLabel(connection.phase) }}</strong>
+              <strong class="connection-title">{{ connectionTitle }}</strong>
             </div>
             <small>{{ phaseDetail }}</small>
           </div>
@@ -548,7 +898,21 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <p class="muted scan-summary">{{ scanMessage }}</p>
+        <div v-if="connectionActive" class="chip-row">
+          <span class="device-chip">
+            <BatteryIndicator :connection="connection" />
+          </span>
+          <span class="device-chip">
+            <span class="status-dot" :class="atvvReady ? 'success' : 'pending'"></span>
+            {{ atvvReady ? "语音按键已就绪" : "正在确认语音功能" }}
+          </span>
+          <span v-if="connection.powerNotificationsAvailable" class="device-chip">
+            <span class="status-dot success"></span>
+            睡眠唤醒后自动重连
+          </span>
+        </div>
+
+        <p v-if="scanMessage" class="muted scan-summary">{{ scanMessage }}</p>
         <p v-if="operationMessage" class="operation-message">{{ operationMessage }}</p>
 
         <ul v-if="devices.length" class="device-list">
@@ -563,100 +927,12 @@ onUnmounted(() => {
             </button>
           </li>
         </ul>
-
-        <div class="setting-list compact two-col">
-          <div class="setting-row">
-            <strong>设备型号</strong>
-            <span>{{ remoteModelLabel(connection.remoteModel) }}</span>
-          </div>
-          <div class="setting-row">
-            <strong>电池电量</strong>
-            <BatteryIndicator :connection="connection" />
-          </div>
-          <div class="setting-row">
-            <strong>语音按键</strong>
-            <span>{{ atvvReady ? "已就绪" : "正在确认" }}</span>
-          </div>
-          <div class="setting-row">
-            <strong>睡眠唤醒自动重连</strong>
-            <span>{{ connection.powerNotificationsAvailable ? "已启用" : "暂不可用" }}</span>
-          </div>
-          <div class="setting-row">
-            <strong>按住说话快捷键</strong>
-            <span>{{ voiceHoldHotkeyLabel(voiceHotkey) }}</span>
-          </div>
-        </div>
-        <p class="muted voice-hotkey-row">按住遥控器语音键说话，松开即停止；语音会送入右侧选中的设备，由微信输入法等工具转成文字。默认快捷键：{{ chordLabel({ keys: DEFAULT_VOICE_HOTKEY_KEYS }) }}。</p>
-        <div class="button-row voice-hotkey-presets">
-          <button
-            class="secondary-button"
-            type="button"
-            :disabled="
-              savingVoiceHotkey ||
-              captureStartingVoiceHotkey ||
-              !runtime?.platform.windowsApiAvailable
-            "
-            @click="
-              capturingVoiceHotkey
-                ? finishVoiceHotkeyCapture('已取消录入')
-                : beginVoiceHotkeyCapture()
-            "
-          >
-            {{ capturingVoiceHotkey ? "录入中…（按 Esc 取消）" : "修改快捷键" }}
-          </button>
-          <button
-            :class="
-              presetIsActive(DEFAULT_VOICE_HOTKEY_KEYS) ? 'primary-button' : 'secondary-button'
-            "
-            type="button"
-            :disabled="
-              savingVoiceHotkey ||
-              capturingVoiceHotkey ||
-              !runtime?.platform.windowsApiAvailable ||
-              presetIsActive(DEFAULT_VOICE_HOTKEY_KEYS)
-            "
-            @click="applyVoiceHotkey(DEFAULT_VOICE_HOTKEY_KEYS)"
-          >
-            {{ chordLabel({ keys: DEFAULT_VOICE_HOTKEY_KEYS }) }}（默认）
-          </button>
-          <button
-            :class="activeVoiceHotkeyKeys ? 'secondary-button' : 'primary-button'"
-            type="button"
-            :disabled="
-              savingVoiceHotkey ||
-              capturingVoiceHotkey ||
-              !runtime?.platform.windowsApiAvailable ||
-              !activeVoiceHotkeyKeys
-            "
-            @click="applyVoiceHotkey([])"
-          >
-            关闭
-          </button>
-        </div>
-        <p v-if="capturingVoiceHotkey" class="capture-display voice-hotkey-capture">
-          {{
-            voiceCaptureDisplay.length
-              ? chordLabel({ keys: voiceCaptureDisplay })
-              : "请按下要使用的快捷键组合（也可单独按一个 Ctrl/Alt/Win 等修饰键）；按 Esc 取消"
-          }}
-        </p>
-        <p class="muted scan-summary">{{ voiceHotkeyMessage }}</p>
-        <details class="usage-hint-details">
-          <summary>微信输入法使用步骤（点开查看）</summary>
-          <ol>
-            <li>语音设备选择 CABLE Input；</li>
-            <li>在微信输入法的语音设置里，把麦克风设为 CABLE Output；若没有这个选项，把系统默认录音设备设为 CABLE Output；</li>
-            <li>在目标应用的文本框内切换到微信输入法（看任务栏输入指示器确认）；</li>
-            <li>按住遥控器语音键约半秒以上再说话，松开后等待文字出现（需要联网）。快速点按不出文字是微信输入法自己的最短按住要求，不是故障。遥控器语音键自带的 F5 按键会被应用自动屏蔽，物理键盘的 F5 不受影响。</li>
-          </ol>
-        </details>
       </article>
 
       <article class="card">
         <div class="card-title-row">
           <div>
             <h2>语音设备</h2>
-            <p class="muted">选择语音写入的设备。使用微信输入法请选 CABLE Input。</p>
           </div>
           <button
             class="secondary-button"
@@ -678,7 +954,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <p class="muted scan-summary">{{ audioMessage }}</p>
+        <p v-if="audioMessage" class="muted scan-summary">{{ audioMessage }}</p>
         <section class="info-callout capture-input-settings" aria-label="会话麦克风输入">
           <label class="setting-row">
             <span>遥控器说话时临时锁定麦克风输入</span>
@@ -748,13 +1024,6 @@ onUnmounted(() => {
           </li>
         </ul>
 
-        <div class="setting-list compact two-col">
-          <div class="setting-row">
-            <strong>语音设备</strong>
-            <span>{{ wasapiReady ? audioPhaseLabel(audio.phase) : "待选择" }}</span>
-          </div>
-        </div>
-
         <div v-if="audioScanComplete && !virtualCableInstalled" class="info-callout warning vb-cable-callout">
           <div>
             <strong>需要安装 VB-CABLE</strong>
@@ -774,11 +1043,226 @@ onUnmounted(() => {
             wasapiReady
               ? "语音设备已就绪。"
               : virtualCableInstalled
-                ? "已检测到 VB-CABLE。这里选择 CABLE Input；在微信输入法的语音设置里选择 CABLE Output。"
+                ? "已检测到 VB-CABLE。这里选择 CABLE Input；在输入法的语音设置里选择 CABLE Output。"
                 : "正在检测 VB-CABLE…"
           }}
         </div>
       </article>
     </div>
+
+    <!-- ============ 语音输入设置（三步） ============ -->
+    <article class="card setup-card">
+      <div class="card-title-row">
+        <div>
+          <h2>语音输入设置</h2>
+          <p class="muted">设置一次，之后按住遥控器语音键说话，松开就出字。</p>
+        </div>
+      </div>
+
+      <div class="setup-columns">
+        <!-- ① 输入工具 -->
+        <section class="setup-col">
+          <div class="col-head">
+            <span class="step-index">1</span>
+            <strong>选择你在用的输入工具</strong>
+          </div>
+          <div class="tool-list">
+            <button
+              v-for="card in TOOL_CARDS"
+              :key="card.id"
+              class="tool-card"
+              :class="{ selected: voiceInputTool === card.id }"
+              type="button"
+              :disabled="savingVoiceInputTool"
+              @click="selectVoiceInputTool(card.id)"
+            >
+              <span class="radio" aria-hidden="true"></span>
+              <span>
+                <strong>{{ card.name }}</strong>
+                <small>{{ card.note }}</small>
+              </span>
+            </button>
+          </div>
+        </section>
+
+        <!-- ② 遥控器语音键替你按哪个键 -->
+        <section class="setup-col">
+          <div class="col-head">
+            <span class="step-index">2</span>
+            <strong>遥控器语音键替你按哪个键</strong>
+          </div>
+
+          <div v-if="voiceInputTool === 'doubao'" class="tool-panel">
+            <div class="chord-line">
+              按住遥控器语音键 <span class="muted">=</span>
+              <span class="key">右 Alt</span>
+              <span class="pill" :class="toolChordPill('doubao').ok ? 'ok' : 'warn'">
+                {{ toolChordPill("doubao").label }}
+              </span>
+            </div>
+            <div v-if="vokieRunning === true" class="info-callout warning callout-small">
+              检测到 Vokie 正在运行：它和豆包用的是同一个快捷键（右 Alt），按住遥控器语音键可能唤起 Vokie。要用豆包，请先退出 Vokie。
+            </div>
+          </div>
+
+          <div v-else-if="voiceInputTool === 'wechat'" class="tool-panel">
+            <div class="chord-line">
+              按住遥控器语音键 <span class="muted">=</span>
+              <span class="key">左 Ctrl</span>
+              <span class="muted">+</span>
+              <span class="key">左 Win</span>
+              <span class="pill" :class="toolChordPill('wechat').ok ? 'ok' : 'warn'">
+                {{ toolChordPill("wechat").label }}
+              </span>
+            </div>
+          </div>
+
+          <div v-else-if="voiceInputTool === 'vokie'" class="tool-panel">
+            <div v-if="vokieInstalled === false" class="info-callout warning callout-small">
+              没有检测到 Vokie。先安装，再回来设置。
+              <div class="button-row">
+                <button
+                  class="primary-button"
+                  type="button"
+                  :disabled="openingVokiePage"
+                  @click="openVokiePage"
+                >
+                  {{ openingVokiePage ? "正在打开…" : "打开官网 vokie.com" }}
+                </button>
+                <button
+                  class="secondary-button"
+                  type="button"
+                  :disabled="checkingVokie"
+                  @click="refreshVokieInstallation"
+                >
+                  {{ checkingVokie ? "检测中…" : "重新检测" }}
+                </button>
+              </div>
+            </div>
+            <div
+              v-else-if="vokieRunning === false"
+              class="info-callout warning callout-small"
+            >
+              Vokie 没有运行：按住遥控器语音键不会唤起它（如果豆包输入法正在使用，出现的是豆包语音条）。打开 Vokie 后再试。
+              <div class="button-row">
+                <button
+                  class="primary-button"
+                  type="button"
+                  :disabled="launchingVokie"
+                  @click="launchVokieApp"
+                >
+                  {{ launchingVokie ? "正在打开…" : "打开 Vokie" }}
+                </button>
+                <button
+                  class="secondary-button"
+                  type="button"
+                  :disabled="checkingVokie"
+                  @click="refreshVokieInstallation"
+                >
+                  {{ checkingVokie ? "检测中…" : "重新检测" }}
+                </button>
+              </div>
+            </div>
+            <div class="chord-line">
+              按住遥控器语音键 <span class="muted">=</span>
+              <span class="key">右 Alt</span>
+              <span class="pill" :class="toolChordPill('vokie').ok ? 'ok' : 'warn'">
+                {{ toolChordPill("vokie").label }}
+              </span>
+            </div>
+            <p v-if="vokieCheckMessage" class="tiny muted">{{ vokieCheckMessage }}</p>
+          </div>
+
+          <div v-else-if="voiceInputTool === 'other'" class="tool-panel">
+            <p class="tiny muted" style="margin-top: 0">选与你输入工具里一致的语音键：</p>
+            <div class="chip-select">
+              <button
+                v-for="option in OTHER_CHORD_OPTIONS"
+                :key="option.id"
+                class="chip"
+                type="button"
+                :aria-pressed="otherChordActive(option)"
+                :disabled="savingVoiceHotkey || capturingVoiceHotkey"
+                @click="applyOtherChord(option.keys)"
+              >
+                {{ option.label }}
+              </button>
+              <button
+                class="chip"
+                type="button"
+                :aria-pressed="!OTHER_CHORD_OPTIONS.some(otherChordActive)"
+                :disabled="savingVoiceHotkey || captureStartingVoiceHotkey"
+                @click="
+                  capturingVoiceHotkey
+                    ? finishVoiceHotkeyCapture('已取消录入')
+                    : beginVoiceHotkeyCapture()
+                "
+              >
+                {{ capturingVoiceHotkey ? "录入中…（按 Esc 取消）" : "自定义组合键" }}
+              </button>
+            </div>
+            <p v-if="capturingVoiceHotkey" class="capture-display voice-hotkey-capture">
+              {{
+                voiceCaptureDisplay.length
+                  ? chordLabel({ keys: voiceCaptureDisplay })
+                  : waitingPreheldRelease
+                    ? "检测到仍有按住的按键，请先松开所有按键；松开后即可按新组合，录入将自动开始"
+                    : "请按下你输入工具当前设置的语音键（也可单独按一个修饰键）；按 Esc 取消"
+              }}
+            </p>
+            <p v-if="capturingVoiceHotkey && waitingPreheldRelease" class="tiny muted">
+              按“自定义组合键”时仍按着键的组合不会完整录入，先松手即可。
+            </p>
+          </div>
+
+          <p v-if="voiceHotkeyMessage" class="tiny muted voice-hotkey-message">
+            {{ voiceHotkeyMessage }}
+          </p>
+          <div class="info-callout callout-small">
+            避免其他 App 使用同一个快捷键（Vokie、Chatterfly 这类语音工具会抢在输入法前面）。按住语音键时，如果当前输入法还不是你选的工具，可能需要再按住一次才能正常使用。
+          </div>
+        </section>
+
+        <!-- ③ 照着做 -->
+        <section class="setup-col">
+          <div class="col-head">
+            <span class="step-index">3</span>
+            <strong>照着做（只做一次）</strong>
+          </div>
+
+          <ol v-if="voiceInputTool === 'doubao'" class="checklist">
+            <li><span class="mark">1</span><span>豆包麦克风选 CABLE Output</span></li>
+            <li><span class="mark">2</span><span>豆包长按语音键选 右 Alt</span></li>
+            <li><span class="mark">3</span><span>切到豆包后，按住遥控器语音键说话</span></li>
+          </ol>
+          <ol v-else-if="voiceInputTool === 'wechat'" class="checklist">
+            <li><span class="mark">1</span><span>微信输入法麦克风选 CABLE Output</span></li>
+            <li><span class="mark">2</span><span>切到微信输入法后，按住遥控器语音键说话</span></li>
+          </ol>
+          <ol v-else-if="voiceInputTool === 'vokie'" class="checklist">
+            <li><span class="mark">1</span><span>Vokie 麦克风选 CABLE Output</span></li>
+            <li><span class="mark">2</span><span>Vokie 快捷键保持默认的 右 Alt</span></li>
+            <li><span class="mark">3</span><span>在要写字的地方按住遥控器语音键说话</span></li>
+          </ol>
+          <ol v-else-if="voiceInputTool === 'other'" class="checklist">
+            <li><span class="mark">1</span><span>输入工具麦克风选 CABLE Output</span></li>
+            <li><span class="mark">2</span><span>语音键与第 2 步选的键一致</span></li>
+            <li><span class="mark">3</span><span>切到该输入法后，按住遥控器语音键说话</span></li>
+          </ol>
+        </section>
+      </div>
+    </article>
+
+    <details class="usage-hint-details faq">
+      <summary>常见问题（点开查看）</summary>
+      <ul>
+        <li>为什么语音键要“替你按一个键”？遥控器语音键不是键盘按键，输入法只认键盘按键，所以应用替你按住它。</li>
+        <li>“替你按下的键”提供 左 Ctrl + 左 Win、右 Alt、左 Alt 和不按键；也可在“其他工具”中录入自定义组合键。</li>
+        <li>微信输入法要求按住约半秒以上（需要联网），快速点按不出字是它自己的要求，不是故障。</li>
+        <li>豆包要是当前输入法，否则按住遥控器语音键只会弹出 Windows 的 Alt 菜单（记事本里会出现“文件(F)、编辑(E)”这类字母）。应用会在你**按住语音键时**把输入法切到所选工具；刚切换过输入工具后的第一次按住如果没反应，松开再按一次即可（第一次那下用于切换输入法）。</li>
+        <li>Vokie、微信输入法或豆包如果没有单独的麦克风选项，把系统默认录音设备设为 CABLE Output。</li>
+        <li>Vokie 和豆包用的是同一个快捷键（右 Alt），同一时间只会有一个在响应：Vokie 要在运行中，豆包要是当前输入法；两个同时开着时 Vokie 会抢先。</li>
+      </ul>
+    </details>
   </section>
 </template>

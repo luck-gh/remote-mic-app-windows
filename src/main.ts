@@ -2,6 +2,7 @@ import { createApp } from "vue";
 import App from "./App.vue";
 import SceneOverlay from "./components/SceneOverlay.vue";
 import { isTauriRuntime } from "./lib/bridge";
+import { initializeAccentColor } from "./lib/accent";
 import { initializeTheme } from "./lib/theme";
 import { installFrontendDiagnostics, reportFrontendEvent } from "./lib/frontend-diagnostics";
 import { installFocusModalityTracking } from "./lib/focus-modality";
@@ -10,7 +11,10 @@ import "./styles.css";
 const sceneOverlay = new URLSearchParams(window.location.search).get("scene-overlay") === "1";
 installFrontendDiagnostics();
 // 初始化调用在 Vue 挂载前同步应用首帧主题；异步读取设置不阻塞主界面。
-if (!sceneOverlay) void initializeTheme();
+if (!sceneOverlay) {
+  void initializeTheme();
+  void initializeAccentColor();
+}
 try {
   if (sceneOverlay) document.documentElement.classList.add("scene-overlay-document");
   const app = createApp(sceneOverlay ? SceneOverlay : App);

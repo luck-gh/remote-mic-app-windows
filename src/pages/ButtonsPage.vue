@@ -18,6 +18,7 @@ import {
   identityShortcutByButton,
   listPresetApps,
   registerPresetAppNames,
+  remoteModelLabel,
   saveButtonMappings,
   saveButtonMappingTemplate,
   saveMappingConfiguration,
@@ -112,6 +113,11 @@ const remoteModel = computed<RemoteModel>(
 
 /** 配置允许保存；实际执行能力由后端当前设备和增强状态控制。 */
 const UNMAPPABLE_BUTTONS: ReadonlySet<RemoteButton> = new Set<RemoteButton>();
+
+const deviceLabel = computed(() => {
+  if (remoteModel.value !== "unknown") return remoteModelLabel(remoteModel.value);
+  return connectionInfo.value?.remoteName ?? "未连接遥控器";
+});
 
 interface ImageFrame { left: number; top: number; width: number; height: number }
 const remoteImageFrame = ref<ImageFrame>({
@@ -373,7 +379,7 @@ const capabilityNote = computed<string | null>(() => {
   if (shortcutCapability(button, "single", remoteModel.value) === "identity") {
     const identity = identityShortcutByButton[button];
     const label = identity ? chordLabel({ keys: [identity] }) : "";
-    return `提示：此按键闲置约 4 秒后的首次按压会附带一次原生按键动作（结构性泄漏，调查已归档）；4 秒内连按严格单响应，单击配置为同键映射（${label}）时由引擎对冲为单响应。`;
+    return `提示：闲置约 4 秒后第一次按这个键，可能同时出现一次它原本的按键效果；这段时间内连按不受影响。单击动作若就是该键本身（${label}），多出的那一次会被自动合并。`;
   }
   return null;
 });
@@ -522,7 +528,7 @@ function phaseLabel(phase: RawInputPhase | undefined): string {
     case "stopped":
       return "监听已停止";
     case "awaiting":
-      return "等待遥控器连接（系统 HID 接口未就绪）";
+      return "等待遥控器连接";
     case "unsupported":
       return "当前环境暂不支持";
     default:
@@ -559,6 +565,8 @@ function refreshCanvasGeometry(width?: number): void {
 
 onMounted(async () => {
   const setupStarted = performance.now();
+  // Measure before the initial IPC resolves so the first frame uses the real canvas width.
+  if (canvasEl.value) refreshCanvasGeometry(canvasEl.value.clientWidth);
   const [loaded, snapshot, apps, catalog] = await Promise.all([
     getMappingConfiguration(),
     getButtonMappingSnapshot(),
@@ -615,6 +623,7 @@ onMounted(async () => {
   }, 1_000);
 
   // 流式画布：观测容器宽（不足最小画布 800px 时保持 800 由 CSS 缩放兜底）。
+  // 首次宽度已在 onMounted 同步段测过（见函数开头），此处只订阅后续变化。
   // jsdom 测试环境无 ResizeObserver，跳过观测。
   if (canvasEl.value && typeof ResizeObserver !== "undefined") {
     refreshCanvasGeometry(canvasEl.value.clientWidth);
@@ -663,7 +672,7 @@ onUnmounted(() => {
         </label>
         <div class="device-chip" :class="{ connected: connectionInfo?.phase === 'ready' || connectionInfo?.phase === 'streaming' }">
           <span class="status-dot" :class="connectionInfo?.phase === 'streaming' ? 'active' : connectionInfo?.phase === 'ready' ? 'success' : 'pending'"></span>
-          <span>{{ connectionInfo?.remoteName ?? "未连接遥控器" }}</span>
+          <span>{{ deviceLabel }}</span>
           <BatteryIndicator :connection="connectionInfo" />
         </div>
       </div>
@@ -708,7 +717,7 @@ onUnmounted(() => {
       </svg>
 
       <figure ref="remotePhotoEl" class="remote-photo" :style="{ left: `${remoteLeft}px`, top: `${REMOTE_TOP}px` }">
-        <img ref="remoteImageEl" src="/RC003-remote-photo@2x.png" alt="小米蓝牙遥控器 2 Pro（RC003）示意图" draggable="false" @load="measureRemoteImageFrame" />
+        <img ref="remoteImageEl" src="/RC003-remote-photo@2x.png" alt="小米蓝牙语音遥控器 2 Pro（RC003）示意图" draggable="false" @load="measureRemoteImageFrame" />
       </figure>
       <span
         v-for="placement in PLACEMENTS"

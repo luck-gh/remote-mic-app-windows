@@ -17,18 +17,21 @@
   `LockSetForegroundWindow` / `AttachThreadInput` 公共 API 文档：Windows 即使满足常规
   条件仍可拒绝后台进程抢前台，并改为闪烁任务栏；`AttachThreadInput` 只共享输入状态，
   不承诺绕过 foreground lock；用户按 Alt 会解除该锁。本仓库因此以
-  `GetForegroundWindow` 所属进程读回作为唯一成功判据，常规尝试读回失败后才用成对
+  `GetForegroundWindow` 的目标窗口读回作为成功判据，常规尝试读回失败后才用成对
   Alt DOWN/UP 包住一次重试，物理 Alt 已按住时跳过，避免破坏用户键态。官方依据：
   https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow 、
   https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getforegroundwindow 、
   https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-locksetforegroundwindow 、
   https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-attachthreadinput 。
 
-## 遥控器缓存电量显示
+2026-10-02 随上游吸收的窗口筛选使用公开 `GetClassNameW`、`GetWindowRect` 和 `DwmGetWindowAttribute(DWMWA_CLOAKED)`，在身份匹配后排除辅助、未布局和隐藏窗口；`GetWindowTextLengthW` 仅判断特定 Chromium 窗口是否已有标题，不读取或记录标题内容。来源：[GetWindowRect](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect)、[DWMWA_CLOAKED](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute)、[GetWindowTextLengthW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextlengthw)。该兼容筛选来自上游现场，不证明当前本机所有应用都可激活。
 
+## 遥控器电量显示
+
+- 2026-10-02 吸收上游标准 GATT Battery Service `0x180F` / Battery Level `0x2A19` 订阅与读取，使用既有 ATVV GATT 会话及公开 WinRT API，不另开 BLE 会话。来源为 Bluetooth SIG Battery Service 标准和上述固定 Windows 上游；其 RC003 通知实验只作为来源，不作为本地候选实测。
 - Microsoft 公开 Configuration Manager API `CM_Get_Device_ID_List_SizeW` / `CM_Get_Device_ID_ListW` / `CM_Locate_DevNodeW` / `CM_Get_DevNode_PropertyW`：只枚举当前存在的 BTHLE 设备，按连接所选对端的完整地址组件匹配唯一节点，读取 OS 设备属性。官方文档：`https://learn.microsoft.com/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_propertyw`。标准 `System.Devices.BatteryLife` / PKEY_Devices_BatteryLife 的 GUID/PID/type 由本机 Windows SDK 10.0.22621.0 `propkey.h` 核对。
 - `Gronsten/razer-tray`，提交 `8e7e395417023bf2446779a4c5237716183da69f`，`src/DeviceMonitor.cpp`：参考其使用公开 Configuration Manager API 读取 Windows Bluetooth 电量缓存属性 `{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2` 的路径和未知值语义；未复制代码、无运行时依赖。该键不是微软承诺跨版本稳定的标准 BatteryLife 属性，故仅作可失败的兼容读取，严格检查 BYTE、长度为 1、0..100；缺失/异常保持未知。
-- 不访问注册表，不读取第三方 App 数据，不使用设备管理写入 API，不另开 BLE/GATT 会话。独立后台线程每 60 秒查询一次系统缓存，不代表遥控器每 60 秒上报新电量；界面提示缓存来源。连接纪元隔离迟到结果，断连/睡眠后停止监视并隐藏旧值；可选电量功能不影响语音错误状态。详见 `Testing/WindowsBattery.md`。
+- GATT 通知可用时使用该通知；订阅失败或无 BAS 时保留每 60 秒读取系统缓存的路径，不代表遥控器每 60 秒上报新电量。不访问注册表、第三方 App 数据或设备管理写入 API。连接纪元隔离迟到结果，断连/睡眠后停止订阅与监视并隐藏旧值；可选电量功能不影响语音错误状态。详见 `Testing/WindowsBattery.md`，本轮候选本机验收另记。
 
 ## 治理规范迁移
 
@@ -322,3 +325,13 @@
 - 融合模块：`battery.rs`/电量指示，`registered_apps.rs`/应用库，`send_input.rs`/鼠标动作，`key_gate.rs`/系统级录入配对，BLE 部分连接 RAII/资源记录，`graceful_exit.rs`/安装正常退出请求。模板仍只发固定键；应用库只作用户显式通用动作，保持本地草稿保存和可分享导出隐私。
 - 保留本地：逐报告 WDF/PDO 当前来源、mask0物理观察不映射、输入设备锁定与唯一 ExitCleanup、程序默认/临时或保存默认、菜单焦点和偏好、底栏。排除上游仅以 BLE 建链状态吞 F5、遥控在线常驻通用门控、安装超时强杀、全局 artifacts 忽略。历史取证当前树已匿名化，不复跑探针、不重新认可被本地事实取代的失败路线。
 - 合并候选实机仍 pending；历史 RC001、睡眠、语音结果不外推。本轮没有电源、无线电或驱动安装授权。
+
+### 2026-10-02 增量同步边界
+
+- 同一 Windows 上游固定提交 `c81308e011a757dc22d22f2861b687ef787d295e`，与此前已整合的 `74230bf5f841cac2f099d1c6fd25683dac50131d` 相比新增 154 个提交；许可证仍为 GPL-3.0-only。按现行 PLAN 逐块融合，本地用户配置、固定按键模板、逐报告 WDF/PDO 来源与正常清理契约优先。具体任务及实际验证状态归 TODO；上游作者的实验记录不是本机候选验收。
+- 本轮平台融合模块包括 `ble.rs` 的标准 BAS 电量订阅/读取、`application_control.rs` 的已运行应用窗口筛选/激活、`ime.rs` 的会话输入工具与快捷键录入期间让位/恢复，以及微信响应标记和 Vokie 检测。它们仍通过公开 Windows API 或可观察输入事件工作；上游新一轮本机实验结果不外推。保留本地连接到达去重、语音输入设备锁定、直接模板与来源路由。
+- 前端融合上游设置页、应用图标选项、侧栏版本/齿轮、系统强调色、完整遥控型号名、输入工具配置及快捷键录入呈现；保留本地驱动/模板页、显式保存、固定底栏与输入设备锁定。上游连接页“支持更多输入工具”的第二增强链开关不采用，不把保留的输入工具选择混称为全按键捕获。
+- 设置页与可切换图标直接来源于本次 Windows 上游，按其归属说明追溯至 macOS `e8af2da2` 的 `SettingsView.swift`、`AppIconController.swift` 与 `Resources/AppIcons/faceted-duck.png`；本次不引入 macOS 源码。`src-tauri/icons/app-icons/faceted-duck-{16,20,24,32,256}.png` 和 `public/app-icon-faceted-duck.png` 是上游缩放派生资源，继续遵守 [LOGO-LICENSE.md](LOGO-LICENSE.md) 的专有品牌资产边界。Windows 运行期仅变更窗口/托盘与设置页呈现，不宣称更改安装器、快捷方式或可执行文件内图标。
+- **未采用的第二增强链**：`crates/sayall-windows/src/rc003_bridge.rs`、`src-tauri/src/rc003_task.rs`、`hardware/RC003/helper/` 的产品路线不作为本地增强实现。上游 Helper 以共享宿主的 usage 内容代替逐报告设备来源，动态目标包含方向与确认等通用键；其旧 agent 自动刷新调用 `TerminateProcess` 结束 WUDFHost，并通过最高权限计划任务重复启动。上述行为与本地严格来源、显式限定 runas、清理确认后再启及不强杀契约冲突。
+- **语音边界**：上游 `rc003_bridge` 下发语音 usage 替换并以命令写出成功置 `voice_synth_active`，BLE 据此停用 SendInput；此报告合成不在本地指定非语音按键旁路例外中，也不能用提交成功证明目标行为。保留本地 ATVV 按下/释放与配对快捷键路径，不把基础语音改成依赖常驻 Gadget。
+- **历史材料边界**：本轮上游新增探针与 evidence 中发现个人绝对路径和完整设备接口路径，不能未经脱敏纳入本地新提交的文件树。其源码与历史实验可在上述固定上游提交追溯；不复跑探针，不把既有 IOCTL 假设替代本地设备来源实证，不恢复已停止的任务视图取消调查。

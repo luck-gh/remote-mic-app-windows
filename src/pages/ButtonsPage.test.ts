@@ -783,7 +783,7 @@ describe("buttons mapping page", () => {
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
     // 武装族按键显示冷首按原生副作用提示（信息性，不门控）。
-    expect(wrapper.find(".mapping-editor").text()).toContain("原生按键动作");
+    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
   });
 
   it("预设芯片显示实际按键组合，功能描述退为悬停提示", async () => {
@@ -811,7 +811,7 @@ describe("buttons mapping page", () => {
     expect(chipState(wrapper, "Enter")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
-    expect(wrapper.find(".mapping-editor").text()).toContain("原生按键动作");
+    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
 
     await openCell(wrapper, "TV", 0);
     expect(chipState(wrapper, "Enter")).toBe(false);
@@ -827,7 +827,7 @@ describe("buttons mapping page", () => {
     expect(chipState(wrapper, "←")).toBe(false);
     expect(chipState(wrapper, "Backspace")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
-    expect(wrapper.find(".mapping-editor").text()).toContain("原生按键动作");
+    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
 
     // 与型号无关：RC001 上左键同样开放。
     const rc001 = await mountPage("rc001");
@@ -845,7 +845,7 @@ describe("buttons mapping page", () => {
     expect(chipState(wrapper, "左 Win + Shift + S")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
-    expect(wrapper.find(".mapping-editor").text()).not.toContain("原生按键动作");
+    expect(wrapper.find(".mapping-editor").text()).not.toContain("它原本的按键效果");
   });
 
   it("返回/音量±可配置；RC003 的实际增强执行能力不由编辑器声称", async () => {
@@ -872,5 +872,20 @@ describe("buttons mapping page", () => {
       expect(wrapper.find(".mapping-editor").exists(), `${model} 返回格子应打开编辑器`).toBe(true);
       wrapper.unmount();
     }
+  });
+  it.each([
+    ["rc001" as const, "小米蓝牙语音遥控器 2"],
+    ["rc003" as const, "小米蓝牙语音遥控器 2 Pro"],
+  ])("头部设备胶囊显示遥控器型号（%s）", async (model, expected) => {
+    const page = await mountPage(model);
+    expect(page.find(".device-chip").text()).toContain(expected);
+    page.unmount();
+  });
+
+  it("型号未读回时头部设备胶囊退回蓝牙广播名", async () => {
+    const page = await mountPage("unknown");
+    expect(page.find(".device-chip").text()).toContain("小米蓝牙语音遥控器");
+    expect(page.find(".device-chip").text()).not.toContain("连接后显示");
+    page.unmount();
   });
 });
