@@ -76,3 +76,9 @@
 ## 2026-09-16 后续真机结论
 
 新、旧固定包各两次真实持续按住均约60s先收到remote`00 02`，续期持续，随后正常UP/drain，无此次queue overflow；用户明确未先松开。旧包其中一轮公开CoreAudio确认WeType实际active于CABLE Output。不能仅从该表现宣称官方硬件60s上限或EXTEND一定被固件采纳。四轮完整时间线和独立20s溢出边界见 [sixty-second-20260916/evidence.md](sixty-second-20260916/evidence.md)。已正常恢复固定fbc新包，PID30468普通Explorer/RC003Ready/配置与载荷passed；只读observer正常exit0且无残留。新增终态诊断3tests/fmt/reviewpassed未安装，BUG未关闭、未Git提交。
+
+## 2026-10-05 过程成果归档
+
+生产对照的三份 harness/probe 与四份精确生产模块按原字节保存，具名换行属性、SHA、依赖与复核边界见 [既有生产源审计](production-source-audit/README.md)。九份重复 head/index/candidate 快照改指正式提交 `ff7cb8625f46a2712b942c40c585af303314fd2e` 的对应源码；这不改变当时被测源或安装包身份。完整日志、原始机器清单、配置备份和未解决失败现场继续本地保留。
+
+此次只静态核对档案字节、既有清单与正式 Git 来源，没有运行音频/设备实验，没有把旧源接回产品。19秒内部 PCM 溢出不因归档关闭；60秒远端停止研究继续暂停，不恢复调参或重启实验。
