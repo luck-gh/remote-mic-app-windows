@@ -29,8 +29,7 @@ pub mod component_support;
 pub mod file_dialog;
 #[cfg(windows)]
 pub mod graceful_exit;
-pub mod hid_host;
-mod input_driver;
+pub mod rc003_bridge;
 pub mod registered_apps;
 #[cfg(windows)]
 pub use ble::{
@@ -287,6 +286,8 @@ pub struct WindowsPlatform {
     raw_input: Arc<raw_input_windows::RawInputRuntime>,
     #[cfg(windows)]
     send_input: Arc<send_input_windows::SendInputRuntime>,
+    #[cfg(windows)]
+    rc003_bridge: Arc<rc003_bridge::Rc003Bridge>,
 }
 
 impl fmt::Debug for WindowsPlatform {
@@ -375,6 +376,9 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
             ));
+            let rc003_bridge = rc003_bridge::Rc003Bridge::start(button_mapping.sender());
+            rc003_bridge.attach_mapping_runtime(&button_mapping);
+            button_mapping.attach_capture_bridge(&rc003_bridge);
             let scene_control = scene_control::SceneController::new();
             scene_control::register_voice_scene(&scene_control);
             subscribe_button_profile(&scene_control, &button_mapping);
@@ -411,7 +415,6 @@ impl Default for WindowsPlatform {
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
                 button_mapping.sender(),
-                Some(Arc::clone(&button_mapping)),
             ));
             // 遥控器 HID 活动通知接线（断连时遥控器醒来按键 → 立即重连）。
             let wake_runtime = Arc::clone(&runtime);
@@ -438,6 +441,7 @@ impl Default for WindowsPlatform {
                 audio,
                 raw_input,
                 send_input,
+                rc003_bridge,
             }
         }
 
@@ -605,11 +609,27 @@ impl WindowsPlatform {
         }
     }
 
+    pub fn set_rc003_capture_enabled(&self, enabled: bool) {
+        self.button_mapping.set_capture_enabled(enabled);
+    }
+
+    pub fn rc003_bridge_snapshot(&self) -> rc003_bridge::BridgeSnapshot {
+        #[cfg(windows)]
+        {
+            self.rc003_bridge.snapshot()
+        }
+        #[cfg(not(windows))]
+        {
+            rc003_bridge::BridgeSnapshot::default()
+        }
+    }
+
     pub fn voice_hold_hotkey(&self) -> Option<send_input::KeyChord> {
         lock(&self.voice_hold_hotkey).clone()
     }
 
     pub fn set_voice_hold_hotkey(&self, hotkey: Option<send_input::KeyChord>) {
+        // ATVV 与输入设备读回继续拥有语音生命周期；普通按键增强不改语音路径。
         *lock(&self.voice_hold_hotkey) = hotkey;
     }
 

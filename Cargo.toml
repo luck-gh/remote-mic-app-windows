@@ -2,7 +2,6 @@
 members = [
     "crates/sayall-core",
     "crates/sayall-windows",
-    "crates/sayall-component-helper",
     "src-tauri",
 ]
 resolver = "2"

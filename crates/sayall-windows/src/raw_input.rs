@@ -41,6 +41,23 @@ pub const ALL_BUTTONS: [RemoteButton; 13] = [
     RemoteButton::VolumeDown,
 ];
 
+/// Ordinary buttons supported by the unified report capture protocol. Voice remains ATVV.
+pub const ENHANCED_CAPTURE_BUTTON_USAGES: [(RemoteButton, u16); 13] = [
+    (RemoteButton::Back, 0x00F1),
+    (RemoteButton::Ok, 0x0028),
+    (RemoteButton::Tv, 0x0035),
+    (RemoteButton::Home, 0x004A),
+    (RemoteButton::Right, 0x004F),
+    (RemoteButton::Left, 0x0050),
+    (RemoteButton::Down, 0x0051),
+    (RemoteButton::Up, 0x0052),
+    (RemoteButton::Menu, 0x0065),
+    (RemoteButton::Power, 0x0066),
+    (RemoteButton::VolumeMute, 0x007F),
+    (RemoteButton::VolumeUp, 0x0080),
+    (RemoteButton::VolumeDown, 0x0081),
+];
+
 impl RemoteButton {
     /// 在 [`ALL_BUTTONS`] 中的序号（0..12），用于门控位掩码。
     pub fn ordinal(self) -> usize {

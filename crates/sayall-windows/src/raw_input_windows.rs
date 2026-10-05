@@ -64,22 +64,16 @@ pub struct RawInputRuntime {
     snapshot: Arc<Mutex<RawInputSnapshot>>,
     engine: Sender<EngineMessage>,
     control: Mutex<Option<ListenerControl>>,
-    mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
 }
 
 impl RawInputRuntime {
-    pub fn new(
-        snapshot: Arc<Mutex<RawInputSnapshot>>,
-        engine: Sender<EngineMessage>,
-        mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
-    ) -> Self {
+    pub fn new(snapshot: Arc<Mutex<RawInputSnapshot>>, engine: Sender<EngineMessage>) -> Self {
         // 监听器把语义事件交给映射引擎，被 key_gate 吞掉的键盘边沿由钩子线程
         // 直接投递（见 docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md）。
         Self {
             snapshot,
             engine,
             control: Mutex::new(None),
-            mapping,
         }
     }
 
@@ -118,18 +112,10 @@ impl RawInputRuntime {
         // Each listener lifetime gets a clone; stopping must not consume the
         // runtime's only sender and disconnect all subsequent starts.
         let engine = self.engine.clone();
-        let mapping = self.mapping.clone();
         let join = thread::Builder::new()
             .name("sayall-raw-input".to_owned())
             .spawn(move || {
-                listener_thread(
-                    snapshot,
-                    engine,
-                    thread_stop,
-                    thread_hwnd,
-                    ready_sender,
-                    mapping,
-                )
+                listener_thread(snapshot, engine, thread_stop, thread_hwnd, ready_sender)
             })
             .map_err(|error| PlatformError::RawInput(error.to_string()))?;
         let mut control = ListenerControl {
@@ -215,7 +201,6 @@ impl Default for RawInputRuntime {
         Self::new(
             Arc::new(Mutex::new(RawInputSnapshot::default())),
             mpsc::channel().0,
-            None,
         )
     }
 }
@@ -283,7 +268,6 @@ fn listener_thread(
     stop_requested: Arc<AtomicBool>,
     hwnd_slot: Arc<AtomicIsize>,
     ready: mpsc::SyncSender<Result<(), String>>,
-    mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
 ) {
     let result = run_listener(
         Arc::clone(&snapshot),
@@ -291,7 +275,6 @@ fn listener_thread(
         Arc::clone(&stop_requested),
         Arc::clone(&hwnd_slot),
         &ready,
-        mapping,
     );
     if let Err(error) = &result {
         let _ = ready.try_send(Err(error.clone()));
@@ -328,7 +311,6 @@ fn run_listener(
     stop_requested: Arc<AtomicBool>,
     hwnd_slot: Arc<AtomicIsize>,
     ready: &mpsc::SyncSender<Result<(), String>>,
-    mapping: Option<Arc<crate::button_mapping::ButtonMappingRuntime>>,
 ) -> Result<(), String> {
     // 先枚举当前在位设备，但**不**以“找不到”作为失败退出：设备缺失时仍要建窗 +
     // 注册 RIDEV_DEVNOTIFY，从而能收到 WM_INPUT_DEVICE_CHANGE（GIDC_ARRIVAL），
@@ -451,13 +433,6 @@ fn run_listener(
         }
     ));
     let _ = ready.send(Ok(()));
-    let driver_worker = mapping.and_then(|mapping| {
-        if crate::hid_host::packaged() {
-            crate::hid_host::start(selected_path.clone(), Arc::clone(&stop_requested), mapping)
-        } else {
-            crate::input_driver::start(selected_path.clone(), Arc::clone(&stop_requested), mapping)
-        }
-    });
 
     // 绑定审计定时器：见 BINDING_AUDIT_TIMER_ID 的说明。
     // 用 WM_TIMER 而不是把 `GetMessageW` 改写成带超时的等待循环——消息循环保持
@@ -507,9 +482,6 @@ fn run_listener(
     };
 
     stop_requested.store(true, Ordering::Release);
-    if let Some(worker) = driver_worker {
-        let _ = worker.join();
-    }
     let removals = [
         RAWINPUTDEVICE {
             usUsagePage: 0x01,
@@ -644,6 +616,7 @@ fn handle_device_change(handle: HRAWINPUT, event: u32) {
                 };
                 if let Ok(found) = select_single_device_path(&paths) {
                     context.selected_path = normalize_device_path(&found);
+                    context.binding_present = true;
                     let mut state = context.snapshot.lock().unwrap();
                     // 真正的"上线边沿"：相位此前不是 Ready，本次才变为 Ready。
                     //

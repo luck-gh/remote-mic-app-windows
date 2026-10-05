@@ -1,6 +1,6 @@
 //! 按键映射引擎：语义边沿 → 手势识别 → 动作注入。
 //!
-//! 输入双源（见 key_gate.rs 与
+//! RC003 由报告层捕获独占映射输入；以下键盘/HID 双源仅用于 RC001（见 key_gate.rs 与
 //! docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md 的实证）：
 //! 1. Raw Input 监听线程：HID 报文（usage 集合，绝对状态）与未被吞的键盘事件；
 //! 2. key_gate 钩子线程：被吞键盘事件的边沿。
@@ -52,10 +52,10 @@ pub enum EngineMessage {
     HidUsages(BTreeSet<u16>),
     /// 门控吞下的键盘边沿（已归因到遥控器）。
     GateEdge(ButtonEdge),
-    /// Device-bound driver channel; these edges were removed before kbdhid.
+    /// Device-bound report capture; these edges were removed before kbdhid.
     DriverEdge(ButtonEdge),
     /// Verified physical state for UI only; never enters the gesture/execution merger.
-    HidObservation(u8),
+    HidObservation(u64),
     /// Raw Input 监听器已停止：释放全部按住状态。
     ListenerStopped,
     /// 匹配的遥控器 HID 设备被移除（断连/睡眠）：释放全部按住状态。
@@ -244,9 +244,9 @@ impl ButtonObservation {
         });
     }
 
-    fn physical(&self, buttons: u8) {
+    fn physical(&self, buttons: u64) {
         self.update(|state| {
-            state.physical = crate::hid_host::BUTTONS
+            state.physical = crate::raw_input::ALL_BUTTONS
                 .iter()
                 .enumerate()
                 .filter_map(|(index, button)| (buttons & (1 << index) != 0).then_some(*button))
@@ -272,6 +272,8 @@ impl ButtonObservation {
 pub struct ButtonMappingRuntime {
     observation: Arc<ButtonObservation>,
     configuration: Mutex<InputConfiguration>,
+    capture_bridge: Mutex<std::sync::Weak<crate::rc003_bridge::Rc003Bridge>>,
+    capture_enabled: std::sync::atomic::AtomicBool,
     sender: Sender<EngineMessage>,
     receiver: Mutex<Option<Receiver<EngineMessage>>>,
     state: Arc<Mutex<EngineState>>,
@@ -289,26 +291,20 @@ struct InputConfiguration {
     model: crate::RemoteModel,
     connected: bool,
     enhanced: bool,
+    captured_mask: u64,
 }
 
 impl InputConfiguration {
     fn apply_input_capabilities(&self, mut mappings: ButtonMappings) -> ButtonMappings {
         mappings.enabled &= self.connected;
-        if !self.connected
-            || self.model == crate::RemoteModel::Unknown
-            || (self.model != crate::RemoteModel::Rc001 && !self.enhanced)
-        {
-            for button in [
-                RemoteButton::Back,
-                RemoteButton::VolumeUp,
-                RemoteButton::VolumeDown,
-            ] {
-                mappings.actions.remove(&button);
-            }
-        }
-        if self.model == crate::RemoteModel::Rc003 && !self.enhanced {
-            mappings.actions.remove(&RemoteButton::Tv);
-            mappings.actions.remove(&RemoteButton::Home);
+        if !self.connected || self.model == crate::RemoteModel::Unknown {
+            mappings.actions.clear();
+        } else if self.model == crate::RemoteModel::Rc003 {
+            mappings
+                .actions
+                .retain(|button, _| self.captured_mask & (1 << button.ordinal()) != 0);
+        } else if self.model != crate::RemoteModel::Rc001 {
+            mappings.actions.clear();
         }
         mappings
     }
@@ -411,6 +407,8 @@ impl ButtonMappingRuntime {
         let runtime = Self {
             observation: Arc::clone(&observation),
             configuration: Mutex::new(InputConfiguration::default()),
+            capture_bridge: Mutex::new(std::sync::Weak::new()),
+            capture_enabled: std::sync::atomic::AtomicBool::new(false),
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Arc::clone(&state),
@@ -476,6 +474,8 @@ impl ButtonMappingRuntime {
         configuration.mappings = mappings;
         let (execution, recognition) = configuration.effective_mappings();
         if previous == (execution.clone(), recognition.clone()) {
+            drop(configuration);
+            self.sync_capture_targets();
             return;
         }
         let _ = self.sender.send(EngineMessage::MappingsChanged {
@@ -483,6 +483,8 @@ impl ButtonMappingRuntime {
             recognition,
             enhanced: configuration.enhanced,
         });
+        drop(configuration);
+        self.sync_capture_targets();
     }
 
     /// Selects an application-specific ordinary-key profile. `None` restores
@@ -503,6 +505,7 @@ impl ButtonMappingRuntime {
             ))
         };
         let Some((execution, recognition, enhanced)) = changed else {
+            self.sync_capture_targets();
             return;
         };
         crate::ble::gatt_note(format!(
@@ -517,6 +520,7 @@ impl ButtonMappingRuntime {
             "map_profile_switch phase=completed profile_active={profile_active} terminal_result={}",
             if result.is_ok() { "passed" } else { "failed" }
         ));
+        self.sync_capture_targets();
     }
 
     /// Atomically switches the current direct profile and semantic-recognition
@@ -542,6 +546,7 @@ impl ButtonMappingRuntime {
             ))
         };
         let Some((execution, recognition, enhanced)) = changed else {
+            self.sync_capture_targets();
             return;
         };
         crate::ble::gatt_note(format!(
@@ -556,6 +561,7 @@ impl ButtonMappingRuntime {
             "map_application_switch phase=completed profile_active={profile_active} scene_active={scene_active} terminal_result={}",
             if result.is_ok() { "passed" } else { "failed" }
         ));
+        self.sync_capture_targets();
     }
 
     /// Adds semantic gesture shapes to recognition without replacing the
@@ -566,6 +572,8 @@ impl ButtonMappingRuntime {
         configuration.scene_mappings = mappings;
         let (execution, recognition) = configuration.effective_mappings();
         if previous == (execution.clone(), recognition.clone()) {
+            drop(configuration);
+            self.sync_capture_targets();
             return;
         }
         let _ = self.sender.send(EngineMessage::MappingsChanged {
@@ -573,6 +581,8 @@ impl ButtonMappingRuntime {
             recognition,
             enhanced: configuration.enhanced,
         });
+        drop(configuration);
+        self.sync_capture_targets();
     }
 
     /// Call only with the current, identified connection; reconnecting is unavailable.
@@ -584,6 +594,11 @@ impl ButtonMappingRuntime {
         }
         configuration.model = model;
         configuration.connected = connected;
+        key_gate::set_report_capture_enabled(model == crate::RemoteModel::Rc003);
+        if !connected {
+            configuration.captured_mask = 0;
+            configuration.enhanced = false;
+        }
         self.observation.connected.store(
             connected && model == crate::RemoteModel::Rc003,
             std::sync::atomic::Ordering::Release,
@@ -601,75 +616,81 @@ impl ButtonMappingRuntime {
             recognition,
             enhanced: configuration.enhanced,
         });
+        drop(configuration);
+        self.sync_capture_targets();
     }
 
-    /// Called only by a descriptor-verified channel bound to the selected HID
-    /// device's PnP parent. UI/component inspection must never enable capture.
-    pub(crate) fn set_input_enhancement(&self, available: bool) {
+    /// Grant execution only for the current report-capture ownership acknowledgement.
+    pub(crate) fn set_capture_owned(&self, mask: u64) {
         let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
-        if configuration.enhanced == available {
+        let mask = if configuration.connected && configuration.model == crate::RemoteModel::Rc003 {
+            mask & (configuration
+                .profile_mappings
+                .as_ref()
+                .unwrap_or(&configuration.mappings)
+                .mapped_mask()
+                | configuration.scene_mappings.mapped_mask())
+        } else {
+            0
+        };
+        if configuration.captured_mask == mask {
             return;
         }
-        configuration.enhanced = available;
+        configuration.captured_mask = mask;
+        configuration.enhanced = mask != 0;
         let (execution, recognition) = configuration.effective_mappings();
         let _ = self.sender.send(EngineMessage::MappingsChanged {
             execution,
             recognition,
-            enhanced: available,
+            enhanced: mask != 0,
         });
         crate::ble::gatt_note(format!(
-            "input_driver capability_available={available} source=device_bound_channel"
+            "enhanced_capture event=engine_ownership mask={mask} available={}",
+            mask != 0
         ));
     }
 
-    pub(crate) fn requested_input_enhancement(&self) -> u32 {
-        let c = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
-        if !c.connected || c.model == crate::RemoteModel::Unknown {
-            return 0;
-        }
-        let generic = c.profile_mappings.as_ref().unwrap_or(&c.mappings);
-        let mask = generic.mapped_mask() | c.scene_mappings.mapped_mask();
-        [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-        ]
-        .into_iter()
-        .enumerate()
-        .fold(0, |result, (i, button)| {
-            result
-                | if mask & (1 << button.ordinal()) != 0 {
-                    1 << i
-                } else {
-                    0
-                }
-        })
+    #[cfg(test)]
+    fn set_input_enhancement(&self, available: bool) {
+        self.set_capture_owned(if available { (1 << 13) - 1 } else { 0 });
     }
 
-    pub(crate) fn requested_host_enhancement(&self) -> u32 {
+    pub(crate) fn requested_capture_mask(&self) -> u64 {
         let c = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
         if !c.connected || c.model != crate::RemoteModel::Rc003 {
             return 0;
         }
-        let generic = c.profile_mappings.as_ref().unwrap_or(&c.mappings);
-        let mask = generic.mapped_mask() | c.scene_mappings.mapped_mask();
-        [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-            RemoteButton::Tv,
-            RemoteButton::Home,
-        ]
-        .into_iter()
-        .enumerate()
-        .fold(0, |result, (i, button)| {
-            result
-                | if mask & (1 << button.ordinal()) != 0 {
-                    1 << i
-                } else {
-                    0
-                }
-        })
+        let profile = c.profile_mappings.as_ref().unwrap_or(&c.mappings);
+        profile.mapped_mask() | c.scene_mappings.mapped_mask()
+    }
+
+    pub(crate) fn attach_capture_bridge(&self, bridge: &Arc<crate::rc003_bridge::Rc003Bridge>) {
+        *self
+            .capture_bridge
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(bridge);
+        self.sync_capture_targets();
+    }
+
+    pub(crate) fn set_capture_enabled(&self, enabled: bool) {
+        self.capture_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+        self.sync_capture_targets();
+    }
+
+    fn sync_capture_targets(&self) {
+        let bridge = self
+            .capture_bridge
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upgrade();
+        if let Some(bridge) = bridge {
+            bridge.set_capture_targets(
+                self.capture_enabled
+                    .load(std::sync::atomic::Ordering::Acquire),
+                self.requested_capture_mask(),
+            );
+        }
     }
 
     pub fn mappings(&self) -> ButtonMappings {
@@ -741,7 +762,7 @@ impl ButtonMappingRuntime {
         self.host_raw_released(timeout).is_some()
     }
 
-    /// Ordered snapshot of the selected device's existing native five-key holds.
+    /// Ordered snapshot of the selected device's existing native holds.
     /// A missing reply is unknown, never permission to reuse an all-up proof.
     pub(crate) fn host_raw_released(&self, timeout: Duration) -> Option<bool> {
         let (sender, receiver) = mpsc::channel();
@@ -759,16 +780,17 @@ impl Drop for ButtonMappingRuntime {
     }
 }
 
-fn ignore_host_owned_keyboard(event: RawKeyboardEvent, merger: &ButtonStateMerger) -> bool {
+fn ignore_host_owned_keyboard(
+    event: RawKeyboardEvent,
+    merger: &ButtonStateMerger,
+    owned_mask: u64,
+) -> bool {
     event.button().is_some_and(|button| {
-        matches!(
-            button,
-            RemoteButton::Back
-                | RemoteButton::VolumeUp
-                | RemoteButton::VolumeDown
-                | RemoteButton::Tv
-                | RemoteButton::Home
-        ) && (event.is_pressed() || !merger.keyboard_button_is_pressed(button))
+        // These messages already passed raw_input_windows' exact selected-device
+        // filter. This only deduplicates the application's event queue; it never
+        // suppresses Windows input. New keys require current capture ownership.
+        owned_mask & (1 << button.ordinal()) != 0
+            && (event.is_pressed() || !merger.keyboard_button_is_pressed(button))
     })
 }
 
@@ -847,7 +869,7 @@ fn engine_worker(
                         .connected
                         .load(std::sync::atomic::Ordering::Acquire)
                 {
-                    observation.physical(buttons & 31);
+                    observation.physical(buttons & ((1 << 13) - 1));
                 } else {
                     observation.clear();
                 }
@@ -858,15 +880,14 @@ fn engine_worker(
             }
             EngineMessage::Barrier(reply) => {
                 let _ = reply.send(
-                    crate::hid_host::BUTTONS
+                    crate::raw_input::ALL_BUTTONS
                         .iter()
                         .all(|button| !merger.keyboard_button_is_pressed(*button)),
                 );
             }
             EngineMessage::Keyboard(event) => {
                 if enhancement_active
-                    && crate::hid_host::packaged()
-                    && ignore_host_owned_keyboard(event, &merger)
+                    && ignore_host_owned_keyboard(event, &merger, key_gate::enhanced_owned_mask())
                 {
                     continue;
                 }
@@ -1400,6 +1421,88 @@ mod tests {
     use crate::key_gate::GATE_TEST_LOCK;
 
     #[test]
+    fn unified_capture_targets_include_profile_and_menu_without_common_actions() {
+        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::new(RecordingInjector::default()),
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        let profile = mappings_with_single(RemoteButton::Ok, KeyCode::Enter);
+        let scene = mappings_with_single(RemoteButton::Menu, KeyCode::Escape);
+        runtime.set_application_mappings(Some(profile), scene);
+        assert_eq!(
+            runtime.requested_capture_mask() as u64,
+            (1 << RemoteButton::Ok.ordinal()) | (1 << RemoteButton::Menu.ordinal())
+        );
+    }
+
+    #[test]
+    fn unified_capture_capabilities_follow_exact_current_targets_and_connection() {
+        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::new(RecordingInjector::default()),
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        runtime.set_application_mappings(
+            Some(mappings_with_single(RemoteButton::Ok, KeyCode::Enter)),
+            mappings_with_single(RemoteButton::Menu, KeyCode::Escape),
+        );
+        // Ordinary native events remain available but cannot authorize any mapping.
+        assert_eq!(
+            runtime
+                .configuration
+                .lock()
+                .unwrap()
+                .effective_mappings()
+                .1
+                .mapped_mask(),
+            0
+        );
+        runtime.set_capture_owned(1 << RemoteButton::Menu.ordinal());
+        assert_eq!(
+            runtime
+                .configuration
+                .lock()
+                .unwrap()
+                .effective_mappings()
+                .1
+                .mapped_mask(),
+            1 << RemoteButton::Menu.ordinal()
+        );
+        runtime.set_application_mappings(
+            Some(mappings_with_single(RemoteButton::Right, KeyCode::Right)),
+            mappings_with_single(RemoteButton::Menu, KeyCode::Escape),
+        );
+        runtime.set_capture_owned(1 << RemoteButton::Ok.ordinal()); // stale target ACK
+        assert_eq!(
+            runtime
+                .configuration
+                .lock()
+                .unwrap()
+                .effective_mappings()
+                .1
+                .mapped_mask(),
+            0
+        );
+        runtime.set_input_context(crate::RemoteModel::Unknown, false);
+        runtime.set_capture_owned((1 << 13) - 1); // late callback after disconnect
+        assert_eq!(
+            runtime
+                .configuration
+                .lock()
+                .unwrap()
+                .effective_mappings()
+                .1
+                .mapped_mask(),
+            0
+        );
+    }
+
+    #[test]
     fn observed_host_hold_survives_mapping_cancel_without_duplicate_edges() {
         let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let observation = ButtonObservation::default();
@@ -1458,7 +1561,7 @@ mod tests {
         sender.send(EngineMessage::HidObservation(7)).unwrap();
         sender.send(EngineMessage::HidObservation(7)).unwrap();
         flush(&runtime);
-        assert_eq!(runtime.requested_host_enhancement(), 0);
+        assert_eq!(runtime.requested_capture_mask(), 0);
         assert_eq!(runtime.snapshot().observed_buttons.len(), 3);
         assert_eq!(observed.lock().unwrap().len(), 3);
         assert!(execution.lock().unwrap().is_empty());
@@ -1494,7 +1597,7 @@ mod tests {
         let sender = runtime.sender();
         for pressed in [true, false] {
             sender
-                .send(EngineMessage::HidObservation(u8::from(pressed)))
+                .send(EngineMessage::HidObservation(u64::from(pressed)))
                 .unwrap();
             sender
                 .send(EngineMessage::DriverEdge(ButtonEdge {
@@ -1536,13 +1639,48 @@ mod tests {
     }
 
     #[test]
+    fn unified_capture_never_filters_unowned_raw_events() {
+        let merger = ButtonStateMerger::default();
+        for pressed in [true, false] {
+            assert!(!ignore_host_owned_keyboard(
+                home_keyboard(pressed),
+                &merger,
+                0
+            ));
+            assert!(!ignore_host_owned_keyboard(
+                home_keyboard(pressed),
+                &merger,
+                1 << RemoteButton::Menu.ordinal()
+            ));
+        }
+        let menu = RawKeyboardEvent {
+            virtual_key: 0x5D,
+            ..home_keyboard(true)
+        };
+        assert!(ignore_host_owned_keyboard(
+            menu,
+            &merger,
+            1 << RemoteButton::Menu.ordinal()
+        ));
+        assert!(!ignore_host_owned_keyboard(
+            menu,
+            &merger,
+            1 << RemoteButton::Home.ordinal()
+        ));
+    }
+
+    #[test]
     fn host_takeover_drains_only_the_selected_raw_source_existing_down() {
         let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..32 {
             let mut merger = ButtonStateMerger::default();
             assert_eq!(merger.update_keyboard(home_keyboard(true)).len(), 1);
             // The source becomes ready between its original native DOWN and UP.
-            assert!(!ignore_host_owned_keyboard(home_keyboard(false), &merger));
+            assert!(!ignore_host_owned_keyboard(
+                home_keyboard(false),
+                &merger,
+                1 << RemoteButton::Home.ordinal()
+            ));
             let released = merger.update_keyboard(home_keyboard(false));
             assert_eq!(
                 released,
@@ -1552,8 +1690,16 @@ mod tests {
                 }]
             );
             assert!(merger.active_button_set().is_empty());
-            assert!(ignore_host_owned_keyboard(home_keyboard(false), &merger));
-            assert!(ignore_host_owned_keyboard(home_keyboard(true), &merger));
+            assert!(ignore_host_owned_keyboard(
+                home_keyboard(false),
+                &merger,
+                1 << RemoteButton::Home.ordinal()
+            ));
+            assert!(ignore_host_owned_keyboard(
+                home_keyboard(true),
+                &merger,
+                1 << RemoteButton::Home.ordinal()
+            ));
         }
     }
 
@@ -1571,17 +1717,29 @@ mod tests {
         };
         merger.apply_driver_button_edge(down);
         // A same-VK UP with no held raw DOWN is rejected, not lent to the driver source.
-        assert!(ignore_host_owned_keyboard(home_keyboard(false), &merger));
+        assert!(ignore_host_owned_keyboard(
+            home_keyboard(false),
+            &merger,
+            1 << RemoteButton::Home.ordinal()
+        ));
         assert!(merger.active_button_set().contains(&RemoteButton::Home));
         assert_eq!(merger.apply_driver_button_edge(up), vec![up]);
 
         merger.update_keyboard(home_keyboard(true));
         merger.apply_driver_button_edge(down);
-        assert!(!ignore_host_owned_keyboard(home_keyboard(false), &merger));
+        assert!(!ignore_host_owned_keyboard(
+            home_keyboard(false),
+            &merger,
+            1 << RemoteButton::Home.ordinal()
+        ));
         assert!(merger.update_keyboard(home_keyboard(false)).is_empty());
         assert!(merger.active_button_set().contains(&RemoteButton::Home));
         assert_eq!(merger.apply_driver_button_edge(up), vec![up]);
-        assert!(ignore_host_owned_keyboard(home_keyboard(false), &merger));
+        assert!(ignore_host_owned_keyboard(
+            home_keyboard(false),
+            &merger,
+            1 << RemoteButton::Home.ordinal()
+        ));
     }
 
     fn flush(runtime: &ButtonMappingRuntime) {
@@ -1717,9 +1875,9 @@ mod tests {
         );
         let saved = mappings_with_single(RemoteButton::Back, KeyCode::Backspace);
         runtime.set_mappings(saved.clone());
-        assert_eq!(runtime.requested_input_enhancement(), 0);
+        assert_eq!(runtime.requested_capture_mask(), 0);
         runtime.set_input_context(crate::RemoteModel::Rc003, true);
-        assert_eq!(runtime.requested_input_enhancement(), 1);
+        assert_eq!(runtime.requested_capture_mask(), 1);
         runtime.set_input_enhancement(true);
         assert!(runtime
             .configuration
@@ -1730,7 +1888,7 @@ mod tests {
             .actions
             .contains_key(&RemoteButton::Back));
         runtime.set_input_context(crate::RemoteModel::Unknown, true);
-        assert_eq!(runtime.requested_input_enhancement(), 0);
+        assert_eq!(runtime.requested_capture_mask(), 0);
         assert!(!runtime
             .configuration
             .lock()
@@ -1811,6 +1969,80 @@ mod tests {
     }
 
     #[test]
+    fn builtin_confirm_native_first_then_captured_presses_each_deliver_one_enter() {
+        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let raw_snapshot = Arc::new(StdMutex::new(RawInputSnapshot::default()));
+        let runtime = ButtonMappingRuntime::new(
+            injector.clone(),
+            Arc::new(UsageCounters::default()),
+            raw_snapshot.clone(),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        runtime.set_mappings(
+            crate::templates::MappingConfiguration::recommended_templates()
+                .remove(1)
+                .mappings,
+        );
+        let routed = Arc::new(StdMutex::new(Vec::new()));
+        let capture = routed.clone();
+        runtime.set_gesture_handler(Some(Arc::new(move |event| {
+            capture.lock().unwrap().push(event);
+            GestureDisposition::PassThrough
+        })));
+        flush(&runtime);
+        runtime
+            .sender()
+            .send(EngineMessage::Keyboard(keyboard_event(0x0D, 0x100)))
+            .unwrap();
+        flush(&runtime);
+        assert!(
+            injector.taps.lock().unwrap().is_empty(),
+            "first native Enter must not be duplicated"
+        );
+        runtime
+            .sender()
+            .send(EngineMessage::Keyboard(keyboard_event(0x0D, 0x101)))
+            .unwrap();
+        flush(&runtime);
+        for _ in 0..6 {
+            runtime.set_capture_owned(1 << RemoteButton::Ok.ordinal());
+            flush(&runtime);
+            runtime
+                .sender()
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            flush(&runtime);
+            runtime
+                .sender()
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Ok,
+                    is_pressed: false,
+                }))
+                .unwrap();
+            flush(&runtime);
+        }
+        assert_eq!(
+            injector.taps.lock().unwrap().as_slice(),
+            vec![
+                KeyChord {
+                    keys: vec![KeyCode::Enter]
+                };
+                6
+            ]
+        );
+        let seen = routed.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        assert!(seen.iter().all(|v| !v.native_delivered));
+        assert!(raw_snapshot.lock().unwrap().active_buttons.is_empty());
+        drop(gate);
+    }
+
+    #[test]
     fn driver_channel_three_keys_execute_once_and_cancel_without_native_injection() {
         let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gate = crate::key_gate::KeyGate::start();
@@ -1879,124 +2111,6 @@ mod tests {
         assert_eq!(injector.taps.lock().unwrap().len(), count);
         assert!(snapshot.lock().unwrap().active_buttons.is_empty());
         drop(gate);
-    }
-
-    #[test]
-    fn host_cancellation_delivers_old_driver_up_before_the_first_new_press() {
-        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::hid_host::{cancel_mapping, Edges, Report, BUTTONS};
-        let gate = crate::key_gate::KeyGate::start();
-        for (index, button) in BUTTONS.into_iter().enumerate() {
-            for delayed_single in [false, true] {
-                let injector = Arc::new(RecordingInjector::default());
-                let runtime = ButtonMappingRuntime::new(
-                    injector.clone(),
-                    Arc::new(UsageCounters::default()),
-                    Arc::new(StdMutex::new(RawInputSnapshot::default())),
-                );
-                runtime.set_input_context(crate::RemoteModel::Rc003, true);
-                let mut mappings = mappings_with_single(button, KeyCode::Escape);
-                if delayed_single {
-                    mappings.actions.get_mut(&button).unwrap().long = ButtonAction::Shortcut {
-                        chord: KeyChord {
-                            keys: vec![KeyCode::Enter],
-                        },
-                    };
-                }
-                runtime.set_mappings(mappings);
-                runtime.set_input_enhancement(true);
-                let mut edges = Edges::default();
-                let released = Report {
-                    buttons: 0,
-                    all_released: true,
-                };
-                let pressed = Report {
-                    buttons: 1 << index,
-                    all_released: false,
-                };
-                edges.accept(1, released).unwrap();
-                for edge in edges.accept(2, pressed).unwrap() {
-                    runtime
-                        .sender()
-                        .send(EngineMessage::DriverEdge(edge))
-                        .unwrap();
-                }
-                flush(&runtime);
-                let before = injector.taps.lock().unwrap().len();
-                assert_eq!(before, usize::from(!delayed_single));
-                cancel_mapping(&runtime, &mut edges);
-                cancel_mapping(&runtime, &mut edges);
-                flush(&runtime);
-                assert_eq!(
-                    injector.taps.lock().unwrap().len(),
-                    before,
-                    "cancel must not click"
-                );
-
-                runtime.set_input_enhancement(true);
-                for report in [pressed, released] {
-                    let sequence = if report.all_released { 4 } else { 3 };
-                    for edge in edges.accept_verified(sequence, report, true).unwrap() {
-                        runtime
-                            .sender()
-                            .send(EngineMessage::DriverEdge(edge))
-                            .unwrap();
-                    }
-                }
-                flush(&runtime);
-                assert_eq!(
-                    injector.taps.lock().unwrap().len(),
-                    before + 1,
-                    "first new press lost after cancelling {button:?}, delayed={delayed_single}"
-                );
-            }
-        }
-        drop(gate);
-    }
-
-    #[test]
-    fn host_cancellation_does_not_release_an_overlapping_raw_source() {
-        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::hid_host::{cancel_mapping, Edges, Report};
-        let runtime = ButtonMappingRuntime::new(
-            Arc::new(RecordingInjector::default()),
-            Arc::new(UsageCounters::default()),
-            Arc::new(StdMutex::new(RawInputSnapshot::default())),
-        );
-        runtime
-            .sender()
-            .send(EngineMessage::Keyboard(home_keyboard(true)))
-            .unwrap();
-        let mut edges = Edges::default();
-        for edge in edges
-            .accept_verified(
-                1,
-                Report {
-                    buttons: 16,
-                    all_released: false,
-                },
-                true,
-            )
-            .unwrap()
-        {
-            runtime
-                .sender()
-                .send(EngineMessage::DriverEdge(edge))
-                .unwrap();
-        }
-        cancel_mapping(&runtime, &mut edges);
-        assert_eq!(
-            runtime.host_raw_released(Duration::from_secs(2)),
-            Some(false)
-        );
-        runtime
-            .sender()
-            .send(EngineMessage::Keyboard(home_keyboard(false)))
-            .unwrap();
-        assert_eq!(
-            runtime.host_raw_released(Duration::from_secs(2)),
-            Some(true)
-        );
     }
 
     #[test]

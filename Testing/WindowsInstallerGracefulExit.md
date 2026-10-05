@@ -1,6 +1,6 @@
 # Windows 安装器优雅退出验证（应用运行中执行安装/卸载）
 
-日期：2026-09-16
+初版：2026-09-16；当前安装前卸载/覆盖流程：2026-10-04。
 
 ## 验证目标
 
@@ -8,17 +8,28 @@
 
 1. 安装器先请求应用退出（会话内命名事件 `Local\SayAll-GracefulExit`）；
 2. 应用收到请求后**自己**关闭 BLE 会话并等待 `ble_session_cleanup` 落盘；
-3. 应用在安装器的强杀时刻之前自行退出，因此 Tauri 模板里的
-   `CheckIfAppIsRunning` 自然落空。
+3. 应用退出后核验按键组件真实清理终态，确认后才覆盖文件；当前定制模板已移除
+   `CheckIfAppIsRunning` 的强杀调用，退出或清理未确认就中止安装。
 
-背景：Tauri 的 NSIS 模板在 `Section Install` / `Section Uninstall` 中把钩子**之后**
+双击发现已有安装时，提供“安装前卸载”和“请勿卸载”：前者安全退出、卸载后自动继续安装，
+后者覆盖；两者保留原安装目录与配置。静默 `/S` 与被动 `/P /UPDATE` 默认覆盖。
+安装器使用当前用户最高可用权限，权限预检必须早于退出和卸载；主程序仍由 `RunAsUser`
+以普通权限启动。独立卸载器仍保留。Helper 每阶段等待 45 秒；原助手结束后至多启动一次包内
+`--cleanup-only`，新阶段重新计时。该预算覆盖共用 30 秒的连接/HELLO 等待和正常响应，
+不是持键释放上限；超时仍为 `pending` / `unconfirmed` 时保留后台清理者和回执，
+停止替换，不强杀。完成新 payload 写入后只把安装目录内两个旧 Helper 与
+`SayAllInput` 的 INF/SYS/CAT 五个明示文件送入回收站，不清除配置、未知文件或已安装驱动。
+
+历史背景（2026-09-16）：当时 Tauri 的 NSIS 默认模板在 `Section Install` / `Section Uninstall` 中把钩子**之后**
 紧跟 `CheckIfAppIsRunning`（`nsis_tauri_utils::KillProcessCurrentUser`，直接
 `TerminateProcess`）。应用在持有活动 BLE GATT 会话时被强杀会留下未关闭的会话，使系统
 蓝牙栈进入僵死态，此后所有 WinRT 入口返回 `0x80070008`，应用内全部自愈手段与睡眠都无效，
 **只能重启电脑**。详见
 [../Bugs/2026-09-16-ble-stack-resource-exhaustion-recovery-ineffective.md](../Bugs/2026-09-16-ble-stack-resource-exhaustion-recovery-ineffective.md)。
 
-## 安装器强杀与"是否关闭应用"弹窗的实际行为
+## 历史：默认模板强杀与"是否关闭应用"弹窗
+
+本节保留历史故障证据；当前覆盖模板不再调用这些强杀分支。
 
 来源：本仓库构建产物（`target/release/nsis/x64/utils.nsh` + `SimpChinese.nsh`，构建时生成，
 可用作 CLI 版本的 ground truth）。`CheckIfAppIsRunning` 的实际分支：
@@ -79,8 +90,35 @@ nsis_tauri_utils::FindProcessCurrentUser "${executableName}"   ; $R0 = 0 表示�
 
 ## 自动化步骤
 
+普通预检和 Windows CI `verify` 运行以下隔离检查，不安装产品、不控制产品进程、
+不写真实 stop 或 receipt；默认路径测试只在 `target/dev/unified-input` 创建小型 fixture：
+
 ```powershell
-# 前置：先清掉本机已装版本（脚本要求干净起点，与其它安装矩阵脚本一致）
+node --test scripts/test-windows-overlay-install.cjs
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-capture-cleanup.ps1
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-retired-files.ps1
+```
+
+CI `installer` job 完成真实 NSIS 构建后，另跑 `test-windows-retired-files.ps1 -RealRecycle`
+核对自建文件实际进入回收站，及 `node scripts/test-windows-overlay-compile.cjs` 编译微型
+payload 的定制模板（生成物不执行）。`test-windows-installer-write-log.ps1` 另运行自有微型
+NSIS fixture：锁定自建文件时必须返回非零并记录失败组件，释放锁后必须实际覆盖、
+以本轮 completed 替换旧日志；日志写失败不得影响 NSIS error flag、error level 或寄存器。
+所有 fixture 日志限定在任务目录，不写生产安装结果日志。2026-10-04 晚最终源码对应结果：模板 4 项、清理协调器
+63 项及真实回收 13 项 `passed`，NSIS 实际编译 `passed`。新增
+`test-windows-reinstall-flow.ps1` 实际执行生产宏，覆盖直接覆盖、卸载续装、非目录拒绝、
+属性查询异常拒绝、子卸载失败与新目录六种场景，全部 `passed`；失败场景核对旧载荷保持且
+没有继续写入。新目录测试使用每次不存在的子目录；非法路径通过普通变量传入，避免 NSIS
+自动过滤 `$INSTDIR` 中非法字符而形成假测试。上述检查不代替下面的真实升级验收。
+
+真实安装的本次结果保存在 `%LOCALAPPDATA%\SayAll\installer-result.log`，只有 start、failed、
+completed 和固定组件名；失败时先看 app/helper/gadget/license/uninstaller 等具体阶段。
+原首次 1603 未被独立 fixture 复现，不能仅凭同包重试成功断定原因；调查记录归
+[前台输入与退出回归](../Bugs/2026-10-03-foreground-input-regression.md)。
+
+```powershell
+# 仅在干净、隔离的 Windows runner 执行真实安装/卸载矩阵；
+# 不要为了运行该脚本先卸载用户正在使用的安装。
 pnpm tauri build --bundles nsis
 ./scripts/test-windows-installer-graceful-exit.ps1
 ```
@@ -110,7 +148,16 @@ rg "app_exit |app_shutdown " "$LOG"
 
 纯断言验证 14 项 passed（冻结 CI 实际日志、逐个缺失标记、失败阶段、未退出及预算边界、无强杀收尾）；未在用户主机执行安装/卸载测试。新一轮 GitHub CI 与受影响硬件验收仍待完成；旧 CI 未执行到卸载场景，不能将其记为 passed。产品二进制未变化，沿用已安装候选。
 
-## 现场结果
+## 2026-10-04 当前候选现场结果
+
+`56fec037` 本地包的“安装前卸载”和“请勿卸载”两条可见向导均从真实 Explorer `open`
+入口通过；安装器实际同用户提升权限，应用自行完整退出后分别卸载续装或覆盖，三份配置
+字节保持，完成页启动的应用实际为普通权限。最终再经 Explorer 重开并核对安装载荷和可见
+主窗口。精确包身份、正常退出耗时、日志片段、验收脚本修正及未覆盖范围归
+[同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-04-晚普通双击安装的权限失败)。
+本轮未执行新的 CI 或独立完整卸载；不能把卸载续装路径外推为所有卸载选项通过。
+
+## 历史现场结果
 
 | 项目 | 结果 | 证据边界 |
 | --- | --- | --- |
@@ -133,7 +180,7 @@ rg "app_exit |app_shutdown " "$LOG"
 ## 边界
 
 - CI 机器无蓝牙硬件，因此 CI 只断言**退出机制**，不断言"真实 GATT 会话在升级中被正确关闭"。
-- 未覆盖可见安装界面、SmartScreen、Windows 10 1809 与代码签名。
+- 当前本机两条可见安装界面已验；SmartScreen、Windows 10 1809、代码签名、真正标准账户和交互 UAC 取消未覆盖。
 - 应用侧宽限（`GRACEFUL_EXIT_TIMEOUT` = 5s）必须始终小于安装器轮询预算
   （`SETTLE 1500ms + 轮询上限 20000ms`）；契约测试守着这个不等式，改动任一侧都要重跑它。
 - **改 NSIS 钩子后必须真跑一次 `makensis`**：`System::Call` 的类型串、输出寄存器名、

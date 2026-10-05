@@ -217,7 +217,7 @@ export type SceneEvent =
   | { type:"default_template_persistence_requested"; requestId:number; applicationId:string; templateId:string };
 export interface TemplateImportRequest { templateIds: string[]; resolvedNames: Record<string,string>; replaceApplicationBindings: boolean; }
 export interface TemplateImportPreview { token:string; templates:Array<{sourceTemplateId:string;template:MappingTemplate}>; addedApplicationBindings:ApplicationBinding[]; replacedApplicationIds:string[]; skippedApplicationIds:string[]; unresolvedApplicationIds:string[]; }
-export type ComponentKind = "hid_enhancement" | "vb_cable";
+export type ComponentKind = "vb_cable";
 export type ComponentAction = "install" | "repair" | "remove" | "open_vendor_wizard";
 export type InstallationState = "unknown" | "not_installed" | "installed_not_loaded" | "available" | "restart_required" | "incompatible" | "failed" | "not_implemented";
 export type PackageState = "missing" | "trusted" | "signature_missing" | "authorization_missing" | "incompatible" | "failed" | "download_available";
@@ -788,30 +788,113 @@ export async function copyTemplateCatalogEntry(templateId:string,name:string):Pr
 export async function getSceneSnapshot():Promise<SceneSnapshot|null>{return invoke("get_scene_snapshot");}
 export async function selectCurrentTemplate(templateId:string|null):Promise<SceneSnapshot>{return invoke("select_current_template", { templateId });}
 export async function subscribeSceneEvents(callback:(event:SceneEvent)=>void):Promise<()=>void>{const unlisten=await listen<SceneEvent>("scene-event",event=>callback(event.payload));return unlisten;}
-export async function getComponentStatus(): Promise<ComponentStatus[]> {
+export async function getComponentStatus(component: ComponentKind): Promise<ComponentStatus> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法检测组件状态");
-  return invoke<ComponentStatus[]>("get_component_status");
+  return invoke<ComponentStatus>("get_component_status", { component });
 }
 export async function performComponentAction(component: ComponentKind, action: ComponentAction): Promise<ComponentOperation> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法执行组件操作");
   return invoke<ComponentOperation>("perform_component_action", { component, action });
 }
 
-export async function startHidHostEnhancement(): Promise<string> {
-  return invoke<string>("start_hid_host_enhancement");
-}
-export async function getHidHostStatus(): Promise<string> {
-  return invoke<string>("get_hid_host_status");
-}
 export async function setMenuTemplateSwitchEnabled(enabled: boolean): Promise<MappingConfiguration> {
   return invoke("set_menu_template_switch_enabled", { enabled });
 }
-export async function getHidHostAutoRestore(): Promise<boolean> {
-  return invoke<boolean>("get_hid_host_auto_restore");
+
+export interface Rc003BridgeSnapshot {
+  phase: Rc003BridgePhase;
+  port: number;
+  helperPid: number;
+  acceptedTotal: number;
+  deniedTotal: number;
+  replacedTotal: number;
+  edgesApplied: number;
+  usagesDropped: number;
+  malformedTotal: number;
+  watchdogReleaseTotal: number;
+  pressedUsages: number[];
+  lastRxAgeMs: number | null;
+  targetGeneration: number;
+  targetUsages: number[];
+  ownedUsages: number[];
 }
-export async function setHidHostAutoRestore(enabled: boolean): Promise<boolean> {
-  return invoke<boolean>("set_hid_host_auto_restore", { enabled });
+
+/** `stopped` = 该平台没有这个机制（非 Windows），或桥接未启用。 */
+export type Rc003BridgePhase = "stopped" | "listening" | "connected" | "failed";
+
+const BROWSER_RC003_BRIDGE: Rc003BridgeSnapshot = {
+  phase: "stopped",
+  port: 0,
+  helperPid: 0,
+  acceptedTotal: 0,
+  deniedTotal: 0,
+  replacedTotal: 0,
+  edgesApplied: 0,
+  usagesDropped: 0,
+  malformedTotal: 0,
+  watchdogReleaseTotal: 0,
+  pressedUsages: [],
+  lastRxAgeMs: null,
+  targetGeneration: 0,
+  targetUsages: [],
+  ownedUsages: [],
+};
+
+export async function getRc003BridgeSnapshot(): Promise<Rc003BridgeSnapshot> {
+  // `typeof window` 这一层不能省：组件卸载后轮询仍可能再触发一次，
+  // 而测试环境在 teardown 之后 window 已不可用 —— 直接调 `isTauriRuntime()`
+  // 会抛 ReferenceError，表现为一个与被测功能无关的 unhandled rejection。
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return BROWSER_RC003_BRIDGE;
+  }
+  return invoke<Rc003BridgeSnapshot>("get_rc003_bridge_snapshot");
 }
+
+/** Persisted intent is separate from the installed task and live bridge. */
+export interface Rc003TaskStatus {
+  installed: boolean;
+  /** The previous capture session has not yet confirmed clean shutdown. */
+  cleanupPending: boolean;
+  canRetryCleanup: boolean;
+  /**
+   * 这次打开开关会触发系统授权（UAC）。2026-10-03 起恒为 true：每次开启都会
+   * 重新注册任务并弹一次 Windows 授权窗口。字段保留给诊断与类型兼容，
+   * 前端弹窗判据已不依赖它（每次开启都弹确认，只有关闭方向直接执行）。
+   */
+  authorizationRequired: boolean;
+  /** 用户意图（持久化，默认关闭）。开关显示读它，而不是读 installed。 */
+  enabled: boolean;
+  helperPath: string | null;
+  lastError: string | null;
+}
+
+/**
+ * 开关打开：**每次都重新授权**（弹一次 UAC 重新注册任务，主程序会等它完成），
+ * 然后触发助手；开关关闭：结束助手，任务留在系统里但授权视为作废
+ * （提权任务普通权限删不掉），下次开启必弹 UAC（2026-10-03 Andy 定稿）。
+ */
+export async function getRc003TaskStatus(): Promise<Rc003TaskStatus> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return { installed: false, authorizationRequired: true, enabled: false, cleanupPending: false, canRetryCleanup: false, helperPath: null, lastError: null };
+  }
+  return invoke<Rc003TaskStatus>("get_rc003_task_status");
+}
+
+export async function enableRc003Capture(): Promise<Rc003TaskStatus> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return { installed: false, authorizationRequired: true, enabled: false, cleanupPending: false, canRetryCleanup: false, helperPath: null, lastError: null };
+  }
+  return invoke<Rc003TaskStatus>("enable_rc003_capture");
+}
+
+export async function disableRc003Capture(): Promise<Rc003TaskStatus> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return { installed: false, authorizationRequired: true, enabled: false, cleanupPending: false, canRetryCleanup: false, helperPath: null, lastError: null };
+  }
+  return invoke<Rc003TaskStatus>("disable_rc003_capture");
+}
+
+
 
 export async function saveButtonMappings(mappings: ButtonMappings): Promise<ButtonMappings> {
   if (!isTauriRuntime()) {
@@ -1205,58 +1288,6 @@ export function buttonTriggerLabel(trigger: ButtonTrigger): string {
     double: "双击",
     long: "长按",
   }[trigger];
-}
-
-/**
- * 武装族按键的"同键映射"表（对齐 crates/sayall-windows/src/send_input.rs
- * 的 native_key）：映射动作与原生动作相同时，映射引擎的泄漏对冲保证
- * 冷首按单响应（原生动作已交付，引擎跳过注入）。
- */
-export const identityShortcutByButton: Partial<Record<RemoteButton, KeyCode>> = {
-  ok: "enter",
-  up: "up",
-  down: "down",
-  left: "left",
-  right: "right",
-  home: "home",
-};
-
-export type ShortcutCapability = "all" | "identity" | "none";
-
-/**
- * 按键 × 触发 × 型号 的"单响应能力"判定（2026-09-06 定稿；注入链路已由
- * examples/preset_inject_probe.rs 真机验证 36/36 全部正确——所有可见按键
- * 的所有配置均真实生效，本矩阵**只用于编辑器的信息提示**，不做门控）：
- *
- * - **all**（直接归因族：电源 VK 0xFF/0x5F、菜单 VK_APPS）：原始键
- *   从不泄漏 → 任意配置严格单响应；
- * - **identity**（武装族常见物理 VK：确定/方向）：孤立冷首按原始键
- *   必泄漏（结构性武装死锁，公开 API 内不可根除）→ 同键映射由泄漏对冲
- *   保证单响应，其他映射"配置动作正常执行 + 冷首按附带一次原生动作"；
- * - **none**：普通输入路径没有同键单响应保证；不是禁止保存配置。
- *
- * RC003 返回/音量±/TV/Home 的报告增强能力由后端实时门禁决定，
- * 编辑器针对这五键显示增强提示，不以本矩阵推断来源或已通过实机验收。
- */
-export function shortcutCapability(
-  button: RemoteButton,
-  trigger: ButtonTrigger,
-  _model: RemoteModel,
-): ShortcutCapability {
-  if (button === "power" || button === "menu") {
-    return "all";
-  }
-  if (
-    button === "back" ||
-    button === "volume_up" ||
-    button === "volume_down" ||
-    button === "tv"
-  ) {
-    // 普通输入路径无保证；增强路径的实时能力不在此静态矩阵中。
-    return "none";
-  }
-  // 武装族（确定/方向）：单击可配同键映射（对冲单响应）。
-  return trigger === "single" ? "identity" : "none";
 }
 
 const keyLabels: Record<string, string> = {

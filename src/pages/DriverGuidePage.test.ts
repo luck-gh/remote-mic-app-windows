@@ -18,7 +18,7 @@ describe("driver guide", () => {
     await flushPromises();
     expect(mocks.scanPairedRemotes).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain("菜单和主页");
-    await wrapper.get("button:not(.secondary-button)").trigger("click");
+    await wrapper.findAll("button").find(button => button.text() === "扫描已配对遥控器")!.trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("Windows 已配对并被 SayAll 发现");
     expect(wrapper.text()).not.toContain("已完成连接");
@@ -28,7 +28,11 @@ describe("driver guide", () => {
     mocks.getConnectionSnapshot.mockResolvedValue(connected);
     const wrapper = mount(DriverGuidePage, { props: { runtime: { ...runtime, platform: { ...runtime.platform, connection: connected } } }, global: { stubs: { ComponentSupportPanel: true } } });
     await flushPromises();
-    expect(wrapper.text()).toContain("已完成连接");
+    expect(wrapper.get(".connection-status .driver-status").text()).toBe("✓ 蓝牙已连接");
+    expect(wrapper.findAll(".connection-status .driver-status")).toHaveLength(1);
+    expect(wrapper.text()).not.toContain("BLE");
+    expect(wrapper.text()).toContain("全按键支持的状态单独显示");
+    expect(wrapper.get(".connection-status .driver-status").classes()).toContain("success");
     expect(wrapper.text()).toContain("重新配对方法");
     expect(wrapper.text()).toContain("菜单和主页");
     expect(wrapper.text()).toContain("打开 Windows 蓝牙设置");

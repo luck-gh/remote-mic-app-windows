@@ -3226,14 +3226,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sayall-component-helper"
-version = "0.0.0"
-dependencies = [
- "sayall-windows",
- "serde_json",
-]
-
-[[package]]
 name = "sayall-core"
 version = "0.0.0"
 dependencies = [

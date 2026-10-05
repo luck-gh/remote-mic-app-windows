@@ -1,11 +1,68 @@
 !include WinVer.nsh
+!define SAYALL_CLEANUP_VERIFIER "${__FILEDIR__}\verify-capture-cleanup.ps1"
+!define SAYALL_CLEANUP_HELPER "${__FILEDIR__}\..\sayall-helper.exe"
+!define SAYALL_RETIRED_RECYCLER "${__FILEDIR__}\recycle-retired-files.ps1"
+
+Var SayAllInstallResultDirectory
+Var SayAllInstallStage
+Var SayAllReinstall
+Var SayAllPreviousInstallDirectory
+Var SayAllReinstallRadio
+Var SayAllOverlayRadio
+
+; One current-run result, using fixed event/component identifiers only. Logging
+; is best-effort and preserves the caller's error flag and process error level.
+!macro SayAllLogInstallResult _mode _event _component
+  Push $R6
+  Push $R7
+  ${If} ${Errors}
+    StrCpy $R6 1
+  ${Else}
+    StrCpy $R6 0
+  ${EndIf}
+  CreateDirectory "$SayAllInstallResultDirectory"
+  ClearErrors
+  FileOpen $R7 "$SayAllInstallResultDirectory\installer-result.log" ${_mode}
+  ${IfNot} ${Errors}
+    !if "${_mode}" == "a"
+      FileSeek $R7 0 END
+    !endif
+    FileWrite $R7 "event=${_event} component=${_component}$\r$\n"
+    FileClose $R7
+  ${EndIf}
+  ${If} $R6 = 1
+    SetErrors
+  ${Else}
+    ClearErrors
+  ${EndIf}
+  Pop $R7
+  Pop $R6
+!macroend
+
+; Deliberately enumerate shipped resources: a new payload needs an explicit
+; diagnostic component instead of putting an arbitrary resource path in a log.
+!macro SayAllSetResourceComponent _name
+  !if "${_name}" == "frida-gadget.dll"
+    StrCpy $SayAllInstallStage gadget
+  !else if "${_name}" == "sayall-helper.exe"
+    StrCpy $SayAllInstallStage helper
+  !else if "${_name}" == "licenses\ATTRIBUTION.md"
+    StrCpy $SayAllInstallStage license_attribution
+  !else if "${_name}" == "licenses\Frida-COPYING.txt"
+    StrCpy $SayAllInstallStage license_frida
+  !else
+    !error "Missing fixed diagnostic component for bundle resource"
+  !endif
+!macroend
 
 !define SAYALL_MINIMUM_WINDOWS_BUILD 17763
 !define SAYALL_DOWNGRADE_ERROR_LEVEL 1638
 !define SAYALL_VB_CABLE_SERVICE_KEY "SYSTEM\CurrentControlSet\Services\VBAudioVACMME"
 !define SAYALL_VB_CABLE_DOWNLOAD_URL "https://vb-audio.com/Cable/"
 
-; ── 部署前先请应用优雅退出（2026-09-16）───────────────────────────────
+; 历史说明（2026-09-16）：下述默认 Tauri 流程是当时故障的来源。
+; 当前 windows/installer.nsi 在正常退出后按用户选择卸载再安装或直接覆盖；
+; 两条路径均无强杀调用，清理失败则停止，后面只做一次保守进程复核。
 ;
 ; 背景：Tauri 默认模板的 `CheckIfAppIsRunning`（utils.nsh）在检测到应用正在
 ; 运行时不会给应用任何退出机会，而是直接强杀。**本仓库构建产物的实际分支**
@@ -60,6 +117,7 @@
 !define SAYALL_LEGACY_RUNNING_ERROR_LEVEL 1639
 
 !macro SayAllRequestGracefulExit _uid
+  StrCpy $SayAllInstallStage app_exit
   Push $R8
   Push $R9
   ; 先确认是否真有实例在跑。`FindProcessCurrentUser` 的返回值语义由实测确定
@@ -129,15 +187,181 @@
   Pop $R8
 !macroend
 
-!macro NSIS_HOOK_PREINSTALL
+; The app owns normal shutdown. Confirm its elevated capture Helper has also
+; released inputs and detached its hook before the installer touches resources.
+!macro SayAllVerifyCaptureCleanup
+  Push $R8
+  Push $R9
+  InitPluginsDir
+  StrCpy $SayAllInstallStage cleanup_verifier
+  ClearErrors
+  File /oname=$PLUGINSDIR\SayAllVerifyCaptureCleanup.ps1 "${SAYALL_CLEANUP_VERIFIER}"
+  !insertmacro SayAllRequireWriteSuccess cleanup_verifier
+  StrCpy $SayAllInstallStage cleanup_helper
+  ClearErrors
+  File /oname=$PLUGINSDIR\sayall-helper.exe "${SAYALL_CLEANUP_HELPER}"
+  !insertmacro SayAllRequireWriteSuccess cleanup_helper
+  StrCpy $SayAllInstallStage capture_cleanup
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\SayAllVerifyCaptureCleanup.ps1" -CleanupHelperPath "$PLUGINSDIR\sayall-helper.exe"'
+  Pop $R8
+  Pop $R9
+  DetailPrint "$R9"
+  ${If} $R8 != 0
+    SetErrorLevel 1639
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONINFORMATION|MB_OK "未能确认按键组件已完成自动清理，本次安装尚未替换文件。清理记录已保留，稍后再次安装会继续恢复。$\r$\nAutomatic input cleanup is not confirmed. No application files have been replaced; cleanup records are preserved for the next installation attempt."
+    ${EndIf}
+    Abort
+  ${EndIf}
+  Pop $R9
+  Pop $R8
+!macroend
+
+; The vendored template never invokes Tauri's force-exit macro. Recheck after
+; cleanup so an instance launched during the wait causes an abort, not a kill.
+!macro SayAllAssertAppStopped _uid
+  StrCpy $SayAllInstallStage app_stopped
+  nsis_tauri_utils::FindProcessCurrentUser "${MAINBINARYNAME}.exe"
+  Pop $R9
+  ${If} $R9 = 0
+    SetErrorLevel 1639
+    Abort "SayAll restarted during cleanup. Installation stopped."
+  ${EndIf}
+!macroend
+
+!macro SayAllRequireWriteSuccess _component
+  StrCpy $SayAllInstallStage "${_component}"
+  ${If} ${Errors}
+    SetErrorLevel 1603
+    Abort "Unable to write the application payload. Installation stopped."
+  ${EndIf}
+!macroend
+
+; Open the nearest existing directory for FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY.
+; OPEN_EXISTING and BACKUP_SEMANTICS check access without creating a probe file.
+!macro SayAllRequireWritableDirectory _directory _uid
+  StrCpy $SayAllInstallStage directory_access
+  Push $R7
+  Push $R8
+  Push $R9
+  StrCpy $R8 "${_directory}"
+  sayall_access_parent_${_uid}:
+    System::Call 'kernel32::GetFileAttributesW(w R8) i .R9 ?e'
+    Pop $R7
+    ${If} $R9 = -1
+      ; Only a missing file/path can use the nearest existing parent. Access
+      ; denial or any other attribute failure must not bypass this preflight.
+      ${If} $R7 != 2
+      ${AndIf} $R7 != 3
+        Goto sayall_access_failed_${_uid}
+      ${EndIf}
+      ${GetParent} "$R8" $R9
+      ${If} $R9 == ""
+      ${OrIf} $R9 == $R8
+        Goto sayall_access_failed_${_uid}
+      ${EndIf}
+      StrCpy $R8 $R9
+      Goto sayall_access_parent_${_uid}
+    ${EndIf}
+    IntOp $R9 $R9 & 16
+    ${If} $R9 = 0
+      Goto sayall_access_failed_${_uid}
+    ${EndIf}
+    System::Call 'kernel32::CreateFileW(w R8, i 6, i 7, p 0, i 3, i 0x02000000, p 0) p .R9'
+    ${If} $R9 = -1
+      Goto sayall_access_failed_${_uid}
+    ${EndIf}
+    System::Call 'kernel32::CloseHandle(p R9)'
+    !insertmacro SayAllLogInstallResult a passed directory_access
+    Goto sayall_access_done_${_uid}
+  sayall_access_failed_${_uid}:
+    SetErrorLevel 5
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONSTOP|MB_OK "当前权限无法写入安装目录，本次安装已停止，尚未退出应用或卸载程序。请选择可写目录，或使用同一账户的管理员权限运行安装包。"
+    ${EndIf}
+    Abort "Installation directory access denied before cleanup."
+  sayall_access_done_${_uid}:
+    Pop $R9
+    Pop $R8
+    Pop $R7
+!macroend
+
+!macro SayAllUninstallBeforeInstall
+  ${If} $SayAllReinstall = 1
+    InitPluginsDir
+    StrCpy $SayAllInstallStage reinstall_uninstaller
+    ClearErrors
+    WriteUninstaller "$PLUGINSDIR\SayAllReinstallUninstall.exe"
+    !insertmacro SayAllRequireWriteSuccess reinstall_uninstaller
+    StrCpy $SayAllInstallStage reinstall_uninstall
+    !insertmacro SayAllLogInstallResult a start reinstall_uninstall
+    ClearErrors
+    ; _?= must be last and unquoted: NSIS consumes the remaining directory text.
+    ; Run current cleanup logic, never an obsolete installed uninstaller.
+    ExecWait '"$PLUGINSDIR\SayAllReinstallUninstall.exe" /S /UPDATE _?=$SayAllPreviousInstallDirectory' $R8
+    ${If} ${Errors}
+    ${OrIf} $R8 != 0
+      SetErrorLevel 1603
+      Abort "Uninstall before installation failed. Installation stopped."
+    ${EndIf}
+    ; Check a user-visible side effect instead of trusting the child exit code.
+    IfFileExists "$SayAllPreviousInstallDirectory\${MAINBINARYNAME}.exe" 0 +3
+      SetErrorLevel 1603
+      Abort "Previous application remains. Installation stopped."
+    !insertmacro SayAllLogInstallResult a completed reinstall_uninstall
+  ${Else}
+    !insertmacro SayAllLogInstallResult a selected overlay
+  ${EndIf}
+!macroend
+
+!macro SayAllRecycleProductFiles
+  InitPluginsDir
+  StrCpy $SayAllInstallStage product_recycler
+  ClearErrors
+  File /oname=$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1 "${SAYALL_RETIRED_RECYCLER}"
+  !insertmacro SayAllRequireWriteSuccess product_recycler
+  StrCpy $SayAllInstallStage product_cleanup
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1" -InstallDirectory "$INSTDIR" -ProductFiles'
+  Pop $R8
+  Pop $R9
+  DetailPrint "$R9"
+  ${If} $R8 != 0
+    !insertmacro SayAllLogInstallResult a failed product_cleanup
+    SetErrorLevel 1603
+    Abort "Product files could not be recycled. User settings are preserved."
+  ${EndIf}
+  !insertmacro SayAllLogInstallResult a completed product_cleanup
+!macroend
+
+!macro SayAllRecycleRetiredFiles
+  InitPluginsDir
+  StrCpy $SayAllInstallStage retired_recycler
+  ClearErrors
+  File /oname=$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1 "${SAYALL_RETIRED_RECYCLER}"
+  !insertmacro SayAllRequireWriteSuccess retired_recycler
+  StrCpy $SayAllInstallStage retired_cleanup
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1" -InstallDirectory "$INSTDIR"'
+  Pop $R8
+  Pop $R9
+  DetailPrint "$R9"
+  ${If} $R8 != 0
+    SetErrorLevel 1603
+    Abort "Retired product files could not be recycled. No permanent deletion was attempted."
+  ${EndIf}
+!macroend
+
+!macro SayAllValidateUpgrade
+  StrCpy $SayAllInstallStage platform_check
   ${IfNot} ${AtLeastBuild} ${SAYALL_MINIMUM_WINDOWS_BUILD}
     MessageBox MB_ICONSTOP|MB_OK "无线麦 SayAll 需要 Windows 10 1809（内部版本 17763）或更高版本。$\r$\nSayAll requires Windows 10 1809 (build 17763) or later."
+    !insertmacro SayAllLogInstallResult a failed platform_check
     SetErrorLevel 1633
     Quit
   ${EndIf}
 
   Push $R8
   Push $R9
+  StrCpy $SayAllInstallStage version_check
   ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"
   ${If} $R8 != ""
     nsis_tauri_utils::SemverCompare "${VERSION}" $R8
@@ -147,22 +371,30 @@
         MessageBox MB_ICONSTOP|MB_OK "已安装较新版本的无线麦 SayAll，不能用此旧版本覆盖。$\r$\nA newer version of SayAll is already installed. This older installer cannot replace it."
       ${EndIf}
       SetErrorLevel ${SAYALL_DOWNGRADE_ERROR_LEVEL}
+      !insertmacro SayAllLogInstallResult a failed version_check
       Quit
     ${EndIf}
   ${EndIf}
   Pop $R9
   Pop $R8
 
+!macroend
+
+!macro NSIS_HOOK_PREINSTALL
+  !insertmacro SayAllValidateUpgrade
   ; 版本校验通过后才请正在运行的实例优雅退出：升级路径的关键一步。
   !insertmacro SayAllRequestGracefulExit install
+  !insertmacro SayAllVerifyCaptureCleanup
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
   ; 卸载同样不得强杀正在连接的应用（AGENTS.md 同一条规则）。
   !insertmacro SayAllRequestGracefulExit uninstall
+  !insertmacro SayAllVerifyCaptureCleanup
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
+  !insertmacro SayAllRecycleRetiredFiles
   Push $R8
   ReadRegStr $R8 HKLM "${SAYALL_VB_CABLE_SERVICE_KEY}" "DisplayName"
   ${If} $R8 == ""

@@ -78,7 +78,7 @@ pub struct AppSettings {
     pub voice_input_tool: Option<VoiceInputTool>,
     pub launch_at_login: bool,
     pub open_window_at_launch: bool,
-    pub restore_hid_enhancement: bool,
+    pub rc003_capture_enabled: bool,
     pub check_prerelease_updates: bool,
     pub theme_preference: ThemePreference,
     /// 应用图标；老配置没有这个字段时落回内置默认图标。
@@ -110,7 +110,7 @@ impl Default for AppSettings {
             voice_input_tool: None,
             launch_at_login: false,
             open_window_at_launch: true,
-            restore_hid_enhancement: false,
+            rc003_capture_enabled: false,
             check_prerelease_updates: false,
             theme_preference: ThemePreference::System,
             app_icon: AppIconIdentifier::Standard,
@@ -275,5 +275,38 @@ mod tests {
         .unwrap();
         assert_eq!(settings.app_icon, AppIconIdentifier::Standard);
         assert_eq!(settings.gain_db, 12.0);
+    }
+}
+
+#[cfg(test)]
+mod enhancement_default_tests {
+    use super::AppSettings;
+    #[test]
+    fn legacy_helper_opt_in_does_not_authorize_unified_capture() {
+        let loaded: AppSettings = serde_json::from_str(
+            r#"{"restore_hid_enhancement":true,"capture_input":{"enabled":true,"endpointId":"capture-test"},"ui_preferences":{"lockButtonSelection":false}}"#,
+        ).unwrap();
+        let encoded = serde_json::to_value(loaded).unwrap();
+        assert_eq!(encoded["rc003_capture_enabled"], false);
+        assert!(encoded.get("restore_hid_enhancement").is_none());
+        assert_eq!(encoded["capture_input"]["endpointId"], "capture-test");
+        assert_eq!(encoded["ui_preferences"]["lockButtonSelection"], false);
+        assert!(encoded["ui_preferences"]
+            .get("hidEnhancementExpanded")
+            .is_none());
+    }
+    #[test]
+    fn unified_capture_requires_explicit_opt_in_and_reopens_saved_intent() {
+        assert!(!AppSettings::default().rc003_capture_enabled);
+        assert!(
+            !serde_json::from_str::<AppSettings>("{}")
+                .unwrap()
+                .rc003_capture_enabled
+        );
+        let saved: AppSettings = serde_json::from_str(r#"{"rc003_capture_enabled":true}"#).unwrap();
+        assert!(saved.rc003_capture_enabled);
+        let reopened: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(reopened.rc003_capture_enabled);
     }
 }

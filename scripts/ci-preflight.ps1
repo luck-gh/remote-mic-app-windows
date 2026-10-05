@@ -2,7 +2,7 @@
 #
 # 背景（2026-09-05）：CI verify 曾因 rustfmt 格式漂移连续 10 次失败（run
 # #64-#73），而 CI 全量流水线约 19 分钟，反馈太慢。本脚本镜像 CI 的快速
-# 步骤（默认 7 步，失败时按 CI 步骤名报告）——本地过 = CI 的这些步骤必过
+# 步骤（默认 11 步，失败时按 CI 步骤名报告）——本地过 = CI 的这些步骤必过
 # （同一命令、同一仓库根）。
 #
 # 2026-09-21 补充：默认加入 runtime-simulation 的**编译检查**（CI 第 7 步的轻量版）。
@@ -11,8 +11,8 @@
 # 于是"本地 6/6 通过 + CI 红灯"并存了三个提交。
 #
 # 用法（仓库根目录）：
-#   powershell -File scripts\ci-preflight.ps1           # 7 步，含 runtime-simulation 编译检查
-#   powershell -File scripts\ci-preflight.ps1 -Full     # 8 步，追加 runtime-simulation Tauri 完整构建（慢，发布前用）
+#   powershell -File scripts\ci-preflight.ps1           # 11 步，含 Helper/agent 与隔离安装器回归
+#   powershell -File scripts\ci-preflight.ps1 -Full     # 12 步，追加 runtime-simulation Tauri 完整构建（慢，发布前用）
 #
 # 说明：CI 后续的重型步骤（NSIS 安装包、安装矩阵测试）本地不镜像——
 # 它们依赖 CI 环境且极少因常规改动失败；快速步骤通过后 CI 失败的概率
@@ -52,7 +52,7 @@ $step = 0
 function Invoke-Step {
     param([string]$Name, [scriptblock]$Action)
     $script:step++
-    Write-Host ("[$script:step/$(if ($Full) { 8 } else { 7 })] $Name ...")
+    Write-Host ("[$script:step/$(if ($Full) { 12 } else { 11 })] $Name ...")
     & $Action
     if ($LASTEXITCODE -ne 0) {
         Write-Host ("  FAIL（exit=$LASTEXITCODE）——CI 步骤 [$Name] 将失败") -ForegroundColor Red
@@ -85,8 +85,30 @@ Invoke-Step "Check Rust formatting" {
     cargo fmt --all -- --check
 }
 
+Invoke-Step "Stage locked input Helper resources" {
+    node scripts/stage-bundle-inputs.cjs
+}
+
 Invoke-Step "Test Rust workspace" {
     cargo test --workspace
+}
+
+Invoke-Step "Test unified input Helper" {
+    cargo test --locked --manifest-path hardware/RC003/helper/Cargo.toml
+}
+
+Invoke-Step "Test unified report agent" {
+    node hardware/RC003/helper/agent/agent_logic_test.mjs
+}
+
+# Only isolated contracts/path fixtures here. Actual recycling and NSIS compilation
+# belong to the installer CI job after its bundle build.
+Invoke-Step "Test isolated installer contracts" {
+    node --test scripts/test-windows-overlay-install.cjs
+    if ($LASTEXITCODE -ne 0) { return }
+    powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-capture-cleanup.ps1
+    if ($LASTEXITCODE -ne 0) { return }
+    powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-retired-files.ps1
 }
 
 Invoke-Step "Check Windows Tauri host" {

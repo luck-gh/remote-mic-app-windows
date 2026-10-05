@@ -24,6 +24,18 @@ use crate::send_input::KeyCode;
 use serde::Serialize;
 use std::sync::Arc;
 
+static REPORT_CAPTURE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CAPTURE_OWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn set_report_capture_enabled(value: bool) {
+    REPORT_CAPTURE_ENABLED.store(value, std::sync::atomic::Ordering::Release);
+}
+pub(crate) fn set_enhanced_owned_mask(mask: u64) {
+    CAPTURE_OWNED.store(mask, std::sync::atomic::Ordering::Release);
+}
+pub fn enhanced_owned_mask() -> u64 {
+    CAPTURE_OWNED.load(std::sync::atomic::Ordering::Acquire)
+}
 /// 录入边沿的来源。
 ///
 /// `Real` = 物理按键事件本身；`Injected` = 外部钩子（微信输入法等）在
@@ -605,6 +617,11 @@ mod windows_impl {
         let Some(button) = button_for_keyboard(vk_code as u16, make_code) else {
             return false;
         };
+        // RC003 mappings have one report-capture source. The keyboard hook must
+        // leave physical keyboards alone, including while capture is unavailable.
+        if super::REPORT_CAPTURE_ENABLED.load(Ordering::Acquire) {
+            return false;
+        }
         if requires_report_source(vk_code, make_code) {
             return false;
         }

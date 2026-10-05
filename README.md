@@ -97,14 +97,17 @@ Mac 可以运行前端构建和纯 Rust 测试，但不能证明 WinRT BLE、Raw
 ## 本地检查
 
 ```bash
-# 一键前置自检（推荐，push 前跑，约 1-2 分钟；通过 = CI 的快速步骤必过）
+# 一键前置自检（首次需构建 Helper 并获取散列锁定的 Gadget）
 powershell -ExecutionPolicy Bypass -File scripts\ci-preflight.ps1
 
 # 或分步执行：
 pnpm install
 pnpm test
 pnpm build
+node scripts/stage-bundle-inputs.cjs
 cargo test --workspace
+cargo test --locked --manifest-path hardware/RC003/helper/Cargo.toml
+node hardware/RC003/helper/agent/agent_logic_test.mjs
 cargo fmt --all -- --check
 ```
 

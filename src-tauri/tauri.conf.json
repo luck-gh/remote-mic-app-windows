@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:2430",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "node scripts/stage-bundle-inputs.cjs && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -34,6 +34,12 @@
     ],
     "createUpdaterArtifacts": true,
     "publisher": "GetSayAll",
+    "resources": [
+      "sayall-helper.exe",
+      "frida-gadget.dll",
+      "licenses/Frida-COPYING.txt",
+      "licenses/ATTRIBUTION.md"
+    ],
     "category": "Productivity",
     "shortDescription": "把 RC001/RC003 遥控器的语音和按键桥接到 Windows",
     "longDescription": "无线麦 SayAll Windows 版通过公开 Windows API 接收 RC001 和 RC003 遥控器的语音和普通按键。",
@@ -58,6 +64,7 @@
         "displayLanguageSelector": true,
         "installerIcon": "icons/icon.ico",
         "installerHooks": "windows/installer-hooks.nsh",
+        "template": "windows/installer.nsi",
         "uninstallerIcon": "icons/icon.ico",
         "startMenuFolder": "无线麦 SayAll"
       }

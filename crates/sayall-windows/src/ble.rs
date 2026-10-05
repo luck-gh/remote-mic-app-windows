@@ -3050,11 +3050,15 @@ pub fn initialize_diagnostic_log(
 /// 与 `gatt_sink()` 取同一路径来源，因此 `SAYALL_GATT_LOG` 覆盖时也返回真实目录，
 /// 不会指错地方。注意隐私边界：该路径只允许回给本机 UI，**不得写入日志内容**
 /// （日志条目里出现用户路径违反 AGENTS.md 的隐私规则）。
-pub fn diagnostic_log_directory() -> Option<std::path::PathBuf> {
+pub(crate) fn diagnostic_log_path() -> Option<std::path::PathBuf> {
     DIAGNOSTIC_LOG_PATH
         .get()
         .cloned()
-        .or_else(|| std::env::var_os("SAYALL_GATT_LOG").map(std::path::PathBuf::from))?
+        .or_else(|| std::env::var_os("SAYALL_GATT_LOG").map(std::path::PathBuf::from))
+}
+
+pub fn diagnostic_log_directory() -> Option<std::path::PathBuf> {
+    diagnostic_log_path()?
         .parent()
         .map(std::path::Path::to_path_buf)
 }

@@ -76,6 +76,10 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn open_bluetooth_settings(&self) -> Result<(), PlatformError>;
     fn voice_hold_hotkey(&self) -> Option<KeyChord>;
     fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>);
+    fn set_rc003_capture_enabled(&self, _enabled: bool) {}
+    fn rc003_bridge_snapshot(&self) -> sayall_windows::rc003_bridge::BridgeSnapshot {
+        Default::default()
+    }
     /// 「你在用的输入工具」：BLE 工作线程在语音会话开始前按它决定把哪个
     /// 输入法切进当前会话（`ime::ensure_session_ime`）。
     fn set_voice_input_tool(&self, _tool: Option<VoiceInputTool>) {}
@@ -130,6 +134,13 @@ pub trait PlatformRuntime: Debug + Send + Sync {
 }
 
 impl PlatformRuntime for WindowsPlatform {
+    fn set_rc003_capture_enabled(&self, enabled: bool) {
+        WindowsPlatform::set_rc003_capture_enabled(self, enabled);
+    }
+
+    fn rc003_bridge_snapshot(&self) -> sayall_windows::rc003_bridge::BridgeSnapshot {
+        WindowsPlatform::rc003_bridge_snapshot(self)
+    }
     fn capture_config_gate(&self) -> Arc<std::sync::Mutex<()>> {
         self.capture_config_gate()
     }

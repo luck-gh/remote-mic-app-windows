@@ -8,7 +8,6 @@ import {
   connectionPhaseLabel,
   formatDiagnosticReport,
   GITHUB_REPOSITORY_URL,
-  identityShortcutByButton,
   isRecommendedVoiceEndpoint,
   OFFICIAL_WEBSITE_URL,
   openGitHubRepository,
@@ -16,7 +15,6 @@ import {
   openOfficialWebsite,
   openVbCableDownloadPage,
   remoteModelLabel,
-  shortcutCapability,
   VB_CABLE_DOWNLOAD_URL,
   type AudioPhase,
   type ConnectionPhase,
@@ -31,47 +29,6 @@ describe("mouse actions", () => {
     expect(actionSummary({ type: "scroll", direction: "down", steps: 5 })).toBe("滚轮向下 5 格");
     expect(actionSummary({ type: "mouse_move", direction: "left", distance: 75 })).toBe("鼠标向左 75 px");
     expect(actionSummary({ type: "mouse_click", kind: "double_left" })).toBe("左键双击");
-  });
-});
-
-describe("mapping capability matrix（单响应判定，用于信息提示）", () => {
-  it("直接归因族（电源/菜单）全部触发单响应", () => {
-    expect(shortcutCapability("power", "long", "rc003")).toBe("all");
-    expect(shortcutCapability("power", "single", "rc003")).toBe("all");
-    expect(shortcutCapability("menu", "double", "rc003")).toBe("all");
-  });
-
-  it("武装族（确定/方向/主页）单击可同键对冲，双击/长按判定为附带原生动作", () => {
-    expect(shortcutCapability("ok", "single", "rc003")).toBe("identity");
-    expect(shortcutCapability("ok", "double", "rc003")).toBe("none");
-    expect(shortcutCapability("ok", "long", "rc003")).toBe("none");
-    expect(shortcutCapability("up", "single", "rc003")).toBe("identity");
-    expect(shortcutCapability("down", "single", "rc001")).toBe("identity");
-    expect(shortcutCapability("left", "single", "rc003")).toBe("identity");
-    expect(shortcutCapability("left", "double", "rc001")).toBe("none");
-    expect(shortcutCapability("right", "long", "rc001")).toBe("none");
-    expect(shortcutCapability("home", "single", "rc003")).toBe("identity");
-  });
-
-  it("TV 与返回/音量±不从普通输入路径推断单响应保证", () => {
-    expect(shortcutCapability("tv", "single", "rc003")).toBe("none");
-    expect(shortcutCapability("tv", "long", "rc001")).toBe("none");
-    for (const button of ["back", "volume_up", "volume_down"] as const) {
-      expect(shortcutCapability(button, "single", "rc003")).toBe("none");
-      expect(shortcutCapability(button, "double", "rc001")).toBe("none");
-      expect(shortcutCapability(button, "long", "unknown")).toBe("none");
-    }
-  });
-
-  it("identityShortcutByButton 对齐 Rust native_key（泄漏对冲判定依据）", () => {
-    expect(identityShortcutByButton.ok).toBe("enter");
-    expect(identityShortcutByButton.up).toBe("up");
-    expect(identityShortcutByButton.down).toBe("down");
-    expect(identityShortcutByButton.left).toBe("left");
-    expect(identityShortcutByButton.right).toBe("right");
-    expect(identityShortcutByButton.home).toBe("home");
-    expect(identityShortcutByButton.tv).toBeUndefined();
-    expect(identityShortcutByButton.power).toBeUndefined();
   });
 });
 

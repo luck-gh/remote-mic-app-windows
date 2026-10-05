@@ -1,8 +1,5 @@
-//! Read-only component evidence and the fixed, fail-closed elevation boundary.
-//! Release trust is compiled into the application/helper, never supplied by IPC
-//! or by an adjacent, editable manifest. VB-CABLE uses its official interactive
-//! setup as the separate elevation boundary. HID source and its device channel
-//! exist; fixed package hashes and kernel catalog policy gate maintenance.
+//! VB-CABLE evidence and its verified, official interactive installer.
+//! Input capture is owned by the unified RC003 bridge, not a filter driver.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,25 +7,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(windows)]
-#[path = "input_driver_package.rs"]
-mod hid_package;
-/// Separate Helper only: no caller-provided log path is accepted at elevation.
-pub fn initialize_helper_diagnostics() -> bool {
-    #[cfg(windows)]
-    {
-        hid_package::enable_helper_audit()
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentKind {
-    HidEnhancement,
     VbCable,
 }
 
@@ -143,21 +125,6 @@ pub struct ComponentOperation {
     pub status: ComponentStatus,
 }
 
-impl ComponentOperation {
-    pub fn exit_code(&self) -> i32 {
-        match self.outcome {
-            OperationOutcome::Completed | OperationOutcome::WizardClosed => 0,
-            OperationOutcome::Blocked => 50,
-            OperationOutcome::Cancelled => 1223,
-            OperationOutcome::Denied => 5,
-            OperationOutcome::TimedOut => 1460,
-            OperationOutcome::RestartRequired => 3010,
-            OperationOutcome::Failed if self.status.restart_required => 3011,
-            OperationOutcome::Failed => 1,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct Evidence {
     installed: Option<bool>,
@@ -206,37 +173,19 @@ fn describe(component: ComponentKind, evidence: Evidence) -> ComponentStatus {
         (InstallationState::Available, ComponentReason::Ready)
     };
     let wizard_supported = cfg!(all(windows, target_arch = "x86_64"));
-    let is_vb = component == ComponentKind::VbCable;
-    let blockers = if is_vb {
-        vec![ComponentReason::OfficialWizardRequired]
-    } else {
-        vec![ComponentReason::SigningPolicyMissing]
-    };
     ComponentStatus {
         component,
-        installation: if is_vb {
-            installation
-        } else {
-            InstallationState::Unknown
-        },
-        package: if is_vb {
-            PackageState::DownloadAvailable
-        } else {
-            PackageState::SignatureMissing
-        },
+        installation,
+        package: PackageState::DownloadAvailable,
         installed_version: None,
         service_installed: evidence.installed,
         loaded: evidence.loaded,
         bound: None,
         audio_endpoints_ready: evidence.endpoints,
         restart_required: evidence.restart,
-        reason: if is_vb {
-            reason
-        } else {
-            ComponentReason::SigningPolicyMissing
-        },
-        blockers,
-        allowed_actions: if is_vb && wizard_supported {
+        reason,
+        blockers: vec![ComponentReason::OfficialWizardRequired],
+        allowed_actions: if wizard_supported {
             vec![ComponentAction::OpenVendorWizard]
         } else {
             Vec::new()
@@ -244,22 +193,8 @@ fn describe(component: ComponentKind, evidence: Evidence) -> ComponentStatus {
     }
 }
 
-fn inspect_one(component: ComponentKind) -> ComponentStatus {
-    #[cfg(windows)]
-    if component == ComponentKind::HidEnhancement {
-        return hid_package::inspect();
-    }
-    let evidence = match component {
-        // A guessed service name is not evidence of this product's filter.
-        ComponentKind::HidEnhancement => Evidence {
-            installed: None,
-            loaded: None,
-            endpoints: None,
-            restart: false,
-            failure: None,
-        },
-        ComponentKind::VbCable => probe_vb_cable(),
-    };
+pub fn inspect_component(component: ComponentKind) -> ComponentStatus {
+    let evidence = probe_vb_cable();
     let status = describe(component, evidence);
     crate::gatt_note(format!(
         "component_support action=inspect component={component:?} installation={:?} reason={:?} allowed_actions={}",
@@ -270,71 +205,19 @@ fn inspect_one(component: ComponentKind) -> ComponentStatus {
     status
 }
 
-pub fn inspect_components() -> Vec<ComponentStatus> {
-    [ComponentKind::HidEnhancement, ComponentKind::VbCable]
-        .into_iter()
-        .map(inspect_one)
-        .collect()
-}
-
-/// Fixed CLI vocabulary; paths, commands, extra switches and manifests are rejected.
-pub fn parse_helper_arguments(arguments: &[String]) -> Option<(ComponentKind, ComponentAction)> {
-    let [component, action] = arguments else {
-        return None;
-    };
-    let component = match component.as_str() {
-        "hid_enhancement" => ComponentKind::HidEnhancement,
-        "vb_cable" => ComponentKind::VbCable,
-        _ => return None,
-    };
-    let action = match action.as_str() {
-        "install" => ComponentAction::Install,
-        "repair" => ComponentAction::Repair,
-        "remove" => ComponentAction::Remove,
-        _ => return None,
-    };
-    Some((component, action))
-}
-
-// VB-CABLE stays on its independent vendor wizard. Non-Windows HID cannot use
-// the Windows-only fixed-package Helper implementation.
-fn unsupported_operation_reason(component: ComponentKind) -> ComponentReason {
-    match component {
-        ComponentKind::VbCable => ComponentReason::OfficialWizardRequired,
-        ComponentKind::HidEnhancement => ComponentReason::SigningPolicyMissing,
-    }
-}
-
 /// Call on a background thread after the visible VB-Audio donationware notice
 /// and explicit wizard confirmation. Legacy silent actions remain unsupported.
 pub fn perform_component_action(
     component: ComponentKind,
     action: ComponentAction,
 ) -> ComponentOperation {
-    #[cfg(windows)]
-    if component == ComponentKind::HidEnhancement {
-        return operation_result(component, action, hid_package::launch(action));
-    }
     if action == ComponentAction::OpenVendorWizard {
-        return operation_result(component, action, open_vendor_wizard(component));
+        return operation_result(component, action, open_vendor_wizard());
     }
     operation_result(
         component,
         action,
-        Err(unsupported_operation_reason(component)),
-    )
-}
-
-/// The independent Helper rechecks the fixed HID package; VB stays on its wizard.
-pub fn helper_request(component: ComponentKind, action: ComponentAction) -> ComponentOperation {
-    #[cfg(windows)]
-    if component == ComponentKind::HidEnhancement {
-        return operation_result(component, action, hid_package::maintain(action));
-    }
-    operation_result(
-        component,
-        action,
-        Err(unsupported_operation_reason(component)),
+        Err(ComponentReason::OfficialWizardRequired),
     )
 }
 
@@ -343,7 +226,7 @@ fn operation_result(
     action: ComponentAction,
     result: Result<Option<u32>, ComponentReason>,
 ) -> ComponentOperation {
-    let mut status = inspect_one(component);
+    let mut status = inspect_component(component);
     if matches!(result, Ok(Some(3010 | 3011 | 1641))) {
         status.restart_required = true;
     }
@@ -364,9 +247,6 @@ fn operation_result(
     let message=format!(
         "component_support action={action:?} component={component:?} terminal_result={outcome:?} reason={reason:?}"
     );
-    #[cfg(windows)]
-    hid_package::note(message);
-    #[cfg(not(windows))]
     crate::gatt_note(message);
     ComponentOperation {
         component,
@@ -627,15 +507,12 @@ fn download_vendor_package() -> Result<VerifiedArtifact, ComponentReason> {
     prepare_vendor_package(&bytes)
 }
 
-fn open_vendor_wizard(component: ComponentKind) -> Result<Option<u32>, ComponentReason> {
-    if component != ComponentKind::VbCable {
-        return Err(ComponentReason::NotImplemented);
-    }
+fn open_vendor_wizard() -> Result<Option<u32>, ComponentReason> {
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
         let guard = OperationGuard::acquire()?;
         let package = download_vendor_package()?;
-        native::run_elevated_helper(package, component, ComponentAction::OpenVendorWizard, guard)
+        native::run_vendor_wizard(package, guard)
     }
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     Err(ComponentReason::UnsupportedArchitecture)
@@ -680,6 +557,15 @@ fn confined_path(root: &Path, relative: &str) -> Result<PathBuf, ComponentReason
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_hid_driver_component_is_rejected_at_the_ipc_boundary() {
+        assert!(serde_json::from_str::<ComponentKind>(r#""hid_enhancement""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<ComponentKind>(r#""vb_cable""#).unwrap(),
+            ComponentKind::VbCable
+        );
+    }
 
     // Component operations deliberately share one process-wide exclusion guard.
     static OPERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -754,7 +640,7 @@ mod tests {
         assert_eq!(ready.bound, None);
         assert_eq!(ready.installed_version, None);
         assert_eq!(
-            describe(ComponentKind::HidEnhancement, evidence(None, None, None)).installation,
+            describe(ComponentKind::VbCable, evidence(None, None, None)).installation,
             InstallationState::Unknown
         );
     }
@@ -778,57 +664,23 @@ mod tests {
     }
 
     #[test]
-    fn helper_accepts_only_exact_component_action_pairs() {
+    fn silent_vendor_operations_are_blocked_without_elevation() {
         let _operation_test = OPERATION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            parse_helper_arguments(&["vb_cable".into(), "install".into()]),
-            Some((ComponentKind::VbCable, ComponentAction::Install))
-        );
-        for args in [
-            vec![],
-            vec!["vb_cable", "install", "--manifest", "other.json"],
-            vec!["other", "install"],
-            vec!["vb_cable", "cmd.exe"],
-            vec!["../driver", "remove"],
+        for action in [
+            ComponentAction::Install,
+            ComponentAction::Repair,
+            ComponentAction::Remove,
         ] {
-            assert!(parse_helper_arguments(
-                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
-            )
-            .is_none());
+            assert_eq!(
+                perform_component_action(ComponentKind::VbCable, action).outcome,
+                OperationOutcome::Blocked
+            );
         }
-    }
-
-    #[test]
-    fn absent_release_material_blocks_every_write_without_elevation() {
-        let _operation_test = OPERATION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for component in [ComponentKind::HidEnhancement, ComponentKind::VbCable] {
-            for action in [
-                ComponentAction::Install,
-                ComponentAction::Repair,
-                ComponentAction::Remove,
-            ] {
-                assert_eq!(
-                    helper_request(component, action).outcome,
-                    OperationOutcome::Blocked
-                );
-            }
-        }
-        // A real exported entrypoint follows the same gate before it can open a
-        // package or launch a process. Its status recheck is read-only.
-        let result =
-            perform_component_action(ComponentKind::HidEnhancement, ComponentAction::Install);
+        let result = perform_component_action(ComponentKind::VbCable, ComponentAction::Install);
         assert_eq!(result.outcome, OperationOutcome::Blocked);
-        assert!(matches!(
-            result.reason,
-            ComponentReason::SigningPolicyMissing
-                | ComponentReason::PackageMissing
-                | ComponentReason::PathRejected
-        ));
-        assert_eq!(result.exit_code(), 50);
+        assert_eq!(result.reason, ComponentReason::OfficialWizardRequired);
     }
 
     #[test]
@@ -870,17 +722,10 @@ mod tests {
     }
 
     #[test]
-    fn vendor_wizard_rejects_other_components_without_processes() {
+    fn vendor_wizard_rejects_untrusted_download_without_processes() {
         let _operation_test = OPERATION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            open_vendor_wizard(ComponentKind::HidEnhancement),
-            Err(ComponentReason::NotImplemented)
-        );
-        assert!(
-            parse_helper_arguments(&["vb_cable".into(), "open_vendor_wizard".into()]).is_none()
-        );
         assert_eq!(
             unpack_vendor_zip(b"untrusted downloaded bytes").unwrap_err(),
             ComponentReason::HashMismatch
@@ -1180,10 +1025,8 @@ mod native {
         Ok(wide)
     }
 
-    pub(super) fn run_elevated_helper(
+    pub(super) fn run_vendor_wizard(
         helper: VerifiedArtifact,
-        component: ComponentKind,
-        action: ComponentAction,
         guard: OperationGuard,
     ) -> Result<Option<u32>, ComponentReason> {
         // ShellExecuteEx may require COM. Never assume a reused host worker's
@@ -1203,16 +1046,14 @@ mod native {
                 }
             }
             let _com = Com;
-            run_elevated_in_apartment(helper, component, action, guard)
+            run_vendor_in_apartment(helper, guard)
         })
         .join()
         .map_err(|_| ComponentReason::HelperFailed)?
     }
 
-    fn run_elevated_in_apartment(
+    fn run_vendor_in_apartment(
         helper: VerifiedArtifact,
-        component: ComponentKind,
-        action: ComponentAction,
         guard: OperationGuard,
     ) -> Result<Option<u32>, ComponentReason> {
         use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -1221,40 +1062,17 @@ mod native {
             ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
             SHELLEXECUTEINFOW,
         };
-        use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
-        let vendor_wizard = action == ComponentAction::OpenVendorWizard;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
         let executable = shell_path(&helper.path)?;
-        let component = match component {
-            ComponentKind::HidEnhancement => "hid_enhancement",
-            ComponentKind::VbCable => "vb_cable",
-        };
-        let action = match action {
-            ComponentAction::OpenVendorWizard => "",
-            ComponentAction::Install => "install",
-            ComponentAction::Repair => "repair",
-            ComponentAction::Remove => "remove",
-        };
-        let arguments: Vec<u16> = if vendor_wizard {
-            String::new()
-        } else {
-            format!("{component} {action}")
-        }
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
         let directory = shell_path(helper.path.parent().ok_or(ComponentReason::PathRejected)?)?;
         let mut launch = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
             lpVerb: w!("runas"),
             lpFile: PCWSTR(executable.as_ptr()),
-            lpParameters: PCWSTR(arguments.as_ptr()),
+            lpParameters: PCWSTR::null(),
             lpDirectory: PCWSTR(directory.as_ptr()),
-            nShow: if vendor_wizard {
-                SW_SHOWNORMAL.0
-            } else {
-                SW_HIDE.0
-            },
+            nShow: SW_SHOWNORMAL.0,
             ..Default::default()
         };
         if let Err(error) = unsafe { ShellExecuteExW(&mut launch) } {
@@ -1272,8 +1090,7 @@ mod native {
             return Err(ComponentReason::HelperFailed);
         }
         let process = launch.hProcess;
-        let wait =
-            unsafe { WaitForSingleObject(process, if vendor_wizard { 600_000 } else { 60_000 }) };
+        let wait = unsafe { WaitForSingleObject(process, 600_000) };
         if wait == WAIT_TIMEOUT {
             // Never kill an installer or pretend it rolled back. Retain the
             // verified file and operation lock until its actual termination.

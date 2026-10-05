@@ -115,27 +115,32 @@ async function recordExternalEntry(label: string, steps: string[]): Promise<void
 
 async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   mark("journey_start");
-  // 应用默认打开"按键"页（对齐 Mac 页序），先导航到连接页完成连接旅程。
-  await openPage("连接");
-  await waitFor(
-    () => (document.querySelector("h1")?.textContent?.trim() === "连接" ? true : null),
-    "连接首页",
-  );
+  // 驱动页允许已连接时重新扫描；连接页在自动连接后会禁用扫描入口。
+  await openPage("驱动", "驱动与配对");
   const runtime = await getRuntimeSnapshot();
   assert(runtime.platform.platform === "windows-ci-simulation", "应用未使用 Windows CI 仿真后端");
   steps.push("Tauri WebView 通过真实 IPC 读取仿真运行快照");
 
-  await clickButton("扫描已配对设备");
+  const pairing = await waitFor(
+    () => document.querySelector<HTMLDetailsElement>(".driver-guide .pairing-guide"),
+    "配对与重新连接区域",
+  );
+  const pairingSummary = pairing.querySelector<HTMLElement>("summary");
+  assert(pairingSummary?.textContent?.trim() === "配对与重新连接", "驱动页缺少配对展开入口");
+  if (!pairing.open) pairingSummary.click();
+  await waitFor(() => (pairing.open ? true : null), "配对与重新连接展开");
+  await clickButton("扫描已配对遥控器");
   await waitFor(
-    () => (document.body.textContent?.includes("找到 2 个已配对的小米遥控器") ? true : null),
+    () => (document.querySelectorAll(".driver-guide .device-list li").length === 2 ? true : null),
     "RC001/RC003 扫描结果",
   );
   const remotes = await scanPairedRemotes();
   assert(remotes.length === 2, "仿真扫描没有同时返回 RC001 和 RC003");
   assert(remotes.some((remote) => remote.model === "rc001"), "仿真扫描缺少 RC001");
   assert(remotes.some((remote) => remote.model === "rc003"), "仿真扫描缺少 RC003");
-  steps.push("连接页面渲染 RC001/RC003 扫描结果");
+  steps.push("驱动页展开配对区域，经扫描按钮渲染 RC001/RC003 结果");
 
+  await openPage("连接");
   const rc001 = remotes.find((remote) => remote.model === "rc001");
   assert(rc001, "找不到 RC001 仿真设备");
   const connection = await connectRemote(rc001.id);

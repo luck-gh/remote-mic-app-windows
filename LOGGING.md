@@ -41,6 +41,16 @@ windows_build=<build 或 unknown>
 在用户看到主页面前后分别留痕，确保安装后白屏可以区分为宿主、WebView、脚本、
 Vue 渲染或 IPC 阶段故障。
 
+安装器另在 `%LOCALAPPDATA%\SayAll\installer-result.log` 保存当前安装结果摘要，每次启动
+覆盖上一轮，仅记录固定的 `event=start|selected|passed|failed|completed` 和 `component` 分类。失败分类
+区分正常退出、按键清理、旧文件回收及具体写入组件（如 `app`、`helper`、`gadget`、
+`uninstaller`），并区分目录权限预检、选择覆盖、安装前卸载与产品文件回收。当前包临时
+卸载器追加到父安装轮，不覆盖起始记录；正文不记录实际路径、配置内容或用户身份。这份摘要用于定位本次安装
+停在哪一阶段，不替代上述应用事件日志；日志写入成功或失败均不得改变 NSIS 原有错误
+标志、退出码和调用方寄存器。验证方法见
+[安装器专项](Testing/WindowsInstallerGracefulExit.md)，现场归因见
+[前台按键回归记录](Bugs/2026-10-03-foreground-input-regression.md)。
+
 ## 必需事件链
 
 每项功能按实际存在的边界记录：

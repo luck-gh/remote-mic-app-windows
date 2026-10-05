@@ -155,9 +155,9 @@ impl SettingsStore {
         })
     }
 
-    pub fn save_restore_hid_enhancement(&self, enabled: bool) -> Result<(), String> {
-        self.update("保存三键增强启动设置", |settings| {
-            settings.restore_hid_enhancement = enabled;
+    pub fn save_rc003_capture_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存全按键支持设置", |settings| {
+            settings.rc003_capture_enabled = enabled;
         })
     }
     pub fn save_ui_preference(
@@ -1118,7 +1118,7 @@ mod tests {
         let store = template_test_store();
         let original = source_configuration();
         store.save_mapping_configuration(original.clone()).unwrap();
-        store.save_restore_hid_enhancement(true).unwrap();
+        store.save_rc003_capture_enabled(true).unwrap();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 store
@@ -1160,7 +1160,7 @@ mod tests {
         });
         let reopened = SettingsStore::new(store.path.clone());
         let app = reopened.load().unwrap();
-        assert!(app.restore_hid_enhancement);
+        assert!(app.rc003_capture_enabled);
         assert_eq!(
             app.ui_preferences,
             sayall_core::UiPreferences {
@@ -1239,11 +1239,11 @@ mod tests {
     fn enhancement_and_menu_opt_ins_reopen_without_replacing_other_preferences() {
         let store = template_test_store();
         let mut settings = store.load().unwrap();
-        assert!(!settings.restore_hid_enhancement);
+        assert!(!settings.rc003_capture_enabled);
         store.save_theme_preference(ThemePreference::Dark).unwrap();
         settings = store.load().unwrap();
-        store.save_restore_hid_enhancement(true).unwrap();
-        settings.restore_hid_enhancement = true;
+        store.save_rc003_capture_enabled(true).unwrap();
+        settings.rc003_capture_enabled = true;
         assert_eq!(
             SettingsStore::new(store.path.clone()).load().unwrap(),
             settings
@@ -1260,8 +1260,8 @@ mod tests {
                 .unwrap(),
             configuration
         );
-        store.save_restore_hid_enhancement(false).unwrap();
-        settings.restore_hid_enhancement = false;
+        store.save_rc003_capture_enabled(false).unwrap();
+        settings.rc003_capture_enabled = false;
         assert_eq!(store.load().unwrap(), settings);
         assert_eq!(store.load_mapping_configuration().unwrap(), configuration);
     }
