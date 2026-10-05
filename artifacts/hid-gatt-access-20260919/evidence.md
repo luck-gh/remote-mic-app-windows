@@ -607,3 +607,204 @@ Rust观察/执行隔离与生命周期3项、IPC序列化1项、按键页24项�
 BLE真实连接ready、input_context connected=true、电量公开读取available、journal为空；Helper已握手与bound、配置mask7回执成功，但新run `864b2e7a45b14fb097f895a3cc444684` 仍 `pending_per_request`，不以进程存在宣称增强动作ready。复用现有Notepad→BUDTH关联，建立独立空白 `RC003-acceptance-merge.txt`（PID33472）；03:26:52.608起仅请求语音短句hold/release+x验收，等待用户实际反馈。三键首实际报告、映射/注入、菜单/键盘录入与其他受影响硬件结果仍pending；无电源/无线电操作。此后允许push test并建draft PR运行CI，main合入仍需CI及受影响实机门禁通过。
 
 2026-09-27 CI 跟进：draft PR [#1](https://github.com/luck-gh/remote-mic-app-windows/pull/1)，head `6811bc8b4ff6422bde2992653563a02fde3f2587`。首轮 [run 36266247769](https://github.com/luck-gh/remote-mic-app-windows/actions/runs/36266247769) completed/failure，唯一失败步骤为运行中安装的正常退出测试；此前前端/Rust/仿真/生产构建/安装矩阵/静默安装步骤已通过，artifact 上传未执行。命名退出请求与 supervisor/input_quiesce/raw_input_stop/ble_disconnect/capture_route 清理均 passed，overall 85ms/failed_stages0；失败因测试仍断言已删除的上游 `ble_session_shutdown/platform_shutdown` 日志。修正仅涉及测试契约和文档，要求统一 ExitCleanup 全阶段、从 NSIS 读取21.5s预算，失败收尾不强杀；14项纯断言（含冻结实际日志与缺阶段/失败/超时反例）通过。当前产品包不变、用户运行现场与配置未动；新CI与用户语音组仍 pending，未重建/重装、未合main、未发布。
+
+2026-09-27 12:33 UI/增强恢复候选：先确认 b293ebfd 的 [CI run36283553274](https://github.com/luck-gh/remote-mic-app-windows/actions/runs/36283553274) 09:05 completed/success，未补过期查询。用户新增默认自动启动和恢复按钮后，只修改现有偏好默认及原客户端正常启停：Idle→Queued→Starting→Running；手动恢复 Running→Restarting，旧进程未退出不得进入 Queued。原生终态0=正常，1=业务失败但清理完成，2=清理未确认，卸载/分离/manager关闭错误纳入2；来源/报告/WDF脚本未改。15秒提示仅报告仍待清理，不允许以超时替代完成；应用正常退出仍用原有有界RawInput stop，不强杀。UI保留准确状态、自动启动可关闭、限定UAC与简单菜单操作提示。前端68项通过（唯一初次失败为旧文案断言，overlay16已复验）；Rust增强/配对/管道8项、缺省与显式false/字段保存重开2项、原生10项控制器+3项退出码验证通过。无实际设备操作/来源复验，候选安装与用户实机待验；此前语音组无回复，不标passed。
+
+- 启动加载失败补界：设置损坏/读取失败时仍启动普通主程序，但明确禁止该次自动增强；新配置默认 true、已保存 false 分别保留。真实启动分支回归 1 passed。12:36 中间包未安装，最终包为本补界之后增量构建。
+
+2026-09-27 12:46 最终部署：最终增量构建10279 exit0；0.2.6 包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T12:41:59.2056585+08:00，26,412,810 bytes，SHA256 `356e70b2b95398b1483b18ee09b14463bc3509728ddf47e8895161d46f2c72e3`。旧App32936/Helper27836经原托盘入口正常退出，应用清理121ms/failed_stages0，Helper script_cleanup/script_unload/session_detach/terminal均0。首次退出身份检查被CIM时间舍入拒绝且未发命令，改用GetProcess精确创建时间后只发一次真实退出，没有强杀。
+
+管理员原目录覆盖exit0；安装App SHA256 `e66ca264ea70a51e7a1bb5472a00053f249bd72226312201b2a3dd82d28f8552`，逐字节仅NSIS UNK→NSS三字节差异；安装Helper SHA256 `7c56f3f290f8f3b69b1d2f3bc8b959a7d1fad998ea896fe3e325632bfcf5535a`，与本次冻结构建的Helper完全匹配。本次Helper改动仅清理终态准确传播，固定来源/WDF报告脚本不变。真实Explorer启动App45248（12:43:19.3499436，TokenElevation0）与Helper29324（12:43:20.6878095，TokenElevation1），实际映像均既有安装目录。退出前最新settings/button-mappings/capture-input-session三文件安装后字节相同，用户09:36新映射及自动增强true/输入锁定true均保留。
+
+新run `7d087f23981b4d7da3dad8b0463c8656` 自动请求一次、peer_verified、公开树唯一当前节点通过、mask7配置accepted=true；仍bound source=pending_per_request，尚无新会话逐报告/真实释放ready证据，不要求初始化或自行预热。当前仅请用户在驱动页点一次“重新启动增强”，完成后核正常旧进程退出与唯一新Helper；实机尚pending。b293 CI只覆盖已提交整合候选，不能外推本轮18文件未提交修改。未合main/未发布/未执行电源无线电操作。过程材料复用enhancement-restart-*，保留首失败与最终验证/部署摘要到本次验收关闭，未另复制包或清理历史材料。
+
+2026-09-27 13:33 用户要求删除签名驱动页面区域：ComponentSupportPanel的HID状态、维护按钮/处理/文案已移除；原页面get_component_status会同时检测两组件，现改为指定component查询，页面仅请求vb_cable。后台inspect/maintenance保留，未执行驱动安装/卸载或修改安全策略。ComponentSupportPanel5项与DriverGuide2项通过，覆盖首次与向导返回刷新均只查询VB-CABLE；真实增强重启前一组仍无用户反馈，不标passed。
+
+2026-09-27 13:39 页面区域移除部署：受影响7项前端测试、pnpm build及本地NSIS构建57504均exit0。最终0.2.6包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T13:37:11.2189275+08:00，26,417,350 bytes，SHA256 `b08b46584e20daa9a2c7fa7aa1c126668ae34f16be11140ed5f63d4506bb38ee`。旧App45248/Helper29324正常退出，客户端cleanup_completed clean=true/exit_code0/142ms，应用overall passed/263ms/failed_stages0，原生script_cleanup/unload/detach/terminal均0。这是正常退出证据，不能冒称此前按钮重启组已通过。
+
+管理员原目录覆盖exit0，安装App SHA `ced650a6504f436b680ca1089827769561f65b0c4bb1df7a9d25d3cce7faeb85`，与release仅NSIS标记3字节不同；Helper SHA `ee6dc4290bc1355361781a715d0e28d1722662d14938e24052b39284b3a4e18c`与本次构建精确一致。真实Explorer新App36816（13:38:29.6948180，TokenElevation0）/Helper36732（13:38:30.9250428，TokenElevation1），实际路径均既有安装目录。settings、button-mappings、capture-input-session与退出前最新基线字节相同；自动增强/输入锁定true保留。run `fa7386fbac634016b9fca238b9504c89` 自动请求一次、peer_verified、mask7 accepted=true，bound仍pending_per_request，不额外等待/请求准备键或声称逐报告ready。未重试旧UIA/截图路线，自然页面删除观察、按钮重启及既有未回语音/Menu实机仍pending；无Git写入/系统驱动安装卸载/电源无线电操作。component-panel-removal-*只留本次测试、最终构建及部署摘要至验收关闭，不复制新台账或清理历史材料。
+
+2026-09-27 13:52 RC003整体折叠候选：原生details/summary总标题仅名称和已有真实状态短句，交互按钮均在展开内容内；刷新与重启只更新状态，不重建折叠容器。新增既有UiPreferences字段hidEnhancementExpanded/default true及白名单分支，经SettingsStore单字段锁合并，不重配映射/启用或停止Helper。首次加载程序open变化不落盘，收起读取及保存失败沿既有模式保留真实值与错误。组件6/驱动页2/偏好5共13passed，现有并发写入+重开保护用例1passed，pnpm build exit0。未重跑HID/原生或电源/无线电，源已冻结准备唯一候选安装；实际折叠观察仍pending。
+
+2026-09-27 13:59 总折叠部署：唯一构建28237 exit0，0.2.6包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T13:55:38.9612158+08:00，26,417,002 bytes，SHA256 `b7f0e462bad634620798cdc506f31f6641e5efed634a49fcb33fae4219f59e5c`。旧App36816/Helper36732经原托盘正常退出，客户端clean=true/exit0/162ms，整体291ms/failed_stages0，原生cleanup/unload/detach/terminal均0。管理员既有目录覆盖exit0。
+
+安装App SHA `2c32aebb74af5f87f79a82b0c330210b134b294ad63ab3ef6cfbadee2e9cbdb0` 与构建EXE仅NSIS标记3字节差异；Helper SHA `4bddb20fc14aa11d39d1bffb25a4c68e0f7cdcfd27f8f50b3ae74757a41878d4` 精确匹配本次构建。Explorer新App9952（13:57:16.0033829，TokenElevation0）、Helper46944（13:57:17.3337831，TokenElevation1），实际安装路径已核。settings/button-mappings/capture-input-session与退出前最新基线字节相同，自动增强与输入锁定true保留；新折叠字段只在用户实际改变偏好时单字段写入，启动不覆盖旧配置。新run `45fd60b08bec4c258ba4214383df07d5` 已握手、配置回执成功，初始bound pending_per_request；本次未验证逐报告动作ready，不把其存在或UI截图当旧按钮重启/设备实机通过。仅待用户自然开页面观察总折叠、状态及页面重开记忆，不请求遥控预热、不重试UIA/截图路线。过程材料限enhancement-collapse-*，保留本次验证/最终构建/部署摘要至验收关闭；全部改动仍未提交，未合main或发布。
+
+2026-09-27 14:08 驱动页对比候选：重启按钮原缺共享primary/secondary类，次按钮原透明边界在卡片上过淡。仅.driver-guide作用域复用浅深主题，补主操作类、实色次按钮边框、hover/按下/焦点/disabled；其他页面不变。summary名称与短状态分列可换行，无按钮嵌summary。现有已就绪/等待映射或释放/异常分为成功/等待/错误文字+符号徽标；BLE连接单独标BLE，不代替增强状态。后端判定/来源/折叠持久与配置均未改。
+
+ComponentSupportPanel12/DriverGuide2/主题3共17passed，前端生产构建通过。依据[W3C文本最低对比](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html)与[非文本对比](https://www.w3.org/WAI/WCAG22/Understanding/non-text-contrast.html)，本页浅深实际token计算32项：原浅色pending4.454未达4.5，仅本页改用既有text-control；最终文字最小4.634:1，按钮边界/焦点最小4.526:1，分别超过4.5/3目标。这是CSS色值计算，非整应用可访问性认证或实机视觉passed。复用历史UIA导航不可访问事实，不建立新截图/页面扫描工具，安装后待用户自然观察。
+
+2026-09-27 14:12 对比候选部署及已有重启实证：构建23409 exit0，0.2.6包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T14:10:00.9901436+08:00，26,416,889 bytes，SHA256 `bde4735b2c9394a2df5a412e5427ba1c39b8ca6c7b6f5a4c0b880f61d1cc6bb1`。退出前发现历史Helper46944已不存在，第一次精确身份检查即停止，未发退出或安装命令；限定当前实例与已有日志一次核对确认13:59:05.744实际restart_requested，旧Helper143ms内clean=true/exit0，随后restart_cleanup_passed→runas，13:59:06.430唯一新Helper34476完成peer_verified。该事实只关闭“客户端正常清理旧实例→唯一新实例启动/握手”的重启链，来源重新确认及三键动作仍未验，不补发重启或按键。
+
+随后App9952/Helper34476经原托盘正常退出，客户端122ms/clean=true/exit0，应用overall249ms/failed_stages0，原生cleanup/unload/detach/terminal均0；管理员原安装目录覆盖exit0。安装App SHA256 `2a2cf9844e93de8fd822ea12f24c0869ca4bd1664994b6528ab610025426367a`，与release仅NSIS标记3字节差异；Helper SHA256 `d686d5de92ea825a446adf6d02336d7276380678b9ee41d1cdfaa923ef161bd8`与本次构建一致，本轮仅前端视觉改动未改其源码。Explorer启动App45848（14:11:15.2951802，TokenElevation0）/Helper46960（14:11:16.4555583，TokenElevation1），映像均为既有安装目录。settings/button-mappings/capture-input-session与本次正常退出前最新基线字节相同，保留用户自动增强/输入锁定及UI偏好选择。
+
+新run `1bfee54f68484d5aa944c0f88a0029e3`自动请求一次、peer_verified、mask7 accepted=true，初始bound仍pending_per_request；未以握手或进程存在宣称逐报告ready。最终自然视觉观察仍pending，不重复设备、UIA或截图验证。过程材料限本次driver-contrast测试/构建日志、色值与部署摘要，保留至验收关闭；未清理历史、未Git写入/合main/发布，未执行电源/无线电操作。
+
+2026-09-27 滚动槽宽度修正：用户截图表明驱动卡片展开产生根滚动条后整页缩窄。既有app-shell只有min-height，普通main未受视口高度约束，实际长页由根滚动；按键页则已有独立buttons-scroll和固定操作行。现仅CSS把app-shell限定100dvh、普通main设min-height0及原生scrollbar-gutter:stable，移除该滚动层隐藏滚动条的旧样式；按键页外层gutter:auto避免叠加，正文已有stable保留，固定操作行用hidden+stable对齐槽位且不产生第二条滚动条。侧栏、浮层、状态判定及用户配置不改，无JS测量或固定滚动条像素值。[Chromium官方Chrome94说明](https://developer.chrome.com/blog/new-in-chrome-94)确认该原生属性用于内容扩展时避免重排；现有WebView2沿用Chromium能力，不新增兼容层。
+
+既有Buttons29/DriverGuide2/ComponentSupportPanel12/导航11共54passed，未新增CSS镜像测试，也未重复HID/Rust/语音验证。无现成可直接复用的主页面几何浏览器检查，不建立新载体；自动化结果不代表折叠前后真实矩形或自然视觉passed。唯一构建89143及其生产前端构建exit0。14:25:43旧App45848/Helper46960通过已验证托盘入口正常退出，客户端264ms/clean=true/exit0，整体393ms/failed_stages0，script_cleanup/unload/detach/terminal均0；退出前以最新三文件hash保留配置基线，无强杀。
+
+14:27滚动槽候选部署：0.2.6包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T14:27:19.8947277+08:00，SHA256 `926a9848edfb7f94b358ca293532331b03e3d1032739e2f3c051fdfa2b93b100`，管理员既有目录覆盖exit0。真实Explorer启动App41980（14:27:54.7578817，TokenElevation0）/Helper27176（14:27:56.0492689，TokenElevation1）；安装App SHA256 `742892e4373a0c15bfb022d806d3ee34b4421c2929a4f92934e65169ec67ff33`与本次release仅NSIS三字节标记不同，Helper SHA256 `dd3cee67005e36328b6ee08d6172d86eb25a41957475eb7bfc8b1eba662435ee`精确匹配固定构建产物。settings/button-mappings/capture-input-session与退出前最新基线字节相同。未读新按键日志或确认逐报告ready，本轮只交付CSS候选，设备动作及此前未反馈验收均不外推。
+
+自然折叠/展开前后页面宽度、按键页独立滚动与固定操作行视觉仍pending。过程材料仅保留scrollbar-gutter测试/构建日志与部署摘要到验收关闭；完成用的一次性身份读取脚本及无独有内容的passed文本移入系统回收站，未触碰历史材料。无Git写入/发布/电源/无线电操作。
+
+
+2026-09-27 内置模板/TV组合候选：真实旧日志确认Ok单击配置Shift+Enter，并有native_delivered=true后额外Shift+Enter注入；这是明确换行配置及首原生沿复用问题，不能由此推断修饰键卡住或已验证微信发送。三内置模板改为可就地编辑/单项显式复位、稳定ID及关联保持；所有既有用户副本/内置自改覆盖均保留。默认Confirm Enter，方向/Back/Vol/Power维持即时单击；Home为Home/CtrlHome/CtrlEnd，TV短CtrlAltTab、长WinTab，Menu和语音不变。自定义Confirm非SingleEnter在编辑器明确提示首原生Enter可能先交付，不扩Helper抑制范围。
+
+系统任务选择仅使用公开固定快捷键与当前Shell PID/窗口类身份；主动模式接管遥控方向/确认/取消，原生已交付同键不再注入，持有与退出代次清理不留修饰键。系统界面出现时不当普通跨程序切换清掉模式；离开后恢复实际程序模板，未知系统窗口失败关闭。成熟参考与限定类见ATTRIBUTION；无第三方内容扫描/私有接口。
+
+TDD已记录内置只读、默认Confirm、复位入口、导入副本、任务路由及前台先变/原生确认后到竞态的RED→GREEN。前端179 passed，Rust工作区348 passed/17 ignored，fmt/check与simulation check通过；真实Windows WebView/IPC仿真14步通过。首仿真被旧安装版单实例保护拒绝，随后正常退出App41980/Helper27176（overall259ms/failed_stages0、cleanup/unload/detach/terminal0）后暴露首次IPC早于AppState注册；已前移管理状态、隔离仿真的登录项同步及Helper启动，Tauri相关51项和同一真实仿真复验通过。用户三份配置与退出前最新hash相同。
+
+以上软件与仿真证据均不代替RC003或系统任务界面验收；TV首次打开/方向/Enter/Escape与第二次TV取消、内置编辑复位、微信安全目标实际发送以及冷/闲置首Confirm仍pending。原未回复语音/Menu/UI组不外推。此轮不执行电源/无线电/强杀/Git写入；只保留本任务templates-task-switch-*、editable-defaults-*的首失败与最终摘要作为本候选对照，待验收关闭按LOGGING回收可再生中间物，未扩大历史清理。
+
+2026-09-27 22:36组合候选部署：唯一生产构建20257 exit0，0.2.6包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T22:35:16.8448640+08:00，26,436,742 bytes，SHA256 `a3586eedced4c46fbb8e55ed33ccd00d14f5d2acb59bf48885c26a074b1b668a`；管理员既有目录覆盖exit0。真实Explorer启动App47868（22:36:07.2217359，TokenElevation0）和自动Helper41732（22:36:08.6261146，TokenElevation1）。安装App SHA256 `af36c5e2f33389cb6e92dbfa221b0e17f93e16095de35fda70294927c3cc2262`与生产release只差允许NSIS三字节标记；Helper SHA256 `2d35e7759c3e52919cee5777f10a9be8f51745ab27ca63a916cde1870239728a`与打包载荷精确相等，未改其来源协议。settings/button-mappings/capture-input-session与本次正常退出前最新基线逐文件字节相同。
+
+run `0741e770701d44579e67bb864b8cc49a`已peer_verified/bound、BLE ready，来源仍pending_per_request，未声称增强动作ready。安装后曾有效模板mask31，随后真实前台Chrome无匹配为mask0；配置确认Codex→preset-agent、follow=true、内置Agent无用户覆盖，故用户自然切回Codex时使用新TV默认动作。Notepad原BUDTH不用于TV验收；Menu偏好true/用户配置不改。首TV真实使用不得用初始化键掩盖；未打开须停止一次核日志，不重按。现阶段仅待用户TV系统界面反馈及后续安全聊天目标Confirm/隔离复位，不自动发送第三方消息。
+
+2026-09-27 TV取消失败修正及诊断：冻结旧run两种模式launch=ok后0–1ms foreground_changed清场、后续TV DOWN/UP无Escape，不能先归因Esc无效。现可信执行边沿TV新DOWN复用原受保护取消；重复DOWN/Long/UP消费，不用UI观察或未知来源触发。原Shell类守卫不放宽；日志新增本动作固定关系/有限系统公开class/代次，等待一次精确取证。7项定向RED→GREEN、工作区349passed/17ignored、fmt/workspace/simulation check passed，前端179与真实IPC14步未改内容复用。
+
+唯一生产构建41503 exit0，包0.2.6、2026-09-27T22:59:28.0306673+08:00、26,436,222bytes，`target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe` SHA256 `52047c89b14db9d94f1fd88f254d07b2cfa83f7ad01ded62bfd53298e25f1eac`。旧App47868/Helper41732正常退出（overall272ms/failed_stages0、cleanup/unload/detach/terminal0）；管理员覆盖exit0。Explorer启动App49276（23:00:07.0358128，TokenElevation0）/Helper41760（23:00:08.4693783，TokenElevation1）。App安装SHA256 `2c0bb712863d05703e53cc50778f5ea3c8ab40acd64e090c3a816dcd4857458f`与release仅NSIS标记差异；Helper `541b2584881ea39bdf78ae9ace4ca870c0dcecf0e60166cb2fd421f5dd5d71c6`与打包载荷精确相等。三份用户配置与本次退出前最新hash相同，无新配置/接口/来源协议变化。
+
+run3923634ce0f44aa6b854b1dfa73b2c35已握手/最新mask31 ack accepted=true，仍source pending_per_request；基线23:01:22.738。既有Codex无覆盖preset-agent使用新TV动作，不拿Notepad BUDTH代验。不插初始化键，首次未开即停、每模式失败不反复。两模式打开是用户观察，取消明确failed；诊断候选实际结果待回复，不外推确认/微信发送、编辑复位或旧待验。过程材料限tv-cancel-*首失败与最终门禁/构建、配置hash留到故障闭合；未清历史或Git写入，未执行电源/无线电/强杀。
+
+
+2026-09-27 23:15 TV诊断组：同一52047c89/App49276中，Applications在23:15:53.845、Desktops在23:16:02.667 launch=ok，随后同Shell `ForegroundStaging`、target_known=false、accepted_class=false，1ms内foreground_changed清模式；后续可信TV DOWN/UP到达却未发Escape。用户两模式再次TV均失败。具体修正及隐私日志片段归 [Bug](../../Bugs/2026-09-27-task-switch-tv-cancel.md)。新代码只保留未确认阶段、严格最终窗口后取消，超时终态零注入；定向10项RED→GREEN、workspace352passed/17ignored、fmt/check/simulation check exit0，未变前端179/真实IPC14复用。实际取消仍待新候选验收，不能由测试通过推断Windows最终窗口必定出现。
+
+
+2026-09-27 有限阶段修复候选交付：唯一生产构建64077 exit0，含前端生产构建；0.2.6安装包 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-27T23:38:11.7807534+08:00，26,430,208bytes，SHA256 `2313101f2bdd6e838426451b18c261cee1feb8de254c1a9a549f911d245f1eb1`。旧App49276/Helper41760由既有托盘入口正常退出，客户端clean=true/exit0/142ms，应用overall265ms/failed_stages0，两个原实例均消失。管理员原安装目录覆盖exit0；真实Explorer启动App48704（23:39:40.9396659，TokenElevation0）、Helper41632（23:39:43.0542025，TokenElevation1）。
+
+安装App SHA256 `8bfbe22164fde5f711685a01426e2b44b30d3e177800297d617d997102478338`与release只差NSIS标记；Helper `e64e1c95ce5bb014784fa7fc996494bd898fc84830a6939cce9cda465508f3d1`与本次固定构建载荷精确相等。settings/button-mappings/capture-input-session与正常退出前最新hash全部相同，未回写旧配置。run `70db0902319a46c9bb2beccc53bafa7a` 已peer_verified、configuration1/mask31 accepted=true、raw_released=true；23:39:44.276原生bound仍source=pending_per_request，未收到报告不能称增强ready。Codex→preset-agent且无用户覆盖，保持当前TV默认，旧Notepad BUDTH不作本组入口。
+
+新包两模式再次TV取消待用户实际观察，不加初始化键、不自动按键；首开失败停止该段，取消失败只用实体Escape退出一次，不反复试。若过渡类没有最终窗口，10秒终态将明确拒绝而非向未知窗口发Escape。所有既有其他pending未外推。仅保留本轮tv-staging红/绿/门禁/生产日志、包元数据/安装配置hash及上次唯一分类故障对照，用途为同候选复验，闭合后按LOGGING清理可再生材料；未清历史、无Git写入/电源/无线电/强杀。
+
+
+2026-09-27 用户对2313101f有限阶段修订版两模式复验反馈“依然是无法取消的状态，不过这个也还好，不纠结这个问题了”。Applications/Desktops再次TV取消均记failed，完整机制未闭合；已知ForegroundStaging处理改动及软件352/17、定向10项证据保留，但不标真实取消passed/resolved。依用户要求停止本Bug调查/修复/复验，未拉取新运行日志、未尝试新接口、未修改代码/构建/安装/操作设备。上一轮已无在途工具或控制器，未作系统扫描。仅原位同步Bug/TODO/手册与本证据，保留全部未提交状态，无Git写入；其它任务本轮不自动续做。
+
+
+2026-09-27→28 TV默认调整：用户要求三个内置TV短按Tab、长按任务视图保持，原Applications任务切换继续可选，不恢复已停止的再次TV取消排查。本机初查及正常退出前均确认preset-agent/chat/browser用户覆盖0，所以只改工厂共用Single字段与三项IPC镜像，未写用户配置/普通副本。
+
+TDD先改现有默认测试：Rust单项、前端契约各因旧Applications≠Tab准确RED，其余30项前端通过。最少生产改动后完整前端179 passed；Rust全套首轮9个旧任务动作夹具因隐式依赖旧默认失败，已仅在测试中显式选择仍保留的Applications，生产取消状态机不改。显式可选动作10项通过，最终workspace352 passed/17 ignored、fmt/workspace check/simulation check均exit0。无新增依赖/迁移/配置回写，HID来源、Helper、按放协议未变，旧同内容WebView/IPC证据复用。
+
+9月28日00:00旧App48704/Helper41632通过既有托盘入口正常退出；客户端clean=true/exit0/650ms，整体780ms/failed_stages0，两个原实例均终止。保存settings/button-mappings/capture-input-session最新哈希供安装后核对，未回写旧备份。生产构建32600进行中，实际Tab移焦/长按打开未验，取消问题继续failed且停止，不把此次软件门禁当它的复验。过程仅tv-tab-*红/绿/门禁/构建及配置hash，供本候选受影响验收，闭合后按LOGGING回收可再生中间物；不扩历史清理。
+
+
+2026-09-28 TV默认Tab最终交付：构建32600 exit0（含pnpm build）；0.2.6 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-28T00:04:28.2228861+08:00，26,433,001bytes，SHA256 `1dfdf2e780b9cb899a360ea5c140a24b32e4c0d82bb4ee4165766fb2a315f227`。管理员原目录覆盖exit0，真实Explorer启动App51184（00:06:07.6802179，TokenElevation0）/Helper45724（00:06:09.8740997，TokenElevation1）。安装App SHA256 `4e1d61725b1d0b6fd23de14f04e411e099f1831e091ac78012062d668fd8b494`与release仅NSIS标记差异，Helper `b1fbd4cb3d2ea4630bd2e0e4b01b6102dc46e7cde07b6fe26b98becc7f10bb1d`与本次载荷精确相等；源码/HID协议未改。三配置与退出前最新hash全部相同，Codex→preset-agent，三个内置覆盖0，用户副本/关联未写。
+
+新run `db81da18fa574d6a807923212ded544c` peer_verified、configuration1/mask31 accepted=true、raw_released=true；00:06:11.419 bound仍source=pending_per_request。不由进程/握手声称执行ready，不加遥控初始化掩盖首按；00:07:14.954窄验收基线；主控实际仅发送短TV一次Tab效果观察，真实Tab pending。长按生产实现未变且此前用户已看到任务视图打开，复用该有限证据不重复要求；不外推导航/取消，不再TV取消复验。原取消failed/停止排查不变；无Git写入、无电源/无线电/强杀。
+
+
+2026-09-28用户确认1dfdf2e7默认短TV Tab“符合预期效果”：实际观察passed，无需重按。随后明确要求短长独立，长开任务视图后短TV仍为Tab。只读当前App51184/Helper45724同创建代确认；代码显示Scene新TV DOWN直接cancel_requested、task_tv_consumed拦手势，任务模式映射还把TV改为Single Escape/丢Long。这是旧契约与新要求冲突，不继续旧取消机制调查。
+
+TDD真实GestureRecognizer→Scene route两用例先RED：任务映射实际Escape而非配置Tab/Long，按下即产生旧取消；最小修正后两模式、Tab/ShiftTab配置、原长按无附带Tab、连续三次短按各一次零Esc、方向/确认及外部切走迟到UP通过。只在Scene保存进入前TV动作、删除物理TV取消专用字段/函数，发布原手势配置；普通TV固定键/组合复用既有mapper；任务导航的未知窗口/阶段守卫不放宽，不缓存被拒绝导航。原旧取消断言已被新契约替代，相关Scene27项通过，完整检查进行中。编辑器仅删一处旧“再按TV取消”文案。实际任务视图内短Tab待新候选用户反馈，不追加来源/取消/电源/无线电实验。
+
+补充真实路由TDD：原窗口/ForegroundStaging期间普通TV短按先RED为Blocked。修正为PassThrough后，在原窗口、过渡窗口及最终任务窗口均由既有mapper执行进入前配置，避免专用task injector二次派发；方向/Confirm和显式TaskSwitch仍走原守卫。Scene27项再次通过，外部离开后旧UP仍排空。
+
+最终受影响门禁：前端179 passed；workspace353 passed/17 ignored、fmt/workspace check/runtime-simulation check均exit0。Helper/HID及IPC载荷协议未改，复用未变范围证据。00:32:59旧App51184/Helper45724通过既有托盘正常退出：Helper clean=true/exit0/162ms，整体285ms/failed_stages0，两个实例均终止。退出前重新记录三配置hash，不回写历史备份；生产构建72219进行中，实际长开后短Tab/确认仍pending。过程材料沿用target/dev/rc003-three-key/tv-independent-*，仅供本候选TDD/构建/安装对照，按LOGGING收尾不扩历史清理。
+
+2026-09-28 TV短长独立最终候选：构建72219 exit0（含pnpm build）；0.2.6 `target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-28T00:36:55.0624182+08:00，26,433,696bytes，SHA256 `6584546a3255c2235e136987f756084f5f08372d1f72c6c9f21b5d053371f45d`。原目录管理员覆盖exit0；真实Explorer启动App50380（00:37:59.1614257，TokenElevation0）/Helper49732（00:38:00.5085724，TokenElevation1）。App SHA256 `235b1c09dd0fc959e422113ac6e02bc54b5e773fce92624346ec54e80be33082`与release/NSIS标记契约相符，Helper `334ed6761c7867875ba518769d508039d5bcbf5caad9d624c082b7b83c9eeed8`与本次release载荷字节相同；HID来源/Helper协议未改。三配置相对退出前最新hash全部相同，Codex→preset-agent，三内置覆盖0，用户副本/关联/偏好未写。
+
+run `1f38c19850484ce9a336092b0bb344b3` peer_verified；configuration1/mask31 accepted=true、raw_released=true；00:38:01.425 bound仍source=pending_per_request，未由进程/握手冒称真实来源ready。00:39:20.510窄组基线，主控准备长TV打开任务视图→完全释放→独立短TV观察Tab→方向/Confirm，不加准备键、不发送消息、不重试已叫停的取消。真实结果pending；本轮不做电源/无线电/来源实验/Git写入。单独默认短Tab的用户通过证据归1dfdf2e7，不能替本新组通过。
+
+
+## 2026-09-29 启动异常与滚动位置修订
+
+- 新故障以 [启动 Bug 记录](../../Bugs/2026-09-29-startup-webview-and-enhancement.md) 为根因/未定边界真源。现有两份本应用 Crashpad 固定元数据显示同模块访问异常，未公开原 dump；增强失败四实例初始绑定均为空且线程永久复制旧值，自动/手动均 peer_verified 后拒绝，非 UAC 未调用。
+- 最小修订：每监听器共享当前严格绑定；未在位请求保留、不同目标先正常清旧会话，同接口断连仍保留原 native PnP 合同。WebView 每窗口 ProcessFailed 分类、一次 renderer 重载及原生不可恢复提示；不关闭第三方软件或降低安全设置。按键页只调横向 padding 所属层，滚动条与其他 main 页面右侧对齐，正文与四按钮底栏 stable gutter 一致。
+- 红绿：空绑定消费请求与 WebView 有限恢复均先实际失败再通过。完整 Rust workspace 356 passed / 17 ignored，fmt/workspace check/runtime-simulation check exit 0；前端 179 passed、生产 build exit 0；原生控制器 10 + 清理终态 3 passed，新增空接口拒绝原因断言通过。未复跑来源实验。
+- 旧安装实例 15:27:16 经产品已有正常退出信号完成；overall failed_stages=0，85ms，App/Helper均0。退出前记录最新配置哈希；未写用户配置。debug 仿真误用 devUrl 的 localhost 错误已正常收尾，与用户原故障分离；改用 CI 内嵌资源后 App10604、exit0、真实 WebView/IPC 14步通过，未强杀。最终本地包部署见下。A 原崩溃责任未闭合、增强设备晚到首用与本轮视觉仍未passed；旧 TV取消调查已停止，原其他pending不变。
+
+2026-09-29最终部署：生产构建36546 exit0、仿真隔离passed。唯一包`target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，15:39:53.0032512，26,441,854 bytes，SHA256 `5ead8a6dd463c8789db29fd9a1d1473bc2de2bbdc9bec2cdc999e7577bd878ed`；管理员既有目录覆盖exit0。安装App SHA `ff661b84ca2fa8420946f3268627da40508ff11e3bdc29a42b46d6f475674893`仅既有NSIS标记三字节差异；Helper SHA `9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b`精确匹配。Explorer App29528（15:44:50.6135300，普通token0）/Helper12144（15:44:52.7321940，提权token1）路径已核，三份配置退出前/安装后/启动后哈希完全相同。
+
+同一App超过90秒观察无新增ProcessFailed/Crashpad，文档/Vue/首次IPC通过；未故意重现原异常，不称原崩溃根因已修复。自动增强已过旧拒绝点，configuration1/mask31 accepted=true，15:46:20.749真实来源selected_instance/request ready/all_up=true、physical0/raw_released=true。用户自然语音产生报告，开发方无预热/准备键；当前就绪不等于开机最先首按/晚到场景passed。正式既有Codex Agent三键与实体键盘、两页滚动条/四按钮布局待用户窄组反馈。
+
+本轮材料复用`target/dev/rc003-three-key/startup-*`及`webview-failure-*`，保留定向红绿/全套/最终包日志、安装身份与配置哈希至本候选验收关闭；错误debug与正确embedded仿真记录用途为区分自致localhost错误，不复制原始dump或用户配置。未清历史唯一证据，未Git写入/电源/无线电/强杀。
+
+## 2026-09-29 按键页菜单占用展示
+
+用户两图证明菜单已被模板选择接管时，旧页面仍显示普通配置“未设置”并进入编辑器；这不是菜单没实现。有限静态核对scene_control：面板外Single打开，Double无独立定义；面板内Single取消，当前面板独立Long改变默认保存偏好并消费UP，开面板那次持有不附带切偏好。生产路由不改。
+
+仅ButtonsPage读取既有menuTemplateSwitchEnabled；不把程序默认跟随开关/编辑目标/执行器ready当占用。卡片可读灰态保留真实按下高亮，显示“已启用模板切换”与三个真实行为；点击、监听选择和迟到编辑更新统一门控。既有页内轮询只读最新开关，不重载或覆盖编辑草稿；未读/失败禁菜单编辑，卸载迟到结果不落地。关闭恢复原映射，不写配置/新增开关。
+
+TDD新增占用与首次未知等用例真实RED，最小实现后ButtonsPage34项passed；覆盖关闭后内置模板Menu可编辑/保存、跨占用保留其草稿、其他编辑器DOM/草稿不变、监听高亮但不跟随、读取失败/卸载。纯前端修改，未重跑未改Rust/HID；最终前端/安装/视觉边界后补。本轮材料限menu-card-*，保留红绿/完整前端/最终包与安装摘要至验收闭合，不复制用户配置或清历史证据。前一启动/三键动作/滚动实际未反馈，不因截图扩大passed。
+
+本轮终态：前端183/183、build exit0；唯一增量包86859 exit0，复用未改Helper，不额外Rust/HID验证。旧App29528与当时实际Helper27752经已有退出事件正常终止，Helper clean=true/exit0/203ms、app_shutdown overall failed_stages0/333ms。安装前以最新三配置hash为基线，不回写旧备份。
+
+0.2.6包`target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-29T16:42:12.3543157+08:00，26,429,884 bytes，SHA256 `a10acd72c2656c218ab4680fc921e3c2a968010fba755010d18305787e6cd8b7`；管理员原目录覆盖exit0。安装App SHA `29b37e237e37719677fd532506af9dc95d7a1bdb2f0b06dae24e37acfb5317a1`与构建仅既有NSIS三字节标记差异；Helper `9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b`与上一候选相同。
+
+Explorer新App32556（16:43:48.3120980，TokenElevation0）/Helper37220（16:43:49.5145980，TokenElevation1）固定安装路径及载荷已核。最新settings/button-mappings/capture-input-session安装及启动后字节完全保持，菜单模板开关真实true。真实安装版前端buttons_menu_ownership=template_menu_reserved、Vue/IPC与按键页资源加载passed，只证明运行分支已应用；自然视觉、关闭可编辑及恢复true的UI组待用户，无遥控预热/源实验。Helper存在不记三键ready或动作通过，前轮未答项目仍pending。无Git写入/发布/电源/无线电/强杀。
+
+## 2026-09-30 菜单与语音卡共享只读呈现
+
+有界核对：语音卡本来没有click、keyboard编辑或映射自动选择入口，RemoteButton不包含voice；其active独立来自真实voiceState。现有缺口是语音卡仍继承普通mapping-card的可点击hover。仅ButtonsPage给菜单接管卡及语音卡同一只读class，使用既有浅/深色token的轻底色/边框与低强调标题，去hover阴影；不用整卡opacity，active/flashed物理观察保留。菜单唯一开关false后仍恢复原映射/编辑，不写配置；保留三格真实行为说明。
+
+纯局部呈现，复用既有语音无编辑控件、菜单占用/关闭/草稿/监听高亮边界测试，未新增镜像测试。完整pnpm test：19文件183/183（含ButtonsPage34）；pnpm build exit0。未重跑未改Rust/HID，未操作遥控器或读取第三方内容。最终安装与用户自然视觉结论分开记录，原三键启动首用/完整白屏根因/此前未答UI交互仍pending。
+
+材料复用target/dev/rc003-three-key/readonly-card-*，仅本次测试/前端/生产包日志及安装身份摘要保留至本候选视觉验收闭合；不复制配置正文、不清历史证据或Git写入。
+
+最终安装：构建会话98355 exit0；0.2.6包`target/release/bundle/nsis/无线麦 SayAll_0.2.6_x64-setup.exe`，2026-09-30T11:00:45.1825959+08:00，26,432,805 bytes，SHA256 `53a09d45244892403dcc2e663119b7aea72b1b39e9e00f5d9b3d2dd496997a1b`。旧App32556/Helper37220正常退出，Helper clean=true/exit0，overall failed_stages=0（596ms）；固定原安装目录覆盖exit0，未强杀。
+
+Explorer实际App34672（11:02:59.9877790，TokenElevation0）/Helper46124（11:03:01.4297410，TokenElevation1）；安装App SHA `7cfa4523ff65b50904ab4d7f6ef3701f26eb3d42de7fa8a0fcb2c16d62afc7bb`与本次release仅既有NSIS三字节标记差异，Helper保持 `9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b`。主程序版本0.2.6；本构建运行日志source_revision=unknown，版本身份以本次完整安装包/映像哈希核对，不借HEAD外推源码提交验收。
+
+三份最新用户配置在安装及启动后字节全保持，menuTemplateSwitchEnabled仍true。真实安装前端document_load/Vue/initial IPC、buttons_page_resource_setup与template_menu_reserved分支通过；没有实体按键预热或UI自动切换。鼠标悬停、点击不可选及轻量灰态真实观感待用户自然观察，不外推三键/语音/开机首用或原崩溃解决。所有已有Git改动保留，本轮无Git写入/发布/电源/无线电操作。
+用户实际观察53a09d45后明确“差异还是有点儿小”，本轮视觉目标未满足，不外推点击/语音/设备passed。继续同一小修：只读底色改既有pending-surface中性灰、边框用mapping-line；菜单动作格去按钮小底板/圆角，保留静态分栏；沿本页inline SVG绘制方式复用单一小锁图形，为菜单/语音提供非颜色线索，语音“按住说话”保留。不存在独立图标库，未新增依赖。普通卡/事件/物理高亮/配置不改；新候选仅复用既有前端验证与正常升级。
+加强版终态：既有完整前端19文件183/183、build exit0；唯一增量包会话64640 exit0（release1m28s），未新增镜像测试/重跑Rust或HID。App34672/Helper46124经正常退出，Helper clean=true/exit0，overall failed_stages0/317ms。0.2.6包同一既有NSIS路径，2026-09-30T11:11:58.5816960+08:00，26,433,380 bytes，SHA256 `acec0075ae8aef9cdf921bd22d06f77f6af964767dfd39cad6c8760263cf3dfa`；管理员固定目录覆盖exit0。
+
+实际安装App SHA `13c0ad1514c9f5a9a8553698ddc8776fc28d01dad7815ab53795d45b4edc5d37`与release仅已知NSIS三字节标记差异，Helper仍9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b。Explorer App49236（11:14:17.0610670，Token0）/Helper51472（11:14:18.5473060，Token1）固定文件核对通过；三份最新配置在安装/启动后字节保持，菜单模板开关true。真实Buttons页面/Vue/IPC/占用分支已加载，尚未获得加强版视觉反馈；不外推点击/实体按键/语音或此前未答项目。无额外设备操作、Git写入或发布。
+用户提供浅/深截图并明确新规则：可点击卡稍粗边框，只读菜单/语音不显示边框。截图已直接查看，acec0075视觉未满足；按此替换上一只读强调边框方案，不叠加。仅本页CSS：所有卡2px边框占位、内距6/9→5/8px保持总尺寸与内容起点；readonly边框透明、outline与shadow均none，含hover/active/flashed，不再用外框表示物理活动；活动底色保留。菜单内部竖线删除，三列留白与锁/说明保留；普通可编辑hover/选中/按钮键盘焦点规则不变，关闭菜单占用恢复普通边框。
+
+既有JSDOM加载实际生产全局CSS与Vue编译scoped CSS，浅/深×普通/active/flashed分别计算普通/readonly边框宽度、透明色、outline/shadow、border-box与外尺寸/内距：12项通过。此为CSS计算验证，未冒充浏览器视觉；无新增测试镜像、通用工具或dev实例。完整pnpm test183/183、pnpm build exit0，未变Rust/HID不重跑。
+最新无框只读终态：唯一生产会话71460 exit0（release1m36s）；旧App49236/Helper51472正常清理，Helper clean=true/exit0，overall failed_stages0/357ms。NSIS同一路径0.2.6包，2026-09-30T11:32:56.2586104+08:00，26,434,732 bytes，SHA256 `353e3cea30640219f0834a47c7f0a3e09b3a96b448308101b16008ca2179ad5e`；管理员固定目录覆盖exit0。
+
+Explorer实际App32260（11:35:05.2270440，Token0）/Helper4444（11:35:06.4854510，Token1）。安装App SHA `f9d926a20f37660307340dee0887e18afc073b64bc46929067946744984110f4`与release仅已知NSIS标记差异，Helper仍9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b；3份最新配置安装/启动后字节保持，菜单开关true。真实document/Vue/IPC/Buttons资源与template_menu_reserved分支加载，浅/深真实无框视觉尚待用户，未重新测试未改语音/Menu/HID。材料仍复用readonly-card-*，新增仅CSS计算摘要；本次无Git写入、发布、电源、无线电或第三方设置变更。
+
+## 2026-09-30 按键页菜单模式入口
+
+用户截图定位长按行为未加粗，并明确要在按键页切换菜单模板模式。长按格字重对齐单击；后续按用户位置修正，将同一原生checkbox移入“菜单”标题旁，右侧固定小锁槽仅在已确认启用时显示锁，移除下方重复标签行。只读aria-disabled限于映射区，标题控件鼠标/键盘仍可操作且不冒泡选择卡片；hover/focus同一短说明，失败反馈仍在稳定位置直接显示。保留无可见外框、语音固定只读及现有冻结底栏。与模板页复用setMenuTemplateSwitchEnabled/set_menu_template_switch_enabled窄字段接口，无第二份设置或后端改动。
+
+保存时立即恢复原生change已变的DOM checked，仅返回确认后采用保存值；局部pending禁重入、不切全页busy，固定反馈高度。保存失败读回实际值，读回也失败时保持未知/禁编辑并由既有轮询恢复。保存修订号隔离此前已发出的轮询；只更新该字段，不重载草稿/模板，已有Menu editor在真正接管后关闭，关回保留原有映射草稿；卸载迟到结果不落新页。只写分支类别结构日志，不记录用户配置正文。
+
+TDD：新增4项因缺少控件RED，既有34项仍通过；实现后38/38，完整前端19文件187/187及pnpm build exit0。覆盖真实pending DOM/重复change、保存确认及Menu草稿、旧轮询/后续外部设置更新、失败回读/未知恢复及卸载迟到。字体不另写镜像测试，未重跑未改Rust/HID或实体设备。材料复用target/dev/rc003-three-key/menu-mode-control-*，保留红绿/完整前端/最终包与安装摘要至本入口实测完成；不复制私密配置、无Git写入。前一截图只证明当时渲染/边框，不外推其他待验。
+本轮终态：旧App32260/Helper4444正常退出，Helper clean=true/exit0，overall failed_stages0/405ms。唯一生产会话77348 exit0（release2m14s）。NSIS同一既有路径0.2.6包，2026-09-30T12:22:34.8357926+08:00，26,434,659 bytes，SHA256 `484d5d5fe69c122d607a4cc475259505084fe583c66683d302c7378515cb79fa`，管理员原目录覆盖exit0。
+
+Explorer App36904（12:24:39.3597280，Token0）/Helper5888（12:24:41.3914360，Token1），实际固定路径/映像核对。安装App SHA `9a0a188980cd87481aa6b4495ab7d3c91a54b0a10e823d2345c9938707905f22`与release仅既有NSIS标记差异；Helper仍9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b。三配置安装/启动后字节全保持，原菜单开关true；新前端Vue/initial IPC已加载。新checkbox实际保存/两页同步与Long加粗自然视觉待用户：仅按键页关闭→模板页读回/恢复true→按键页读回，不改映射、不按实体键；尚未反馈不记passed。保留所有其他待验边界，无Git写入或设备/电源/无线电操作。
+
+标题位置修订：用户后续截图只确认位置需要调整，不代表此前两页同步已验。复用同字段/同保存函数，只移动原生checkbox，映射区承担aria-disabled；确认前小锁与checked保持原值。新增标题位置/已保存锁态断言与真实DOM click/键盘传播隔离测试先2失败、原37通过，最小实现后39/39；完整pnpm test为19文件188/188，pnpm build exit0。真实click在连接document的组件上验证，不以未连接DOM的默认行为代替实际事件；Space/Enter不阻止原生默认语义且不冒泡卡片。Tooltip依现有浅/深theme token，绝对定位不占卡片尺寸；语音无checkbox、失败信息仍在固定反馈位置。新候选自然标题位置/hover与键盘聚焦说明、两页同步仍待用户观察；未改Rust/HID/语音不重跑。
+标题修订部署：唯一生产会话42185 exit0（release2m00s），旧App36904/Helper5888正常退出，Helper clean=true/exit0，overall failed_stages0/360ms。0.2.6同路径NSIS包2026-09-30T12:45:20.5507292+08:00，26,435,094 bytes，SHA256 `d71135dffbc0d796a0629869af2c2b3e044bdefe49620ffcab557301329447b9`；管理员原目录覆盖exit0。Explorer实际App51952（12:47:00.8395780，Token0）/Helper55000（12:47:02.9972540，Token1）固定路径核对；App SHA `da5917579af1c4c5c25e7bcd667c58dceb3c3e32145243f147e0ad80ec57c476`与release仅已知NSIS标记差异，Helper仍9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b。安装/启动后三配置字节保持，菜单原值true。新进程Vue/initial IPC及Buttons的template_menu_reserved/listeners_and_polling_ready实际加载；这些不代替视觉与设置交互验收。
+
+当前NEEDS_USER：仅标题位置、确认后的锁显隐和hover/键盘focus说明自然观察；可取消再恢复原true，不修改映射、不按遥控，不重复其他硬件矩阵。截图未确认之前双页同步，相关pending保留。过程输出仍复用原menu-mode-control-*，无多份包/源码副本；红绿及最终包/身份摘要保留到本入口实际验收完成，其余历史材料未清理。无Git写入、设备输入或系统设置操作。
+
+同主题小范围删除（用户红框）：仅删除菜单卡下方常驻“菜单由模板切换使用……”段落及它自带的上下margin，后方监听卡自然前移。读取失败提示独立v-if保留，保存反馈稳定空间、标题checkbox/锁、hover/focus tooltip及aria-describedby两个目标、监听说明/底栏均保留；没有新状态或设置。原39项保存/事件/错误回归在完整188/188中通过，pnpm build exit0；生产JS核对删除文案不再存在，tooltip/反馈ID/监听说明仍存在。纯文案删除不新增镜像测试、不重跑Rust/HID，也不要求用户重复既有功能验收；前一截图只证明标题控件渲染，不外推两页同步、三键首按或白屏根因。
+本次删除版交付：唯一生产会话17963 exit0，release1m39s；旧App51952/Helper55000正常清理，Helper clean=true/exit0，overall failed_stages0/673ms。0.2.6同一既有NSIS路径，2026-09-30T14:21:14.9342430+08:00，26,434,649 bytes，SHA256 `d239601fbaac61433da5751ac6d7847e97c87c7bc36d05c5821b25cb16d86b34`；管理员既有目录覆盖exit0。Explorer App54060（14:22:40.5833080，Token0）/Helper46360（14:22:43.8494470，Token1）实际路径/映像核对；App SHA `192c3decd433fdbd0061c3f5b25dd6f6f269dd07176581884e426fa760facfe3`与release仅既有NSIS标记差异，Helper仍9a0afec16f3cd90d6579a49515f1611cf276bbf12b5b85da471638373a5a795b。安装/启动后最新三配置字节保持，菜单true。Vue/initial IPC及Buttons接管/监听资源实际加载。
+
+本次常驻文案删除按组件回归/生产产物与部署核对收口，不额外要求用户重复视觉问卷/开关或实体键。此前标题交互、双页同步和原硬件/白屏未闭合项仍按原证据保留pending，不借此删除结案。过程文件复用menu-mode-control-*；最终包、此次前端/构建及安装身份摘要保留支撑当前交付，没有新增副本或清理历史证据。未作Git写入、强杀、电源/蓝牙或用户配置修改。
+
+## 2026-10-02 上游合并候选本地安装与打开
+
+用户明确要求重新安装合并后的程序并打开查看。被测来源为本地合并提交 `c089497133c7588b6ea4418d2e824d67a35890f9`（上游固定 `c81308e011a757dc22d22f2861b687ef787d295e`），叠加原有 41 个未提交文件修改；不能把提交本身当作完整构建身份。相关文件 SHA256 记录于本地 `target/dev/upstream-sync/local-source-hashes.json`，原有工作及备份保持，未创建额外提交或推送。
+
+执行 `scripts/build-local-input-candidate.ps1` 完成生产 NSIS 构建，随后 `scripts/verify-runtime-simulation-isolation.ps1` passed。唯一新交付候选为 `target/release/bundle/nsis/无线麦 SayAll_0.5.0_x64-setup.exe`，26,644,032 bytes，SHA256 `733e3aef331160e43caad1550f98c9375ea77c8abf9f795ac40dd35de09ffdf3`。沿用已有构建缓存和既定 Helper/驱动资源，不额外复制包；同代码已有前端 241 项、Rust 工作区测试/check/fmt 和仿真编译结果不重复执行。
+
+23:41 通过应用正常退出事件关闭旧 App 4356 及其 Helper，`app_shutdown stage=overall phase=completed terminal_result=passed failed_stages=0 took_ms=264`，BLE local_release/completed 同为 passed。确认两进程实际结束后才管理员覆盖现有安装目录，NSIS `/S /UPDATE` exit0；安装注册项与 PE 版本均读回 0.5.0。安装 App SHA256 `1f7c9ec76c3519be3185141c8fe5a3088cb0cb6d671bb10d6cd07da44fa6d1d9` 与 release `17f023fbea2b9918bd341a863094a2c535850f21c6fb16b6e57075204b0da2e8` 全字节比较，仅官方 `__TAURI_BUNDLE_TYPE_VAR_UNK` → `__TAURI_BUNDLE_TYPE_VAR_NSS` 的三字节变化。HID Helper `106203487ada95064e4927ea1b47a13e5e79fb4951ae006c9a726aa588faf696`、component Helper `d4d3d7f91f5d26dc20ffa97164ce5c58875188ac12f3bce80156e3a53efe9db6` 及 INF/SYS/CAT 均与构建源同 hash；未触发驱动安装。
+
+23:43:17 实际 Explorer 11788 启动 App 14824，两者 TokenElevation=0、同用户会话；唯一安装路径实例、标题“无线麦 SayAll”的可见主窗口均验证通过。新日志 ver=0.5.0/source_revision=c089497/build_channel=local，主 WebView document_load finished、Vue mount、initial_ipc_ready（139ms）、buttons_page listeners_and_polling_ready（143ms）完整。观察 128 秒无 WebView process_failed；settings.json、button-mappings.json、capture-input-session.json 在安装后和启动后逐字节 hash 保持。不记录配置内容。
+
+结论：生产构建、正常退出、原目录覆盖、载荷一致、配置保留、普通权限启动及主窗口/前端初始就绪为 passed。自动更新检查实际出现一次 `manifest_or_network_failure`，保留该失败，不修改更新源；本次不验证在线更新。完整 runtime-simulation、RC001/RC003 冷态首用/连续会话及三键、语音、第三方行为仍 deferred；本次打开不能替代此前功能与视觉待验。前轮 Debug 仿真单实例拒绝仍为历史失败，不改写为通过。
+
+本地临时目录仅保留本候选构建日志、必要生命周期片段、相关源码指纹和部署核对摘要，供未完成验收与对照使用；本候选被替代或验收闭合后回收。一次性部署/验证脚本已收尾回收，未清理历史包或其他任务材料。未强杀进程、未发布 Tag/Release、未更改用户配置。
+## 2026-10-03 统一上游全按键支持：源码与本地部署
+
+用户明确选择上游全按键方案并删除重复的本地增强。输入固定 `4d4de099f823cc67f334ff2a498e98c2806e4455`，在 `c089497133c7588b6ea4418d2e824d67a35890f9` 及原有未提交修改上整合，没有新增提交。当前十三个普通按键使用同一报告桥接和手势引擎；目标集合包括当前模板与 Menu 控制。零映射只观察、Disabled 不回放原生键、确认真实 UP 与旧代取消继续保留。删除 native/hid-host-helper、hid_host 客户端、input_driver/package 与 component Helper 生产链，源码按回收站规则处理；历史驱动研究和证据保留。
+
+语音保持原来的 ATVV、输入设备准备、IME 激活与成对 SendInput。没有启用上游可选报告语音合成：固定延时不能证明本地设备锁定已经完成。本机 capture_input.enabled 原为 true，迁移后仍为 true；不增加第二个语音用户开关。新授权 rc003_capture_enabled 默认 false，不把旧 restore_hid_enhancement 当计划任务授权；实际通过应用开启确认流程后才保存 true。
+
+验证：前端232项及build passed；Rust工作区测试、fmt、check和runtime-simulation编译 passed（19项需外部条件的既有测试 ignored）；最后任务拒绝启动的新增回归先观察pending残留红灯，再以相关Host12项/check验证修复。独立Helper Rust25项、报告agent72项、Helper离线自检和安装清理回执6项 passed。Thread.sleep按官方秒单位修复的红绿测试、旧代/持有键/取消和真正完成回执均有定向证据。未安装Frida Python绑定，哑进程真实Frida传输自检 deferred。
+
+15:54旧安装App14824经正常退出事件关闭，overall passed、failed_stages=0、484ms，旧Helper随后消失，未强杀。隔离状态目录的Debug仿真实际执行19步并正常退出：Windows WebView→Tauri IPC、映射保存、模板、设置持久化、六页导航及模拟语音/资源释放 passed；这不代表真实BLE、WASAPI或实体按键通过。随后重新构建生产前端/主程序，生产仿真隔离检查 passed。
+
+本地NSIS：0.5.0、x64 GUI子系统2，12,565,240字节，SHA256 `02515fb8d0b73373c7738172a528bbf202093ab180f5b64188ef94ac17548c51`。构建App `48eebc1f27df33fecbcdf4d6ac82d5923bea7872424cb0a5c5d5751696d8e21b`；安装App `cd27bc099d6a97cebfabbc6b0a7406e299dd71e91fdcbcbda78ae4e2c1b53fd1`，全字节差异仅Tauri官方UNK→NSS bundle marker。Helper `7ec2d5ae0054694ffcb31761d9b2c0af6c3e2bbfe445b1b9601cf7af0947c356`；Gadget17.18.0 `350beb0e801dc7dc39d21512960d1048b9f21dc72c0ee5ced5cf5d9dc8ea6687`。版本锁、GPL/Frida许可随包提供。
+
+16:03管理员覆盖现有安装目录，安装前后settings、button-mappings、capture-input-session三份文件hash相同。Explorer11788启动App51996，父子同用户会话且TokenElevation均0；唯一安装实例、可见非零尺寸主窗口、新Helper/Gadget与构建/暂存三方hash一致，均passed。旧安装副本sayall-hid-host-helper.exe、sayall-component-helper.exe、SayAllInput已移回收站，不执行驱动卸载。新日志Vue mount/initial IPC就绪，观察期间无WebView process_failed。
+
+16:06通过实际应用“开启全按键支持”及确认按钮授权，Helper56676启动，TokenElevation=1、路径为当前安装版；named-pipe鉴权、S off回执、当前Menu目标65的ownership回执均观察到。16:09从UI关闭，App撤目标、Helper写同PID/代次passed清理回执后实际退出，关闭命令passed；16:10重新确认开启，Helper37764再次完成鉴权、S off和ownership回执，证明可正常停用/重新开启。当前保持App/全按键支持打开供用户验收。界面已无可操作的三键/五键入口。
+
+边界：上述通过证明授权、桥接与生命周期，不证明实体按键动作或严格逐设备共存。RC001与RC003物理短/双/长按、键盘共存、闲置首用语音、快速会话和持键退出仍deferred，已请求用户自然操作反馈；电源/无线电测试仍禁止。本轮没有发布Tag/Release或上传资产。target/dev/unified-input保留必要红绿/最终日志、源码指纹、仿真报告、部署/清理回执和原修改保全补丁，供本候选验收与复核；验收闭合或被替代后回收。废弃编辑脚本和未交付报告合成方案的临时日志已回收，不清理其他任务材料。

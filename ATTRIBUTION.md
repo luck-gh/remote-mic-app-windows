@@ -2,6 +2,26 @@
 
 本仓库是面向 Windows 的 Rust/Tauri 工程。
 
+## 统一上游全按键支持（2026-10-03）
+
+- 固定来源为 [GetSayAll/remote-mic-app-windows `4d4de099`](https://github.com/GetSayAll/remote-mic-app-windows/tree/4d4de099f823cc67f334ff2a498e98c2806e4455)，采用 `hardware/RC003/helper` 的 Rust Helper、内嵌 agent、固定 Gadget 构建输入，以及 `rc003_bridge.rs`、`rc003_task.rs` 和授权交互。项目与来源均按已有 GPL-3.0-only 归属保留；Frida 固定 17.18.0 的许可和下载散列随资源锁定及安装包提供。
+- 本地整合保留模板/程序关联和 Menu 控制；捕获集合来自实际有效模板与菜单，删除五键专用 Helper、驱动生产链及无来源 LL 兜底。没有映射的键只观察，禁用动作不回放原生按键。基础 ATVV 与音频设备锁定保持独立。上游可选报告层语音合成固定关闭，保留本地设备准备成功后成对 SendInput 的现有语音路径；固定延时不能替代本地设备准备的完成回执。
+- 根据 [Frida Thread API](https://frida.re/docs/javascript-api/#thread)，`Thread.sleep()` 接收秒：原 agent 将毫秒直接传入的等待已改为换算秒，并以真实 API 单位更新测试。该修复不调整既定 150 ms 门限，不能算作冷态延迟优化实测。
+- 删除强杀共享宿主以更新 Gadget 的恢复路径；旧/不匹配 agent 明确拒绝。关闭时通过实际 agent `stopped` 回执确认撤钩与合成 UP，持键释放未到时保留当前会话等待，不把进程退出码当成功。本地协议将回执绑定宿主 PID/OS 创建时刻、Agent `instance` 与本次 `stop_id`；同实例重新确认可消除其旧未确认状态，另一实例或空启动取消不得代替，旧协议活体的部署限制见 [前台回归记录](Bugs/2026-10-03-foreground-input-regression.md)。清理结果以同一 Helper PID/启动代次写入本机原子回执；Gadget DLL 仍驻留，不能宣称模块卸载。来源选择及逐报告设备归属仍需本机共存验收，不把上游历史实测外推为本地双型号通过。
+- 本节按用户新方向替代下文历史同步“不采用计划任务、Gadget 与报告层合成”的实现选择；历史来源与证据保留。当前部署和验证结果见 [既有输入证据](artifacts/hid-gatt-access-20260919/evidence.md)。
+
+### 前台回归调查的参考边界（2026-10-03）
+
+- 2026-10-04 未部署的脚本重载实验曾参考 [Frida Gadget Script](https://frida.re/docs/gadget/#script)，在自有进程中观察到两次不同实例重载。复审发现共享脚本跨宿主、重载握手期限及失败观测证据仍有缺口；用户正常重启后，同一安装版已恢复菜单和增强键，因此撤回实验，不作为当前产品能力。根因和恢复证据归同主题 Bug；保留原 ignore 模式的真实部署边界，不把实验扩大解释为真机更新通过。
+
+- 2026-10-04 异常终止恢复采用 Microsoft [进程终止语义](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)与 [WaitForSingleObject](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)：强制终止不会执行进程清理代码，必须由外部拥有者或下次启动核实；持有的进程对象进入 signaled 才能证明该实例终止。恢复回执持久化 Host PID 与 GetProcessTimes 创建时刻，避免 PID 复用；同实例仍存活则需当前协议的新停止确认。未根据进程名、时间流逝或文件消失推断已撤钩，不终止共享 WUDFHost。Windows 自有子进程与 TCP 实测只证明协议/身份边界，不替代双型号实体按键验收。
+
+- 2026-10-04 一次性恢复审查采用 [Frida Gadget Script 契约](https://frida.re/docs/gadget/#script)：`on_change=ignore` 默认只加载一次脚本；固定 [17.18.0 ScriptRunner](https://github.com/frida/frida-core/blob/17.18.0/lib/gadget/gadget.vala#L876-L918) 持有单个脚本，不能将磁盘更新当作运行实例更新。结合唯一模块、首次加载与完整 HELLO 记录、实际 TCP 两端 PID、同一进程对象及新鲜停止回执，已完成一次性正常停止；工具仅留本机取证，不进入生产兼容层。Microsoft [UMDF pooling](https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/using-device-pooling-in-umdf-drivers) 允许多设备共享宿主，本机只读确认 7 个活动栈；[PnPUtil 单实例重启](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax) 不能据返回成功保证共享宿主卸载，本轮未执行。恢复与实际验证范围见上述 Bug 记录。
+
+- follow-app 退出判据使用 Microsoft [GetNamedPipeServerProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeserverprocessid) 将实际管道服务端与描述文件 PID 核对，并持有进程句柄与创建时刻；[进程退出契约](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process) 规定进程对象在退出后变为 signaled，[WaitForSingleObject](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject) 的零超时查询用于读回该事实。20 秒仍为首次身份绑定期限及失联诊断阈值；存活 App 的桥接迟到不再等于退出，显式关闭和真实退出仍走同一 Agent 清理回执。Windows 自有管道/自有子进程已验证服务端 PID、持有句柄、正常退出后的 signaled 与实例不替换；不能据此宣称 RC001/RC003 或旧驻留 Agent 的部署恢复通过。
+
+- 现场与前一安装版对照归 [Bug 记录](Bugs/2026-10-03-foreground-input-regression.md)。原语音路径在准备后集中投递时受到 `sync_channel(32)` 的消息条数限制；Rust [sync_channel](https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html) 官方契约确认其容量按消息计、控制消息保持 FIFO。修复复用本项目既有 32000 样本上限与标准库通道，不增加依赖、不增大音频容量；唤醒通知可合并，但生命周期控制不能被丢弃。
+- Microsoft [IAudioClient::Start](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-start) 要求渲染流先填充数据再启动，[IAudioRenderClient](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudiorenderclient) 规定接口的释放线程边界。继续由原 WASAPI worker 负责设备对象、写入、启动与清理，设备调用不移到 BLE 回调；分段日志用于定位慢调用，不改变快捷键或门限时序。官方 API 成功与单元测试都不证明 RC001/RC003 或第三方输入法真机通过。
 - Microsoft [SetForegroundWindow 的异步激活说明](https://devblogs.microsoft.com/oldnewthing/20161118-00/?p=94745)：跨输入队列调用后立即查询前台，目标可能尚未处理激活消息。菜单返回自身主窗口由宿主 UI 线程直接完成，避免 UI 等待后台、后台恢复又需要 UI 泵消息；不使用 AttachThreadInput 或固定 sleep 掩盖。外部窗口路径维持原契约，并记录错误分类，实际返回效果以窗口读回为准。
 
 ## 系统任务切换（2026-09-27）
@@ -286,7 +306,22 @@
 - **NSIS 与既有安装器门禁的相互作用**：updater 以 `/P`（passive）+ `/UPDATE` 运行，既有 installer-hooks.nsh 的 PREINSTALL SemVer 降级门禁照常生效（升级路径不受影响）；POSTINSTALL 的 VB-CABLE 提示在 passive（非 Silent）模式下仍会弹出——仅影响未装 VB-CABLE 的用户，与首装行为一致，保留。
 - **预览版通道（2026-09-08 增补）**：Tauri 官方 Runtime Configuration 文档明确支持通过 `UpdaterBuilder::endpoints` 在运行时选择 stable/beta 等独立通道；本仓库据此保持默认稳定端点不变，仅在用户显式开启“检查预览版更新”后覆盖端点。GitHub Releases 页面公开提供标准 Atom feed（`releases.atom`），包含已发布的正式版与 Pre-release、排除 Draft；实现从本仓库 feed 的 `alternate` 链接读取 SemVer tag，选择最高版本并自行构造本仓库 `https://github.com/GetSayAll/remote-mic-app-windows/releases/download/<tag>/latest.json`，避开匿名 REST API 每 IP 60 次/小时限流。最终安装包仍由 Tauri minisign 强制验签。
 
+## 2026-10-04 覆盖升级与受限回收
+
+- 同日晚按用户进一步明确的安装交互，已有版本提供“安装前卸载”与“请勿卸载”；前者安全退出后卸载并自动续装，后者覆盖。安装权限依据 [NSIS RequestExecutionLevel](https://nsis.sourceforge.io/Reference/RequestExecutionLevel) 与微软 [Running with Administrator Privileges](https://learn.microsoft.com/en-us/windows/win32/secbp/running-with-administrator-privileges)：在既有 currentUser 安装范围采用 `highest`，对同一管理员账户请求可用权限，避免 `admin` 接受另一账户凭据后误用其 HKCU/配置。真正标准账户仍没有管理员写权限，不能把它表述为跨账户安装支持；受保护目录须在卸载旧版之前明确拒绝。主程序继续使用原普通权限 manifest，安装后启动复用现有 `nsis_tauri_utils::RunAsUser`。未引入 NSIS 已弃用的 UAC 插件、未改用户目录 ACL 或扩大产品运行权限。两条交互路径的实测与限制归同主题 Bug。
+- 目录权限预检依据微软 [CreateFileW 的目录契约](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew#directories) 与 [File Access Rights Constants](https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants)。用 `OPEN_EXISTING`、`FILE_FLAG_BACKUP_SEMANTICS` 和目录新增文件/子目录权限打开现有目录，不创建探针文件、不修改 ACL，也不以运行中 EXE 的映像锁推断目录权限。[GetFileAttributesW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw) 失败时读取错误码，仅文件/路径不存在可检查父目录，拒绝访问等错误直接停止。本机同一普通令牌的受保护安装目录返回 5，工作区目录返回 0，句柄均关闭；这一证据只覆盖目录权限，不替代逐个 payload 写入和回收的实际成功判据。
+
+- 安装模板实质改编自 [Tauri `tauri-cli-v2.11.4` 的 NSIS 模板](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi)，固定提交 `8909f221d1515955fc843808032bdc5d62209c96`，上游 MIT / Apache-2.0 双许可证。按 [Tauri 官方自定义模板入口](https://v2.tauri.app/distribute/windows-installer/#custom-installer-template) 配置 `bundle.windows.nsis.template`。本地删除调用旧安装器及默认强制结束进程分支；交互安装按用户选择调用当前包生成的卸载器或覆盖，静默与被动更新覆盖，均保留原安装目录和用户设置。独立卸载器仍保留，不能把覆盖升级测试替代卸载或真实蓝牙验收。
+- 旧文件回收使用公开 [IFileOperation::SetOperationFlags](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-setoperationflags) 的 `FOFX_RECYCLEONDELETE`、`FOFX_EARLYFAILURE` 与无错误 UI 标志；[IFileOperationProgressSink](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifileoperationprogresssink) 逐项检查回收语义、成功结果和非空回收目标，再核对原路径消失。覆盖后只处理安装根目录内两个旧 Helper 和三个 SayAllInput 包文件；选择安装前卸载时另回收主程序、当前 Helper、Gadget、两份许可和卸载器六个固定文件。拒绝 reparse 路径，不递归删除、不提供永久删除替代。自建 Windows fixture 实际观察到五个退休文件和六个产品文件进入回收站，配置及未知文件保持；真实安装验收另记于同主题 Bug。
+- `verify-capture-cleanup.ps1` 复用本产品新 Helper 的 `--cleanup-only` 协议：等待原助手正常退出后才允许独立提权清理，校验执行者 PID / 进程创建时刻 / 回执代次与终态；超时只阻止文件替换，保留仍等待真实释放的清理者。安装器不生成或修改清理证明。流程分支测试只从 PowerShell AST 提取函数并替换 OS 边界，不执行脚本顶层生产入口；模板 fixture 只编译；另有隔离的宏执行 fixture 验证卸载续装、拒绝写入和子卸载失败，不调用真实产品进程。
+
 ## WASAPI 原端点恢复（2026-09-15）
+
+### 2026-10-04/05 麦克风目标与写入端自动配对
+
+采用 [Windows Device Topologies](https://learn.microsoft.com/en-us/windows/win32/coreaudio/device-topologies) 与 [IConnector::GetDeviceIdConnectedTo](https://learn.microsoft.com/en-us/windows/win32/api/devicetopology/nf-devicetopology-iconnector-getdeviceidconnectedto) 公开拓扑查询，再读取适配器 `PKEY_Device_InstanceId` 证明同一条线；不以显示名替换、共同 ContainerId 或唯一播放设备猜配。代码位于 `audio_route.rs`，复用现有 Windows 依赖，没有新增库。
+
+[VB-CABLE 官方参考手册](https://vb-audio.com/Cable/VBCABLE_ReferenceManual.pdf) 第 6–7 页说明 Pack45 的标准输入与 16ch 输入通向同一输出，且不可同时使用。本机只读生产 resolver 实证：一个 Capture、两个 Render，端点拓扑 ID 不同但适配器 PnP 身份一致；默认选标准输入，保留已有同线、精确 ID/名称有效的 16ch 选择。仅按官方适配器与 pin 属性识别 Base/A/B/C/D；多个同类 pin、身份缺失、跨线或设备不可用都不自动选择。其他设备保留显式手动配置并标明未确认配对，不声称支持 HiFi Cable/Voicemeeter 自动配对。此只读取证没有设置系统默认设备、打开音频流或采集语音，不能替代实体收音验收。
 
 采用现有 `wasapi 0.24.0` 依赖，不新增音频引擎或复制外部代码。微软 [Recovering from an Invalid-Device Error](https://learn.microsoft.com/en-us/windows/win32/coreaudio/recovering-from-an-invalid-device-error) 定义释放旧 WASAPI 接口并重新激活设备的恢复模式；本产品保留用户明确选择的精确 ID/name，重新枚举验证并在 open 后再核 name，不切换默认端点。该官方错误场景不是本次内部队列溢出的根因证据。本机 10:19:39 worker queue_overflow 后 `fail_audio` 丢 sink 而后续无法重建的实证、隔离 WASAPI 故障后首用与连续消费、取消边界见 `artifacts/audio-sink-recovery-20260915/evidence.md`。不修改 32000 样本阈值；消费为何落后仍需新增吞吐元数据定位。
 
@@ -346,3 +381,8 @@
 - **未采用的第二增强链**：`crates/sayall-windows/src/rc003_bridge.rs`、`src-tauri/src/rc003_task.rs`、`hardware/RC003/helper/` 的产品路线不作为本地增强实现。上游 Helper 以共享宿主的 usage 内容代替逐报告设备来源，动态目标包含方向与确认等通用键；其旧 agent 自动刷新调用 `TerminateProcess` 结束 WUDFHost，并通过最高权限计划任务重复启动。上述行为与本地严格来源、显式限定 runas、清理确认后再启及不强杀契约冲突。
 - **语音边界**：上游 `rc003_bridge` 下发语音 usage 替换并以命令写出成功置 `voice_synth_active`，BLE 据此停用 SendInput；此报告合成不在本地指定非语音按键旁路例外中，也不能用提交成功证明目标行为。保留本地 ATVV 按下/释放与配对快捷键路径，不把基础语音改成依赖常驻 Gadget。
 - **历史材料边界**：本轮上游新增探针与 evidence 中发现个人绝对路径和完整设备接口路径，不能未经脱敏纳入本地新提交的文件树。其源码与历史实验可在上述固定上游提交追溯；不复跑探针，不把既有 IOCTL 假设替代本地设备来源实证，不恢复已停止的任务视图取消调查。
+
+## 2026-09-29 WebView 进程异常处理
+
+- [Microsoft WebView2 进程事件](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-related-events)：RenderProcessExited 可用 Reload；BrowserProcessExited 需要重新创建控件，本轮不盲目 Reload 浏览器退出。使用项目现有 Tauri / webview2-com 0.38.2 公开回调，只记录类别/数值，不记 ProcessDescription 或用户地址。每窗口至多一次 renderer 重载；无法恢复提示通过产品正常退出重开，未宣称原崩溃责任已解决。
+- [MINIDUMP_EXCEPTION_STREAM](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_exception_stream) 与 [MINIDUMP_MODULE](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_module)：只解释本应用已有 dump 的异常码/模块相对地址，未读取或发布内存正文。
