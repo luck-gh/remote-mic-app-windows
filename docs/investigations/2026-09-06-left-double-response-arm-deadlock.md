@@ -24,7 +24,7 @@
 4. **独立预信号管线的历史证据边界（2026-09-19 校正）**：
    - 当时 CreateFileW+ReadFile 打开键盘 HID collection 得到 err=5；这是该 collection 的访问结果，不能外推 BluetoothGATT 服务接口。
    - 旧 WinRT 脚本只记录空集合，缺少 RequestAccessAsync、Status/ProtocolError 与原始运行摘要；不能据此证明“OS HID 栈占用”或所有公开 GATT 路线不可用。
-   - 9/19 普通 Explorer 用户、STA、unpackaged 的只读复核：选定设备 access=Allowed、唯一 0x1812 服务枚举 Success，但该服务 RequestAccessAsync=DeniedBySystem。随即停止，未读取 Report 值、写 CCCD 或注册通知；配置哈希一致。这只证明本机此次 WinRT 服务访问被系统拒绝。证据见 `artifacts/hid-gatt-access-20260919/winrt-result.json`。
+   - 9/19 普通 Explorer 用户、STA、unpackaged 的只读复核：选定设备 access=Allowed、唯一 0x1812 服务枚举 Success，但该服务 RequestAccessAsync=DeniedBySystem。随即停止，未读取 Report 值、写 CCCD 或注册通知；配置哈希一致。这只证明本机此次 WinRT 服务访问被系统拒绝。证据见 `334c372:artifacts/hid-gatt-access-20260919/evidence.md` 的 WinRT 脱敏结论。
    - Win32 BluetoothGATT 独立接口的访问检查另行核验，不能借 WinRT 拒绝或 HID collection 错误代替实测。
 5. **dwExtraInfo=0**：LL 钩子事件无设备指纹可用。
 

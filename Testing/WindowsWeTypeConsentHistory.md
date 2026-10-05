@@ -129,10 +129,10 @@ Remote: RC001 | RC003
 
 - Source commit：`6504010828b12713ce033cb3e231087af6a6482f`；使用该提交源码归档，未纳入当时工作区其他未提交修改。归档 SHA-256 为 `476258314c776be9347409481e60f1084b4e86f000ce8fa5bbf5b6ea5f89bd7d`。
 - 版本0.2.5，通道 `local`，release tag 为 `none`。临时 Tauri 配置只关闭 updater 发布资产生成，复用项目 target 中 NSIS 工具缓存；应用功能源码及更新公钥不变，没有公开上传或发布该包。
-- 安装包：`artifacts/local-wetype-fix-6504010/SayAll-Windows-0.2.5-wetype-fix-6504010-x64-setup.exe`；SHA-256 `6dbccecec965e3126b28c2bf27472af335ec8ca7b814945626d62dde3ed0b499`，签名状态 `NotSigned`，仅本地测试。安装后的主 EXE SHA-256 为 `ecef5515afa6308f2406287c197fc9621b00852e6a913457cf88236ff4c8f7f0`。
+- 当时本地安装包为 `SayAll-Windows-0.2.5-wetype-fix-6504010-x64-setup.exe`；SHA-256 `6dbccecec965e3126b28c2bf27472af335ec8ca7b814945626d62dde3ed0b499`，签名状态 `NotSigned`，仅本地测试。安装后的主 EXE SHA-256 为 `ecef5515afa6308f2406287c197fc9621b00852e6a913457cf88236ff4c8f7f0`。该已结束对照的工作目录现已回收，保留此历史身份，不保证能重建相同二进制。
 - 前端构建、Windows release 编译和 NSIS 打包 `passed`。`cargo test --release --locked -p sayall-windows --lib wetype_revive -- --include-ignored --nocapture` 为6项 `passed`，包括本机11条公开历史记录的只读测试。
 - GUI PE 子系统、x64架构、源码标识、修复日志标记和 NSIS bundle 标记核对 `passed`。第一次打包已写入 NSIS 标记，第二次仅打包报告未找到未替换占位符；最终成品含 `NSS`、不含 `UNK`，不能把第二次进程失败解释为最终成品未完成。
-- 2026-10-05静态归档核对：旧 `source.zip` / `source/` 的215项源码与上述提交仅在规范换行后相符，另13项为生成物；不宣称整目录或原始字节与提交完全相同。有效源码身份改用精确提交；交付包、`validation.json`、`local-build.log` / `frontend-build.log` / `bundle.log`、`wetype-tests.log` 及 `settings-backup-20260911` 仍作为本地材料保留，不提交私有设置。原本地诊断文档的有效事实已收归本节。
+- 2026-10-05静态归档核对：旧 `source.zip` / `source/` 的215项源码与上述提交仅在规范换行后相符，另13项为生成物；不宣称整目录或原始字节与提交完全相同。有效源码身份改用精确提交，原本地诊断文档的有效事实已收归本节。随后按用户要求进一步撤去不必要的本地过程目录：该问题已有源码修复与两次真实观察，旧包、逐轮日志和过期设置备份不再用于当前恢复，随目录回收；保留上述原失败、安装身份、计数及未验边界。当前应用配置未被改写。
 
 ### 覆盖安装失败与获准安装例外
 

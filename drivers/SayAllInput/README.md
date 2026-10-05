@@ -22,7 +22,7 @@
 
 运行 `pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-input-driver.ps1`。依赖现有 MSVC/SDK 26100 与仓库 `target/wdk-nuget/10.0.26100.6584` 下的官方 Microsoft.Windows.WDK.x64 NuGet；锁定包 SHA256 为 `c393d03dfb640b5c92f546b32f6770ef68cd3aaf691956e7d66d8e2c28a1b55e`，NuGet author/repository/timestamp 校验通过。依赖、开发二进制与日志不构成可再分发签名包。
 
-本地证据在 `artifacts/three-key-input-20260914/`，状态机与内核构建日志在 `target/input-driver/`。Inf2Cat 成功只生成内容目录；必须使用 `signtool verify /kp /v /c SayAllInput.cat SayAllInput.sys` 验证正式 Microsoft 内核签名及内容绑定。当前执行结果为签名缺失，不能安装。
+历史证据在 Git `334c372:artifacts/three-key-input-20260914/evidence.md`，状态机与内核构建日志在 `target/input-driver/`。Inf2Cat 成功只生成内容目录；必须使用 `signtool verify /kp /v /c SayAllInput.cat SayAllInput.sys` 验证正式 Microsoft 内核签名及内容绑定。当前执行结果为签名缺失，不能安装。
 
 Microsoft 硬件计划账号、组织/EV 条件、签名提交和发行许可仍是外部条件。Attestation 仅用于微软定义的测试交付，产品认证须按 HLK/WHCP 要求另行完成。不得安装上游测试签名二进制，不关闭 Secure Boot/内存完整性，不开启 TESTSIGNING。
 
@@ -40,6 +40,6 @@ RC001 与 RC003 的每个三键分别需要真实报告→Windows 交付→设�
 
 Helper 在加载器阶段限定 System32 依赖（DEPENDENTLOADFLAG=0x800，Windows 10 RS1 起支持），本地构建使用静态 CRT；不会在 main 前从用户可写安装目录寻找 VCRUNTIME。固定包路径解析为 canonical 后持有全部祖先目录及成员的 deny-write/delete 句柄，供后续 WinTrust 和 Windows 安装 API 使用。维护失败且 Windows 要求重启使用失败状态与 restartRequired 同时表达；恢复/回滚不是原操作成功。独立审查与静态 PE 检查不能替代带签名内核的系统实测。
 
-本轮最终本地包和逐型号逐键矩阵见 [交付证据](../../artifacts/three-key-input-20260914/evidence.md)。2026-09-14 的托盘自动退出阻塞已于 2026-09-15 用户确认退出后解除：冻结包覆盖安装 exit 0，Explorer 普通权限启动、实际载荷与配置哈希核验 passed。最终 Release Helper 的签名拒绝路径已于开发阶段实际执行，exit 50；驱动仍未签名、未加载，应用安装不代表三键或内核验收。
+本轮最终本地包和逐型号逐键矩阵见 交付证据（历史 Git `334c372:artifacts/three-key-input-20260914/evidence.md`）。2026-09-14 的托盘自动退出阻塞已于 2026-09-15 用户确认退出后解除：冻结包覆盖安装 exit 0，Explorer 普通权限启动、实际载荷与配置哈希核验 passed。最终 Release Helper 的签名拒绝路径已于开发阶段实际执行，exit 50；驱动仍未签名、未加载，应用安装不代表三键或内核验收。
 
-2026-09-19 只读复核：核心12项源码与上述维护冻结全部同SHA，SYS/INF/CAT也同字节；复用既有开发验证，不重跑同SHA构建。用户目前没有明确可用的Microsoft签名渠道，此外部门槛不可用；仍不采购、申请、上传或安装未签名候选。三键最小源码闭包已存在，但实际过滤层、物理报告、抑制/映射、WDF和维护验收尚缺。TV/Home及全部共享VK键盘共存不在mask7范围，仍有独立实现与实证缺口。详细差距见[9/19核对](../../artifacts/hid-host-future-open-20260919/kernel-gap.md)。
+2026-09-19 只读复核：核心12项源码与上述维护冻结全部同SHA，SYS/INF/CAT也同字节；复用既有开发验证，不重跑同SHA构建。用户目前没有明确可用的Microsoft签名渠道，此外部门槛不可用；仍不采购、申请、上传或安装未签名候选。三键最小源码闭包已存在，但实际过滤层、物理报告、抑制/映射、WDF和维护验收尚缺。TV/Home及全部共享VK键盘共存不在mask7范围，仍有独立实现与实证缺口。详细差距见9/19核对（历史 Git `334c372:artifacts/hid-host-future-open-20260919/kernel-gap.md`）。

@@ -51,8 +51,8 @@ try {
 if($LASTEXITCODE -ne 0){Get-Content (Join-Path $out 'probe-build.log') -Tail 25;exit $LASTEXITCODE}
 & $compiler /nologo /W3 /TC /MT /O2 /utf-8 @includes "$root/Testing/hid_host_probe_thread_test.c" "/Fo$out/hid_host_probe_thread_test.obj" "/Fe$out/hid_host_probe_thread_test.exe" /link /DEPENDENTLOADFLAG:0x800 /DYNAMICBASE /NXCOMPAT "/LIBPATH:$($vc.FullName)/lib/x64" "/LIBPATH:$sdk/Lib/10.0.26100.0/ucrt/x64" "/LIBPATH:$sdk/Lib/10.0.26100.0/um/x64" onecore.lib > (Join-Path $out 'probe-thread-test-build.log') 2>&1
 if($LASTEXITCODE -ne 0){Get-Content (Join-Path $out 'probe-thread-test-build.log') -Tail 15;exit $LASTEXITCODE}
-& (Join-Path $out 'hid_host_probe_thread_test.exe') > (Join-Path $root 'artifacts/hid-host-three-key-20260915/probe-thread-tests.log') 2>&1
-if($LASTEXITCODE -ne 0){Get-Content (Join-Path $root 'artifacts/hid-host-three-key-20260915/probe-thread-tests.log') -Tail 10;exit $LASTEXITCODE}
+& (Join-Path $out 'hid_host_probe_thread_test.exe') > (Join-Path $out 'probe-thread-tests.log') 2>&1
+if($LASTEXITCODE -ne 0){Get-Content (Join-Path $out 'probe-thread-tests.log') -Tail 10;exit $LASTEXITCODE}
 @{recordedAt=(Get-Date).ToString('o');officialArchive='52d4b60d0fb9f9e69f03c652d50d5f3f22c9c967b3d23ff26d33d3c9039bd2d3';lockedMembers=$members;outputSha256=(Get-FileHash -LiteralPath (Join-Path $out 'sayall-hid-host-probe.exe')).Hash.ToLowerInvariant();cSha256=(Get-FileHash -LiteralPath (Join-Path $root 'Testing/hid_host_probe.c')).Hash.ToLowerInvariant();runtimeHeaderSha256=(Get-FileHash -LiteralPath (Join-Path $root 'Testing/hid_host_probe_runtime.h')).Hash.ToLowerInvariant();threadObserverSha256=(Get-FileHash -LiteralPath (Join-Path $root 'Testing/hid_host_probe_thread.h')).Hash.ToLowerInvariant();jsSha256=(Get-FileHash -LiteralPath (Join-Path $root 'Testing/hid_host_probe.js')).Hash.ToLowerInvariant()} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 (Join-Path $out 'probe-build-identity.json')
 } finally {for($i=$locks.Count-1;$i -ge 0;$i--){$locks[$i].Dispose()}}
 Write-Output 'probe_build=passed execution=not_started'

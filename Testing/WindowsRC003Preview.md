@@ -318,4 +318,4 @@ macOS 上对完整 Tauri Host 的 Windows 目标交叉检查需要 `llvm-rc`，�
 5. 断连、睡眠、正常退出均先走 BLE owner 的快捷键 UP，再做路由恢复。记录未能恢复时的具体错误与 journal 状态。异常退出恢复只在隔离验证环境制造：下次启动必须显示“恢复/保留当前选择”，未点击不得静默改设备；即使未改过的角色发生外部变化，也不能恢复其余角色。
 6. IPolicyConfig 不能保证目标软件覆盖其显式指定的麦克风。将三角色默认确认、WASAPI 实际供音、WeType 采集端点和用户可见结果分别记录 passed/failed/deferred；有硬件但未操作的项标未执行，不虚构 deferred 原因。
 
-本候选真实验收证据归 `artifacts/capture-input-session-20260916/evidence.md`。状态以该记录为准。
+本候选真实验收证据归 `334c372:artifacts/capture-input-session-20260916/evidence.md`。状态以该记录为准。
