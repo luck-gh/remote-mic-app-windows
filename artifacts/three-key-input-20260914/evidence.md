@@ -54,3 +54,5 @@ RC003 HidP 描述符合成证明 Report 1 为 121 字节、三个 u16 槽位 1/3
 正常安全配置、Windows 1809、Verifier、冷/闲置首用、组合、断连、睡眠、异常退出与驱动卸载均待真实目标环境验收。签名账号、组织/EV、微软提交与产品认证是外部条件；未代购、申请或发布。应用安装闭环已于 2026-09-15 完成，无需额外构建或重复已冻结测试；上述内核与硬件验收仍 deferred。
 
 实现、固定参考、验证真源分别见 [驱动说明](../../drivers/SayAllInput/README.md)、[ATTRIBUTION](../../ATTRIBUTION.md)、[专项](../../Testing/StructuredTemplatesAndDrivers.md)、[TODO](../../TODO.md)。
+
+2026-10-05 整理补充：`artifacts/windows-preview/` 的旧0.2.5安装包与本目录保留包 `无线麦 SayAll_0.2.5_x64-setup.exe` 逐字相同，SHA-256 为 `0d437e5feabe19428cf06a4e3614f24e1f152b8241439c915575a70cdd19fd0f`。重复包及其自动生成的 checksum/metadata 可回收；它们标记 `NotSigned`、`sourceCommit=null`、`unsigned-ci-preview-not-for-public-release`，不补推源码身份或公开发布资格。保留包与本页原部署证据用于历史对照，复核用途结束后再按 LOGGING 评估。相同内容的中间日志只回收副本，保留本页所引原记录；未新增硬件或驱动验收。
