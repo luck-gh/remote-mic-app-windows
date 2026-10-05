@@ -879,6 +879,19 @@ fn get_scene_snapshot(
 }
 
 #[tauri::command]
+async fn select_current_template(
+    state: tauri::State<'_, AppState>,
+    template_id: Option<String>,
+) -> Result<sayall_windows::scene_control::SceneSnapshot, String> {
+    let platform = state.platform.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        platform.select_current_template(template_id.as_deref())
+    })
+    .await
+    .map_err(|_| "模板切换任务失败".to_owned())?
+}
+
+#[tauri::command]
 async fn get_ui_preferences(
     state: tauri::State<'_, AppState>,
 ) -> Result<sayall_core::UiPreferences, String> {
@@ -1089,6 +1102,33 @@ async fn update_button_mapping_template(
     .map_err(|error| format!("更新按键模板任务失败：{error}"))?;
     sayall_windows::gatt_note(format!(
         "button_template action=update phase=completed terminal_result={}",
+        if result.is_ok() { "passed" } else { "failed" }
+    ));
+    result
+}
+
+#[tauri::command]
+async fn reset_builtin_template(
+    template_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    sayall_windows::gatt_note(
+        "button_template action=reset phase=requested payload=redacted".to_owned(),
+    );
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .update_mapping_configuration(
+                |configuration| configuration.reset_builtin_template(&template_id),
+                |saved| apply_mapping_configuration(platform.as_ref(), saved),
+            )
+            .map(|(saved, _)| saved)
+    })
+    .await
+    .map_err(|error| format!("复位模板任务失败：{error}"))?;
+    sayall_windows::gatt_note(format!(
+        "button_template action=reset phase=completed terminal_result={}",
         if result.is_ok() { "passed" } else { "failed" }
     ));
     result
@@ -1371,11 +1411,13 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut open_app_count = 0_usize;
     let mut scroll_count = 0_usize;
     let mut mouse_count = 0_usize;
+    let mut task_switch_count = 0_usize;
     let mut disabled_count = 0_usize;
     for actions in mappings.actions.values() {
         for action in [&actions.single, &actions.double, &actions.long] {
             match action {
                 ButtonAction::Shortcut { .. } => shortcut_count += 1,
+                ButtonAction::TaskSwitch { .. } => task_switch_count += 1,
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
                 ButtonAction::Scroll { .. } => scroll_count += 1,
                 ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
@@ -1386,7 +1428,7 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} scroll_count={scroll_count} mouse_count={mouse_count} disabled_cell_count={disabled_count}",
+        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} scroll_count={scroll_count} mouse_count={mouse_count} task_switch_count={task_switch_count} disabled_cell_count={disabled_count}",
         mappings.enabled,
         mappings.actions.len()
     )
@@ -1427,6 +1469,9 @@ async fn test_button_mapping(
         .await
         .map_err(|error| format!("测试打开应用任务失败：{error}"))?
         .map_err(|error| error.to_string()),
+        ButtonAction::TaskSwitch { .. } => {
+            Err("请在目标程序中使用遥控器触发任务切换，以校验系统窗口和取消边界".to_owned())
+        }
         ButtonAction::Disabled => Err("该触发方式当前未配置动作".to_owned()),
     }
 }
@@ -2248,6 +2293,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
         }
     }
     let was_interactive = state.interactive;
+    let previous_menu_generation = state.menu_generation;
     let mode = match event {
         SceneEvent::Snapshot { snapshot } if snapshot.panel.is_some() => {
             let interactive =
@@ -2346,6 +2392,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
                         let mut overlay = overlay.lock().unwrap_or_else(|p| p.into_inner());
                         overlay.panel_open = true;
                         overlay.interactive = true;
+                        overlay.menu_generation = previous_menu_generation;
                     }
                     app.state::<AppState>()
                         .platform
@@ -2359,6 +2406,13 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
             window.hide().and_then(|()| window.set_focusable(false))
         }
     };
+    if mode == "hide" && result.is_ok() {
+        // A nonforeground hide need not raise a native focus event. Complete
+        // the return-target lifecycle explicitly once the window is hidden.
+        app.state::<AppState>()
+            .platform
+            .set_template_menu_focus(false);
+    }
     if interactive && !was_interactive {
         let requested = result.is_ok() && activate_template_menu(&window);
         let verified = requested && overlay_is_foreground(&window);
@@ -3174,6 +3228,17 @@ pub fn run() {
             #[cfg(not(windows))]
             let _ = saved_settings;
 
+            // Creating a second WebView can pump the main WebView's first IPC.
+            // Publish its state before entering that nested window creation.
+            let supervisor = spawn_raw_input_supervisor(Arc::downgrade(&platform));
+            let exit_cleanup = ExitCleanup::new(Arc::clone(&platform), supervisor);
+            app.manage(AppState {
+                capture_config_operation: platform.capture_config_gate(),
+                platform: Arc::clone(&platform),
+                exit_cleanup,
+                settings: settings.clone(),
+                pending_update: std::sync::Mutex::new(None),
+            });
             create_scene_overlay(app)?;
             // 语义按键边沿与手势事件 → 前端（画布高亮与单击/双击/长按反馈）。
             register_button_events(&platform, app.handle().clone());
@@ -3201,18 +3266,6 @@ pub fn run() {
                 ));
             }
 
-            // Raw Input 监听自愈：启动即尝试，失败（遥控器休眠/未连接）进入
-            // 10 秒重试循环；用户在按键页显式停止（Stopped）时不重试。
-            let supervisor = spawn_raw_input_supervisor(Arc::downgrade(&platform));
-            let exit_cleanup = ExitCleanup::new(Arc::clone(&platform), supervisor);
-
-            app.manage(AppState {
-                capture_config_operation: platform.capture_config_gate(),
-                platform,
-                exit_cleanup,
-                settings,
-                pending_update: std::sync::Mutex::new(None),
-            });
             // 安装/升级前的优雅退出监听（2026-09-16）：安装器会先请求退出、
             // 若清理未完成则安装器中止，不允许强杀。
             spawn_installer_graceful_exit_watcher(app.handle().clone());
@@ -3294,6 +3347,7 @@ pub fn run() {
         get_mapping_configuration,
         get_template_catalog,
         get_scene_snapshot,
+        select_current_template,
         get_ui_preferences,
         set_ui_preference,
         template_menu_key,
@@ -3318,6 +3372,7 @@ pub fn run() {
         save_button_mapping_template,
         duplicate_button_mapping_template,
         update_button_mapping_template,
+        reset_builtin_template,
         create_mapping_template,
         duplicate_mapping_template,
         rename_mapping_template,
@@ -3385,6 +3440,7 @@ pub fn run() {
         get_mapping_configuration,
         get_template_catalog,
         get_scene_snapshot,
+        select_current_template,
         get_ui_preferences,
         set_ui_preference,
         template_menu_key,
@@ -3409,6 +3465,7 @@ pub fn run() {
         save_button_mapping_template,
         duplicate_button_mapping_template,
         update_button_mapping_template,
+        reset_builtin_template,
         create_mapping_template,
         duplicate_mapping_template,
         rename_mapping_template,

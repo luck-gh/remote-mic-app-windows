@@ -57,7 +57,7 @@ describe("applied mapping switch notice", () => {
     const checkbox=wrapper.get('input[type="checkbox"]');
     await checkbox.setValue(false);await flushPromises();
     expect((checkbox.element as HTMLInputElement).checked).toBe(true);
-    expect(mocks.invoke).not.toHaveBeenCalled();expect(wrapper.text()).toContain("正在记住选项");
+    expect(mocks.invoke).not.toHaveBeenCalled();expect(wrapper.text()).toContain("正在保存选项");
     receive({type:"snapshot",snapshot:{...snapshot("template"),preferenceError:true}});await flushPromises();
     expect((checkbox.element as HTMLInputElement).checked).toBe(false);
     expect(wrapper.text()).toContain("选项保存失败");wrapper.unmount();
@@ -108,7 +108,7 @@ describe("applied mapping switch notice", () => {
     const wrapper = mount(SceneOverlay); await flushPromises();
     receive({ type:"snapshot", snapshot:snapshot("template") }); await flushPromises();
     const input = wrapper.get('input[type="checkbox"]').element as HTMLInputElement;
-    expect(wrapper.text()).toContain("长按菜单键：切换是否更新默认");
+    expect(wrapper.text()).toContain("长按菜单键：切换此项并记住");
     for (const updateDefault of [true, false]) {
       receive({ type:"snapshot", snapshot:{ ...snapshot("template"), updateDefault } });
       await flushPromises();

@@ -315,13 +315,27 @@ fn subscribe_button_profile(
     scene: &Arc<scene_control::SceneController>,
     runtime: &Arc<ButtonMappingRuntime>,
 ) {
+    subscribe_button_profile_with_hook(scene, runtime, || {});
+}
+
+fn subscribe_button_profile_with_hook(
+    scene: &Arc<scene_control::SceneController>,
+    runtime: &Arc<ButtonMappingRuntime>,
+    after_read: impl Fn() + Send + Sync + 'static,
+) {
     let weak_scene = Arc::downgrade(scene);
     let runtime = Arc::clone(runtime);
+    let submission = Arc::new(Mutex::new(()));
     scene.subscribe(Arc::new(move |event| {
         if matches!(event, scene_control::SceneEvent::Snapshot { .. }) {
             if let Some(scene) = weak_scene.upgrade() {
+                // Keep reads and both queue submissions ordered across concurrent
+                // snapshots. Generation checks on the acknowledgement alone cannot
+                // stop an older profile from replacing a newer engine mapping.
+                let _submission = submission.lock().unwrap_or_else(|p| p.into_inner());
                 let (profile, semantic, generation, foreground, notice) =
                     scene.application_mapping_update();
+                after_read();
                 runtime.set_application_mappings(profile, semantic);
                 let weak = Arc::downgrade(&scene);
                 runtime.publish_mapping_notice(move |available| {
@@ -384,7 +398,13 @@ impl Default for WindowsPlatform {
                 Arc::clone(&voice_hold_hotkey),
                 Arc::new({
                     let button_mapping = Arc::clone(&button_mapping);
-                    move |model, connected| button_mapping.set_input_context(model, connected)
+                    let scene = Arc::clone(&scene_control);
+                    move |model, connected| {
+                        if !connected {
+                            scene.cancel_task_switch("disconnected");
+                        }
+                        button_mapping.set_input_context(model, connected)
+                    }
                 }),
                 Arc::clone(&voice_input_tool),
             ));
@@ -696,6 +716,13 @@ impl WindowsPlatform {
         self.scene_control.snapshot()
     }
 
+    pub fn select_current_template(
+        &self,
+        template_id: Option<&str>,
+    ) -> Result<scene_control::SceneSnapshot, String> {
+        self.scene_control.select_template(template_id)
+    }
+
     pub fn set_template_menu_focus(&self, focused: bool) {
         self.scene_control.set_template_menu_focus(focused);
     }
@@ -747,6 +774,9 @@ impl WindowsPlatform {
 
     /// Synchronize the identified connection at the same transition that owns it.
     pub fn set_input_context(&self, model: RemoteModel, connected: bool) {
+        if !connected {
+            self.scene_control.cancel_task_switch("disconnected");
+        }
         self.button_mapping.set_input_context(model, connected);
     }
 
@@ -754,6 +784,7 @@ impl WindowsPlatform {
     /// has been cancelled. The barrier is bounded so normal exit cannot wait
     /// forever for the mapping worker.
     pub fn quiesce_input(&self) -> Result<(), PlatformError> {
+        self.scene_control.cancel_task_switch("normal_exit");
         self.button_mapping
             .set_input_context(RemoteModel::Unknown, false);
         if self
@@ -932,6 +963,7 @@ impl WindowsPlatform {
     }
 
     pub fn stop_raw_input(&self) -> Result<RawInputSnapshot, PlatformError> {
+        self.scene_control.cancel_task_switch("listener_stopped");
         #[cfg(windows)]
         {
             self.raw_input.stop()

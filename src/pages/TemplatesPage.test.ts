@@ -5,7 +5,8 @@ import TemplatesPage from "./TemplatesPage.vue";
 import ApplicationTemplateBindings from "../components/ApplicationTemplateBindings.vue";
 import {
   getMappingConfiguration, listPresetApps, saveMappingConfiguration,
-  getTemplateCatalog, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
+  getSceneSnapshot, subscribeSceneEvents,
+  getTemplateCatalog, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
   listRunningApps, removeApplicationBinding, upsertApplicationBinding,
   type MappingConfiguration,
 } from "../lib/bridge";
@@ -14,8 +15,9 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/bridge")>();
   return {
     ...actual,
+    getSceneSnapshot: vi.fn(), subscribeSceneEvents: vi.fn(),
     getMappingConfiguration: vi.fn(), listPresetApps: vi.fn(),
-    updateButtonMappingTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
+    updateButtonMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
     getTemplateCatalog: vi.fn(), setButtonMappingFollowEnabled: vi.fn(), setMappingNoticeEnabled: vi.fn(), setMenuTemplateSwitchEnabled: vi.fn(),
     listRunningApps: vi.fn(), removeApplicationBinding: vi.fn(),
     upsertApplicationBinding: vi.fn(),
@@ -30,8 +32,8 @@ const configuration = {
 };
 
 const catalog = [
-  ...["Agent", "聊天工具", "浏览器"].map((name, i) => ({ id:["preset-agent","preset-chat","preset-browser"][i]!,name,kind:"direct" as const,readOnly:true,buttonMappings:{enabled:true,actions:{}} })),
-  { id:"buttons",name:"工作",kind:"direct" as const,readOnly:false,buttonMappings:{enabled:true,actions:{}} },
+  ...["Agent", "聊天工具", "浏览器"].map((name, i) => ({ id:["preset-agent","preset-chat","preset-browser"][i]!,name,kind:"direct" as const,builtIn:true,buttonMappings:{enabled:true,actions:{}} })),
+  { id:"buttons",name:"工作",kind:"direct" as const,builtIn:false,buttonMappings:{enabled:true,actions:{}} },
 ];
 
 const stubs = {
@@ -45,6 +47,8 @@ const stubs = {
 describe("templates page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getSceneSnapshot).mockResolvedValue({ templateId: "preset-agent", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 } as import("../lib/bridge").SceneSnapshot);
+    vi.mocked(subscribeSceneEvents).mockResolvedValue(() => {});
     vi.mocked(getMappingConfiguration).mockResolvedValue(structuredClone(configuration));
     vi.mocked(getTemplateCatalog).mockResolvedValue(structuredClone(catalog));
     vi.mocked(listPresetApps).mockResolvedValue([{ id: "edge", name: "Edge", installed: true }]);
@@ -52,6 +56,28 @@ describe("templates page", () => {
     vi.mocked(setButtonMappingFollowEnabled).mockResolvedValue({ ...structuredClone(configuration), buttonMappingFollowEnabled: true });
     vi.mocked(saveMappingConfiguration).mockImplementation(async (next) => structuredClone(next));
     vi.mocked(listRunningApps).mockResolvedValue([{ applicationId: "edge", name: "Edge", preset: true }]);
+  });
+
+  it("highlights only the applied template and changes it on runtime application events", async () => {
+    let handler!: (event: import("../lib/bridge").SceneEvent) => void;
+    vi.mocked(subscribeSceneEvents).mockImplementation(async callback => { handler = callback; return () => {}; });
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    expect(wrapper.findAll('.template-row.current-template')).toHaveLength(1);
+    expect(wrapper.get('.template-row.current-template').text()).toContain("Agent");
+    await wrapper.findAll('.template-row')[3]!.findAll('button').find(button => button.text() === "编辑")!.trigger('click');
+    expect(wrapper.get('.template-row.current-template').text()).toContain("Agent");
+    handler({ type: "mapping_applied", revision: 2, notice: { kind: "template", templateId: "buttons", name: "工作", actionsAvailable: true } });
+    await flushPromises();
+    expect(wrapper.get('.template-row.current-template').text()).toContain("工作");
+    expect(wrapper.findAll('.template-row.current-template')).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("does not highlight a pending scene candidate before mappings are applied", async () => {
+    vi.mocked(getSceneSnapshot).mockResolvedValueOnce({ templateId: "buttons", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 2 } as import("../lib/bridge").SceneSnapshot);
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    expect(wrapper.get('.template-row.current-template').text()).toContain("Agent");
+    wrapper.unmount();
   });
 
   it("changes only the persisted notice switch and reads its saved value on reload", async () => {
@@ -172,7 +198,7 @@ describe("templates page", () => {
   it("edits all three columns in a scrollable dialog and persists only the selected template", async () => {
     const wrapper = mount(TemplatesPage, { global: { stubs } });
     await flushPromises();
-    await wrapper.findAll("button").find((button) => button.text() === "编辑")!.trigger("click");
+    await wrapper.findAll(".complete-template-panel .template-row")[3]!.findAll("button").find((button) => button.text() === "编辑")!.trigger("click");
     expect(wrapper.find("[role='dialog']").attributes("aria-label")).toContain("编辑完整按键模板");
     expect(wrapper.findAll(".template-grid .mapping-cell")).toHaveLength(39);
     await wrapper.findAll(".template-grid .mapping-cell")[0]!.trigger("click");
@@ -183,7 +209,7 @@ describe("templates page", () => {
       actions: expect.objectContaining({ back: expect.objectContaining({ single: { type: "shortcut", chord: { keys: ["enter"] } } }) }),
     }));
     expect(saveMappingConfiguration).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain("自动切换关闭，当前继续使用通用配置");
+    expect(wrapper.text()).toContain("若正在使用此模板，实际按键映射会同步更新");
     expect(wrapper.find("[role='dialog']").exists()).toBe(false);
     await wrapper.findAll(".complete-template-panel .template-row")[3]!.findAll("button").find((button) => button.text() === "编辑")!.trigger("click");
     expect(wrapper.findAll(".template-grid .mapping-cell")[0]!.text()).toContain("Enter");
@@ -339,20 +365,31 @@ describe("templates page", () => {
     expect(refresh.attributes("disabled")).toBeUndefined();
   });
 
-  it("puts the fixed key recommendations first and only permits viewing or copying them", async () => {
+  it("edits stable defaults and resets only an explicitly confirmed default", async () => {
     const wrapper = mount(TemplatesPage, { global: { stubs } });
     await flushPromises();
     const rows = wrapper.findAll(".complete-template-panel .template-row");
     expect(rows.slice(0, 3).map((row) => row.text())).toEqual(expect.arrayContaining([
       expect.stringContaining("Agent"), expect.stringContaining("聊天工具"), expect.stringContaining("浏览器"),
     ]));
-    expect(rows[0]!.text()).toContain("查看配置");
+    expect(rows[0]!.text()).toContain("编辑");
+    expect(rows[0]!.text()).toContain("复位模板");
     expect(rows[0]!.text()).toContain("复制");
     expect(rows[0]!.text()).not.toContain("重命名");
     expect(rows[0]!.text()).not.toContain("删除");
     expect(rows[3]!.text()).toContain("编辑");
     expect(rows[3]!.text()).toContain("重命名");
     expect(rows[3]!.text()).toContain("删除");
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const reset = rows[0]!.findAll("button").find(button => button.text() === "复位模板")!;
+    await reset.trigger("click"); await flushPromises();
+    expect(resetBuiltinTemplate).not.toHaveBeenCalled();
+    vi.mocked(resetBuiltinTemplate).mockResolvedValue(structuredClone(configuration));
+    await reset.trigger("click"); await flushPromises();
+    expect(resetBuiltinTemplate).toHaveBeenCalledExactlyOnceWith("preset-agent");
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining("只复位"));
+    expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("已复位");
   });
 
   it("shows an actionable load failure", async () => {

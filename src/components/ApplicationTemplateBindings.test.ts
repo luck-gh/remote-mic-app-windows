@@ -28,8 +28,8 @@ const base: MappingConfiguration = {
 };
 
 const catalog: TemplateCatalogEntry[] = [
-  { id:"preset-agent", name:"Agent", kind:"direct", readOnly:true, buttonMappings:{enabled:true,actions:{}} },
-  ...base.templates.map(t => ({ id:t.id, name:t.name, kind:"direct" as const, readOnly:false, buttonMappings:t.mappings })),
+  { id:"preset-agent", name:"Agent", kind:"direct", builtIn:true, buttonMappings:{enabled:true,actions:{}} },
+  ...base.templates.map(t => ({ id:t.id, name:t.name, kind:"direct" as const, builtIn:false, buttonMappings:t.mappings })),
 ];
 
 function mountPanel(configuration = structuredClone(base)) {

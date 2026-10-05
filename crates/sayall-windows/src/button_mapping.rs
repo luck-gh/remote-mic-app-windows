@@ -1280,6 +1280,11 @@ fn fire_gesture(
     }
     match action {
         ButtonAction::Disabled => {}
+        ButtonAction::TaskSwitch { .. } => {
+            // Only the foreground-guarded system-task router may execute this action.
+            crate::gatt_note("task_switch phase=rejected reason=router_unavailable".to_owned());
+            lock_state(state).last_error = Some("任务切换控制器不可用".to_owned());
+        }
         ButtonAction::Scroll { direction, steps } => {
             crate::ble::gatt_note(format!(
                 "map_fire button={button:?} trigger={trigger:?} action=scroll direction={direction:?} steps={steps}"

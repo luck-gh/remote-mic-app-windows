@@ -246,6 +246,13 @@ pub struct KeyChord {
     pub keys: Vec<KeyCode>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSwitchView {
+    Applications,
+    Desktops,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ButtonAction {
@@ -253,6 +260,9 @@ pub enum ButtonAction {
     Disabled,
     Shortcut {
         chord: KeyChord,
+    },
+    TaskSwitch {
+        view: TaskSwitchView,
     },
     /// 打开/激活预设应用（Mac presetApplication 对齐；target = 预设 id）。
     OpenApp {

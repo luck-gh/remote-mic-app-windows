@@ -7,7 +7,7 @@ export interface UiPreferences {
   associationsExpanded: boolean;
 }
 
-// Only the three existing presentation preferences; never reapplies mappings.
+// Presentation preferences only; never reapplies mappings or changes device state.
 export function useUiPreference(field: keyof UiPreferences) {
   const value = ref(true);
   const loaded = ref(false);

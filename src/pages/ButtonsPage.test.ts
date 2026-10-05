@@ -6,10 +6,12 @@ import ButtonsPage from "./ButtonsPage.vue";
 type EdgeHandler = (edge: { button: string; isPressed: boolean }) => void;
 type GestureHandler = (gesture: { button: string; trigger: string }) => void;
 type ShortcutCaptureHandler = (edge: { key: string; isPressed: boolean }) => void;
+type SceneHandler = (event: import("../lib/bridge").SceneEvent) => void;
 
 let edgeHandler: EdgeHandler | null = null;
 let gestureHandler: GestureHandler | null = null;
 let shortcutCaptureHandler: ShortcutCaptureHandler | null = null;
+let sceneHandler: SceneHandler | null = null;
 
 vi.mock("../lib/bridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/bridge")>();
@@ -21,6 +23,9 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   });
   return {
     ...actual,
+    getSceneSnapshot: vi.fn(async () => ({ templateId: "preset-agent", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 })),
+    selectCurrentTemplate: vi.fn(),
+    subscribeSceneEvents: vi.fn(async (handler: SceneHandler) => { sceneHandler = handler; return () => { sceneHandler = null; }; }),
     getMappingConfiguration: vi.fn(async () => ({
       menuTemplateSwitchEnabled: false, mappingNoticeEnabled: true, commonMappings: {
         enabled: true,
@@ -61,11 +66,12 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     })),
     getTemplateCatalog: vi.fn(async () => ([
       ...builtinCatalog,
-      { id: "scene-copy", name: "我的按键模板", kind: "direct", readOnly: false, buttonMappings: userTemplate().mappings },
-      { id: "profile-a", name: "模板 A", kind: "direct", readOnly: false, buttonMappings: { enabled: true, actions: {} } },
+      { id: "scene-copy", name: "我的按键模板", kind: "direct", builtIn: false, buttonMappings: userTemplate().mappings },
+      { id: "profile-a", name: "模板 A", kind: "direct", builtIn: false, buttonMappings: { enabled: true, actions: {} } },
     ])),
     copyTemplateCatalogEntry: vi.fn(),
     saveMappingConfiguration: vi.fn(async (configuration: unknown) => configuration),
+    setMenuTemplateSwitchEnabled: vi.fn(),
     saveButtonMappings: vi.fn(async (mappings: unknown) => mappings),
     saveButtonMappingTemplate: vi.fn(async (name: string, mappings: unknown) => ({ id: "new-template", name, mappings })),
     updateButtonMappingTemplate: vi.fn(async (templateId: string, mappings: unknown) => ({ id: templateId, name: "模板 A", mappings })),
@@ -97,10 +103,13 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 });
 
 import {
+  getSceneSnapshot,
+  selectCurrentTemplate,
   getMappingConfiguration,
   getButtonMappingSnapshot,
   getTemplateCatalog,
   saveMappingConfiguration,
+  setMenuTemplateSwitchEnabled,
   subscribeButtonEdges,
   subscribeButtonGestures,
   saveButtonMappings,
@@ -199,6 +208,7 @@ beforeEach(() => {
   vi.mocked(getMappingConfiguration).mockClear();
   vi.mocked(getTemplateCatalog).mockClear();
   vi.mocked(saveMappingConfiguration).mockClear();
+  vi.mocked(setMenuTemplateSwitchEnabled).mockReset();
   vi.mocked(subscribeButtonEdges).mockClear();
   vi.mocked(subscribeButtonGestures).mockClear();
   vi.mocked(saveButtonMappings).mockClear();
@@ -207,6 +217,271 @@ beforeEach(() => {
 });
 
 describe("buttons mapping page", () => {
+  it("shows the applied template separately from the editing draft and follows runtime changes", async () => {
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const current = wrapper.get('output[aria-label="当前使用的按键模板"]');
+    expect(current.text()).toBe("Agent");
+    expect(wrapper.find('.current-template-display select, .current-template-display button, .current-template-display input').exists()).toBe(false);
+    const editor = wrapper.get('.editing-source-picker select');
+    await editor.setValue("template:profile-a"); await flushPromises();
+    expect(current.text()).toBe("Agent");
+    expect(selectCurrentTemplate).not.toHaveBeenCalled();
+    sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "template", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
+    await flushPromises();
+    expect(current.text()).toBe("模板 A");
+    expect((editor.element as HTMLSelectElement).value).toBe("template:profile-a");
+    wrapper.unmount();
+  });
+
+  it("shows an unconfirmed state on read failure and updates to common only after application", async () => {
+    vi.mocked(getSceneSnapshot).mockRejectedValueOnce(new Error("读取失败"));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const current = wrapper.get('output[aria-label="当前使用的按键模板"]');
+    expect(current.text()).toBe("正在确认当前模板…");
+    expect(wrapper.text()).toContain("读取失败");
+    sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "common", templateId: null, name: null, actionsAvailable: true } });
+    await flushPromises();
+    expect(current.text()).toBe("通用配置");
+    expect(selectCurrentTemplate).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+  it("saves Menu mode through the shared narrow command without changing drafts or confirming pending state", async () => {
+    const base = await getMappingConfiguration();
+    const wrapper = await mountPage();
+    const menu = () => wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "菜单")!;
+    let resolve!: (value: typeof base) => void;
+    vi.mocked(setMenuTemplateSwitchEnabled).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    try {
+      const input = wrapper.get('input[aria-label="菜单键切换模板"]');
+      expect(menu().get('.mapping-card-title input').element).toBe(input.element);
+      expect(menu().find('.menu-mode-lock .readonly-icon').exists()).toBe(false);
+      expect(input.element.closest('[aria-disabled="true"]')).toBeNull();
+      await menu().find(".mapping-cell").trigger("click");
+      wrapper.findComponent({name:"ButtonActionEditor"}).vm.$emit("update", {type:"shortcut", chord:{keys:["f5"]}});
+      await flushPromises();
+      await input.setValue(true);
+      expect(input.element).toHaveProperty("checked", false);
+      expect(menu().find('.menu-mode-lock .readonly-icon').exists()).toBe(false);
+      expect(input.element).toHaveProperty("disabled", true);
+      expect(wrapper.find(".mapping-editor").exists()).toBe(true);
+      expect(wrapper.get(".mapping-actions button").element).toHaveProperty("disabled", false);
+      await input.trigger("change");
+      expect(setMenuTemplateSwitchEnabled).toHaveBeenCalledExactlyOnceWith(true);
+      resolve({...base, menuTemplateSwitchEnabled:true, commonMappings:{enabled:true,actions:{}}});
+      await flushPromises();
+      expect(input.element).toHaveProperty("checked", true);
+      expect(menu().find('.menu-mode-lock .readonly-icon').exists()).toBe(true);
+      expect(input.element.closest('[aria-disabled="true"]')).toBeNull();
+      expect(menu().get('.mapping-cells').attributes('aria-disabled')).toBe('true');
+      expect(input.element).toHaveProperty("disabled", false);
+      expect(wrapper.find(".mapping-editor").exists()).toBe(false);
+      expect(menu().classes()).not.toContain("selected");
+      vi.mocked(setMenuTemplateSwitchEnabled).mockResolvedValueOnce({...base,menuTemplateSwitchEnabled:false});
+      await input.setValue(false);
+      await flushPromises();
+      expect(menu().find(".mapping-cell").element).toHaveProperty("disabled", false);
+      expect(menu().find('.menu-mode-lock .readonly-icon').exists()).toBe(false);
+      expect(menu().text()).toContain("F5");
+      expect(saveMappingConfiguration).not.toHaveBeenCalled();
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("keeps the Menu header control separate from mapping selection and exposes its explanation on focus", async () => {
+    const base = await getMappingConfiguration();
+    const wrapper = await mountPage();
+    const root = wrapper.element;
+    document.body.appendChild(root);
+    let resolve!: (value: typeof base) => void;
+    vi.mocked(setMenuTemplateSwitchEnabled).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    try {
+      const menu = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '菜单')!;
+      const input = menu.get<HTMLInputElement>('.mapping-card-title input');
+      expect(input.attributes('aria-describedby')).toContain('menu-mode-tooltip');
+      expect(menu.get('[role="tooltip"]').text()).toBe('启用后，菜单键用于切换模板；关闭后可自定义。');
+      expect(wrapper.get('.voice-card').find('input').exists()).toBe(false);
+      for (const key of [' ', 'Enter']) {
+        const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+        const bubbled = vi.fn();
+        menu.element.addEventListener('keydown', bubbled, { once: true });
+        input.element.dispatchEvent(event);
+        expect(bubbled).not.toHaveBeenCalled();
+        expect(event.defaultPrevented).toBe(false);
+        menu.element.removeEventListener('keydown', bubbled);
+      }
+      input.element.click();
+      await flushPromises();
+      expect(setMenuTemplateSwitchEnabled).toHaveBeenCalledExactlyOnceWith(true);
+      expect(input.element.checked).toBe(false);
+      expect(menu.classes()).not.toContain('selected');
+      expect(wrapper.find('.mapping-editor').exists()).toBe(false);
+      resolve({ ...base, menuTemplateSwitchEnabled: true });
+      await flushPromises();
+      expect(input.element.checked).toBe(true);
+      expect(menu.classes()).not.toContain('selected');
+    } finally { wrapper.unmount(); root.remove(); }
+  });
+
+  it("ignores a pre-save Menu poll and still reads later changes from the shared setting", async () => {
+    vi.useFakeTimers();
+    const base = await getMappingConfiguration();
+    const wrapper = await mountPage();
+    let finishPoll!: (value: typeof base) => void;
+    try {
+      vi.mocked(getMappingConfiguration).mockImplementationOnce(() => new Promise(done => { finishPoll=done; }));
+      await vi.advanceTimersByTimeAsync(1000);
+      vi.mocked(setMenuTemplateSwitchEnabled).mockResolvedValueOnce({...base,menuTemplateSwitchEnabled:true});
+      const input=wrapper.get('input[aria-label="菜单键切换模板"]');
+      await input.setValue(true);
+      await flushPromises();
+      finishPoll({...base,menuTemplateSwitchEnabled:false});
+      await flushPromises();
+      expect(input.element).toHaveProperty("checked", true);
+      vi.mocked(getMappingConfiguration).mockResolvedValueOnce({...base,menuTemplateSwitchEnabled:false});
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(input.element).toHaveProperty("checked", false);
+      expect(setMenuTemplateSwitchEnabled).toHaveBeenCalledTimes(1);
+    } finally { wrapper.unmount(); vi.useRealTimers(); }
+  });
+
+  it("reads back a failed Menu save and keeps it unavailable if the actual state cannot be read", async () => {
+    vi.useFakeTimers();
+    const base = await getMappingConfiguration();
+    const wrapper = await mountPage();
+    try {
+      const input=wrapper.get('input[aria-label="菜单键切换模板"]');
+      vi.mocked(setMenuTemplateSwitchEnabled).mockRejectedValueOnce(new Error("response lost"));
+      vi.mocked(getMappingConfiguration).mockResolvedValueOnce({...base,menuTemplateSwitchEnabled:true});
+      await input.setValue(true);
+      await flushPromises();
+      expect(input.element).toHaveProperty("checked", true);
+      expect(wrapper.get('.menu-mode-feedback [role="alert"]').text()).toContain("保存未确认");
+      vi.mocked(setMenuTemplateSwitchEnabled).mockRejectedValueOnce(new Error("save failed"));
+      vi.mocked(getMappingConfiguration).mockRejectedValueOnce(new Error("read failed"));
+      await input.setValue(false);
+      await flushPromises();
+      expect(input.element).toHaveProperty("disabled", true);
+      expect(wrapper.text()).toContain("菜单功能读取失败");
+      vi.mocked(getMappingConfiguration).mockResolvedValueOnce(base);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(input.element).toHaveProperty("checked", false);
+      expect(input.element).toHaveProperty("disabled", false);
+      expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); vi.useRealTimers(); }
+  });
+
+  it("does not apply a late Menu save reply to a new page or restart reads after unmount", async () => {
+    const base=await getMappingConfiguration();
+    const wrapper=await mountPage();
+    let resolve!: (value: typeof base) => void;
+    vi.mocked(setMenuTemplateSwitchEnabled).mockImplementationOnce(() => new Promise(done => { resolve=done; }));
+    await wrapper.get('input[aria-label="菜单键切换模板"]').setValue(true);
+    wrapper.unmount();
+    const next=await mountPage();
+    const reads=vi.mocked(getMappingConfiguration).mock.calls.length;
+    try {
+      resolve({...base,menuTemplateSwitchEnabled:true});
+      await flushPromises();
+      expect(next.get('input[aria-label="菜单键切换模板"]').element).toHaveProperty("checked", false);
+      expect(getMappingConfiguration).toHaveBeenCalledTimes(reads);
+    } finally { next.unmount(); }
+  });
+
+  it("shows reserved Menu behavior and blocks clicks and unlocked listener selection without changing mappings", async () => {
+    const base = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({ ...base, menuTemplateSwitchEnabled: true, buttonMappingFollowEnabled: false });
+    const wrapper = await mountPage();
+    const menu = () => wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "菜单")!;
+    try {
+      expect(menu().text()).toContain("已启用模板切换");
+      expect(menu().text()).toContain("打开 / 取消");
+      expect(menu().text()).toContain("按单击处理");
+      expect(menu().text()).toContain("切换保存选项");
+      expect(menu().text()).not.toContain("未设置");
+      for (const cell of menu().findAll(".mapping-cell")) {
+        expect(cell.element).toHaveProperty("disabled", true);
+        await cell.trigger("click");
+      }
+      await menu().trigger("click");
+      await wrapper.findAll(".toggle-row").find(row => row.text().includes("锁定当前按键"))!.find("input").setValue(false);
+      edgeHandler!({ button: "menu", isPressed: true });
+      await flushPromises();
+      expect(menu().classes()).toContain("active");
+      expect(menu().classes()).not.toContain("selected");
+      expect(wrapper.find(".mapping-editor").exists()).toBe(false);
+      await wrapper.find(".editing-source-picker select").setValue("template:preset-agent");
+      expect(menu().find(".mapping-cell").element).toHaveProperty("disabled", true);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("closes only a newly reserved Menu editor, rejects its late update, and restores its unsaved draft when released", async () => {
+    vi.useFakeTimers();
+    const base = await getMappingConfiguration();
+    const wrapper = await mountPage();
+    const menu = () => wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "菜单")!;
+    try {
+      await wrapper.find(".editing-source-picker select").setValue("template:preset-agent");
+      await menu().find(".mapping-cell").trigger("click");
+      const editor = wrapper.findComponent({ name: "ButtonActionEditor" });
+      const custom = { type: "shortcut", chord: { keys: ["f5"] } };
+      editor.vm.$emit("update", custom);
+      await flushPromises();
+      vi.mocked(getMappingConfiguration).mockResolvedValueOnce({ ...base, menuTemplateSwitchEnabled: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(wrapper.find(".mapping-editor").exists()).toBe(false);
+      editor.vm.$emit("update", { type: "disabled" });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(menu().find(".mapping-cell").element).toHaveProperty("disabled", false);
+      expect(menu().text()).toContain("F5");
+      await menu().find(".mapping-cell").trigger("click");
+      expect(wrapper.find(".mapping-editor").exists()).toBe(true);
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(updateButtonMappingTemplate).toHaveBeenCalledWith("preset-agent", expect.objectContaining({actions: expect.objectContaining({menu: expect.objectContaining({single: custom})})}));
+      expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); vi.mocked(getMappingConfiguration).mockReset().mockResolvedValue(base); vi.useRealTimers(); }
+  });
+
+  it("retains other key drafts and the open editor during Menu ownership changes", async () => {
+    vi.useFakeTimers();
+    const base = await getMappingConfiguration();
+    const wrapper = await mountPage();
+    try {
+      await wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "电源")!.find(".mapping-cell").trigger("click");
+      const editor = wrapper.findComponent({ name: "ButtonActionEditor" });
+      editor.vm.$emit("update", {type:"shortcut", chord:{keys:["tab"]}});
+      vi.mocked(getMappingConfiguration).mockResolvedValueOnce({...base, menuTemplateSwitchEnabled:true});
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(wrapper.findComponent({name:"ButtonActionEditor"}).element).toBe(editor.element);
+      expect(wrapper.find(".mapping-editor h2").text()).toContain("电源");
+      expect(wrapper.find(".mapping-editor").text()).toContain("Tab");
+    } finally { wrapper.unmount(); vi.mocked(getMappingConfiguration).mockReset().mockResolvedValue(base); vi.useRealTimers(); }
+  });
+
+  it("does not expose Menu editing before its setting loads or after a read failure, and ignores a late read after unmount", async () => {
+    let resolve!: (value: Awaited<ReturnType<typeof getMappingConfiguration>>) => void;
+    const base = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockImplementationOnce(() => new Promise(value => { resolve = value; }));
+    const wrapper = mount(ButtonsPage, {props:{runtime}});
+    const menu = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "菜单")!;
+    expect(menu.find(".mapping-cell").element).toHaveProperty("disabled", true);
+    expect(menu.text()).not.toContain("未设置");
+    wrapper.unmount();
+    resolve({...base, menuTemplateSwitchEnabled:false});
+    await flushPromises();
+    expect(subscribeButtonEdges).not.toHaveBeenCalled();
+    vi.mocked(getMappingConfiguration).mockRejectedValueOnce(new Error("unavailable"));
+    const failed = await mountPage();
+    try {
+      const card=failed.findAll(".mapping-card").find(item => item.find("strong").text() === "菜单")!;
+      expect(card.find(".mapping-cell").element).toHaveProperty("disabled", true);
+      expect(card.text()).toContain("读取失败");
+      expect(card.text()).not.toContain("未设置");
+    } finally { failed.unmount(); }
+  });
+
   it("adds scanned apps to the library without changing button bindings", async () => {
     const wrapper = await mountPage();
     await flushPromises();
@@ -278,12 +553,30 @@ describe("buttons mapping page", () => {
     await wrapper.find(".editing-source-picker select").setValue("template:preset-agent"); await flushPromises();
     expect(wrapper.text()).not.toContain("区域动作");
     expect(wrapper.findAll(".editing-source-picker select")).toHaveLength(1);
-    expect(wrapper.findAll(".mapping-cell")[0]!.element).toHaveProperty("disabled", true);
-    expect(wrapper.findAll(".mapping-card").find(card => card.text().includes("确定"))!.text()).toContain("Shift");
+    expect(wrapper.findAll(".mapping-cell")[0]!.element).toHaveProperty("disabled", false);
+    expect(wrapper.findAll(".mapping-card").find(card => card.text().includes("确定"))!.text()).toContain("Enter");
     expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
   });
 
-  it("requires an explicit discard before opening a read-only template over a dirty direct draft", async () => {
+  it("offers system task actions and explains native Confirm limits while keeping plain Enter immediate", async () => {
+    const wrapper = await mountPage();
+    await wrapper.find(".editing-source-picker select").setValue("template:preset-agent"); await flushPromises();
+    const confirmCard = wrapper.findAll(".mapping-card").find(card => card.text().includes("确定"))!;
+    await confirmCard.findAll(".mapping-cell")[0]!.trigger("click");
+    expect(wrapper.find(".editor-note[role='note']").exists()).toBe(false);
+    await confirmCard.findAll(".mapping-cell")[2]!.trigger("click");
+    expect(wrapper.get(".editor-note[role='note']").text()).toContain("首次原生 Enter");
+    const tvCard = wrapper.findAll(".mapping-card").find(card => card.text().includes("TV"))!;
+    await tvCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const editor = wrapper.findComponent({ name: "ButtonActionEditor" });
+    await editor.findAll("button").find(button => button.text() === "任务切换")!.trigger("click");
+    expect(editor.emitted("update")?.at(-1)).toEqual([{ type: "task_switch", view: "applications" }]);
+    await editor.findAll("button").find(button => button.text() === "任务视图")!.trigger("click");
+    expect(editor.emitted("update")?.at(-1)).toEqual([{ type: "task_switch", view: "desktops" }]);
+    wrapper.unmount();
+  });
+
+  it("requires an explicit discard before opening another template over a dirty direct draft", async () => {
     const confirm = vi.spyOn(window, "confirm");
     const wrapper = await mountPage();
     const source = wrapper.find(".editing-source-picker select");
@@ -783,7 +1076,7 @@ describe("buttons mapping page", () => {
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
     // 武装族按键显示冷首按原生副作用提示（信息性，不门控）。
-    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
+    expect(wrapper.find(".mapping-editor").text()).not.toContain("它原本的按键效果");
   });
 
   it("预设芯片显示实际按键组合，功能描述退为悬停提示", async () => {
@@ -805,29 +1098,29 @@ describe("buttons mapping page", () => {
     );
   });
 
-  it("全开放：确定·双击与 TV 所有操作可配 + 各自的单响应提示", async () => {
+  it("all keys share the editor without separate capture paths", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "确定", 1);
     expect(chipState(wrapper, "Enter")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
-    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
+    expect(wrapper.find(".mapping-editor").text()).not.toContain("它原本的按键效果");
 
     await openCell(wrapper, "TV", 0);
     expect(chipState(wrapper, "Enter")).toBe(false);
     expect(chipState(wrapper, "静音")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
-    expect(wrapper.find(".mapping-editor").text()).toContain("显式启动三键增强");
+    expect(wrapper.find(".mapping-editor").text()).not.toMatch(/三键|五键|增强就绪/);
   });
 
-  it("左键与其余方向键同样开放自定义并显示结构性泄漏提示", async () => {
+  it("all directions remain configurable without legacy capture hints", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "左", 0);
     expect(chipState(wrapper, "←")).toBe(false);
     expect(chipState(wrapper, "Backspace")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
-    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
+    expect(wrapper.find(".mapping-editor").text()).not.toContain("它原本的按键效果");
 
     // 与型号无关：RC001 上左键同样开放。
     const rc001 = await mountPage("rc001");

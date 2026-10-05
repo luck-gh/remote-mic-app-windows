@@ -21,6 +21,9 @@ pub struct WindowToken {
     process_id: u32,
     window_id: u64,
     generation: u64,
+    task_switcher: bool,
+    shell_owned: bool,
+    public_task_class: String,
 }
 
 impl WindowToken {
@@ -38,7 +41,41 @@ impl WindowToken {
             process_id,
             window_id,
             generation,
+            task_switcher: false,
+            shell_owned: false,
+            public_task_class: "other".into(),
         }
+    }
+
+    pub(crate) fn is_task_switcher(&self) -> bool {
+        self.task_switcher
+    }
+    pub(crate) fn is_task_staging(&self) -> bool {
+        self.shell_owned && self.public_task_class == "ForegroundStaging"
+    }
+    pub(crate) fn shell_owned(&self) -> bool {
+        self.shell_owned
+    }
+    pub(crate) fn public_task_class(&self) -> &str {
+        &self.public_task_class
+    }
+    pub(crate) fn same_window(&self, other: &Self) -> bool {
+        self.process_id == other.process_id && self.window_id == other.window_id
+    }
+    #[cfg(test)]
+    pub(crate) fn as_task_switcher(mut self) -> Self {
+        self.task_switcher = true;
+        self.shell_owned = true;
+        self.public_task_class = "TaskSwitcherWnd".into();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_task_staging(mut self) -> Self {
+        self.shell_owned = true;
+        self.public_task_class = "ForegroundStaging".into();
+        self.task_switcher = false;
+        self
     }
 
     pub fn application_id(&self) -> &str {
@@ -68,6 +105,8 @@ pub enum ApplicationControlError {
     IdentityUnavailable,
     #[error("应用控制令牌已失效")]
     StaleToken,
+    #[error("请先松开实体键盘的修饰键")]
+    ModifiersHeld,
     #[error("公开窗口操作不可用")]
     WindowOperationFailed,
 }
@@ -78,6 +117,9 @@ struct ForegroundIdentity {
     adapter: ApplicationAdapterKind,
     process_id: u32,
     window_id: u64,
+    task_switcher: bool,
+    shell_owned: bool,
+    public_task_class: String,
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +140,9 @@ impl TokenState {
             process_id: identity.process_id,
             window_id: identity.window_id,
             generation: self.generation,
+            task_switcher: identity.task_switcher,
+            shell_owned: identity.shell_owned,
+            public_task_class: identity.public_task_class,
         }
     }
 
@@ -129,6 +174,14 @@ pub struct ApplicationController {
 pub trait ApplicationControlBackend: Send + Sync {
     fn identify_foreground(&self) -> Result<WindowToken, ApplicationControlError>;
     fn restore_foreground(&self, token: &WindowToken) -> Result<(), ApplicationControlError>;
+    fn send_task_keys(
+        &self,
+        token: &WindowToken,
+        chord: &crate::send_input::KeyChord,
+    ) -> Result<(), ApplicationControlError> {
+        let _ = (token, chord);
+        Err(ApplicationControlError::UnsupportedPlatform)
+    }
 }
 
 impl ApplicationController {
@@ -162,6 +215,14 @@ impl ApplicationController {
 }
 
 impl ApplicationControlBackend for ApplicationController {
+    fn send_task_keys(
+        &self,
+        token: &WindowToken,
+        chord: &crate::send_input::KeyChord,
+    ) -> Result<(), ApplicationControlError> {
+        platform::send_task_keys(token, chord)
+    }
+
     fn identify_foreground(&self) -> Result<WindowToken, ApplicationControlError> {
         ApplicationController::identify_foreground(self)
     }
@@ -169,6 +230,14 @@ impl ApplicationControlBackend for ApplicationController {
     fn restore_foreground(&self, token: &WindowToken) -> Result<(), ApplicationControlError> {
         ApplicationController::restore_foreground(self, token)
     }
+}
+
+// Public HWND class/owner identification only, no control-tree or title query.
+// Fakeymacs config.py 20260823_01 uses these two established task UI classes.
+fn task_switcher_identity(pid: u32, shell_pid: u32, class: &str) -> bool {
+    shell_pid != 0
+        && pid == shell_pid
+        && matches!(class, "MultitaskingViewFrame" | "TaskSwitcherWnd")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -180,7 +249,8 @@ mod platform {
     use super::*;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow,
+        GetClassNameW, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId, IsWindow,
+        SetForegroundWindow,
     };
 
     pub(super) fn foreground_identity() -> Result<ForegroundIdentity, ApplicationControlError> {
@@ -196,12 +266,77 @@ mod platform {
         let executable = crate::app_launcher::process_executable_path(process_id)
             .ok_or(ApplicationControlError::IdentityUnavailable)?;
         let (application_id, adapter) = application_identity_for_executable(&executable);
+        let (task_switcher, shell_owned, public_task_class) =
+            task_switcher_window(hwnd, process_id);
         Ok(ForegroundIdentity {
             application_id,
             adapter,
             process_id,
             window_id: hwnd.0 as usize as u64,
+            task_switcher,
+            shell_owned,
+            public_task_class,
         })
+    }
+
+    fn task_switcher_window(hwnd: HWND, process_id: u32) -> (bool, bool, String) {
+        let shell = unsafe { GetShellWindow() };
+        let mut shell_pid = 0;
+        unsafe { GetWindowThreadProcessId(shell, Some(&mut shell_pid)) };
+        let mut class = [0u16; 128];
+        let length = unsafe { GetClassNameW(hwnd, &mut class) };
+        let class = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+        let shell_owned = shell_pid != 0 && process_id == shell_pid;
+        // Only Shell-owned public classes or the fixed known system categories
+        // are logged. Never log an unrelated application's custom class/title.
+        let diagnostic_class = if shell_owned
+            || matches!(
+                class.as_str(),
+                "MultitaskingViewFrame"
+                    | "TaskSwitcherWnd"
+                    | "Windows.UI.Core.CoreWindow"
+                    | "Windows.UI.Input.InputSite.WindowClass"
+            ) {
+            class
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                .collect()
+        } else {
+            "other".to_owned()
+        };
+        (
+            task_switcher_identity(process_id, shell_pid, &class),
+            shell_owned,
+            diagnostic_class,
+        )
+    }
+
+    pub(super) fn send_task_keys(
+        token: &WindowToken,
+        chord: &crate::send_input::KeyChord,
+    ) -> Result<(), ApplicationControlError> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        };
+        let current = foreground_identity()?;
+        if current.process_id != token.process_id
+            || current.window_id != token.window_id
+            || current.task_switcher != token.task_switcher
+        {
+            return Err(ApplicationControlError::StaleToken);
+        }
+        // Never release a modifier owned by the physical keyboard. Our shortcuts
+        // are single complete DOWN/UP batches; no Alt is retained between actions.
+        if [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+            .iter()
+            .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+        {
+            return Err(ApplicationControlError::ModifiersHeld);
+        }
+        crate::send_input_windows::SendInputRuntime::new()
+            .tap(chord.clone())
+            .map(|_| ())
+            .map_err(|_| ApplicationControlError::WindowOperationFailed)
     }
 
     pub(super) fn restore_foreground(token: &WindowToken) -> Result<(), ApplicationControlError> {
@@ -226,6 +361,13 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
+    pub(super) fn send_task_keys(
+        _: &super::WindowToken,
+        _: &crate::send_input::KeyChord,
+    ) -> Result<(), super::ApplicationControlError> {
+        Err(super::ApplicationControlError::UnsupportedPlatform)
+    }
+
     use super::*;
     pub(super) fn foreground_identity() -> Result<ForegroundIdentity, ApplicationControlError> {
         Err(ApplicationControlError::UnsupportedPlatform)
@@ -252,11 +394,24 @@ mod tests {
 
     fn identity(application_id: &str, window_id: u64) -> ForegroundIdentity {
         ForegroundIdentity {
+            task_switcher: false,
+            shell_owned: false,
+            public_task_class: "other".into(),
             application_id: application_id.to_owned(),
             adapter: ApplicationAdapterKind::Generic,
             process_id: 42,
             window_id,
         }
+    }
+
+    #[test]
+    fn task_switcher_requires_exact_shell_owner_and_supported_public_class() {
+        assert!(task_switcher_identity(4, 4, "MultitaskingViewFrame"));
+        assert!(task_switcher_identity(4, 4, "TaskSwitcherWnd"));
+        assert!(!task_switcher_identity(5, 4, "MultitaskingViewFrame"));
+        assert!(!task_switcher_identity(4, 4, "CabinetWClass"));
+        assert!(!task_switcher_identity(4, 4, "Windows.UI.Core.CoreWindow"));
+        assert!(!task_switcher_identity(0, 0, "TaskSwitcherWnd"));
     }
 
     #[test]

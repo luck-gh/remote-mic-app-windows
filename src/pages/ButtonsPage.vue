@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { useCurrentTemplate } from "../lib/current-template";
 import ButtonActionEditor from "../components/ButtonActionEditor.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
 import SettingsDialog from "../components/SettingsDialog.vue";
@@ -15,20 +16,19 @@ import {
   getButtonMappingSnapshot,
   getMappingConfiguration,
   getTemplateCatalog,
-  identityShortcutByButton,
   listPresetApps,
   registerPresetAppNames,
   remoteModelLabel,
   saveButtonMappings,
   saveButtonMappingTemplate,
   saveMappingConfiguration,
-  shortcutCapability,
+  setMenuTemplateSwitchEnabled,
   startRawInput,
   stopRawInput,
   subscribeButtonEdges,
   subscribeButtonGestures,
   updateButtonMappingTemplate,
-  copyTemplateCatalogEntry,
+  resetBuiltinTemplate,
   type ButtonAction,
   type ButtonActions,
   type ButtonEdge,
@@ -46,6 +46,7 @@ import {
 } from "../lib/bridge";
 
 const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+const READONLY_ICON = "M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3";
 
 /** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 640，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
@@ -110,9 +111,6 @@ const TRIGGERS: ButtonTrigger[] = ["single", "double", "long"];
 const remoteModel = computed<RemoteModel>(
   () => props.runtime?.platform.connection.remoteModel ?? "unknown",
 );
-
-/** 配置允许保存；实际执行能力由后端当前设备和增强状态控制。 */
-const UNMAPPABLE_BUTTONS: ReadonlySet<RemoteButton> = new Set<RemoteButton>();
 
 const deviceLabel = computed(() => {
   if (remoteModel.value !== "unknown") return remoteModelLabel(remoteModel.value);
@@ -237,7 +235,14 @@ const VOICE_ICON_STROKES = ["M6.3 11.5a5.7 5.7 0 0 0 11.4 0", "M12 17.2v3.8"];
 const mappings = ref<ButtonMappings>({ enabled: true, actions: {} });
 const savedSnapshot = ref<ButtonMappings>({ enabled: true, actions: {} });
 type EditingSource = "common" | `template:${string}`;
+const currentTemplate = useCurrentTemplate();
 const configuration = ref<MappingConfiguration | null>(null);
+// This is the saved Menu opt-in, not program-default following or mapping enablement.
+const menuTemplateSwitchEnabled = ref<boolean | null>(null);
+const menuStateReadFailed = ref(false);
+const menuModePending = ref(false);
+const menuModeError = ref<string | null>(null);
+let menuConfigurationRevision = 0;
 const templateCatalog = ref<TemplateCatalogEntry[]>([]);
 const editingSource = ref<EditingSource>("common");
 /** 已安装的预设应用（打开应用动作可选列表）。 */
@@ -264,6 +269,93 @@ let resizeObserver: ResizeObserver | null = null;
 let unmounted = false;
 let resourcesReady = false;
 let saveSequence = 0;
+let snapshotPending = false;
+
+function menuReserved(button: RemoteButton): boolean {
+  return button === "menu" && menuTemplateSwitchEnabled.value !== false;
+}
+
+const menuStateLabel = computed(() => menuTemplateSwitchEnabled.value === true
+  ? "已启用模板切换" : menuStateReadFailed.value ? "菜单功能读取失败" : "正在读取菜单功能");
+const menuBehavior: Record<ButtonTrigger, string> = {
+  single: "打开 / 取消",
+  double: "按单击处理",
+  long: "切换保存选项",
+};
+const menuBehaviorDetail: Record<ButtonTrigger, string> = {
+  single: "面板外单击打开模板选择；面板内单击取消选择。",
+  double: "没有独立双击动作，连续短按按两次单击处理。",
+  long: "面板外与单击相同，仅打开；面板内再次长按切换“同时更新此程序的默认模板”，松开不取消。",
+};
+
+function cellSummary(button: RemoteButton, trigger: ButtonTrigger): string {
+  if (!menuReserved(button)) return actionSummary(actionOf(button, trigger));
+  return menuTemplateSwitchEnabled.value === true ? menuBehavior[trigger] : "暂不可编辑";
+}
+
+async function readMenuConfiguration(): Promise<MappingConfiguration | null> {
+  if (menuModePending.value) return null;
+  const revision = menuConfigurationRevision;
+  try {
+    const saved = await getMappingConfiguration();
+    if (!unmounted && revision === menuConfigurationRevision && !menuModePending.value) applySavedMenuMode(saved);
+    return saved;
+  } catch {
+    if (!unmounted && revision === menuConfigurationRevision && !menuModePending.value) {
+      if (!menuStateReadFailed.value) reportFrontendEvent({event:"buttons_menu_ownership", phase:"completed", result:"failed", reason:"configuration_read_failed"});
+      menuTemplateSwitchEnabled.value = null;
+      menuStateReadFailed.value = true;
+    }
+    return null;
+  }
+}
+
+function applySavedMenuMode(saved: MappingConfiguration): void {
+  menuTemplateSwitchEnabled.value = saved.menuTemplateSwitchEnabled;
+  menuStateReadFailed.value = false;
+  if (configuration.value) configuration.value = { ...configuration.value, menuTemplateSwitchEnabled: saved.menuTemplateSwitchEnabled };
+}
+
+async function toggleMenuMode(event: Event): Promise<void> {
+  const previous = menuTemplateSwitchEnabled.value;
+  // A native change toggles the DOM first; show only the confirmed setting while saving.
+  (event.target as HTMLInputElement).checked = previous === true;
+  if (unmounted || busy.value || menuModePending.value || previous === null || !configuration.value) return;
+  const revision = ++menuConfigurationRevision;
+  menuModePending.value = true;
+  menuModeError.value = null;
+  reportFrontendEvent({event:"buttons_menu_mode", phase:"requested", result:"passed", reason:previous ? "disable" : "enable"});
+  try {
+    const saved = await setMenuTemplateSwitchEnabled(!previous);
+    if (unmounted || revision !== menuConfigurationRevision) return;
+    applySavedMenuMode(saved);
+    reportFrontendEvent({event:"buttons_menu_mode", phase:"completed", result:"passed", reason:"saved_setting_applied"});
+  } catch {
+    if (unmounted || revision !== menuConfigurationRevision) return;
+    menuModeError.value = "保存未确认，请检查当前开关状态。";
+    reportFrontendEvent({event:"buttons_menu_mode", phase:"completed", result:"failed", reason:"save_unconfirmed"});
+    try {
+      const saved = await getMappingConfiguration();
+      if (!unmounted && revision === menuConfigurationRevision) applySavedMenuMode(saved);
+    } catch {
+      if (!unmounted && revision === menuConfigurationRevision) {
+        menuTemplateSwitchEnabled.value = null;
+        menuStateReadFailed.value = true;
+        reportFrontendEvent({event:"buttons_menu_mode", phase:"completed", result:"failed", reason:"readback_failed"});
+      }
+    }
+  } finally {
+    if (!unmounted && revision === menuConfigurationRevision) menuModePending.value = false;
+  }
+}
+
+watch(menuTemplateSwitchEnabled, (value) => {
+  if (value !== false) {
+    if (editingTarget.value?.button === "menu") editingTarget.value = null;
+    if (selectedButton.value === "menu") selectedButton.value = null;
+  }
+  if (value !== null) reportFrontendEvent({event:"buttons_menu_ownership", phase:"completed", result:"passed", reason:value ? "template_menu_reserved" : "custom_mapping_available"});
+}, {flush:"sync"});
 
 function releasePageResources(): void {
   unlistenEdges?.();
@@ -279,7 +371,6 @@ function releasePageResources(): void {
 }
 
 const activeTemplateEntry = computed(() => editingSource.value === "common" ? null : templateCatalog.value.find(t => t.id === editingSource.value.slice("template:".length)) ?? null);
-const templateReadOnly = computed(() => activeTemplateEntry.value?.readOnly ?? false);
 const dirty = computed(() => JSON.stringify(mappings.value) !== JSON.stringify(savedSnapshot.value));
 
 const enabled = computed({
@@ -345,20 +436,20 @@ function actionOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction {
 }
 
 function selectButton(button: RemoteButton): void {
-  if (busy.value) return;
+  if (busy.value || menuReserved(button)) return;
   selectedButton.value = button;
 }
 
 function openEditor(button: RemoteButton, trigger: ButtonTrigger): void {
-  if (busy.value || templateReadOnly.value) return;
+  if (busy.value || menuReserved(button)) return;
   selectedButton.value = button;
   editingTarget.value = { button, trigger };
 }
 
 function applyAction(action: ButtonAction): void {
-  if (busy.value || templateReadOnly.value) return;
+  if (busy.value) return;
   const target = editingTarget.value;
-  if (!target) return;
+  if (!target || menuReserved(target.button)) return;
   const next: ButtonMappings = {
     ...mappings.value,
     actions: { ...mappings.value.actions },
@@ -368,21 +459,6 @@ function applyAction(action: ButtonAction): void {
   next.actions[target.button] = actions;
   mappings.value = next;
 }
-
-/** 编辑器提示不代替后端来源校验和实时能力门禁。 */
-const capabilityNote = computed<string | null>(() => {
-  if (!editingTarget.value) return null;
-  const button = editingTarget.value.button;
-  if (["back", "volume_up", "volume_down", "home", "tv"].includes(button)) {
-    return "提示：RC003 的这些按键需要在“驱动”页显式启动三键增强，状态就绪后才能执行映射。增强仅接管已确认属于遥控器的按键报告；实体键盘的反引号、波浪号和 Home 保持原样。当前候选版本仍待实机验收。";
-  }
-  if (shortcutCapability(button, "single", remoteModel.value) === "identity") {
-    const identity = identityShortcutByButton[button];
-    const label = identity ? chordLabel({ keys: [identity] }) : "";
-    return `提示：闲置约 4 秒后第一次按这个键，可能同时出现一次它原本的按键效果；这段时间内连按不受影响。单击动作若就是该键本身（${label}），多出的那一次会被自动合并。`;
-  }
-  return null;
-});
 
 async function persist(message?: string): Promise<boolean> {
   const request = ++saveSequence;
@@ -409,6 +485,13 @@ async function persist(message?: string): Promise<boolean> {
         };
       }
     }
+    if (source !== "common") {
+      const id = source.slice("template:".length);
+      templateCatalog.value = templateCatalog.value.map(item => item.id === id ? {...item, buttonMappings: cloneMappings(saved)} : item);
+      if (configuration.value && !configuration.value.templates.some(item => item.id === id)) {
+        configuration.value.templates.push({id, name: templateCatalog.value.find(item => item.id === id)!.name, mappings: cloneMappings(saved)});
+      }
+    }
     mappings.value = cloneMappings(saved);
     savedSnapshot.value = cloneMappings(saved);
     if (message) {
@@ -425,14 +508,27 @@ async function persist(message?: string): Promise<boolean> {
   }
 }
 
-function restoreDefaults(): void {
+async function restoreDefaults(): Promise<void> {
   if (busy.value) return;
+  const template = activeTemplateEntry.value;
+  if (template?.builtIn) {
+    if (!window.confirm(`只复位“${template.name}”为当前版本默认按键？该模板修改和当前草稿将丢失，其它模板及关联保持不变。`)) return;
+    busy.value = true;
+    try {
+      configuration.value = await resetBuiltinTemplate(template.id);
+      templateCatalog.value = await getTemplateCatalog();
+      const saved = templateCatalog.value.find(item => item.id === template.id)?.buttonMappings;
+      if (saved) { mappings.value = cloneMappings(saved); savedSnapshot.value = cloneMappings(saved); }
+      statusMessage.value = `已复位“${template.name}”`;
+    } catch (error) { statusMessage.value = String(error); } finally { busy.value = false; }
+    return;
+  }
   mappings.value = { enabled: true, actions: {} };
   statusMessage.value = "已载入默认草稿；点击“保存配置”后写入当前编辑目标";
 }
 
 async function saveConfiguration(): Promise<void> {
-  if (!templateReadOnly.value) await persist("配置已保存并生效");
+  await persist("配置已保存并生效");
 }
 
 function openSaveTemplateDialog(): void {
@@ -443,7 +539,6 @@ function openSaveTemplateDialog(): void {
 }
 
 async function saveAsTemplate(): Promise<void> {
-  if (templateReadOnly.value) return;
   const name = templateNameDraft.value.trim();
   if (!name) {
     templateNameError.value = "请输入模板名称";
@@ -505,17 +600,7 @@ async function selectEditingSource(event: Event): Promise<void> {
   select.value = editingSource.value;
 }
 
-async function copyTemplate(entry: TemplateCatalogEntry): Promise<void> {
-  busy.value = true;
-  try {
-    const copy = await copyTemplateCatalogEntry(entry.id, `${entry.name} 副本`);
-    configuration.value = await getMappingConfiguration();
-    templateCatalog.value = await getTemplateCatalog();
-    loadEditingSource(`template:${copy.id}`);
-    statusMessage.value = `已复制“${entry.name}”；现在可编辑副本`;
-  } catch (error) { statusMessage.value = error instanceof Error ? error.message : String(error); }
-  finally { busy.value = false; }
-}
+
 
 function phaseLabel(phase: RawInputPhase | undefined): string {
   switch (phase) {
@@ -568,7 +653,7 @@ onMounted(async () => {
   // Measure before the initial IPC resolves so the first frame uses the real canvas width.
   if (canvasEl.value) refreshCanvasGeometry(canvasEl.value.clientWidth);
   const [loaded, snapshot, apps, catalog] = await Promise.all([
-    getMappingConfiguration(),
+    readMenuConfiguration(),
     getButtonMappingSnapshot(),
     listPresetApps().catch(() => [] as PresetAppInfo[]),
     getTemplateCatalog(),
@@ -592,7 +677,7 @@ onMounted(async () => {
       next.delete(edge.button);
     }
     activeButtons.value = next;
-    if (!lockSelection.value && edge.isPressed) {
+    if (!lockSelection.value && edge.isPressed && !menuReserved(edge.button)) {
       selectedButton.value = edge.button;
     }
   });
@@ -617,9 +702,15 @@ onMounted(async () => {
   unlistenGestures = stopGestures;
 
   snapshotTimer = window.setInterval(async () => {
-    mappingSnapshot.value = await getButtonMappingSnapshot();
-    // Same observation union as button-edge, including unconfigured host keys.
-    activeButtons.value = new Set(mappingSnapshot.value.observedButtons);
+    if (snapshotPending || unmounted) return;
+    snapshotPending = true;
+    try {
+      const [snapshot] = await Promise.all([getButtonMappingSnapshot(), readMenuConfiguration()]);
+      if (unmounted) return;
+      mappingSnapshot.value = snapshot;
+      // Update only live state, never replace the user's editing draft.
+      activeButtons.value = new Set(snapshot.observedButtons);
+    } finally { snapshotPending = false; }
   }, 1_000);
 
   // 流式画布：观测容器宽（不足最小画布 800px 时保持 800 由 CSS 缩放兜底）。
@@ -666,9 +757,9 @@ onUnmounted(() => {
     <header class="page-header mapping-header">
       <div class="mapping-heading-row">
         <h1>按键映射</h1>
-        <label class="toggle-row mapping-toggle-slot" :class="{ unavailable: templateReadOnly }" :title="templateReadOnly ? '内置推荐模板只读，请复制后编辑。' : '开启后，遥控器按键按本页配置执行动作；关闭时，遥控器保持原始按键行为。'">
-          <span>{{ templateReadOnly ? "内置推荐模板（只读）" : "启用自定义按键功能" }}</span>
-          <input v-model="enabled" type="checkbox" class="toggle-input" :disabled="busy || templateReadOnly" />
+        <label class="toggle-row mapping-toggle-slot" title="开启后，遥控器按键按本页配置执行动作；关闭时，遥控器保持原始按键行为。">
+          <span>启用自定义按键功能</span>
+          <input v-model="enabled" type="checkbox" class="toggle-input" :disabled="busy" />
         </label>
         <div class="device-chip" :class="{ connected: connectionInfo?.phase === 'ready' || connectionInfo?.phase === 'streaming' }">
           <span class="status-dot" :class="connectionInfo?.phase === 'streaming' ? 'active' : connectionInfo?.phase === 'ready' ? 'success' : 'pending'"></span>
@@ -677,6 +768,10 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="mapping-header-controls">
+        <div class="current-template-display">
+          <span>当前使用</span>
+          <output aria-label="当前使用的按键模板">{{ !currentTemplate.applied.value ? '正在确认当前模板…' : currentTemplate.templateId.value ? currentTemplate.applied.value.name ?? '当前模板' : '通用配置' }}</output>
+        </div>
         <label class="editing-source-picker">
           <span>编辑配置</span>
           <select :value="editingSource" :disabled="busy" @change="selectEditingSource">
@@ -686,6 +781,7 @@ onUnmounted(() => {
 
 
       </div>
+      <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
       <p class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
     </header>
 
@@ -748,6 +844,8 @@ onUnmounted(() => {
           selected: selectedButton === placement.button,
           active: activeButtons.has(placement.button),
           flashed: firedFlash?.button === placement.button,
+          'menu-reserved': menuReserved(placement.button),
+          'mapping-readonly': menuReserved(placement.button),
         }"
         :style="{ top: `${cardTop(placement)}px`, width: `${cardWidth}px` }"
         @click="selectButton(placement.button)"
@@ -765,36 +863,46 @@ onUnmounted(() => {
             />
           </svg>
           <strong>{{ buttonLabels[placement.button] }}</strong>
+          <label v-if="placement.button === 'menu'" class="menu-mode-control" @click.stop @keydown.stop @keyup.stop>
+            <input type="checkbox" aria-label="菜单键切换模板" aria-describedby="menu-mode-tooltip menu-mode-feedback" :checked="menuTemplateSwitchEnabled === true" :disabled="busy || menuModePending || menuTemplateSwitchEnabled === null || !configuration" :aria-busy="menuModePending" @change.stop="toggleMenuMode" />
+            <span class="menu-mode-lock">
+              <svg v-if="menuTemplateSwitchEnabled === true" class="readonly-icon" viewBox="0 0 24 24" fill="none" aria-label="固定功能，不可自定义">
+                <path :d="READONLY_ICON" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </span>
+            <span id="menu-mode-tooltip" class="menu-mode-tooltip" role="tooltip">启用后，菜单键用于切换模板；关闭后可自定义。</span>
+          </label>
+          <span v-if="menuReserved(placement.button)" class="menu-reserved-label">{{ menuStateLabel }}</span>
         </div>
-        <div class="mapping-cells">
+        <div class="mapping-cells" :aria-disabled="menuReserved(placement.button) ? true : undefined">
           <button
             v-for="trigger in TRIGGERS"
             :key="trigger"
             type="button"
             class="mapping-cell"
             :class="{
-              set: actionOf(placement.button, trigger).type !== 'disabled',
-              'semantic-readonly-action': templateReadOnly && actionOf(placement.button, trigger).type !== 'disabled',
+              set: !menuReserved(placement.button) && actionOf(placement.button, trigger).type !== 'disabled',
               editing:
                 editingTarget?.button === placement.button && editingTarget?.trigger === trigger,
               flashed: firedFlash?.button === placement.button && firedFlash?.trigger === trigger,
             }"
-            :disabled="busy || templateReadOnly || (!templateReadOnly && UNMAPPABLE_BUTTONS.has(placement.button))"
+            :disabled="busy || menuReserved(placement.button)"
             :title="
-              !templateReadOnly && UNMAPPABLE_BUTTONS.has(placement.button)
-                ? '此按键暂不支持自定义，按键功能保持原样'
+              menuReserved(placement.button)
+                ? menuTemplateSwitchEnabled === true ? menuBehaviorDetail[trigger] : menuStateLabel
                 : `${buttonLabels[placement.button]} · ${buttonTriggerLabel(trigger)}：${actionSummary(actionOf(placement.button, trigger))}`
             "
             @click.stop="openEditor(placement.button, trigger)"
           >
             <small>{{ buttonTriggerLabel(trigger) }}</small>
-            <span>{{ actionSummary(actionOf(placement.button, trigger)) }}</span>
+            <span>{{ cellSummary(placement.button, trigger) }}</span>
           </button>
         </div>
       </article>
 
       <article
-        class="mapping-card voice-card center"
+        class="mapping-card mapping-readonly voice-card center"
+        aria-disabled="true"
         :class="{ active: voiceActive }"
         :style="{ top: `${VOICE_CARD_TOP}px`, width: `${cardWidth}px` }"
       >
@@ -812,11 +920,20 @@ onUnmounted(() => {
             />
           </svg>
           <strong>语音键</strong>
+          <svg class="readonly-icon" viewBox="0 0 24 24" fill="none" aria-label="固定功能，不可自定义">
+            <path :d="READONLY_ICON" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
           <span class="badge pending voice-badge" :class="{ active: voiceActive }">按住说话</span>
         </div>
         <p class="voice-note">按下开始、松开结束；不参与自定义映射，不加双击/长按延迟。</p>
       </article>
     </div>
+
+    <div id="menu-mode-feedback" class="menu-mode-feedback" aria-live="polite">
+      <span v-if="menuModePending" class="muted">正在保存…</span>
+      <span v-else-if="menuModeError" class="error-text" role="alert">{{ menuModeError }}</span>
+    </div>
+    <p v-if="menuStateReadFailed" class="menu-reserved-note" role="alert">未能读取菜单功能，暂不可编辑菜单键；正在重新读取，已有映射未更改。</p>
 
     <article v-if="editingTarget" ref="editorPanel" class="card mapping-editor">
       <div class="card-title-row">
@@ -824,7 +941,7 @@ onUnmounted(() => {
           <h2>{{ buttonLabel(editingTarget.button) }} · {{ buttonTriggerLabel(editingTarget.trigger) }}</h2>
           <p class="muted">当前：{{ actionSummary(actionOf(editingTarget.button, editingTarget.trigger)) }}</p>
         </div>
-        <div v-if="!templateReadOnly" class="button-row">
+        <div class="button-row">
           <button
             class="secondary-button editor-disable-btn"
             :class="{ 'is-active': actionOf(editingTarget.button, editingTarget.trigger).type === 'disabled' }"
@@ -840,22 +957,20 @@ onUnmounted(() => {
       </div>
       <ButtonActionEditor
         :key="`${editingSource}:${editingTarget.button}:${editingTarget.trigger}`"
-          :shortcuts-only="editingSource !== 'common'"
-        v-if="!templateReadOnly"
+        :shortcuts-only="editingSource !== 'common'"
         :mappings="mappings"
         :button="editingTarget.button"
         :trigger="editingTarget.trigger"
         :preset-apps="presetApps"
-        :capability-note="capabilityNote"
         @update="applyAction"
         @applications="mappings = { ...mappings, applications: $event }"
         @status="statusMessage = $event"
       />
 
-      <p v-if="!templateReadOnly && editingTarget.trigger === 'single'" class="muted editor-note">
+      <p v-if="editingTarget.trigger === 'single'" class="muted editor-note">
         未配置双击与长按时，单击在按下瞬间触发（零延迟）；返回/方向/音量键按住会连续触发。
       </p>
-      <p v-else-if="!templateReadOnly" class="muted editor-note">
+      <p v-else class="muted editor-note">
         {{ editingTarget.trigger === "double" ? "双击判定窗口约 0.3 秒：配置后单击会稍等片刻以区分双击。" : "长按约 0.55 秒触发；配置后按住连发停用。" }}
       </p>
     </article>
@@ -874,7 +989,7 @@ onUnmounted(() => {
         >
           {{ rawInput?.phase === "ready" ? "停止监听" : "启动监听" }}
         </button>
-        <small v-if="!templateReadOnly && mappingSnapshot && !mappings.enabled" class="muted"> · 总开关关闭（按键保持原样）</small>
+        <small v-if="mappingSnapshot && !mappings.enabled" class="muted"> · 总开关关闭（按键保持原样）</small>
         <small v-if="dirty" class="muted"> · 当前编辑目标有未保存更改</small>
       </div>
       <label class="toggle-row" title="开启后，操作实体遥控器不会切换正在编辑的按键。">
@@ -892,20 +1007,18 @@ onUnmounted(() => {
 
     <footer class="mapping-actions" aria-label="按键配置操作">
       <div class="button-row">
-        <button v-if="!templateReadOnly" class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
+        <button class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
           保存当前配置
         </button>
-        <button v-else-if="templateReadOnly" class="secondary-button" type="button" :disabled="busy" @click="activeTemplateEntry && copyTemplate(activeTemplateEntry)">
-          复制后编辑
-        </button>
-        <button v-if="!templateReadOnly" class="secondary-button" type="button" :disabled="busy" @click="openSaveTemplateDialog">
+
+        <button class="secondary-button" type="button" :disabled="busy" @click="openSaveTemplateDialog">
           保存为模板
         </button>
         <button class="secondary-button" type="button" :disabled="busy" @click="exportConfiguration">
           导出配置…
         </button>
-        <button v-if="!templateReadOnly" class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
-          恢复默认
+        <button class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
+          {{ activeTemplateEntry?.builtIn ? "复位模板" : "恢复默认" }}
         </button>
       </div>
     </footer>
@@ -929,6 +1042,27 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.mapping-card { border-width: 2px; padding: 5px 8px; }
+.mapping-card.mapping-readonly { cursor: default; border-color: transparent; outline: none; box-shadow: none; }
+.mapping-card.mapping-readonly:not(.active):not(.flashed) { background: var(--pending-surface); }
+.mapping-card.mapping-readonly.flashed { background: var(--pressed-surface); }
+.mapping-readonly .mapping-card-title strong,
+.mapping-readonly .mapping-icon { color: var(--text-secondary); }
+.readonly-icon { width: 12px; height: 12px; flex: 0 0 auto; color: var(--text-secondary); }
+.menu-reserved-label { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 11px; }
+.menu-reserved .mapping-cell:disabled { opacity: 1; cursor: default; border-radius: 0; }
+.menu-reserved .mapping-cell:disabled:not(.flashed) { background: transparent; }
+.menu-reserved .mapping-cell span { color: var(--text-secondary); font-size: 11px; }
+.menu-reserved .mapping-cell:last-child span { font-weight: 600; }
+.menu-reserved .mapping-cell:disabled:hover { box-shadow: none; }
+.menu-mode-control { position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; cursor: pointer; }
+.menu-mode-control input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+.menu-mode-lock { display: inline-flex; align-items: center; width: 12px; height: 18px; }
+.menu-mode-tooltip { position: absolute; z-index: 5; bottom: calc(100% + 6px); left: 0; width: 220px; max-width: calc(100vw - 80px); padding: 8px 10px; border-radius: 6px; background: var(--surface-control); color: var(--text-primary); border: 1px solid var(--border-strong); font-size: 12px; font-weight: 400; line-height: 1.5; visibility: hidden; pointer-events: none; }
+.menu-mode-control:hover .menu-mode-tooltip,
+.menu-mode-control:focus-within .menu-mode-tooltip { visibility: visible; }
+.menu-mode-feedback { margin-top: 10px; min-height: 1.5em; font-size: 13px; line-height: 1.5; }
+.menu-reserved-note { margin: 10px 0 12px; line-height: 1.5; font-size: 13px; }
 .buttons-page {
   flex: 1 1 0;
   min-height: 0;
@@ -940,27 +1074,44 @@ onUnmounted(() => {
   min-height: 0;
   min-width: 0;
   overflow: auto;
-  padding: 0 4px 16px;
+  padding: 0 var(--content-inline-padding) 16px;
   scrollbar-gutter: stable;
 }
 .mapping-actions {
   min-width: 0;
-  padding: 12px 4px 16px;
+  /* 与独立正文的槽位对齐；hidden 只预留空间，不显示第二条滚动条。 */
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  padding: 12px var(--content-inline-padding) 16px;
   border-top: 1px solid var(--border);
   background: var(--surface-canvas);
 }
 .mapping-actions .button-row { justify-content: flex-end; }
 .mapping-actions button { max-width: 100%; white-space: normal; }
-.editing-source-picker {
+.editing-source-picker, .current-template-display {
   display: grid;
   gap: 4px;
-  min-width: 180px;
+  min-width: 0;
 }
-.editing-source-picker > span {
+.editing-source-picker > span, .current-template-display > span {
   color: var(--text-muted);
   font-size: 0.78rem;
 }
-.editing-source-picker select { min-height: 36px; }
+.editing-source-picker select { min-height: 36px; min-width: 0; width: 100%; }
+.current-template-display output {
+  display: block;
+  box-sizing: border-box;
+  min-height: 36px;
+  padding: 0 8px;
+  line-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  background: var(--surface-control);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
 .mapping-header {
   display: grid;
@@ -980,17 +1131,14 @@ onUnmounted(() => {
 .mapping-heading-row .device-chip { justify-self: end; }
 .mapping-header-controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 240px));
+  grid-template-columns: repeat(2, minmax(0, 240px));
+  justify-content: start;
   gap: 12px;
   width: 100%;
 }
 .mapping-header-status { min-height: 20px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mapping-cell.semantic-readonly-action:disabled { opacity: 1; }
-.mapping-cell.semantic-readonly-action:disabled small { color: var(--text-muted); }
-.mapping-cell.semantic-readonly-action:disabled span { color: var(--accent-text); }
 @media (max-width: 620px) {
   .mapping-heading-row { grid-template-columns: 1fr; gap: 8px; }
   .mapping-heading-row .device-chip { justify-self: start; }
-  .mapping-header-controls { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
 }
 </style>

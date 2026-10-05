@@ -138,6 +138,7 @@ export const mouseMoveLabels: Record<MoveDirection, string> = { up: "鼠标向�
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
+  | { type: "task_switch"; view: "applications" | "desktops" }
   | { type: "scroll"; direction: "up" | "down"; steps?: number }
   | { type: "mouse_click"; kind: MouseClickKind }
   | { type: "mouse_move"; direction: MoveDirection; distance: number }
@@ -195,7 +196,7 @@ export interface RunningAppInfo { applicationId: string; name: string; preset: b
 export interface MappingTemplate { id: string; name: string; mappings: ButtonMappings; }
 export type ButtonMappingTemplate = MappingTemplate;
 export interface ApplicationBinding { applicationId: string; templateId: string; menuOrder: number; launchTarget?: string | null; }
-export interface TemplateCatalogEntry { id: string; name: string; kind: "direct"; readOnly: boolean; buttonMappings: ButtonMappings | null; }
+export interface TemplateCatalogEntry { id: string; name: string; kind: "direct"; builtIn: boolean; buttonMappings: ButtonMappings | null; }
 export interface MappingConfiguration {
   menuUpdateDefault?: boolean;
   menuTemplateSwitchEnabled: boolean;
@@ -770,6 +771,7 @@ export async function setButtonMappingFollowEnabled(enabled: boolean): Promise<M
 export async function createMappingTemplate(name: string): Promise<MappingTemplate> { return invoke("create_mapping_template", { name }); }
 export async function saveButtonMappingTemplate(name: string, mappings: ButtonMappings): Promise<ButtonMappingTemplate> { return invoke("save_button_mapping_template", { name, mappings }); }
 export async function duplicateButtonMappingTemplate(templateId: string, name: string): Promise<ButtonMappingTemplate> { return invoke("duplicate_button_mapping_template", { templateId, name }); }
+export async function resetBuiltinTemplate(templateId: string): Promise<MappingConfiguration> { return invoke("reset_builtin_template", { templateId }); }
 export async function updateButtonMappingTemplate(templateId: string, mappings: ButtonMappings): Promise<ButtonMappingTemplate> { return invoke("update_button_mapping_template", { templateId, mappings }); }
 export async function reorderApplicationAssociations(applicationIds: string[]): Promise<MappingConfiguration> { return invoke("reorder_application_associations", { applicationIds }); }
 export async function duplicateMappingTemplate(templateId: string, name: string): Promise<MappingTemplate> { return invoke("duplicate_mapping_template", { templateId, name }); }
@@ -784,6 +786,7 @@ export async function previewTemplateImport(sourceToken:string, request:Template
 export async function getTemplateCatalog():Promise<TemplateCatalogEntry[]>{return invoke("get_template_catalog");}
 export async function copyTemplateCatalogEntry(templateId:string,name:string):Promise<TemplateCatalogEntry>{return invoke("copy_template_catalog_entry",{templateId,name});}
 export async function getSceneSnapshot():Promise<SceneSnapshot|null>{return invoke("get_scene_snapshot");}
+export async function selectCurrentTemplate(templateId:string|null):Promise<SceneSnapshot>{return invoke("select_current_template", { templateId });}
 export async function subscribeSceneEvents(callback:(event:SceneEvent)=>void):Promise<()=>void>{const unlisten=await listen<SceneEvent>("scene-event",event=>callback(event.payload));return unlisten;}
 export async function getComponentStatus(): Promise<ComponentStatus[]> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法检测组件状态");
@@ -1314,6 +1317,7 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
 
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
+  if (action.type === "task_switch") return action.view === "applications" ? "任务切换" : "任务视图";
   if (action.type === "scroll") {
     const label = action.direction === "up" ? "滚轮向上" : "滚轮向下";
     return (action.steps ?? 1) === 1 ? label : `${label} ${action.steps} 格`;

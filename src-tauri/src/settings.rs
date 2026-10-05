@@ -976,7 +976,7 @@ fn resolve_mapping_import(
     let builtin_template_ids = MappingConfiguration::recommended_templates()
         .into_iter()
         .map(|template| template.id)
-        .filter(|id| declared.contains(id))
+        .filter(|id| declared.contains(id) && !configuration.templates.iter().any(|t| &t.id == id))
         .collect();
     Ok((version, configuration.normalized()?, builtin_template_ids))
 }
@@ -1166,7 +1166,7 @@ mod tests {
             sayall_core::UiPreferences {
                 lock_button_selection: false,
                 templates_expanded: false,
-                associations_expanded: false
+                associations_expanded: false,
             }
         );
         let mut expected = original;
@@ -2022,17 +2022,14 @@ mod tests {
     }
 
     #[test]
-    fn imported_builtin_body_is_rejected_instead_of_overwriting_canonical_definition() {
-        let base = std::env::temp_dir().join(format!(
-            "sayall-builtin-template-reject-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+    fn imported_builtin_edit_becomes_a_copy_without_overwriting_local_default() {
+        let base =
+            std::env::temp_dir().join(format!("sayall-builtin-import-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let store = SettingsStore::new(base.join("settings.json"));
-        let path = base.join("invalid.json");
+        let path = base.join("edited-default.json");
         let mut builtin = MappingConfiguration::recommended_templates().remove(0);
-        builtin.name = "被篡改".to_owned();
+        builtin.mappings.actions.clear();
         let document = serde_json::json!({
             "formatVersion": 3,
             "commonMappings": ButtonMappings::default(),
@@ -2042,7 +2039,41 @@ mod tests {
             "applicationBindings": []
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        assert!(store.preview_mapping_configuration_import(&path).is_err());
-        let _ = std::fs::remove_dir_all(base);
+        let preview = store.preview_mapping_configuration_import(&path).unwrap();
+        assert!(
+            preview.builtin_template_ids.is_empty(),
+            "a customized body is imported as a copy, not a canonical reference"
+        );
+        assert_eq!(preview.configuration.templates.len(), 1);
+        assert_eq!(
+            store.load_mapping_configuration().unwrap().templates.len(),
+            0
+        );
+        let selected = store
+            .preview_template_import(
+                preview.source_token.as_deref().unwrap(),
+                TemplateImportRequest {
+                    template_ids: vec![
+                        sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID.to_owned()
+                    ],
+                    resolved_names: BTreeMap::new(),
+                    replace_application_bindings: false,
+                },
+            )
+            .unwrap();
+        let saved = store
+            .apply_mapping_configuration_import(&selected.token)
+            .unwrap();
+        assert_eq!(saved.templates.len(), 1);
+        assert_ne!(
+            saved.templates[0].id,
+            sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID
+        );
+        assert!(saved.templates[0].mappings.actions.is_empty());
+        assert!(!saved
+            .template_mappings(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID)
+            .unwrap()
+            .actions
+            .is_empty());
     }
 }

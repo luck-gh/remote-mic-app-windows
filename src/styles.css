@@ -182,7 +182,7 @@ body {
 
 /* 侧栏对齐 macOS SettingsView：宽 108px、图标 21 semibold、文字 13 semibold、
    选中 = 强调色 + 10% 背景（无白卡/阴影/hover 白底，Mac plain 按钮样式）。 */
-.app-shell { display: grid; grid-template-columns: 108px minmax(0, 1fr); min-height: 100vh; }
+.app-shell { display: grid; grid-template-columns: 108px minmax(0, 1fr); height: 100dvh; }
 .sidebar {
   position: sticky;
   top: 0;
@@ -217,18 +217,20 @@ nav { display: grid; gap: 4px; }
 .nav-icon { width: 21px; height: 21px; display: block; }
 .sidebar-footer { margin-top: auto; padding: 10px 4px; color: var(--muted); font-size: 12px; text-align: center; }
 
-.content { min-width: 0; padding: 22px clamp(22px, 3vw, 40px) 26px; overflow: auto; scrollbar-width: none; }
-.content::-webkit-scrollbar { display: none; }
+/* 普通页面只在内容区滚动，始终保留原生滚动条槽，折叠不改变卡片宽度。 */
+.content { --content-inline-padding: clamp(22px, 3vw, 40px); min-width: 0; min-height: 0; padding: 22px var(--content-inline-padding) 26px; overflow: auto; scrollbar-gutter: stable; }
 .content.content-buttons {
   height: 100dvh;
   min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  scrollbar-gutter: auto;
+  padding-inline: 0;
   padding-bottom: 0;
 }
 .content-buttons > .error-banner,
-.content-buttons > .update-banner { flex-shrink: 0; }
+.content-buttons > .update-banner { flex-shrink: 0; margin-inline: var(--content-inline-padding); }
 .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .page-header h1 { margin: 0; font-size: 22px; line-height: 1.2; letter-spacing: -0.4px; }
 .two-column { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.85fr); gap: 14px; align-items: start; }
@@ -659,7 +661,7 @@ body.pointer-nav .theme-option:has(input:focus-visible) { outline: none; }
 .toggle-placeholder { width: 34px; height: 20px; flex: none; }
 
 @media (max-width: 1020px) {
-  .content { padding: 20px 22px 26px; }
+  .content { --content-inline-padding: 22px; padding: 20px var(--content-inline-padding) 26px; }
   .two-column { grid-template-columns: 1fr; }
   .device-row { grid-template-columns: 1fr; }
   .setup-columns { grid-template-columns: 1fr; }

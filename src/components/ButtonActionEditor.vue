@@ -344,6 +344,15 @@ onUnmounted(() => {
   <div class="button-action-editor">
     <p class="muted">当前：{{ actionSummary(action) }}</p>
 <div class="action-sections">
+        <p v-if="button === 'ok' && (trigger !== 'single' || action.type !== 'shortcut' || action.chord.keys.length !== 1 || action.chord.keys[0] !== 'enter')" class="muted editor-note" role="note">确认键的首次原生 Enter 可能先到达目标窗口；其他组合键、双击或长按不能保证阻止这次原生确认。需要即时确认时请使用单击 Enter。</p>
+        <section class="action-section">
+          <h4 class="action-section-title">系统任务选择</h4>
+          <div class="preset-grid">
+            <button class="chip" type="button" :class="{ selected: action.type === 'task_switch' && action.view === 'applications' }" @click="apply({ type: 'task_switch', view: 'applications' })">任务切换</button>
+            <button class="chip" type="button" :class="{ selected: action.type === 'task_switch' && action.view === 'desktops' }" @click="apply({ type: 'task_switch', view: 'desktops' })">任务视图</button>
+          </div>
+          <p class="muted editor-note">方向选择，确认切换，返回取消；TV 按各手势配置执行。不持续按住 Alt。</p>
+        </section>
         <p v-if="capabilityNote" class="muted editor-note capability-note">{{ capabilityNote }}</p>
         <section v-for="group in groups" :key="group.label" class="action-section">
           <h4 class="action-section-title">{{ group.label }}</h4>

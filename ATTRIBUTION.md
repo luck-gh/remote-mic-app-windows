@@ -2,6 +2,17 @@
 
 本仓库是面向 Windows 的 Rust/Tauri 工程。
 
+- Microsoft [SetForegroundWindow 的异步激活说明](https://devblogs.microsoft.com/oldnewthing/20161118-00/?p=94745)：跨输入队列调用后立即查询前台，目标可能尚未处理激活消息。菜单返回自身主窗口由宿主 UI 线程直接完成，避免 UI 等待后台、后台恢复又需要 UI 泵消息；不使用 AttachThreadInput 或固定 sleep 掩盖。外部窗口路径维持原契约，并记录错误分类，实际返回效果以窗口读回为准。
+
+## 系统任务切换（2026-09-27）
+
+- Microsoft Windows keyboard shortcuts：Ctrl+Alt+Tab 显示应用缩略图并允许箭头选择，不要求持续按住 Alt；Win+Tab 为任务视图。https://support.microsoft.com/en-us/windows/keyboard-shortcuts-in-windows-dcc61a57-8ff0-cffe-9796-cb9706c75eec 。任务视图方向/Enter参考 https://support.microsoft.com/en-us/accessibility/windows/navigate-and-explore-the-windows-taskbar 。CtrlAltTab的确认/Escape不能仅由参考表外推；再次TV取消曾实测failed并按用户要求停止排查。2026-09-28改为TV各手势遵从用户配置，不再把物理TV硬编码取消。
+- `smzht/fakeymacs`，固定提交 `f83de826fc7a2ac76a0d5f91f2b54a3f0a50d1e4`，`config.py`（版本20260823_01）的 `is_task_switching_window`：参考其公开进程+窗口类识别方式。https://github.com/smzht/fakeymacs/blob/f83de826fc7a2ac76a0d5f91f2b54a3f0a50d1e4/config.py#L2756-L2764 。本实现不复制其输入框/标题/控件检查，仅取较窄的 MultitaskingViewFrame、TaskSwitcherWnd 类，另以 GetShellWindow 的真实进程所有者及当前 HWND 校验；广义 CoreWindow/InputSite 类未纳入，未知 Windows 实现失败关闭。没有依赖或第三方界面扫描。
+- 注入复用现有 Windows SendInput 成对批次；当前物理修饰键按住时拒绝任务快捷键，不通过补发任意 UP 清键、不持续拥有 Alt。公开输入返回成功仅是提交证据，系统界面和 RC003 行为待本机验收。
+
+- 本次官方核对未找到直接开关 CtrlAltTab/WinTab 界面的受支持非按键 API：[GetAltTabInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getalttabinfoa)只读取切换窗口信息；[IVirtualDesktopManager](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ivirtualdesktopmanager)管理窗口的桌面归属而非打开任务界面；[UIA获取元素](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-obtainingelements)依赖查找控件，本产品不采用。此为本轮有限核对结果，不宣称所有API不存在。
+- 23:15真实日志确认同Shell ForegroundStaging导致原控制器误清；该类只作为当前启动代的未确认阶段，不授予导航/注入资格。保留最终严格窗口校验及10秒未确认失败终态；没有引入新接口或第三方内容扫描。真实取消结果仍待本机。
+
 ## 鼠标动作扩展
 
 - 鼠标单击/双击参考 AutoHotkey v2 Click 的成对按下/释放行为，不复制其代码或引入依赖；通过 Windows SendInput 单批发送 2/4 个边沿，部分提交时补发释放，不新设双击等待常量。参考： https://www.autohotkey.com/docs/v2/lib/Click.htm 。

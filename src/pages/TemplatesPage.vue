@@ -5,9 +5,10 @@ import ApplicationTemplateBindings from "../components/ApplicationTemplateBindin
 import SettingsDialog from "../components/SettingsDialog.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import { useUiPreference } from "../lib/ui-preferences";
+import { useCurrentTemplate } from "../lib/current-template";
 import {
   actionSummary, buttonLabels, buttonTriggerLabel, copyTemplateCatalogEntry,
-  deleteMappingTemplate,
+  deleteMappingTemplate, resetBuiltinTemplate,
   getMappingConfiguration, listPresetApps, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled,
   getTemplateCatalog, renameMappingTemplate, updateButtonMappingTemplate, setButtonMappingFollowEnabled,
   type ButtonAction, type ButtonMappingTemplate, type ButtonMappings,
@@ -16,6 +17,7 @@ import {
 } from "../lib/bridge";
 
 const configuration = ref<MappingConfiguration | null>(null);
+const currentTemplate = useCurrentTemplate();
 const templateExpansion = useUiPreference("templatesExpanded");
 const catalog = ref<TemplateCatalogEntry[]>([]);
 const presetApps = ref<PresetAppInfo[]>([]);
@@ -40,7 +42,6 @@ const nameDraft = ref("");
 const nameError = ref<string | null>(null);
 const triggers: ButtonTrigger[] = ["single", "double", "long"];
 const buttons = Object.keys(buttonLabels) as RemoteButton[];
-const editingReadOnly = computed(() => catalog.value.find(item => item.id === editing.value?.id)?.readOnly ?? false);
 
 async function refresh(): Promise<void> {
   if (busy.value) return;
@@ -111,7 +112,7 @@ function toggleMenuTemplateSwitch(event: Event): void {
 }
 
 function openRename(template: TemplateCatalogEntry): void {
-  if (template.readOnly) return;
+  if (template.builtIn) return;
   nameDialog.value = template;
   nameDraft.value = template.name;
   nameError.value = null;
@@ -162,6 +163,15 @@ function edit(template: ButtonMappingTemplate): void {
   error.value = null;
 }
 
+function resetDefault(template: TemplateCatalogEntry): void {
+  if (busy.value || !template.builtIn || !window.confirm(`只复位“${template.name}”为当前版本默认按键？该模板的修改将丢失，程序关联和其它模板保持不变。`)) return;
+  void run(async () => {
+    const saved = await resetBuiltinTemplate(template.id);
+    catalog.value = await getTemplateCatalog();
+    return saved;
+  }, `已复位“${template.name}”`);
+}
+
 function copyCatalogEntry(template: TemplateCatalogEntry): void {
   void run(async () => {
     await copyTemplateCatalogEntry(template.id, `${template.name} 副本`);
@@ -183,7 +193,7 @@ function actionOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction {
 }
 
 function applyAction(action: ButtonAction): void {
-  if (busy.value || editingReadOnly.value || !draft.value || !editingAction.value) return;
+  if (busy.value || !draft.value || !editingAction.value) return;
   const { button, trigger } = editingAction.value;
   const actions = draft.value.actions[button] ?? {
     single: { type: "disabled" }, double: { type: "disabled" }, long: { type: "disabled" },
@@ -195,7 +205,7 @@ function applyAction(action: ButtonAction): void {
 }
 
 async function saveDraft(): Promise<void> {
-  if (busy.value || editingReadOnly.value || !editing.value || !draft.value || !configuration.value) return;
+  if (busy.value || !editing.value || !draft.value || !configuration.value) return;
   saving.value = true;
   error.value = null;
   try {
@@ -205,15 +215,12 @@ async function saveDraft(): Promise<void> {
     );
     configuration.value = {
       ...configuration.value,
-      templates: configuration.value.templates.map((item) => item.id === saved.id ? saved : item),
+      templates: [...configuration.value.templates.filter(item => item.id !== saved.id), saved],
     };
     catalog.value = catalog.value.map((item) => item.id === saved.id
       ? { ...item, name: saved.name, buttonMappings: saved.mappings }
       : item);
-    const enabled = configuration.value.buttonMappingFollowEnabled;
-    status.value = enabled
-      ? "完整按键模板已保存；已启用的程序关联会立即热加载更新"
-      : "完整按键模板已保存；自动切换关闭，当前继续使用通用配置";
+    status.value = "完整按键模板已保存；若正在使用此模板，实际按键映射会同步更新";
     editing.value = null;
     draft.value = null;
     editingAction.value = null;
@@ -270,36 +277,39 @@ onMounted(() => {
     <template v-else>
       <section class="card run-modes">
         <h2>模板切换规则</h2>
-        <p class="muted">创建模板或添加关联不会自动开启模板切换。</p>
+        <p class="muted">按程序自动加载，也可用菜单键手动选择。</p>
         <label class="mode-row">
           <input type="checkbox" aria-label="按程序加载默认模板" aria-describedby="program-default-help" :checked="configuration.buttonMappingFollowEnabled" :disabled="busy" :aria-busy="rulePending.buttonMappingFollowEnabled" :aria-disabled="busy || rulePending.buttonMappingFollowEnabled" @change="toggleButtonMappingFollow">
-          <span><strong>按程序加载默认模板</strong><small id="program-default-help">切换到程序时使用其默认模板，同程序换窗不变。关闭或没有关联时使用通用配置。</small></span>
+          <span><strong>按程序加载默认模板</strong><small id="program-default-help">切换程序时加载默认；同程序换窗不变。</small></span>
         </label>
         <label class="mode-row">
           <input type="checkbox" aria-label="菜单键选择完整模板" aria-describedby="menu-template-help" :checked="configuration.menuTemplateSwitchEnabled" :disabled="busy" :aria-busy="rulePending.menuTemplateSwitchEnabled" :aria-disabled="busy || rulePending.menuTemplateSwitchEnabled" @change="toggleMenuTemplateSwitch">
-          <span><strong>菜单键选择完整模板</strong><small id="menu-template-help">短按菜单键选择模板，默认仅本次临时使用，切到其他程序后清除。面板勾选“同时更新此程序的默认模板”才会保存关联；关闭后菜单键按当前映射执行。</small></span>
+          <span><strong>菜单键选择完整模板</strong><small id="menu-template-help">短按打开选择；面板可选本次使用或保存为程序默认。</small></span>
         </label>
         <label class="mode-row">
           <input type="checkbox" aria-label="模板切换提示" aria-describedby="mapping-notice-help" :checked="configuration.mappingNoticeEnabled" :disabled="busy" :aria-busy="rulePending.mappingNoticeEnabled" :aria-disabled="busy || rulePending.mappingNoticeEnabled" @change="toggleMappingNotice">
-          <span><strong>模板切换提示</strong><small id="mapping-notice-help">实际生效模板变化时短暂显示名称。同模板换窗不重复提示，不影响按键动作。</small></span>
+          <span><strong>模板切换提示</strong><small id="mapping-notice-help">仅生效模板变化时短暂提示。</small></span>
         </label>
+        <details class="template-help"><summary>使用说明</summary><p class="muted">关闭自动加载后，手动选中的模板在本次运行中持续使用，切换程序不会清除；重启后恢复通用配置。开启自动加载后，菜单未勾选更新默认时仅覆盖当前程序，切到其他程序后清除；勾选并确认才保存该程序默认。按键页切换仅改变当前使用模板。关闭菜单选择后，菜单键按当前映射执行。提示开关不影响按键动作。</p></details>
         <p class="rule-feedback error-text" role="status" aria-live="polite">{{ ruleError ? `保存失败：${ruleError}` : "" }}</p>
       </section>
 
       <details class="card collapsible-card complete-template-panel" :open="templateExpansion.value.value" :aria-busy="templateExpansion.pending.value" @toggle="templateExpansion.toggleDetails">
         <summary><h2>完整按键模板</h2><span class="section-count">{{ catalog.length }} 个模板</span></summary>
         <div class="collapsible-body">
-        <p class="muted">所有模板统一发送固定按键或组合键，不读取第三方界面。前三项为只读推荐，可复制后编辑；未配置的动作不执行映射。</p>
-        <div v-for="template in catalog" :key="template.id" class="status-panel template-row">
+        <p class="muted">所有模板统一发送固定按键或组合键，不读取第三方界面。前三项可直接编辑或单独复位；未配置的动作不执行映射。</p>
+        <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
+        <div v-for="template in catalog" :key="template.id" class="status-panel template-row" :class="{ 'current-template': currentTemplate.applied.value && currentTemplate.templateId.value === template.id }" :aria-current="currentTemplate.applied.value && currentTemplate.templateId.value === template.id ? 'true' : undefined">
           <span>
             <strong>{{ template.name }}</strong>
-            <small>固定按键与组合键 · 已关联 {{ bindingCount(template) }} 个程序<span v-if="template.readOnly"> · 固定推荐模板</span></small>
+            <small>固定按键与组合键 · 已关联 {{ bindingCount(template) }} 个程序<span v-if="template.builtIn"> · 默认模板</span></small>
           </span>
           <span class="button-row">
-            <button type="button" class="secondary-button" :disabled="busy" @click="directTemplate(template) && edit(directTemplate(template)!)">{{ template.readOnly ? "查看配置" : "编辑" }}</button>
+            <button type="button" class="secondary-button" :disabled="busy" @click="directTemplate(template) && edit(directTemplate(template)!)">编辑</button>
+            <button v-if="template.builtIn" type="button" class="secondary-button" :disabled="busy" @click="resetDefault(template)">复位模板</button>
             <button type="button" class="secondary-button" :disabled="busy" @click="copyCatalogEntry(template)">复制</button>
-            <button v-if="!template.readOnly" type="button" class="secondary-button" :disabled="busy" @click="openRename(template)">重命名</button>
-            <button v-if="!template.readOnly && template.kind === 'direct'" type="button" class="secondary-button" :disabled="busy" @click="directTemplate(template) && removeDirect(directTemplate(template)!)">删除</button>
+            <button v-if="!template.builtIn" type="button" class="secondary-button" :disabled="busy" @click="openRename(template)">重命名</button>
+            <button v-if="!template.builtIn && template.kind === 'direct'" type="button" class="secondary-button" :disabled="busy" @click="directTemplate(template) && removeDirect(directTemplate(template)!)">删除</button>
           </span>
         </div>
         <p v-if="!catalog.length" class="muted">尚未保存完整按键模板。</p>
@@ -325,12 +335,12 @@ onMounted(() => {
     :busy="busy"
     @close="closeEditor"
   >
-    <label class="toggle-row"><span>启用此模板</span><input v-model="draft.enabled" :disabled="busy || editingReadOnly" type="checkbox" class="toggle-input" /></label>
+    <label class="toggle-row"><span>启用此模板</span><input v-model="draft.enabled" :disabled="busy" type="checkbox" class="toggle-input" /></label>
     <div class="template-grid">
       <strong>按键</strong><strong v-for="trigger in triggers" :key="trigger">{{ buttonTriggerLabel(trigger) }}</strong>
       <template v-for="button in buttons" :key="button">
         <span>{{ buttonLabels[button] }}</span>
-        <button v-for="trigger in triggers" :key="trigger" type="button" class="mapping-cell" :disabled="busy || editingReadOnly" :class="{ selected: editingAction?.button === button && editingAction?.trigger === trigger }" @click="editingAction = { button, trigger }">{{ actionSummary(actionOf(button, trigger)) }}</button>
+        <button v-for="trigger in triggers" :key="trigger" type="button" class="mapping-cell" :disabled="busy" :class="{ selected: editingAction?.button === button && editingAction?.trigger === trigger }" @click="editingAction = { button, trigger }">{{ actionSummary(actionOf(button, trigger)) }}</button>
       </template>
     </div>
     <section v-if="editingAction" class="card action-detail">
@@ -339,7 +349,7 @@ onMounted(() => {
     </section>
     <p v-if="error" class="error-text">保存失败：{{ error }}</p>
     <template #actions>
-      <button v-if="!editingReadOnly" type="button" :disabled="busy" @click="saveDraft">{{ busy ? "正在保存…" : "保存模板" }}</button>
+      <button type="button" :disabled="busy" @click="saveDraft">{{ busy ? "正在保存…" : "保存模板" }}</button>
       <button type="button" class="secondary-button" :disabled="busy" @click="closeEditor">取消</button>
     </template>
   </SettingsDialog>
@@ -379,7 +389,8 @@ onMounted(() => {
 .mode-row:has(input:disabled) { cursor: default; opacity: .65; }
 .run-modes > .rule-feedback { height: 2.8em; line-height: 1.4; margin: 8px 0 0 30px; overflow: auto; overflow-wrap: anywhere; }
 .complete-template-panel { margin-top: 0; }
-.template-row { align-items: center; justify-content: space-between; }
+.template-row { align-items: center; justify-content: space-between; border: 2px solid transparent; }
+.template-row.current-template { border-color: var(--accent); }
 .template-grid { display: grid; grid-template-columns: minmax(90px, .7fr) repeat(3, minmax(150px, 1fr)); gap: 8px; align-items: stretch; min-width: 620px; margin-top: 14px; }
 .template-grid > strong, .template-grid > span { align-self: center; padding: 9px; }
 .template-grid .mapping-cell { min-height: 48px; text-align: left; }

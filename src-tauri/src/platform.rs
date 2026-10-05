@@ -86,6 +86,12 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         configuration: sayall_windows::templates::MappingConfiguration,
     );
     fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot>;
+    fn select_current_template(
+        &self,
+        _template_id: Option<&str>,
+    ) -> Result<sayall_windows::scene_control::SceneSnapshot, String> {
+        Err("当前运行环境不支持模板切换".into())
+    }
     fn set_template_menu_focus(&self, _focused: bool) {}
     fn template_menu_key(
         &self,
@@ -281,6 +287,13 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn scene_snapshot(&self) -> Option<sayall_windows::scene_control::SceneSnapshot> {
         Some(WindowsPlatform::scene_snapshot(self))
+    }
+
+    fn select_current_template(
+        &self,
+        template_id: Option<&str>,
+    ) -> Result<sayall_windows::scene_control::SceneSnapshot, String> {
+        WindowsPlatform::select_current_template(self, template_id)
     }
 
     fn set_template_menu_focus(&self, focused: bool) {

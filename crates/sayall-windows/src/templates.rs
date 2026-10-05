@@ -44,15 +44,14 @@ pub enum TemplateCatalogKind {
     Direct,
 }
 
-/// Read-only projection used by the UI. Built-ins are generated from the
-/// canonical fixed-key definitions and are never written into user settings.
+/// Effective catalog: stable built-in identities may have explicitly saved edits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateCatalogEntry {
     pub id: String,
     pub name: String,
     pub kind: TemplateCatalogKind,
-    pub read_only: bool,
+    pub built_in: bool,
     pub button_mappings: Option<ButtonMappings>,
 }
 
@@ -177,7 +176,12 @@ impl MappingConfiguration {
             }
             template.id = normalized_required(&template.id, "模板 ID")?;
             template.name = normalized_required(&template.name, "模板名称")?;
-            reject_builtin_template_mutation(&template.id)?;
+            if let Some(builtin) = Self::recommended_templates()
+                .into_iter()
+                .find(|t| t.id == template.id)
+            {
+                template.name = builtin.name;
+            }
             if !ids.insert(template.id.clone()) || !names.insert(template.name.clone()) {
                 return Err("模板 ID 或名称重复".to_owned());
             }
@@ -244,16 +248,31 @@ impl MappingConfiguration {
         id: &str,
         mappings: ButtonMappings,
     ) -> Result<MappingTemplate, String> {
-        reject_builtin_template_mutation(id)?;
+        let mappings = mappings
+            .normalized()
+            .map_err(|e| format!("按键模板无效：{e}"))?;
+        if !self.templates.iter().any(|t| t.id == id) {
+            let builtin = Self::recommended_templates()
+                .into_iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| "模板不存在".to_owned())?;
+            self.templates.push(builtin);
+        }
         let template = self
             .templates
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| "模板不存在".to_owned())?;
-        template.mappings = mappings
-            .normalized()
-            .map_err(|e| format!("按键模板无效：{e}"))?;
+        template.mappings = mappings;
         Ok(template.clone())
+    }
+    pub fn reset_builtin_template(&mut self, id: &str) -> Result<MappingTemplate, String> {
+        let builtin = Self::recommended_templates()
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| "只能复位默认模板".to_owned())?;
+        self.templates.retain(|t| t.id != id);
+        Ok(builtin)
     }
     pub fn template_mappings(&self, id: &str) -> Option<ButtonMappings> {
         self.templates
@@ -318,24 +337,36 @@ impl MappingConfiguration {
     }
     pub fn recommended_templates() -> Vec<MappingTemplate> {
         [
-            (BUILTIN_AGENT_TEMPLATE_ID, "Agent", false),
-            (BUILTIN_CHAT_TEMPLATE_ID, "聊天工具", false),
-            (BUILTIN_BROWSER_TEMPLATE_ID, "浏览器", true),
+            (BUILTIN_AGENT_TEMPLATE_ID, "Agent"),
+            (BUILTIN_CHAT_TEMPLATE_ID, "聊天工具"),
+            (BUILTIN_BROWSER_TEMPLATE_ID, "浏览器"),
         ]
         .into_iter()
-        .map(|(id, name, browser)| MappingTemplate {
+        .map(|(id, name)| MappingTemplate {
             id: id.into(),
             name: name.into(),
-            mappings: fixed_keys(browser),
+            mappings: fixed_keys(),
         })
         .collect()
     }
     pub fn template_catalog(&self) -> Vec<TemplateCatalogEntry> {
         Self::recommended_templates()
             .into_iter()
-            .chain(self.templates.iter().cloned())
+            .map(|builtin| {
+                self.templates
+                    .iter()
+                    .find(|t| t.id == builtin.id)
+                    .cloned()
+                    .unwrap_or(builtin)
+            })
+            .chain(
+                self.templates
+                    .iter()
+                    .filter(|t| !is_builtin_template_id(&t.id))
+                    .cloned(),
+            )
             .map(|t| TemplateCatalogEntry {
-                read_only: is_builtin_template_id(&t.id),
+                built_in: is_builtin_template_id(&t.id),
                 id: t.id,
                 name: t.name,
                 kind: TemplateCatalogKind::Direct,
@@ -353,7 +384,7 @@ impl MappingConfiguration {
             id: template.id,
             name: template.name,
             kind: TemplateCatalogKind::Direct,
-            read_only: false,
+            built_in: false,
             button_mappings: Some(template.mappings),
         })
     }
@@ -369,8 +400,8 @@ impl MappingConfiguration {
     }
 }
 
-/// Fixed input-region equivalents only. UI-dependent actions have no default.
-fn fixed_keys(browser: bool) -> ButtonMappings {
+/// Fixed keyboard actions; system task selection uses public shell shortcuts.
+fn fixed_keys() -> ButtonMappings {
     use crate::raw_input::RemoteButton;
     use crate::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
     let mut mappings = ButtonMappings {
@@ -384,14 +415,7 @@ fn fixed_keys(browser: bool) -> ButtonMappings {
         (RemoteButton::Left, vec![KeyCode::Left]),
         (RemoteButton::Right, vec![KeyCode::Right]),
         (RemoteButton::Back, vec![KeyCode::Backspace]),
-        (
-            RemoteButton::Ok,
-            if browser {
-                vec![KeyCode::Enter]
-            } else {
-                vec![KeyCode::Shift, KeyCode::Enter]
-            },
-        ),
+        (RemoteButton::Ok, vec![KeyCode::Enter]),
         (RemoteButton::VolumeUp, vec![KeyCode::VolumeUp]),
         (RemoteButton::VolumeDown, vec![KeyCode::VolumeDown]),
         (RemoteButton::Power, vec![KeyCode::Escape]),
@@ -406,6 +430,27 @@ fn fixed_keys(browser: bool) -> ButtonMappings {
             },
         );
     }
+    let shortcut = |keys| ButtonAction::Shortcut {
+        chord: KeyChord { keys },
+    };
+    mappings.actions.insert(
+        RemoteButton::Home,
+        ButtonActions {
+            single: shortcut(vec![KeyCode::Home]),
+            double: shortcut(vec![KeyCode::Control, KeyCode::Home]),
+            long: shortcut(vec![KeyCode::Control, KeyCode::End]),
+        },
+    );
+    mappings.actions.insert(
+        RemoteButton::Tv,
+        ButtonActions {
+            single: shortcut(vec![KeyCode::Tab]),
+            double: ButtonAction::Disabled,
+            long: ButtonAction::TaskSwitch {
+                view: crate::send_input::TaskSwitchView::Desktops,
+            },
+        },
+    );
     mappings
 }
 
@@ -418,7 +463,7 @@ pub fn is_builtin_template_id(id: &str) -> bool {
 
 pub fn reject_builtin_template_mutation(id: &str) -> Result<(), String> {
     if is_builtin_template_id(id) {
-        Err("内置模板为只读，请先复制后编辑".to_owned())
+        Err("默认模板的名称和身份固定，不能重命名或删除；可以编辑或复位映射".to_owned())
     } else {
         Ok(())
     }
@@ -446,6 +491,143 @@ pub fn new_template_id() -> String {
 mod tests {
     use super::*;
     #[test]
+    fn builtin_edits_keep_identity_and_bindings_and_survive_reload() {
+        let mut c = MappingConfiguration::default();
+        c.upsert_application_binding(ApplicationBinding {
+            application_id: "wechat".into(),
+            template_id: BUILTIN_CHAT_TEMPLATE_ID.into(),
+            menu_order: 0,
+            launch_target: None,
+        })
+        .unwrap();
+        let copy = c
+            .duplicate_template(BUILTIN_CHAT_TEMPLATE_ID, "My copy".into())
+            .unwrap();
+        let bindings = c.application_bindings.clone();
+        let changed = ButtonMappings::default();
+        let saved = c
+            .update_button_mapping_template(BUILTIN_CHAT_TEMPLATE_ID, changed.clone())
+            .unwrap();
+        assert_eq!(saved.id, BUILTIN_CHAT_TEMPLATE_ID);
+        assert_eq!(
+            c.template_mappings(BUILTIN_CHAT_TEMPLATE_ID),
+            Some(changed.clone())
+        );
+        let reopened: MappingConfiguration =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        let reopened = reopened.normalized().unwrap();
+        assert_eq!(reopened.application_bindings, bindings);
+        assert_eq!(reopened.template_mappings(&copy.id), Some(copy.mappings));
+        let catalog = reopened.template_catalog();
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|t| t.id == BUILTIN_CHAT_TEMPLATE_ID)
+                .count(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|t| t.id == BUILTIN_CHAT_TEMPLATE_ID)
+                .unwrap()
+                .button_mappings,
+            Some(changed)
+        );
+        assert_eq!(catalog.len(), 4);
+    }
+
+    #[test]
+    fn reset_default_preserves_other_edits_and_all_associations() {
+        let mut c = MappingConfiguration::default();
+        let user = c.create_template("Mine".into()).unwrap();
+        c.upsert_application_binding(ApplicationBinding {
+            application_id: "wechat".into(),
+            template_id: BUILTIN_CHAT_TEMPLATE_ID.into(),
+            menu_order: 0,
+            launch_target: None,
+        })
+        .unwrap();
+        c.update_button_mapping_template(BUILTIN_CHAT_TEMPLATE_ID, ButtonMappings::default())
+            .unwrap();
+        c.update_button_mapping_template(BUILTIN_AGENT_TEMPLATE_ID, ButtonMappings::default())
+            .unwrap();
+        let bindings = c.application_bindings.clone();
+        c.reset_builtin_template(BUILTIN_CHAT_TEMPLATE_ID).unwrap();
+        assert_eq!(c.application_bindings, bindings);
+        assert_eq!(c.template_mappings(&user.id), Some(user.mappings));
+        assert_eq!(
+            c.template_mappings(BUILTIN_AGENT_TEMPLATE_ID),
+            Some(ButtonMappings::default())
+        );
+        let expected = MappingConfiguration::default().template_mappings(BUILTIN_CHAT_TEMPLATE_ID);
+        assert_eq!(c.template_mappings(BUILTIN_CHAT_TEMPLATE_ID), expected);
+        let before = c.clone();
+        assert!(c.reset_builtin_template("missing").is_err());
+        assert_eq!(c, before);
+    }
+
+    #[test]
+    fn defaults_keep_fast_keys_immediate_and_provide_useful_home_tv_gestures() {
+        use crate::raw_input::RemoteButton;
+        use crate::send_input::{ButtonAction, KeyChord, KeyCode};
+        for template in MappingConfiguration::recommended_templates() {
+            assert_eq!(
+                template
+                    .mappings
+                    .action_for(RemoteButton::Ok, crate::send_input::ButtonTrigger::Single),
+                ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Enter]
+                    }
+                }
+            );
+            for button in [
+                RemoteButton::Ok,
+                RemoteButton::Left,
+                RemoteButton::Right,
+                RemoteButton::Up,
+                RemoteButton::Down,
+                RemoteButton::Back,
+                RemoteButton::VolumeUp,
+                RemoteButton::VolumeDown,
+            ] {
+                let actions = template.mappings.actions(button);
+                assert_eq!(actions.double, ButtonAction::Disabled);
+                assert_eq!(actions.long, ButtonAction::Disabled);
+            }
+            let home = template.mappings.actions(RemoteButton::Home);
+            assert_eq!(
+                home.double,
+                ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Control, KeyCode::Home]
+                    }
+                }
+            );
+            assert_eq!(
+                home.long,
+                ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Control, KeyCode::End]
+                    }
+                }
+            );
+            let tv = serde_json::to_value(template.mappings.actions(RemoteButton::Tv)).unwrap();
+            assert_eq!(
+                tv["single"],
+                serde_json::json!({"type":"shortcut","chord":{"keys":["tab"]}})
+            );
+            assert_eq!(
+                tv["long"],
+                serde_json::json!({"type":"task_switch","view":"desktops"})
+            );
+            assert_eq!(tv["double"], serde_json::json!({"type":"disabled"}));
+            assert!(!template.mappings.actions.contains_key(&RemoteButton::Menu));
+        }
+    }
+
+    #[test]
     fn builtin_wire_fixture_matches_production_fixed_keys() {
         let expected: serde_json::Value = serde_json::from_str(include_str!(
             "../../../contracts/ipc/template-catalog-builtins.json"
@@ -468,8 +650,8 @@ mod tests {
             .template_catalog()
             .iter()
             .all(|t| t.button_mappings.is_some()));
-        assert!(!copied.mappings.actions.contains_key(&RemoteButton::Home));
-        assert!(!copied.mappings.actions.contains_key(&RemoteButton::Tv));
+        assert!(copied.mappings.actions.contains_key(&RemoteButton::Home));
+        assert!(copied.mappings.actions.contains_key(&RemoteButton::Tv));
         assert_eq!(
             copied.mappings.actions[&RemoteButton::Ok].long,
             crate::send_input::ButtonAction::Disabled
@@ -506,7 +688,7 @@ mod tests {
         assert!(c.clone().normalized().is_ok());
         assert!(c
             .update_button_mapping_template(BUILTIN_AGENT_TEMPLATE_ID, ButtonMappings::default())
-            .is_err());
+            .is_ok());
         let mut duplicate = c.clone();
         duplicate
             .application_bindings

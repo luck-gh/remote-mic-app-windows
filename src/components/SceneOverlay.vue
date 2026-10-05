@@ -121,14 +121,14 @@ onUnmounted(() => {
   <main v-if="snapshot?.panel" class="scene-overlay">
     <h1>完整按键模板</h1>
     <label class="default-choice"><input :key="snapshot.generation" type="checkbox" :checked="snapshot.updateDefault" :aria-busy="snapshot.preferencePending" :aria-disabled="snapshot.preferencePending" @change="updateDefault">同时更新此程序的默认模板</label>
-    <small class="default-hint">长按菜单键：切换是否更新默认。此选项会记住，取消菜单也保留；确认模板时才更新程序关联。也可用鼠标或 Tab + 空格切换。</small>
+    <small class="default-hint">长按菜单键：切换此项并记住。确认模板后才更新关联。</small>
     <div class="preference-feedback">
-      <small :class="{ visible: snapshot.preferencePending }" :role="snapshot.preferencePending ? 'status' : undefined">正在记住选项，请稍候再确认模板。</small>
-      <small :class="{ visible: snapshot.preferenceError }" :role="snapshot.preferenceError ? 'alert' : undefined">选项保存失败，已保留上次保存的值，请重试。</small>
+      <small :class="{ visible: snapshot.preferencePending }" :role="snapshot.preferencePending ? 'status' : undefined">正在保存选项…</small>
+      <small :class="{ visible: snapshot.preferenceError }" :role="snapshot.preferenceError ? 'alert' : undefined">选项保存失败，保留原值，请重试。</small>
       <small :class="{ visible: menuError }" :role="menuError ? 'alert' : undefined">{{ menuError ?? '未能更新选择，请重新打开模板菜单。' }}</small>
     </div>
     <ul ref="menuList"><li v-for="(item, index) in snapshot.menuItems" :key="item.label + '-' + index" :class="{ selected: index === snapshot.selectedIndex }"><span>{{ item.label }}</span><small>{{ item.running ? '当前模板' : '可选择' }}</small></li></ul>
-    <p>{{ snapshot.status === 'template_menu_restore_failed' ? '未能返回原窗口，请点击目标窗口继续。' : '上下循环选择 · 松开确定键后应用 · 返回取消' }}</p>
+    <p>{{ snapshot.status === 'template_menu_restore_failed' ? '未能返回原窗口，请点击目标窗口继续。' : '↑↓ 循环 · 确认松开后应用 · 返回 / 短菜单取消' }}</p>
   </main>
   <main v-else-if="notice" ref="noticeElement" class="mapping-notice" role="status">{{ noticeText(notice) }}</main>
   <main v-else class="scene-overlay-empty"></main>
@@ -148,7 +148,7 @@ onUnmounted(() => {
 .scene-overlay h1 { font-size: 18px; margin: 0 0 12px; }
 .default-choice { display: flex; align-items: center; gap: 8px; flex-shrink: 0; font-size: 14px; }
 .default-choice input { width: auto; }
-.default-hint { margin: 6px 0 10px; flex-shrink: 0; }
+.default-hint { font-size: 12px; line-height: 1.5; margin: 5px 0 8px; flex-shrink: 0; }
 .preference-feedback { display: grid; flex-shrink: 0; margin-bottom: 6px; }
 .preference-feedback small { grid-area: 1 / 1; visibility: hidden; overflow-wrap: anywhere; }
 .preference-feedback small.visible { visibility: visible; }

@@ -3,7 +3,7 @@
     "id": "preset-agent",
     "name": "Agent",
     "kind": "direct",
-    "readOnly": true,
+    "builtIn": true,
     "buttonMappings": {
       "enabled": true,
       "actions": {
@@ -92,7 +92,6 @@
             "type": "shortcut",
             "chord": {
               "keys": [
-                "shift",
                 "enter"
               ]
             }
@@ -150,6 +149,51 @@
           },
           "long": {
             "type": "disabled"
+          }
+        },
+        "home": {
+          "single": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "home"
+              ]
+            }
+          },
+          "double": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "control",
+                "home"
+              ]
+            }
+          },
+          "long": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "control",
+                "end"
+              ]
+            }
+          }
+        },
+        "tv": {
+          "single": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "tab"
+              ]
+            }
+          },
+          "double": {
+            "type": "disabled"
+          },
+          "long": {
+            "type": "task_switch",
+            "view": "desktops"
           }
         }
       }
@@ -159,7 +203,7 @@
     "id": "preset-chat",
     "name": "聊天工具",
     "kind": "direct",
-    "readOnly": true,
+    "builtIn": true,
     "buttonMappings": {
       "enabled": true,
       "actions": {
@@ -248,7 +292,6 @@
             "type": "shortcut",
             "chord": {
               "keys": [
-                "shift",
                 "enter"
               ]
             }
@@ -306,6 +349,51 @@
           },
           "long": {
             "type": "disabled"
+          }
+        },
+        "home": {
+          "single": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "home"
+              ]
+            }
+          },
+          "double": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "control",
+                "home"
+              ]
+            }
+          },
+          "long": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "control",
+                "end"
+              ]
+            }
+          }
+        },
+        "tv": {
+          "single": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "tab"
+              ]
+            }
+          },
+          "double": {
+            "type": "disabled"
+          },
+          "long": {
+            "type": "task_switch",
+            "view": "desktops"
           }
         }
       }
@@ -315,7 +403,7 @@
     "id": "preset-browser",
     "name": "浏览器",
     "kind": "direct",
-    "readOnly": true,
+    "builtIn": true,
     "buttonMappings": {
       "enabled": true,
       "actions": {
@@ -461,6 +549,51 @@
           },
           "long": {
             "type": "disabled"
+          }
+        },
+        "home": {
+          "single": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "home"
+              ]
+            }
+          },
+          "double": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "control",
+                "home"
+              ]
+            }
+          },
+          "long": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "control",
+                "end"
+              ]
+            }
+          }
+        },
+        "tv": {
+          "single": {
+            "type": "shortcut",
+            "chord": {
+              "keys": [
+                "tab"
+              ]
+            }
+          },
+          "double": {
+            "type": "disabled"
+          },
+          "long": {
+            "type": "task_switch",
+            "view": "desktops"
           }
         }
       }

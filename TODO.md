@@ -2,6 +2,18 @@
 
 - [ ] 2026-10-02 Windows 上游增量同步：用户要求检查并拉取合并原仓库更新；固定来源 `GetSayAll/remote-mic-app-windows` 的 `c81308e011a757dc22d22f2861b687ef787d295e`，从已整合的 `74230bf` 新增 154 个提交。继续在已有整合分支逐块融合，保留本地未提交工作及全部待验状态。三键/TV/Home 继续使用当前逐报告 WDF/PDO 来源与独立 Helper；不采用上游第二增强链的最高权限计划任务、共享宿主 usage 推断来源、自动强杀 WUDFHost、常驻 Gadget 或语音报告合成。固定按键模板、普通主程序、正常退出与用户配置契约不变。冲突已逐块闭合，基础合并候选已通过前端测试与构建、Rust 工作区测试/check、fmt 和 runtime-simulation 编译；旧配置首用与读取失败回归已验证；保留自定义语音快捷键入口，前端 222 项全通过，原有 41 个文件修改已恢复并保持未提交，叠加后的前端 241 项、Rust 工作区全量测试、check、fmt 和 runtime-simulation 编译全部 passed。Debug 仿真构建 passed；实际运行被现有安装版的单实例保护拒绝（single_instance / existing_instance），未生成验收报告，不能记作 WebView 通过。Windows WebView 完整运行、RC001/RC003 冷态首用、连续会话与第三方实际行为保持 deferred；本次 target/dev/upstream-sync 中的最终测试日志及单实例拒绝现场仅留作未完成运行验收的对照，运行验收闭合或被新候选替代后回收。上游实验和历史 passed 不作为本候选或 RC001/RC003 本机验收。来源与排除边界见 [ATTRIBUTION](ATTRIBUTION.md#windows-官方上游整合2026-09-27)。
 
+- [ ] 2026-09-29 菜单占用呈现：唯一“菜单键选择完整模板”开启时，显示实际打开/取消、按单击处理、面板内长按切换保存选项；禁止普通编辑/监听跟随，读取未定或失败不误开放，关闭恢复原映射/草稿。9/30用户视觉反馈前两版区别不足，最新按明确规则改为普通可编辑卡2px边框、只读菜单/语音无可见外框与内部竖线；透明边框占位/内距补偿保持尺寸，小锁/文字及物理活动底色保留，语音仍无编辑入口且实体生命周期不变。ButtonsPage34项、完整前端183/183与build、浅/深12项CSS计算检查通过；353e3cea本地包正常安装，Explorer普通App/提权Helper实际载荷与原配置保持已核，新增按键页“菜单键切换模板”checkbox，后续按用户要求移至菜单标题旁，确认启用才显示右侧锁；按用户后续红框移除卡片下方常驻长说明及其间距，hover/focus短说明、监听说明与可见保存错误保留，复用模板页窄字段命令，确认前保留旧勾选、失败回读、隔离旧轮询且不覆盖草稿；长按行为同单击加粗。入口4项及标题迁移/原生事件隔离均先RED后GREEN，最新ButtonsPage39/39、完整前端188/188与build通过；d239601f常驻文案删除版已正常覆盖安装（标题内控件/tooltip保留），Explorer普通App/限定提权Helper的实际载荷及三份最新配置保持已核，原菜单开关true；新入口真实保存/两页同步及视觉待用户。不把前端加载或截图外推三键首按/白屏根因已验。证据归既有三键 evidence。
+
+- [ ] 2026-09-28 TV短长独立：任务界面内TV仍经现有手势识别，按进入前模板的固定键/组合或显式任务动作执行；删除物理TV DOWN取消/整次吞掉的旧特判及专用队列。普通TV快捷键经既有mapper，不被ForegroundStaging导航守卫阻断；方向/确认保持系统导航及严格目标守卫；原长按无附加Tab，后续短Tab一次且零Esc。现有真实路由测试先RED后GREEN，Scene27项、前端179项、workspace353 passed/17 ignored及fmt/check/simulation check通过；00:36最终6584546a包已正常覆盖安装/Explorer普通运行，三配置字节保持；视图内短Tab真实反馈待验。旧取消failed/停止排查记录保留，不以本需求重启它。
+
+- [x] TV默认短按Tab：三个内置稳定ID仅Single改Tab，Long任务视图/Double空保持；原Applications任务切换仍可选。当前内置覆盖0，未写用户配置或副本；默认契约先RED，前端179与workspace352 passed/17 ignored、fmt/check/simulation check通过；00:04生产包1dfdf2e7已正常安装，App51184普通/Helper45724提权、配置字节保持；用户已明确确认1dfdf2e7短TV Tab符合预期；长按任务视图打开复用未改实现的既有用户观察，不外推导航/取消。本轮不恢复已停止的再次TV取消排查。
+
+- [ ] 2026-09-27 TV再按取消：2313101f修订版Applications/Desktops再次TV取消实测均failed，用户明确要求停止排查。已知ForegroundStaging提前清模式修正后仍失败，完整机制未闭合；10项定向及352 passed/17 ignored仅为软件证据，不代表真实取消通过。保留候选代码，不继续调查/修复/复验，不标resolved。见 [Bug](Bugs/2026-09-27-task-switch-tv-cancel.md)。
+
+- [ ] 2026-09-27 微信确认、内置模板编辑与 TV 任务选择：日志已确认 Agent/聊天旧默认 Shift+Enter 导致换行；改为 Single Enter 并复用已交付原生 Enter，具体第三方发送效果待真机。三内置稳定 ID 支持就地编辑及显式单项复位，用户副本/自改覆盖/关联不强制更新；Home 三手势与 TV 短任务切换/长任务视图提供有意义默认，其他快速键不加等待，Menu/语音不变。TV 只使用公开系统快捷键和当前 Shell 窗口身份，方向/确认覆盖旧模板，取消/退出无持续修饰键。TDD 已完成模板只读拒绝、任务启动及原生退出竞态 RED→GREEN；前端179项、工作区348 passed/17 ignored及格式/check通过；真实WebView仿真发现首次IPC早于AppState注册，已前移注册并通过Tauri相关51项，真实Windows WebView/IPC仿真14步通过；22:35生产包a3586eed已正常安装并Explorer普通启动，用户配置字节保持；新Helper仍pending_per_request，首TV不得用准备键掩盖；RC003冷态/连续Confirm、TV系统界面和编辑复位实际行为仍待验，不复跑旧未回复语义冷态测试。
+
+- [ ] 2026-09-27 主页面滚动槽稳定：普通页面滚动收敛到视口内main，原生scrollbar-gutter稳定预留宽度；按键页外层不重复留槽，复用独立正文滚动并让固定操作行同宽，侧栏/浮层不加槽。仅CSS，现有页面/导航54项与生产构建通过，14:27:19包926a9848已正常安装，Explorer普通App41980/提权Helper27176、载荷与最新三文件配置保持已核；溢出前后实际宽度和底栏视觉仍待自然观察，不外推设备动作。
+
 - [ ] 2026-09-27 Windows 上游整合：本地 checkpoint `bd2349b` / `f32ae1b` 已保存，`test/windows-upstream-integration` 正逐块合并固定 `74230bf`（115 个上游提交）。共享自动同步仅本仓库条目已停用（控制仓库 PR #1）；保留全部本地 ancestry/用户配置、纯直接模板与严格增强来源。源码冲突标记已闭合，项目7步预检通过（前端169、Rust331passed/17ignored）；合并候选729d14d / 0.2.6包0a15fd2f已正常安装、Explorer普通启动且用户三份配置字节保持；受影响实机等待用户反馈；test已推送、draft PR #1已建立。首轮CI在正常退出测试旧日志断言处失败（实际完整清理85ms/failed_stages0），测试契约已修正并以14项针对性断言验证；新CI待验证，main尚不得合入，不把上游历史 passed 作为本候选结论。
 
 ## v1 决策（2026-09-04）
