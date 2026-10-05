@@ -104,11 +104,11 @@ p("=" * 70)
 p("2. 类键过滤驱动槽位（挂载可行性）")
 p("=" * 70)
 p()
-dump_key(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-08002be10318}",
+dump_key(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}",
          "Keyboard 类键 {4d36e96b}")
-dump_key(r"SYSTEM\CurrentControlSet\Control\Class\{745a17a0-74d3-11d0-b6fe-00a0c90f57da}",
+dump_key(r"SYSTEM\CurrentControlSet\Control\Class\{745a17a0-74d3-11d0-b6fe-REDACTED_peer_106}",
          "HIDClass 类键 {745a17a0}")
-dump_key(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-08002be10318}\Properties",
+dump_key(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}\Properties",
          "Keyboard 类键 Properties（含 ConnectMultiplePorts）")
 dump_key(r"SYSTEM\CurrentControlSet\Control\Keyboard Layout",
          "Keyboard Layout 全局")
@@ -129,7 +129,7 @@ def search_reg(base, needle, paths=None, depth=0, maxd=3):
     return found
 
 for nd in ("ConnectMultiplePorts", "KeyboardDataQueueSize"):
-    hits = search_reg(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-08002be10318}", nd)
+    hits = search_reg(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96b-e325-11ce-bfc1-REDACTED_peer_109}", nd)
     p("  [%s] 命中 %d 处" % (nd, len(hits)))
     for f, k, v in hits[:10]:
         p("     HKLM\\%s  %s = %s" % (f, k, v))

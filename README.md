@@ -35,9 +35,7 @@
 
 视频作者：[可乐不甜的跑焦日记](https://space.bilibili.com/327214328)
 
-> 同作者制作的小米蓝牙遥控器 2 Pro 3D 打印外壳：[在 MakerWorld 查看](https://makerworld.com.cn/zh/models/2965815-vibegrip-ma-shang-wo-wei-vibe-coding-zuo-de-xiao-m?appSharePlatform=sayall.app)
-
-无线麦 SayAll Windows 版已完成对小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）的 Windows 真机适配，覆盖设备识别、连接、按键映射和语音桥接等已验证场景。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
+无线麦 SayAll Windows 版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
 
 参考源码仓库：[HD838A/remote-mic-app](https://github.com/HD838A/remote-mic-app)（macOS 版）。Windows 版保持独立的平台实现，仅参考其公开的产品行为、协议经验和测试边界，不回填 macOS 代码。
 
@@ -57,7 +55,9 @@
 - Windows CI 可生成带 SHA-256 和来源元数据的未签名 NSIS Preview artifact；
 - Windows CI、来源归属和真机测试手册。
 
-RC001 与 RC003 均已完成 Windows 真机适配；两型号的按键映射真机验收均已通过，语音、安装器、VB-CABLE 和第三方输入法按测试手册分项记录，尚未覆盖的专项继续标记为 `deferred`。公开发布目前仍处于预览阶段，更新包包含 updater minisign 签名，但尚无 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。
+本地 RC003 的来源、映射、键盘并用与部分生命周期已有分项实证；新候选受影响场景仍需本机验收，RC001 无当前实机时保持 `deferred`。语音、安装器、VB-CABLE 和第三方输入法按测试手册分项记录。公开发布目前仍处于预览阶段，更新包包含 updater minisign 签名，但尚无 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。
+
+本次上游整合新增可选电量显示、通用配置的鼠标点击/移动/滚轮、系统级快捷键录入和 Windows 应用库。它们不改变已有默认绑定；完整模板仍为固定键/组合键，不扫描第三方窗口内容。按键页编辑后显式保存，已安装应用库不写入可分享的配置导出。合并候选验证状态见 TODO。
 
 ## 用户安装与配置
 
@@ -97,14 +97,17 @@ Mac 可以运行前端构建和纯 Rust 测试，但不能证明 WinRT BLE、Raw
 ## 本地检查
 
 ```bash
-# 一键前置自检（推荐，push 前跑，约 1-2 分钟；通过 = CI 的快速步骤必过）
+# 一键前置自检（首次需构建 Helper 并获取散列锁定的 Gadget）
 powershell -ExecutionPolicy Bypass -File scripts\ci-preflight.ps1
 
 # 或分步执行：
 pnpm install
 pnpm test
 pnpm build
+node scripts/stage-bundle-inputs.cjs
 cargo test --workspace
+cargo test --locked --manifest-path hardware/RC003/helper/Cargo.toml
+node hardware/RC003/helper/agent/agent_logic_test.mjs
 cargo fmt --all -- --check
 ```
 

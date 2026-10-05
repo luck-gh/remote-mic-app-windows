@@ -1,7 +1,7 @@
 E2-1 前置核查（补正版）
 ==============================================================
 
-目标 HardwareID: HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4
+目标 HardwareID: REDACTED_device_15
 
 （A/B/C 无输出）
 stderr: EXC:Command '['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '<PROBE-DIR>\\_tmp_ps.ps1']' timed out after 90 seconds

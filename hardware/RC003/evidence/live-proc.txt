@@ -1,7 +1,7 @@
-﻿=== cargo/rustc/link processes ===
+=== cargo/rustc/link processes ===
 
-   Id ProcessName StartTime             Path                                   
-   -- ----------- ---------             ----                                   
+   Id ProcessName StartTime             Path
+   -- ----------- ---------             ----
  5680 cargo       2026/9/22/周二 17:26:02 <USER-HOME>\.cargo\bin\ca...
 12768 cargo       2026/9/22/周二 17:26:02 <USER-HOME>\.rustup\toolc...
  7336 node        2026/9/22/周二 17:29:59 <USER-HOME>\.workbuddy\bi...
@@ -62,6 +62,3 @@ FullName      : <USER-HOME>\WorkBuddy\Worktrees\remote-mic-app-windo
                 jeofoka07jutmezk9n737pf.1dgcpks.rcgu.o
 Length        : 1666008
 LastWriteTime : 2026/9/22/周二 17:19:19
-
-
-

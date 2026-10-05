@@ -75,7 +75,7 @@
 ### 2.2 QL-4/RemoteMapper —— 设备专属下层 HID 过滤驱动，重映射为设备专属 F 键（次选）
 
 - 许可 / 形态：MIT，C# 应用 + KMDF 过滤驱动（`driver.c` 142 行、`remap.c` 71 行）。
-- **拦截层**：extension INF，`Class=Extension` / `FilterPosition=Lower`，精确绑定 `HID\{00001812-...}_Dev_VID&012717_PID&32b8_REV&00a4`；栈为 `kbdclass -> kbdhid -> MiRemoteHidFilter -> mshidumdf`（`driver/MiRemoteHidFilter/README.md`）。转发 `IRP_MJ_READ`，在下层完成后**原地等长改写 `report[3]`**，不动描述符、report ID 与长度；只碰键盘 report `0x01`，vendor report `0x06/0x07/0x08` 不改。
+- **拦截层**：extension INF，`Class=Extension` / `FilterPosition=Lower`，精确绑定 `REDACTED_device_60 `kbdclass -> kbdhid -> MiRemoteHidFilter -> mshidumdf`（`driver/MiRemoteHidFilter/README.md`）。转发 `IRP_MJ_READ`，在下层完成后**原地等长改写 `report[3]`**，不动描述符、report ID 与长度；只碰键盘 report `0x01`，vendor report `0x06/0x07/0x08` 不改。
 - **映射表**（`remap.c` + 驱动 README + `keymap.txt`）：`0x80→F13`、`0x81→F14`、`0xF1→F15`、`0x4A(Home)→F16`、`0x65(菜单)→F17`、**`0x35(TV/直播)→F18`**、`0x66(电源)→F19`、`0x3E(F5 语音)→F20`。
 - **它对"物理键盘劫持"的解法逐字**（驱动 README）：「后四个本可映射为 Home / Apps / OEM_3 / Power，但**全局低级键盘钩子没有来源设备 ID**，直接映射会误吞物理键盘的同名键。因此把它们改为 F16–F19，**仅由此 VID/PID 的遥控器生成**。」——即：把"按设备"下沉到驱动，用户态钩子只需吞遥控器专属 F 键，物理键盘不再受影响（满足 R4 的机制）。
 - **实测**：Windows 11 x64、HVCI 开启，8 键逐一 `PASS`（方向/音量±/返回/主页/菜单/直播/电源），有 `verify-keys.bat` 与 `tests/remap_test.c`。
@@ -310,12 +310,12 @@ RC003 --BLE HID--> WUDFHost(已核验为 RC003 独占)
 ## 附录 A：取证方法与本地副本
 
 - 五个参考仓库的完整文件树与关键文件已下载到本机（文件名中的 `/` 以 `__` 代替）：
-  - `C:\Users\Administrator\ref-repos\RemoteMapper\`（QL-4/RemoteMapper）
-  - `C:\Users\Administrator\ref-repos\vibe-flow\`（richlearntodo-debug/vibe-flow）
-  - `C:\Users\Administrator\ref-repos\axonkey\`（leowzz/axonkey）
-  - `C:\Users\Administrator\ref-repos\zstdjan\`、`...\zstdjan-code\`、`...\zstdjan-pinned\`（ZSTDJan/windows-remote-mic-app）
-  - `C:\Users\Administrator\ref-repos\suk-ldev\`（Suk-ldev/remote-mic-app-windows）
-  - 各仓库文件名清单：`C:\Users\Administrator\ref-repos\*.tree.txt`
+  - `REDACTED_user_115
+  - `REDACTED_user_112
+  - `REDACTED_user_116
+  - `REDACTED_user_113
+  - `REDACTED_user_114
+  - 各仓库文件名清单：`REDACTED_user_111
 - 抓取命令（`gh` 需要 git 在 PATH，本机 Git 位于 `…\PortableGit\versions\1.2.0\mingw64\bin`）：
   ```
   gh api repos/<owner>/<repo>/contents/<path>?ref=<SHA> --jq .content   # base64，去换行后解出原文

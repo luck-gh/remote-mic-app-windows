@@ -1,5 +1,7 @@
 # RC003 返回/音量± 三键在 Windows 上不可见（调查归档，2026-09-05）
 
+> 当前阅读边界（2026-10-02）：这里的“不可见”描述当时 Windows 输入通道的观察，不等于遥控器不发送报告，也不是当前三键能力结论。本地后续逐报告来源与增强契约见 [PLAN](../PLAN.md) 和 [FEATURES](../FEATURES.md)；上游后续 IOCTL 实验见[固定上游归档](https://github.com/GetSayAll/remote-mic-app-windows/blob/c81308e011a757dc22d22f2861b687ef787d295e/docs/investigations/2026-09-23-rc003-driverless-capture-investigation.md)，仅作外部研究来源，不外推本地验收或替代当前 WDF/PDO 来源判据。
+
 ## 现象
 
 RC003 遥控器：确认/方向/电源/主页/菜单/TV 键全部正常（卡片高亮、锚点、

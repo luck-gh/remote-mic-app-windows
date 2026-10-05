@@ -1,7 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
+
+/**
+ * 设置页“问题反馈”的外部入口（2026-10-01 用户指定，2026-10-02 官网地址改为
+ * 带 `?from=win` 的来源标记，便于官网区分 Windows 版来客）：官网首页与 Windows
+ * 版源码仓库。
+ *
+ * 这两个字符串同时是 `src-tauri/capabilities/default.json` 里 opener 白名单的
+ * 键——改这里必须同步改那里，否则真机上点击会被插件判为 ForbiddenUrl
+ * （`bridge.test.ts` 逐字锁定了这份契约，runtime simulation 另行断言不在真机
+ * 上被拒绝）。
+ */
+export const OFFICIAL_WEBSITE_URL = "https://sayall.app/?from=win";
+export const GITHUB_REPOSITORY_URL = "https://github.com/GetSayAll/remote-mic-app-windows";
+
+/**
+ * Vokie 官网（2026-10-01 Andy 提供）。
+ *
+ * 同样是 opener 白名单的键：新增 URL 必须同步
+ * `src-tauri/capabilities/default.json` 与 `bridge.test.ts` 的白名单断言。
+ */
+export const VOKIE_HOMEPAGE_URL = "https://vokie.com/";
 
 export type ConnectionPhase =
   | "idle"
@@ -85,6 +107,8 @@ export interface ButtonEdge {
 export interface ShortcutCaptureEdge {
   key: KeyCode;
   isPressed: boolean;
+  /** 边沿来源：real = 物理事件；injected = 外部钩子（输入法）吞下后重放的副本。 */
+  source?: "real" | "injected";
 }
 
 export interface RawInputSnapshot {
@@ -114,6 +138,7 @@ export const mouseMoveLabels: Record<MoveDirection, string> = { up: "鼠标向�
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
+  | { type: "task_switch"; view: "applications" | "desktops" }
   | { type: "scroll"; direction: "up" | "down"; steps?: number }
   | { type: "mouse_click"; kind: MouseClickKind }
   | { type: "mouse_move"; direction: MoveDirection; distance: number }
@@ -136,7 +161,96 @@ export interface ButtonActions {
 export interface ButtonMappings {
   enabled: boolean;
   actions: Partial<Record<RemoteButton, ButtonActions>>;
-  applications?: CustomAppPick[];
+  applications?: AppLibraryEntry[];
+}
+
+export interface CaptureInputSettings {
+  enabled: boolean;
+  endpointId: string | null;
+  endpointName: string | null;
+}
+export interface AudioRouteSnapshot {
+  phase: "paired" | "manual" | "unconfigured" | "unavailable";
+  reason: string | null;
+  captureEndpointId: string | null;
+  captureEndpointName: string | null;
+  renderEndpointId: string | null;
+  renderEndpointName: string | null;
+}
+export async function getAudioRouteSnapshot(): Promise<AudioRouteSnapshot> {
+  if (!isTauriRuntime()) return { phase: "unavailable", reason: "unsupported", captureEndpointId: null, captureEndpointName: null, renderEndpointId: null, renderEndpointName: null };
+  return invoke<AudioRouteSnapshot>("get_audio_route_snapshot");
+}
+export interface CaptureInputSnapshot {
+  settings: CaptureInputSettings;
+  phase: string;
+  recoveryPending: boolean;
+  lastError: string | null;
+}
+export async function getCaptureInput(): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) return { settings: { enabled: false, endpointId: null, endpointName: null }, phase: "unsupported", recoveryPending: false, lastError: null };
+  return invoke<CaptureInputSnapshot>("get_capture_input");
+}
+export async function listCaptureInputs(): Promise<AudioEndpoint[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<AudioEndpoint[]>("list_capture_inputs");
+}
+export async function setCaptureInput(config: CaptureInputSettings): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) throw new Error("请在 Windows 应用中设置会话输入设备");
+  return invoke<CaptureInputSnapshot>("set_capture_input", { config });
+}
+export async function resolveCaptureRecovery(restore: boolean): Promise<CaptureInputSnapshot> {
+  if (!isTauriRuntime()) throw new Error("请在 Windows 应用中恢复输入设备");
+  return invoke<CaptureInputSnapshot>("resolve_capture_recovery", { restore });
+}
+export interface RunningAppInfo { applicationId: string; name: string; preset: boolean; }
+
+export interface MappingTemplate { id: string; name: string; mappings: ButtonMappings; }
+export type ButtonMappingTemplate = MappingTemplate;
+export interface ApplicationBinding { applicationId: string; templateId: string; menuOrder: number; launchTarget?: string | null; }
+export interface TemplateCatalogEntry { id: string; name: string; kind: "direct"; builtIn: boolean; buttonMappings: ButtonMappings | null; }
+export interface MappingConfiguration {
+  menuUpdateDefault?: boolean;
+  menuTemplateSwitchEnabled: boolean;
+  mappingNoticeEnabled: boolean;
+  commonMappings: ButtonMappings;
+  templates: MappingTemplate[];
+  applicationBindings: ApplicationBinding[];
+  buttonMappingFollowEnabled: boolean;
+}
+export interface MappingConfigurationImportPreview { token: string; sourceToken: string | null; formatVersion: number; configuration: MappingConfiguration; builtinTemplateIds: string[]; templateNameConflicts: string[]; unresolvedApplicationIds: string[]; }
+export interface SceneMenuItem { applicationId:string|null; templateId:string; label:string; running:boolean; }
+export interface MappingNotice { kind:string; templateId:string|null; name:string|null; actionsAvailable:boolean; defaultSaveStatus?:string|null; }
+export interface SceneSnapshot { mappingNoticeEnabled:boolean; mappingNotice:MappingNotice|null; mappingNoticeRevision:number; enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; panel:"template"|null; updateDefault:boolean; preferencePending?:boolean; preferenceError?:boolean; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; status:string|null; }
+export type SceneEvent =
+  | { type:"mapping_notice_enabled"; enabled:boolean }
+  | { type:"snapshot"; snapshot:SceneSnapshot }
+  | { type:"mapping_applied"; notice:MappingNotice; revision:number }
+  | { type:"default_template_persistence_requested"; requestId:number; applicationId:string; templateId:string };
+export interface TemplateImportRequest { templateIds: string[]; resolvedNames: Record<string,string>; replaceApplicationBindings: boolean; }
+export interface TemplateImportPreview { token:string; templates:Array<{sourceTemplateId:string;template:MappingTemplate}>; addedApplicationBindings:ApplicationBinding[]; replacedApplicationIds:string[]; skippedApplicationIds:string[]; unresolvedApplicationIds:string[]; }
+export type ComponentKind = "vb_cable";
+export type ComponentAction = "install" | "repair" | "remove" | "open_vendor_wizard";
+export type InstallationState = "unknown" | "not_installed" | "installed_not_loaded" | "available" | "restart_required" | "incompatible" | "failed" | "not_implemented";
+export type PackageState = "missing" | "trusted" | "signature_missing" | "authorization_missing" | "incompatible" | "failed" | "download_available";
+export type ComponentReason =
+  | "ready" | "not_installed" | "service_not_loaded" | "audio_endpoints_missing" | "identity_unavailable"
+  | "package_missing" | "signing_policy_missing" | "authorization_missing" | "uninstall_package_missing"
+  | "unsupported_platform" | "unsupported_architecture" | "detection_failed" | "access_denied"
+  | "restart_required" | "path_rejected" | "hash_mismatch" | "signature_invalid" | "publisher_mismatch"
+  | "version_mismatch" | "invalid_package" | "uac_cancelled" | "uac_denied" | "helper_unavailable"
+  | "helper_timed_out" | "helper_failed" | "verification_failed" | "operation_unsupported" | "operation_in_progress"
+  | "not_implemented" | "official_wizard_required" | "download_failed" | "wizard_closed";
+export type ComponentOperationOutcome = "blocked" | "cancelled" | "denied" | "timed_out" | "restart_required" | "failed" | "completed" | "wizard_closed";
+export interface ComponentStatus {
+  component: ComponentKind; installation: InstallationState; package: PackageState;
+  installedVersion: string | null; serviceInstalled: boolean | null; loaded: boolean | null;
+  bound: boolean | null; audioEndpointsReady: boolean | null; restartRequired: boolean;
+  reason: ComponentReason; blockers: ComponentReason[]; allowedActions: ComponentAction[];
+}
+export interface ComponentOperation {
+  component: ComponentKind; action: ComponentAction; outcome: ComponentOperationOutcome;
+  reason: ComponentReason; status: ComponentStatus;
 }
 
 export interface FiredGesture {
@@ -145,6 +259,7 @@ export interface FiredGesture {
 }
 
 export interface ButtonMappingSnapshot {
+  observedButtons: RemoteButton[];
   enabled: boolean;
   gateActive: boolean;
   listenerActive: boolean;
@@ -285,6 +400,33 @@ export interface AppUpdatePreferences {
 
 export type ThemePreference = "system" | "light" | "dark";
 
+/** Windows 系统强调色（设置 > 个性化 > 颜色），Rust accent 命令契约。 */
+export interface AccentRgb {
+  r: number;
+  g: number;
+  b: number;
+}
+
+export async function getSystemAccentColor(): Promise<AccentRgb | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<AccentRgb | null>("get_system_accent_color");
+}
+
+export async function subscribeAccentChanges(
+  handler: (color: AccentRgb) => void,
+): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<AccentRgb>("system-accent-changed", (event) =>
+    handler(event.payload),
+  );
+  return () => {
+    void unlisten();
+  };
+}
+
 export async function getLaunchAtLogin(): Promise<boolean> {
   if (!isTauriRuntime()) return false;
   return invoke<boolean>("get_launch_at_login");
@@ -302,7 +444,9 @@ export interface AppUpdateProgress {
 }
 
 const browserSnapshot: RuntimeSnapshot = {
-  appVersion: "0.1.0",
+  // 浏览器预览没有安装包可读，这里跟随当前应用版本：它是预览里"设置页版本号"
+  // 与侧栏底部的唯一来源，写死旧值会让预览显示一个不存在的版本。
+  appVersion: "0.5.0",
   platform: {
     platform: "browser-preview",
     windowsApiAvailable: false,
@@ -347,6 +491,7 @@ const browserSnapshot: RuntimeSnapshot = {
     buttonMapping: {
       enabled: true,
       gateActive: false,
+      observedButtons: [],
       listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
@@ -442,7 +587,8 @@ export function formatDiagnosticReport(
  * 打开诊断日志目录（关于页入口）。返回实际打开的目录供界面显示。
  *
  * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径——
- * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网一个 URL）。
+ * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网、产品官网与
+ * 源码仓库三个固定 URL）。
  */
 export async function openLogDirectory(): Promise<string> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开日志目录");
@@ -519,6 +665,75 @@ export async function openVbCableDownloadPage(): Promise<void> {
   await openUrl(VB_CABLE_DOWNLOAD_URL);
 }
 
+/**
+ * 外部链接的统一出口：浏览器预览开新标签，Tauri 运行时交给 opener 插件
+ * （插件只放行 capabilities 白名单内的 URL，前端不做过滤，也不拼接参数）。
+ */
+async function openExternalUrl(url: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  await openUrl(url);
+}
+
+/** 设置页顶部“官网”入口。 */
+export async function openOfficialWebsite(): Promise<void> {
+  await openExternalUrl(OFFICIAL_WEBSITE_URL);
+}
+
+/** 设置页“问题反馈”里的“GitHub”入口。 */
+export async function openGitHubRepository(): Promise<void> {
+  await openExternalUrl(GITHUB_REPOSITORY_URL);
+}
+
+/** 连接页“Vokie 未安装”提示里的官网入口（2026-10-01）。 */
+export async function openVokieHomepage(): Promise<void> {
+  await openExternalUrl(VOKIE_HOMEPAGE_URL);
+}
+
+/** Vokie 检测结果：未安装时连接页显示官网入口；已安装但没运行时提示先启动它。 */
+export interface VokieInstallation {
+  installed: boolean;
+  running: boolean;
+}
+
+export async function getVokieInstallation(): Promise<VokieInstallation> {
+  if (!isTauriRuntime()) {
+    return { installed: false, running: false };
+  }
+  return invoke<VokieInstallation>("get_vokie_installation");
+}
+
+/**
+ * 打开 Vokie（连接页第 ② 步「打开 Vokie」按钮）：装了但没运行时一键叫起来。
+ * 失败时抛错（调用方把原因显示给用户）。
+ */
+export async function launchVokie(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  return invoke<void>("launch_vokie");
+}
+
+/**
+ * 「其他工具」面板记住的按键：`null` = 从未选过（保持现状），`[]` = 明确选了
+ * 「不按键」。选中「其他工具」时恢复它，用户改选时写回。
+ */
+export async function getOtherVoiceHotkey(): Promise<KeyCode[] | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<KeyCode[] | null>("get_other_voice_hotkey");
+}
+
+export async function setOtherVoiceHotkey(keys: KeyCode[]): Promise<KeyCode[] | null> {
+  if (!isTauriRuntime()) {
+    return keys;
+  }
+  return invoke<KeyCode[] | null>("set_other_voice_hotkey", { keys });
+}
+
 export async function getRawInputSnapshot(): Promise<RawInputSnapshot> {
   if (!isTauriRuntime()) {
     return browserSnapshot.platform.rawInput;
@@ -547,6 +762,152 @@ export async function getButtonMappings(): Promise<ButtonMappings> {
   return invoke<ButtonMappings>("get_button_mappings");
 }
 
+export async function openBluetoothSettings(): Promise<void> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开 Windows 蓝牙设置");
+  await invoke("open_bluetooth_settings");
+}
+
+export async function getMappingConfiguration(): Promise<MappingConfiguration> {
+  if (!isTauriRuntime()) return { menuTemplateSwitchEnabled: false, mappingNoticeEnabled: true, commonMappings: { enabled: true, actions: {} }, templates: [], applicationBindings: [], buttonMappingFollowEnabled: false };
+  return invoke<MappingConfiguration>("get_mapping_configuration");
+}
+export async function saveMappingConfiguration(configuration: MappingConfiguration): Promise<MappingConfiguration> {
+  return invoke<MappingConfiguration>("save_mapping_configuration", { configuration });
+}
+export async function setMappingNoticeEnabled(enabled: boolean): Promise<MappingConfiguration> {
+  return invoke("set_mapping_notice_enabled", { enabled });
+}
+export async function setButtonMappingFollowEnabled(enabled: boolean): Promise<MappingConfiguration> {
+  return invoke<MappingConfiguration>("set_button_mapping_follow_enabled", { enabled });
+}
+export async function createMappingTemplate(name: string): Promise<MappingTemplate> { return invoke("create_mapping_template", { name }); }
+export async function saveButtonMappingTemplate(name: string, mappings: ButtonMappings): Promise<ButtonMappingTemplate> { return invoke("save_button_mapping_template", { name, mappings }); }
+export async function duplicateButtonMappingTemplate(templateId: string, name: string): Promise<ButtonMappingTemplate> { return invoke("duplicate_button_mapping_template", { templateId, name }); }
+export async function resetBuiltinTemplate(templateId: string): Promise<MappingConfiguration> { return invoke("reset_builtin_template", { templateId }); }
+export async function updateButtonMappingTemplate(templateId: string, mappings: ButtonMappings): Promise<ButtonMappingTemplate> { return invoke("update_button_mapping_template", { templateId, mappings }); }
+export async function reorderApplicationAssociations(applicationIds: string[]): Promise<MappingConfiguration> { return invoke("reorder_application_associations", { applicationIds }); }
+export async function duplicateMappingTemplate(templateId: string, name: string): Promise<MappingTemplate> { return invoke("duplicate_mapping_template", { templateId, name }); }
+export async function renameMappingTemplate(templateId: string, name: string): Promise<MappingConfiguration> { return invoke("rename_mapping_template", { templateId, name }); }
+export async function deleteMappingTemplate(templateId: string, replacementTemplateId: string | null, unbindApplications = false): Promise<MappingConfiguration> { return invoke("delete_mapping_template", { templateId, replacementTemplateId, unbindApplications }); }
+export async function upsertApplicationBinding(binding: ApplicationBinding): Promise<MappingConfiguration> { return invoke("upsert_application_binding", { binding }); }
+export async function removeApplicationBinding(applicationId: string): Promise<MappingConfiguration> { return invoke("remove_application_binding", { applicationId }); }
+export async function exportMappingConfiguration(templateIds: string[] | null = null): Promise<boolean> { return invoke("export_mapping_configuration", { templateIds }); }
+export async function previewMappingConfigurationImport(): Promise<MappingConfigurationImportPreview | null> { return invoke("preview_mapping_configuration_import"); }
+export async function applyMappingConfigurationImport(token: string): Promise<MappingConfiguration> { return invoke("apply_mapping_configuration_import", { token }); }
+export async function previewTemplateImport(sourceToken:string, request:TemplateImportRequest):Promise<TemplateImportPreview>{return invoke("preview_template_import",{sourceToken,request});}
+export async function getTemplateCatalog():Promise<TemplateCatalogEntry[]>{return invoke("get_template_catalog");}
+export async function copyTemplateCatalogEntry(templateId:string,name:string):Promise<TemplateCatalogEntry>{return invoke("copy_template_catalog_entry",{templateId,name});}
+export async function getSceneSnapshot():Promise<SceneSnapshot|null>{return invoke("get_scene_snapshot");}
+export async function selectCurrentTemplate(templateId:string|null):Promise<SceneSnapshot>{return invoke("select_current_template", { templateId });}
+export async function subscribeSceneEvents(callback:(event:SceneEvent)=>void):Promise<()=>void>{const unlisten=await listen<SceneEvent>("scene-event",event=>callback(event.payload));return unlisten;}
+export async function getComponentStatus(component: ComponentKind): Promise<ComponentStatus> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法检测组件状态");
+  return invoke<ComponentStatus>("get_component_status", { component });
+}
+export async function performComponentAction(component: ComponentKind, action: ComponentAction): Promise<ComponentOperation> {
+  if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法执行组件操作");
+  return invoke<ComponentOperation>("perform_component_action", { component, action });
+}
+
+export async function setMenuTemplateSwitchEnabled(enabled: boolean): Promise<MappingConfiguration> {
+  return invoke("set_menu_template_switch_enabled", { enabled });
+}
+
+export interface Rc003BridgeSnapshot {
+  phase: Rc003BridgePhase;
+  port: number;
+  helperPid: number;
+  acceptedTotal: number;
+  deniedTotal: number;
+  replacedTotal: number;
+  edgesApplied: number;
+  usagesDropped: number;
+  malformedTotal: number;
+  watchdogReleaseTotal: number;
+  pressedUsages: number[];
+  lastRxAgeMs: number | null;
+  targetGeneration: number;
+  targetUsages: number[];
+  ownedUsages: number[];
+}
+
+/** `stopped` = 该平台没有这个机制（非 Windows），或桥接未启用。 */
+export type Rc003BridgePhase = "stopped" | "listening" | "connected" | "failed";
+
+const BROWSER_RC003_BRIDGE: Rc003BridgeSnapshot = {
+  phase: "stopped",
+  port: 0,
+  helperPid: 0,
+  acceptedTotal: 0,
+  deniedTotal: 0,
+  replacedTotal: 0,
+  edgesApplied: 0,
+  usagesDropped: 0,
+  malformedTotal: 0,
+  watchdogReleaseTotal: 0,
+  pressedUsages: [],
+  lastRxAgeMs: null,
+  targetGeneration: 0,
+  targetUsages: [],
+  ownedUsages: [],
+};
+
+export async function getRc003BridgeSnapshot(): Promise<Rc003BridgeSnapshot> {
+  // `typeof window` 这一层不能省：组件卸载后轮询仍可能再触发一次，
+  // 而测试环境在 teardown 之后 window 已不可用 —— 直接调 `isTauriRuntime()`
+  // 会抛 ReferenceError，表现为一个与被测功能无关的 unhandled rejection。
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return BROWSER_RC003_BRIDGE;
+  }
+  return invoke<Rc003BridgeSnapshot>("get_rc003_bridge_snapshot");
+}
+
+/** Persisted intent is separate from the installed task and live bridge. */
+export interface Rc003TaskStatus {
+  installed: boolean;
+  /** The previous capture session has not yet confirmed clean shutdown. */
+  cleanupPending: boolean;
+  canRetryCleanup: boolean;
+  /**
+   * 这次打开开关会触发系统授权（UAC）。2026-10-03 起恒为 true：每次开启都会
+   * 重新注册任务并弹一次 Windows 授权窗口。字段保留给诊断与类型兼容，
+   * 前端弹窗判据已不依赖它（每次开启都弹确认，只有关闭方向直接执行）。
+   */
+  authorizationRequired: boolean;
+  /** 用户意图（持久化，默认关闭）。开关显示读它，而不是读 installed。 */
+  enabled: boolean;
+  helperPath: string | null;
+  lastError: string | null;
+}
+
+/**
+ * 开关打开：**每次都重新授权**（弹一次 UAC 重新注册任务，主程序会等它完成），
+ * 然后触发助手；开关关闭：结束助手，任务留在系统里但授权视为作废
+ * （提权任务普通权限删不掉），下次开启必弹 UAC（2026-10-03 Andy 定稿）。
+ */
+export async function getRc003TaskStatus(): Promise<Rc003TaskStatus> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return { installed: false, authorizationRequired: true, enabled: false, cleanupPending: false, canRetryCleanup: false, helperPath: null, lastError: null };
+  }
+  return invoke<Rc003TaskStatus>("get_rc003_task_status");
+}
+
+export async function enableRc003Capture(): Promise<Rc003TaskStatus> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return { installed: false, authorizationRequired: true, enabled: false, cleanupPending: false, canRetryCleanup: false, helperPath: null, lastError: null };
+  }
+  return invoke<Rc003TaskStatus>("enable_rc003_capture");
+}
+
+export async function disableRc003Capture(): Promise<Rc003TaskStatus> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return { installed: false, authorizationRequired: true, enabled: false, cleanupPending: false, canRetryCleanup: false, helperPath: null, lastError: null };
+  }
+  return invoke<Rc003TaskStatus>("disable_rc003_capture");
+}
+
+
+
 export async function saveButtonMappings(mappings: ButtonMappings): Promise<ButtonMappings> {
   if (!isTauriRuntime()) {
     throw new Error("当前是浏览器预览，无法保存按键映射");
@@ -561,21 +922,6 @@ export async function resetButtonMappings(): Promise<ButtonMappings> {
   return invoke<ButtonMappings>("reset_button_mappings");
 }
 
-/** 返回 false 表示用户在系统文件选择器中取消。 */
-export async function exportButtonMappingConfiguration(): Promise<boolean> {
-  if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法导出按键映射配置");
-  }
-  return invoke<boolean>("export_button_mapping_configuration");
-}
-
-/** 返回 null 表示用户在系统文件选择器中取消。 */
-export async function importButtonMappingConfiguration(): Promise<ButtonMappings | null> {
-  if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法导入按键映射配置");
-  }
-  return invoke<ButtonMappings | null>("import_button_mapping_configuration");
-}
 
 export async function testButtonMapping(
   button: RemoteButton,
@@ -592,6 +938,7 @@ export async function listPresetApps(): Promise<PresetAppInfo[]> {
     // 浏览器预览：展示完整预设表（仅渲染验证）。
     return [
       { id: "sayall", name: "无线麦", installed: true },
+      { id: "codex", name: "Codex", installed: true },
       { id: "wechat", name: "微信", installed: true },
       { id: "edge", name: "Edge 浏览器", installed: true },
       { id: "chrome", name: "Chrome 浏览器", installed: true },
@@ -599,9 +946,25 @@ export async function listPresetApps(): Promise<PresetAppInfo[]> {
       { id: "calc", name: "计算器", installed: true },
       { id: "explorer", name: "文件资源管理器", installed: true },
       { id: "netease_music", name: "网易云音乐", installed: true },
+      // 2026-10-02 扩充的预设（与 Rust PRESET_APPS 同步，仅浏览器预览用）。
+      { id: "vokie", name: "Vokie", installed: true },
+      { id: "vscode", name: "Visual Studio Code", installed: true },
+      { id: "cursor", name: "Cursor", installed: true },
+      { id: "dimagent", name: "DimAgent", installed: true },
+      { id: "qq", name: "QQ", installed: true },
+      { id: "feishu", name: "飞书", installed: true },
+      { id: "hermes", name: "Hermes", installed: true },
     ];
   }
   return invoke<PresetAppInfo[]>("list_preset_apps");
+}
+
+export async function listRunningApps(): Promise<RunningAppInfo[]> {
+  if (!isTauriRuntime()) return [
+    { applicationId: "edge", name: "Edge 浏览器", preset: true },
+    { applicationId: "c:\\tools\\reader.exe", name: "Reader", preset: false },
+  ];
+  return invoke<RunningAppInfo[]>("list_running_apps");
 }
 
 export async function getButtonMappingSnapshot(): Promise<ButtonMappingSnapshot> {
@@ -609,6 +972,7 @@ export async function getButtonMappingSnapshot(): Promise<ButtonMappingSnapshot>
     return {
       enabled: true,
       gateActive: false,
+      observedButtons: [],
       listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
@@ -648,14 +1012,28 @@ export async function subscribeButtonGestures(
   };
 }
 
-export async function startShortcutCapture(): Promise<void> {
-  if (!isTauriRuntime()) return;
-  await invoke("start_shortcut_capture");
+/** 开始 OS 级快捷键录入；返回录入开始时仍被按住的键（preheld）。
+ *  preheld 键的边沿对录入不可见（防粘键：其 DOWN 已进 OS，UP 必须放行），
+ *  后端会等它们全部松开后才开始投递边沿——前端据此提示用户先松手，
+ *  避免"按住中打开录入"被静默截断成半截组合。 */
+export async function startShortcutCapture(): Promise<KeyCode[]> {
+  if (!isTauriRuntime()) return [];
+  const preheld = await invoke<KeyCode[]>("start_shortcut_capture");
+  return preheld ?? [];
 }
 
-export async function stopShortcutCapture(): Promise<void> {
-  if (!isTauriRuntime()) return;
-  await invoke("stop_shortcut_capture");
+/** 微信输入法语音是否在录入会话期间被触发（观测其麦克风 ConsentStore）。 */
+export type WetypeVoiceVerdict = "observed" | "not_observed" | "unknown";
+
+export interface ShortcutCaptureStopResult {
+  /** "unknown" 表示观测不可用，调用方不得据此推断用户按了什么。 */
+  wetypeVoice: WetypeVoiceVerdict;
+}
+
+export async function stopShortcutCapture(): Promise<ShortcutCaptureStopResult | null> {
+  if (!isTauriRuntime()) return null;
+  const result = await invoke<ShortcutCaptureStopResult | null>("stop_shortcut_capture");
+  return result ?? null;
 }
 
 /** 原生低级钩子录入边沿；Win+L 等系统组合在到达 Shell 前已成对吞下。 */
@@ -691,6 +1069,30 @@ export async function setVoiceHoldHotkey(hotkey: KeyChord | null): Promise<KeyCh
     throw new Error("当前是浏览器预览，无法保存按住说话快捷键");
   }
   return invoke<KeyChord | null>("set_voice_hold_hotkey", { hotkey });
+}
+
+/**
+ * 连接页选择的输入工具（2026-09-30 设计稿 v3）。
+ *
+ * 它决定连接页展示的快捷键建议与准备清单；基础语音仍使用成对的
+ * 按住说话快捷键，不依赖可选按键增强 Helper。
+ * `null` = 用户从未选择过：界面仅按当前快捷键展示引导，显式选择后才落存。
+ */
+export type VoiceInputTool = "wechat" | "doubao" | "vokie" | "other";
+
+export async function getVoiceInputTool(): Promise<VoiceInputTool | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<VoiceInputTool | null>("get_voice_input_tool");
+}
+
+export async function setVoiceInputTool(tool: VoiceInputTool): Promise<VoiceInputTool> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法保存输入工具设置");
+  }
+  const saved = await invoke<VoiceInputTool | null>("set_voice_input_tool", { tool });
+  return saved ?? tool;
 }
 
 /** 检查应用更新；浏览器预览下返回"无更新"占位（不发起网络请求）。 */
@@ -757,6 +1159,28 @@ export interface ThemeResultReport {
 export async function reportThemeResult(report: ThemeResultReport): Promise<void> {
   if (!isTauriRuntime()) return;
   await invoke("report_theme_result", { report });
+}
+
+/**
+ * 应用图标（2026-10-02 用户指定；对齐 Mac main `AppIconController`/`AppIconCatalog`）：
+ *
+ * - `standard`：内置应用图标（默认，也是老配置的落点）；
+ * - `faceted-duck`：来自 Mac `Resources/AppIcons/faceted-duck.png` 的「几何鸭」。
+ *
+ * 切换后由 Rust 同时更换**主窗口图标（任务栏 / Alt-Tab / 标题栏）与托盘图标**；
+ * 设置页顶部标识与选项预览用同一 ID 实时渲染。安装包与开始菜单快捷方式的图标
+ * 属于安装产物，运行期不变（Mac 的 bundle 图标同样不变）。
+ */
+export type AppIconIdentifier = "standard" | "faceted-duck";
+
+export async function getAppIcon(): Promise<AppIconIdentifier> {
+  if (!isTauriRuntime()) return "standard";
+  return invoke<AppIconIdentifier>("get_app_icon");
+}
+
+export async function setAppIcon(identifier: AppIconIdentifier): Promise<AppIconIdentifier> {
+  if (!isTauriRuntime()) return identifier;
+  return invoke<AppIconIdentifier>("set_app_icon", { identifier });
 }
 
 /** 下载并安装已检查到的更新（Windows 上安装成功时应用会退出并由安装器重启）。 */
@@ -833,8 +1257,8 @@ export function connectionPhaseLabel(phase: ConnectionPhase): string {
 
 export function remoteModelLabel(model: RemoteModel): string {
   return {
-    rc001: "小米蓝牙遥控器 2",
-    rc003: "小米蓝牙遥控器 2 Pro",
+    rc001: "小米蓝牙语音遥控器 2",
+    rc003: "小米蓝牙语音遥控器 2 Pro",
     unknown: "连接后显示",
   }[model];
 }
@@ -876,63 +1300,6 @@ export function buttonTriggerLabel(trigger: ButtonTrigger): string {
     double: "双击",
     long: "长按",
   }[trigger];
-}
-
-/**
- * 武装族按键的"同键映射"表（对齐 crates/sayall-windows/src/send_input.rs
- * 的 native_key）：映射动作与原生动作相同时，映射引擎的泄漏对冲保证
- * 冷首按单响应（原生动作已交付，引擎跳过注入）。
- */
-export const identityShortcutByButton: Partial<Record<RemoteButton, KeyCode>> = {
-  ok: "enter",
-  up: "up",
-  down: "down",
-  left: "left",
-  right: "right",
-  home: "home",
-};
-
-export type ShortcutCapability = "all" | "identity" | "none";
-
-/**
- * 按键 × 触发 × 型号 的"单响应能力"判定（2026-09-06 定稿；注入链路已由
- * examples/preset_inject_probe.rs 真机验证 36/36 全部正确——所有可见按键
- * 的所有配置均真实生效，本矩阵**只用于编辑器的信息提示**，不做门控）：
- *
- * - **all**（直接归因族：电源 VK 0xFF/0x5F、菜单 VK_APPS）：原始键
- *   从不泄漏 → 任意配置严格单响应；
- * - **identity**（武装族常见物理 VK：确定/方向）：孤立冷首按原始键
- *   必泄漏（结构性武装死锁，公开 API 内不可根除）→ 同键映射由泄漏对冲
- *   保证单响应，其他映射"配置动作正常执行 + 冷首按附带一次原生动作"；
- * - **none**：TV（OEM_3 `~/~，同键映射不可表达）与返回/音量±（RC003
- *   输入栈不可见；RC001 虽可达但 2026-09-07 起全型号禁用——格子禁用，
- *   见 ButtonsPage 的 UNMAPPABLE_BUTTONS）。
- *
- * 2026-09-07 增补（方案 C"遥控器优先"落地，key_gate 常驻抑制族）：
- * Home/TV 已配置映射且遥控器连接期间原生按键被接管——任意按压（含孤立
- * 冷首按）严格单响应，本矩阵的 identity/none 标注对这两键仅剩编辑参考
- * 意义（见 ButtonsPage capabilityNote 的接管提示）。左键自 2026-09-08
- * 起恢复为与上/下/右/确定相同的逐键武装与泄漏对冲机制。
- */
-export function shortcutCapability(
-  button: RemoteButton,
-  trigger: ButtonTrigger,
-  _model: RemoteModel,
-): ShortcutCapability {
-  if (button === "power" || button === "menu") {
-    return "all";
-  }
-  if (
-    button === "back" ||
-    button === "volume_up" ||
-    button === "volume_down" ||
-    button === "tv"
-  ) {
-    // 返回/音量±全型号禁用（2026-09-07 用户决策）；TV 无同键映射可表达。
-    return "none";
-  }
-  // 武装族（确定/方向）：单击可配同键映射（对冲单响应）。
-  return trigger === "single" ? "identity" : "none";
 }
 
 const keyLabels: Record<string, string> = {
@@ -993,6 +1360,7 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
 
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
+  if (action.type === "task_switch") return action.view === "applications" ? "任务切换" : "任务视图";
   if (action.type === "scroll") {
     const label = action.direction === "up" ? "滚轮向上" : "滚轮向下";
     return (action.steps ?? 1) === 1 ? label : `${label} ${action.steps} 格`;
@@ -1014,11 +1382,14 @@ export function actionSummary(action: ButtonAction | undefined): string {
 export interface CustomAppPick {
   name: string;
   path: string;
+  applicationId: string;
 }
 
-export async function scanRegisteredApps(): Promise<CustomAppPick[]> {
+export type AppLibraryEntry = Pick<CustomAppPick, "name" | "path">;
+
+export async function scanRegisteredApps(): Promise<AppLibraryEntry[]> {
   if (!isTauriRuntime()) throw new Error("应用扫描需要在 Windows 客户端中使用");
-  return invoke<CustomAppPick[]>("scan_registered_apps");
+  return invoke<AppLibraryEntry[]>("scan_registered_apps");
 }
 
 /**

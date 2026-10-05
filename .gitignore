@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 dist/
 target/
 src-tauri/target/
@@ -23,16 +24,10 @@ coverage/
 .vscode/
 .workbuddy/memory/
 pnpm-debug.log*
+/artifacts/windows-preview/SHA256SUMS.txt
+/artifacts/windows-preview/build-metadata.json
 __pycache__/
 *.pyc
-
-# ---- 本地产物与诊断证据目录 ----
-# CI workflow 的 paths-ignore 已把 artifacts/ 视为非源码；该目录同时是以下脚本的
-# 产物落地点，不应入库：
-#   scripts/verify-windows-bundle.ps1      -> artifacts/windows-preview/
-#   scripts/generate-updater-manifest.ps1  -> artifacts/windows-release/
-#   Testing/battery-ui-check.cjs           -> artifacts/remote-battery/
-artifacts/
 
 # 文档流水线工作目录（一次性生成物）
 output/
@@ -66,3 +61,10 @@ desktop.ini
 # 不是易变的运行日志，因此对上面的 `*.log` 规则做例外。
 # 说明见 hardware/RC003/README.md。
 !hardware/RC003/evidence/*.log
+
+# Fixed upstream input-helper resources staged for local/CI bundling.
+/src-tauri/frida-gadget.dll
+/src-tauri/licenses/Frida-COPYING.txt
+/src-tauri/licenses/ATTRIBUTION.md
+/hardware/RC003/helper/vendor/*.dll
+/hardware/RC003/helper/vendor/*.xz

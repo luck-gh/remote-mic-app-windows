@@ -1,66 +1,76 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
-import RegisteredAppsDialog from "../components/RegisteredAppsDialog.vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { useCurrentTemplate } from "../lib/current-template";
+import ButtonActionEditor from "../components/ButtonActionEditor.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
+import SettingsDialog from "../components/SettingsDialog.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+import { useUiPreference } from "../lib/ui-preferences";
 import {
   actionSummary,
   buttonLabel,
   buttonLabels,
   buttonTriggerLabel,
   chordLabel,
-  exportButtonMappingConfiguration,
+  exportMappingConfiguration,
   getButtonMappingSnapshot,
-  getButtonMappings,
-  identityShortcutByButton,
-  importButtonMappingConfiguration,
+  getMappingConfiguration,
+  getTemplateCatalog,
   listPresetApps,
-  mouseClickLabels,
-  mouseMoveLabels,
-  pickCustomApp,
   registerPresetAppNames,
-  resetButtonMappings,
+  remoteModelLabel,
   saveButtonMappings,
-  shortcutCapability,
+  saveButtonMappingTemplate,
+  saveMappingConfiguration,
+  setMenuTemplateSwitchEnabled,
   startRawInput,
-  startShortcutCapture,
   stopRawInput,
-  stopShortcutCapture,
   subscribeButtonEdges,
   subscribeButtonGestures,
-  subscribeShortcutCaptureEdges,
+  updateButtonMappingTemplate,
+  resetBuiltinTemplate,
   type ButtonAction,
   type ButtonActions,
   type ButtonEdge,
   type ButtonMappingSnapshot,
   type ButtonMappings,
+  type MappingConfiguration,
+  type TemplateCatalogEntry,
   type ButtonTrigger,
-  type CustomAppPick,
   type FiredGesture,
-  type KeyCode,
-  type MoveDirection,
   type PresetAppInfo,
   type RawInputPhase,
   type RemoteButton,
   type RemoteModel,
   type RuntimeSnapshot,
-  type ShortcutCaptureEdge,
 } from "../lib/bridge";
 
 const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+const READONLY_ICON = "M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3";
 
-/** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 570，宽度流式
+/** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 640，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
  * 与 Mac cardWidth(for:) 同公式；容器不足最小画布 800px 时由 CSS
  * --map-scale 连续缩放兜底（小于最小窗口的恢复态窗口）。 */
 const CANVAS_MIN_WIDTH = 800;
-const CANVAS_HEIGHT = 570;
+const CANVAS_HEIGHT = 640;
 const REMOTE_WIDTH = 202;
 const REMOTE_HEIGHT = 410;
 const CARD_HEIGHT = 72;
 const REMOTE_TOP = (CANVAS_HEIGHT - REMOTE_HEIGHT) / 2;
+const VOICE_CARD_TOP = 8;
+const CARD_ROW_GAP = 16;
+const ORDINARY_ROWS_TOP = VOICE_CARD_TOP + CARD_HEIGHT + CARD_ROW_GAP;
+
+/** 语音独占顶部一行；普通六行在其下等距排列，卡片均使用同一尺寸。 */
+function rowTarget(row: number): number {
+  const step = (CANVAS_HEIGHT - VOICE_CARD_TOP - ORDINARY_ROWS_TOP - CARD_HEIGHT) / 5;
+  return (ORDINARY_ROWS_TOP + row * step + CARD_HEIGHT / 2) / CANVAS_HEIGHT;
+}
 
 const canvasEl = ref<HTMLElement | null>(null);
+const remotePhotoEl = ref<HTMLElement | null>(null);
+const remoteImageEl = ref<HTMLImageElement | null>(null);
 const canvasWidth = ref(CANVAS_MIN_WIDTH);
 const cardWidth = computed(() =>
   Math.min(300, Math.max(270, (canvasWidth.value - 260) / 2)),
@@ -69,31 +79,31 @@ const remoteLeft = computed(() => (canvasWidth.value - REMOTE_WIDTH) / 2);
 
 interface Placement {
   button: RemoteButton;
-  side: "left" | "right";
+  side: "left" | "right" | "center";
   anchor: [number, number];
   targetY: number;
 }
 
 /** 按键卡片布局表：对齐 Mac RemoteMappingLayout.buttonPlacements。 */
 const PLACEMENTS: Placement[] = [
-  { button: "power", side: "left", anchor: [0.386, 0.099], targetY: 0.08 },
-  { button: "up", side: "left", anchor: [0.502, 0.179], targetY: 0.23 },
-  { button: "left", side: "left", anchor: [0.362, 0.246], targetY: 0.38 },
-  { button: "back", side: "left", anchor: [0.406, 0.389], targetY: 0.53 },
-  { button: "home", side: "left", anchor: [0.406, 0.479], targetY: 0.68 },
-  { button: "menu", side: "left", anchor: [0.406, 0.569], targetY: 0.83 },
-  { button: "right", side: "right", anchor: [0.638, 0.246], targetY: 0.215 },
-  { button: "ok", side: "right", anchor: [0.502, 0.246], targetY: 0.36 },
-  { button: "down", side: "right", anchor: [0.502, 0.317], targetY: 0.505 },
-  { button: "volume_up", side: "right", anchor: [0.604, 0.39], targetY: 0.65 },
-  { button: "volume_down", side: "right", anchor: [0.604, 0.48], targetY: 0.795 },
-  { button: "tv", side: "right", anchor: [0.604, 0.569], targetY: 0.94 },
+  { button: "power", side: "left", anchor: [0.386, 0.099], targetY: rowTarget(0) },
+  { button: "up", side: "left", anchor: [0.502, 0.179], targetY: rowTarget(1) },
+  { button: "left", side: "left", anchor: [0.362, 0.246], targetY: rowTarget(2) },
+  { button: "back", side: "left", anchor: [0.406, 0.389], targetY: rowTarget(3) },
+  { button: "home", side: "left", anchor: [0.406, 0.479], targetY: rowTarget(4) },
+  { button: "menu", side: "left", anchor: [0.406, 0.569], targetY: rowTarget(5) },
+  { button: "right", side: "right", anchor: [0.638, 0.246], targetY: rowTarget(0) },
+  { button: "ok", side: "right", anchor: [0.502, 0.246], targetY: rowTarget(1) },
+  { button: "down", side: "right", anchor: [0.502, 0.317], targetY: rowTarget(2) },
+  { button: "volume_up", side: "right", anchor: [0.604, 0.39], targetY: rowTarget(3) },
+  { button: "volume_down", side: "right", anchor: [0.604, 0.48], targetY: rowTarget(4) },
+  { button: "tv", side: "right", anchor: [0.604, 0.569], targetY: rowTarget(5) },
 ];
 const VOICE_PLACEMENT: Placement = {
   button: "ok", // 语音卡不对应 RemoteButton；占位仅用于定位。
-  side: "right",
+  side: "center",
   anchor: [0.63, 0.099],
-  targetY: 0.07,
+  targetY: (VOICE_CARD_TOP + CARD_HEIGHT / 2) / CANVAS_HEIGHT,
 };
 const TRIGGERS: ButtonTrigger[] = ["single", "double", "long"];
 
@@ -102,31 +112,48 @@ const remoteModel = computed<RemoteModel>(
   () => props.runtime?.platform.connection.remoteModel ?? "unknown",
 );
 
-/**
- * 不支持自定义的按键（2026-09-07 用户决策，全型号一致）：
- * 返回/音量±——RC003 上不进 Windows 输入栈（配置无法生效，2026-09-05
- * 调查归档 docs/investigations/2026-09-05-rc003-back-volume-buttons-invisible.md）；
- * RC001 上虽以 VK 0xFF 厂商键可达且可直接归因，为保持两型号行为一致而
- * 不开放配置。存量配置由后端（settings 持久化层 + 映射引擎）双重剥离。
- */
-const UNMAPPABLE_BUTTONS: ReadonlySet<RemoteButton> = new Set<RemoteButton>([
-  "back",
-  "volume_up",
-  "volume_down",
-]);
+const deviceLabel = computed(() => {
+  if (remoteModel.value !== "unknown") return remoteModelLabel(remoteModel.value);
+  return connectionInfo.value?.remoteName ?? "未连接遥控器";
+});
 
-function anchorPoint(placement: Placement): { x: number; y: number } {
-  return {
-    x: remoteLeft.value + REMOTE_WIDTH * placement.anchor[0],
-    y: REMOTE_TOP + REMOTE_HEIGHT * placement.anchor[1],
+interface ImageFrame { left: number; top: number; width: number; height: number }
+const remoteImageFrame = ref<ImageFrame>({
+  left: remoteLeft.value,
+  top: REMOTE_TOP,
+  width: REMOTE_WIDTH,
+  height: REMOTE_HEIGHT,
+});
+
+/**
+ * 以图片实际渲染内容为唯一热点坐标系。照片、热点与 SVG 连线都读取这一个 frame；
+ * 即使容器尺寸或 object-fit 发生变化，也不会再各自使用独立 top/scale。
+ */
+function measureRemoteImageFrame(): void {
+  const photo = remotePhotoEl.value;
+  const image = remoteImageEl.value;
+  if (!photo || !image) return;
+  const hasLayout = photo.clientWidth > 0 && photo.clientHeight > 0;
+  const boxWidth = hasLayout ? photo.clientWidth : REMOTE_WIDTH;
+  const boxHeight = hasLayout ? photo.clientHeight : REMOTE_HEIGHT;
+  const naturalWidth = image.naturalWidth || REMOTE_WIDTH;
+  const naturalHeight = image.naturalHeight || REMOTE_HEIGHT;
+  const scale = Math.max(boxWidth / naturalWidth, boxHeight / naturalHeight);
+  const width = naturalWidth * scale;
+  const height = naturalHeight * scale;
+  remoteImageFrame.value = {
+    left: (hasLayout ? photo.offsetLeft : remoteLeft.value) + (boxWidth - width) / 2,
+    top: (hasLayout ? photo.offsetTop : REMOTE_TOP) + (boxHeight - height) / 2,
+    width,
+    height,
   };
 }
 
-/** 照片容器内相对坐标（锚点橙点渲染在 .remote-photo 内部，坐标系是照片自身）。 */
-function photoAnchorPoint(placement: Placement): { x: number; y: number } {
+function anchorPoint(placement: Placement): { x: number; y: number } {
+  const frame = remoteImageFrame.value;
   return {
-    x: REMOTE_WIDTH * placement.anchor[0],
-    y: REMOTE_HEIGHT * placement.anchor[1],
+    x: frame.left + frame.width * placement.anchor[0],
+    y: frame.top + frame.height * placement.anchor[1],
   };
 }
 
@@ -136,6 +163,9 @@ function cardTop(placement: Placement): number {
 
 /** 卡片朝向遥控器一侧的边缘中点（箭头/连线的落点基准）。 */
 function cardEdgePoint(placement: Placement): { x: number; y: number } {
+  if (placement.side === "center") {
+    return { x: canvasWidth.value / 2, y: VOICE_CARD_TOP + CARD_HEIGHT };
+  }
   return {
     x: placement.side === "left" ? cardWidth.value : canvasWidth.value - cardWidth.value,
     y: placement.targetY * CANVAS_HEIGHT,
@@ -146,6 +176,7 @@ function cardEdgePoint(placement: Placement): { x: number; y: number } {
  * 整体读作一条带箭头的连线（线不再穿过箭头延伸到卡片边缘）。 */
 function lineEndPoint(placement: Placement): { x: number; y: number } {
   const edge = cardEdgePoint(placement);
+  if (placement.side === "center") return { x: edge.x, y: edge.y + 13 };
   const direction = placement.side === "left" ? -1 : 1;
   return { x: edge.x - direction * 13, y: edge.y };
 }
@@ -153,6 +184,10 @@ function lineEndPoint(placement: Placement): { x: number; y: number } {
 function connectionPath(placement: Placement): string {
   const start = anchorPoint(placement);
   const end = lineEndPoint(placement);
+  if (placement.side === "center") {
+    const distance = Math.min(48, Math.max(24, (start.y - end.y) * 0.48));
+    return `M ${start.x.toFixed(1)} ${start.y.toFixed(1)} C ${start.x.toFixed(1)} ${(start.y - distance).toFixed(1)}, ${end.x.toFixed(1)} ${(end.y + distance * 0.55).toFixed(1)}, ${end.x.toFixed(1)} ${end.y.toFixed(1)}`;
+  }
   const direction = placement.side === "left" ? -1 : 1;
   const distance = Math.min(70, Math.max(34, Math.abs(end.x - start.x) * 0.58));
   const endpointDistance = Math.min(42, Math.max(24, distance * 0.6));
@@ -165,6 +200,11 @@ function connectionPath(placement: Placement): string {
  * 底部与连线终点重合（整体一条连线）。 */
 function arrowPolygon(placement: Placement): string {
   const edge = cardEdgePoint(placement);
+  if (placement.side === "center") {
+    const tipY = edge.y + 7;
+    const baseY = tipY + 6;
+    return `${edge.x.toFixed(1)},${tipY.toFixed(1)} ${(edge.x - 4).toFixed(1)},${baseY.toFixed(1)} ${(edge.x + 4).toFixed(1)},${baseY.toFixed(1)}`;
+  }
   const direction = placement.side === "left" ? -1 : 1;
   const tip = { x: edge.x - direction * 7, y: edge.y };
   const baseX = tip.x - direction * 6;
@@ -194,48 +234,134 @@ const VOICE_ICON_STROKES = ["M6.3 11.5a5.7 5.7 0 0 0 11.4 0", "M12 17.2v3.8"];
 
 const mappings = ref<ButtonMappings>({ enabled: true, actions: {} });
 const savedSnapshot = ref<ButtonMappings>({ enabled: true, actions: {} });
+type EditingSource = "common" | `template:${string}`;
+const currentTemplate = useCurrentTemplate();
+const configuration = ref<MappingConfiguration | null>(null);
+// This is the saved Menu opt-in, not program-default following or mapping enablement.
+const menuTemplateSwitchEnabled = ref<boolean | null>(null);
+const menuStateReadFailed = ref(false);
+const menuModePending = ref(false);
+const menuModeError = ref<string | null>(null);
+let menuConfigurationRevision = 0;
+const templateCatalog = ref<TemplateCatalogEntry[]>([]);
+const editingSource = ref<EditingSource>("common");
 /** 已安装的预设应用（打开应用动作可选列表）。 */
 const presetApps = ref<PresetAppInfo[]>([]);
 const selectedButton = ref<RemoteButton | null>(null);
 const editingTarget = ref<{ button: RemoteButton; trigger: ButtonTrigger } | null>(null);
 const editorPanel = ref<HTMLElement | null>(null);
-const lockSelection = ref(true);
+const selectionPreference = useUiPreference("lockButtonSelection");
+const lockSelection = selectionPreference.value;
 const activeButtons = ref<Set<RemoteButton>>(new Set());
 const lastFired = ref<FiredGesture | null>(null);
 const firedFlash = ref<{ button: RemoteButton; trigger: ButtonTrigger } | null>(null);
 const mappingSnapshot = ref<ButtonMappingSnapshot | null>(null);
 const busy = ref(false);
 const statusMessage = ref<string | null>(null);
-const capturingShortcut = ref(false);
-const captureStarting = ref(false);
-const captureDisplay = ref<string[]>([]);
-const safeCaptureMode = ref(false);
-const capturePressedKeys = new Set<KeyCode>();
-let capturedChord: KeyCode[] | null = null;
+const saveTemplateDialogOpen = ref(false);
+const templateNameDraft = ref("");
+const templateNameError = ref<string | null>(null);
 let unlistenEdges: (() => void) | null = null;
 let unlistenGestures: (() => void) | null = null;
-let unlistenShortcutCapture: (() => void) | null = null;
-let captureTimeout: number | null = null;
-let captureRequestId = 0;
 let snapshotTimer: number | null = null;
 let flashTimer: number | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let unmounted = false;
 let resourcesReady = false;
+let saveSequence = 0;
+let snapshotPending = false;
+
+function menuReserved(button: RemoteButton): boolean {
+  return button === "menu" && menuTemplateSwitchEnabled.value !== false;
+}
+
+const menuStateLabel = computed(() => menuTemplateSwitchEnabled.value === true
+  ? "已启用模板切换" : menuStateReadFailed.value ? "菜单功能读取失败" : "正在读取菜单功能");
+const menuBehavior: Record<ButtonTrigger, string> = {
+  single: "打开 / 取消",
+  double: "按单击处理",
+  long: "切换保存选项",
+};
+const menuBehaviorDetail: Record<ButtonTrigger, string> = {
+  single: "面板外单击打开模板选择；面板内单击取消选择。",
+  double: "没有独立双击动作，连续短按按两次单击处理。",
+  long: "面板外与单击相同，仅打开；面板内再次长按切换“同时更新此程序的默认模板”，松开不取消。",
+};
+
+function cellSummary(button: RemoteButton, trigger: ButtonTrigger): string {
+  if (!menuReserved(button)) return actionSummary(actionOf(button, trigger));
+  return menuTemplateSwitchEnabled.value === true ? menuBehavior[trigger] : "暂不可编辑";
+}
+
+async function readMenuConfiguration(): Promise<MappingConfiguration | null> {
+  if (menuModePending.value) return null;
+  const revision = menuConfigurationRevision;
+  try {
+    const saved = await getMappingConfiguration();
+    if (!unmounted && revision === menuConfigurationRevision && !menuModePending.value) applySavedMenuMode(saved);
+    return saved;
+  } catch {
+    if (!unmounted && revision === menuConfigurationRevision && !menuModePending.value) {
+      if (!menuStateReadFailed.value) reportFrontendEvent({event:"buttons_menu_ownership", phase:"completed", result:"failed", reason:"configuration_read_failed"});
+      menuTemplateSwitchEnabled.value = null;
+      menuStateReadFailed.value = true;
+    }
+    return null;
+  }
+}
+
+function applySavedMenuMode(saved: MappingConfiguration): void {
+  menuTemplateSwitchEnabled.value = saved.menuTemplateSwitchEnabled;
+  menuStateReadFailed.value = false;
+  if (configuration.value) configuration.value = { ...configuration.value, menuTemplateSwitchEnabled: saved.menuTemplateSwitchEnabled };
+}
+
+async function toggleMenuMode(event: Event): Promise<void> {
+  const previous = menuTemplateSwitchEnabled.value;
+  // A native change toggles the DOM first; show only the confirmed setting while saving.
+  (event.target as HTMLInputElement).checked = previous === true;
+  if (unmounted || busy.value || menuModePending.value || previous === null || !configuration.value) return;
+  const revision = ++menuConfigurationRevision;
+  menuModePending.value = true;
+  menuModeError.value = null;
+  reportFrontendEvent({event:"buttons_menu_mode", phase:"requested", result:"passed", reason:previous ? "disable" : "enable"});
+  try {
+    const saved = await setMenuTemplateSwitchEnabled(!previous);
+    if (unmounted || revision !== menuConfigurationRevision) return;
+    applySavedMenuMode(saved);
+    reportFrontendEvent({event:"buttons_menu_mode", phase:"completed", result:"passed", reason:"saved_setting_applied"});
+  } catch {
+    if (unmounted || revision !== menuConfigurationRevision) return;
+    menuModeError.value = "保存未确认，请检查当前开关状态。";
+    reportFrontendEvent({event:"buttons_menu_mode", phase:"completed", result:"failed", reason:"save_unconfirmed"});
+    try {
+      const saved = await getMappingConfiguration();
+      if (!unmounted && revision === menuConfigurationRevision) applySavedMenuMode(saved);
+    } catch {
+      if (!unmounted && revision === menuConfigurationRevision) {
+        menuTemplateSwitchEnabled.value = null;
+        menuStateReadFailed.value = true;
+        reportFrontendEvent({event:"buttons_menu_mode", phase:"completed", result:"failed", reason:"readback_failed"});
+      }
+    }
+  } finally {
+    if (!unmounted && revision === menuConfigurationRevision) menuModePending.value = false;
+  }
+}
+
+watch(menuTemplateSwitchEnabled, (value) => {
+  if (value !== false) {
+    if (editingTarget.value?.button === "menu") editingTarget.value = null;
+    if (selectedButton.value === "menu") selectedButton.value = null;
+  }
+  if (value !== null) reportFrontendEvent({event:"buttons_menu_ownership", phase:"completed", result:"passed", reason:value ? "template_menu_reserved" : "custom_mapping_available"});
+}, {flush:"sync"});
 
 function releasePageResources(): void {
-  window.removeEventListener("keydown", handleCaptureKeydown, true);
-  window.removeEventListener("keyup", handleCaptureKeyup, true);
-  window.removeEventListener("blur", handleCaptureBlur);
   unlistenEdges?.();
   unlistenEdges = null;
   unlistenGestures?.();
   unlistenGestures = null;
-  unlistenShortcutCapture?.();
-  unlistenShortcutCapture = null;
-  if (captureTimeout !== null) window.clearTimeout(captureTimeout);
-  captureTimeout = null;
-  void stopShortcutCapture();
   if (snapshotTimer !== null) window.clearInterval(snapshotTimer);
   snapshotTimer = null;
   if (flashTimer !== null) window.clearTimeout(flashTimer);
@@ -244,17 +370,52 @@ function releasePageResources(): void {
   resizeObserver = null;
 }
 
-const dirty = computed(
-  () => JSON.stringify(mappings.value) !== JSON.stringify(savedSnapshot.value),
-);
+const activeTemplateEntry = computed(() => editingSource.value === "common" ? null : templateCatalog.value.find(t => t.id === editingSource.value.slice("template:".length)) ?? null);
+const dirty = computed(() => JSON.stringify(mappings.value) !== JSON.stringify(savedSnapshot.value));
 
 const enabled = computed({
   get: () => mappings.value.enabled,
   set: (value: boolean) => {
     mappings.value = { ...mappings.value, enabled: value };
-    void persist("总开关已更新");
   },
 });
+
+const editingSourceOptions = computed(() => [
+  { value: "common" as EditingSource, label: "通用配置" },
+  ...templateCatalog.value.map((entry) => ({
+    value: `template:${entry.id}` as EditingSource,
+    label: entry.name,
+  })),
+]);
+
+function cloneMappings(value: ButtonMappings): ButtonMappings {
+  return JSON.parse(JSON.stringify(value)) as ButtonMappings;
+}
+
+function mappingsForSource(source: EditingSource): ButtonMappings | null {
+  if (!configuration.value) return null;
+  if (source === "common") return configuration.value.commonMappings;
+  const templateId = source.slice("template:".length);
+  return configuration.value.templates.find(template => template.id === templateId)?.mappings
+    ?? templateCatalog.value.find(template => template.id === templateId)?.buttonMappings ?? null;
+}
+
+function loadEditingSource(source: EditingSource): boolean {
+  const selected = mappingsForSource(source);
+  if (!selected) {
+    editingSource.value = "common";
+    const common = configuration.value?.commonMappings ?? { enabled: true, actions: {} };
+    mappings.value = cloneMappings(common);
+    savedSnapshot.value = cloneMappings(common);
+    statusMessage.value = "所选模板已不存在，已返回通用配置";
+    return false;
+  }
+  editingSource.value = source;
+  mappings.value = cloneMappings(selected);
+  savedSnapshot.value = cloneMappings(selected);
+  editingTarget.value = null;
+  return true;
+}
 
 const voiceActive = computed(
   () => props.runtime?.platform.connection.voiceState === "streaming",
@@ -274,82 +435,21 @@ function actionOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction {
   return actionsOf(button)[trigger];
 }
 
-/** 当前编辑格的打开应用目标（非 open_app 动作返回 null，模板类型收窄用）。 */
-function openAppTargetOf(button: RemoteButton, trigger: ButtonTrigger): string | null {
-  const action = actionOf(button, trigger);
-  return action.type === "open_app" ? action.target : null;
-}
-
-/** 预设 id 集合（区分预设与自定义路径目标）。 */
-const presetAppIds = computed(() => new Set(presetApps.value.map((app) => app.id)));
-
-/** 已在映射中使用过的自定义应用（路径目标，去重；跨格可复选）。 */
-const customApps = computed<Array<{ path: string; name: string }>>(() => {
-  const seen = new Map<string, string>();
-  for (const app of mappings.value.applications ?? []) {
-    seen.set(app.path, app.name);
-  }
-  for (const actions of Object.values(mappings.value.actions)) {
-    for (const action of Object.values(actions)) {
-      if (action.type === "open_app" && !presetAppIds.value.has(action.target)) {
-        const base = action.target.split(/[\\/]/).pop() ?? action.target;
-        const name = base.replace(/\.(exe|lnk)$/i, "") || action.target;
-        if (!seen.has(action.target)) {
-          seen.set(action.target, name);
-        }
-      }
-    }
-  }
-  return [...seen.entries()].map(([path, name]) => ({ path, name }));
-});
-
-const appPickerOpen = ref(false);
-const appPickerError = ref<string | null>(null);
-const appFilter = ref("");
-const filteredCustomApps = computed(() => customApps.value.filter(app => app.name.toLocaleLowerCase().includes(appFilter.value.trim().toLocaleLowerCase())));
-watch([presetApps, () => mappings.value.applications], () => {
-  registerPresetAppNames([...presetApps.value, ...(mappings.value.applications ?? []).map(app => ({ id: app.path, name: app.name }))]);
-}, { deep: true });
-
-async function addScannedApps(apps: CustomAppPick[]): Promise<void> {
-  if (busy.value) return;
-  busy.value = true;
-  appPickerError.value = null;
-  try {
-    const unique = new Map((mappings.value.applications ?? []).map(app => [app.path.toLowerCase(), app]));
-    for (const app of apps) unique.set(app.path.toLowerCase(), app);
-    const saved = await saveButtonMappings({ ...mappings.value, applications: [...unique.values()] });
-    mappings.value = saved;
-    savedSnapshot.value = JSON.parse(JSON.stringify(saved)) as ButtonMappings;
-    appPickerOpen.value = false;
-    statusMessage.value = `已添加 ${apps.length} 个应用，按键绑定未改变`;
-  } catch (cause) {
-    appPickerError.value = cause instanceof Error ? cause.message : String(cause);
-  } finally {
-    busy.value = false;
-  }
-}
-
-/** 打开原生文件选择器添加自定义应用，并应用到当前编辑格。 */
-async function addCustomApp(): Promise<void> {
-  const pick = await pickCustomApp();
-  if (!pick || !editingTarget.value) return;
-  applyAction({ type: "open_app", target: pick.path });
-}
-
 function selectButton(button: RemoteButton): void {
+  if (busy.value || menuReserved(button)) return;
   selectedButton.value = button;
 }
 
 function openEditor(button: RemoteButton, trigger: ButtonTrigger): void {
+  if (busy.value || menuReserved(button)) return;
   selectedButton.value = button;
   editingTarget.value = { button, trigger };
-  if (capturingShortcut.value) void finishShortcutCapture();
 }
 
 function applyAction(action: ButtonAction): void {
+  if (busy.value) return;
   const target = editingTarget.value;
-  if (!target) return;
+  if (!target || menuReserved(target.button)) return;
   const next: ButtonMappings = {
     ...mappings.value,
     actions: { ...mappings.value.actions },
@@ -358,392 +458,149 @@ function applyAction(action: ButtonAction): void {
   actions[target.trigger] = action;
   next.actions[target.button] = actions;
   mappings.value = next;
-  // 对齐 Mac：点击动作即自动保存生效（静默；失败时显示错误信息）。
-  void persist();
 }
 
-/**
- * 预设快捷键分组（对齐 Mac `ButtonActionCategory` 的 basicKeys/systemAndMedia，
- * 并按 Windows 语义适配：Home/End/PageUp/PageDown 属低频导航键、Mac 端基础
- * 按键列表亦无此四键，故移除；复制族从系统组移入基础组，对齐 Mac basicKeys）。
- */
-const PRESET_GROUPS: Array<{ label: string; items: Array<{ label: string; keys: KeyCode[] }> }> = [
-  {
-    label: "基础按键",
-    items: [
-      { label: "Enter", keys: ["enter"] },
-      { label: "Esc", keys: ["escape"] },
-      { label: "空格", keys: ["space"] },
-      { label: "Tab", keys: ["tab"] },
-      { label: "退格", keys: ["backspace"] },
-      { label: "删除", keys: ["delete"] },
-      { label: "↑", keys: ["up"] },
-      { label: "↓", keys: ["down"] },
-      { label: "←", keys: ["left"] },
-      { label: "→", keys: ["right"] },
-      // Home 为"主页键同键映射"的必需预设（能力矩阵 identity 档的唯一
-      // 合法目标；Mac 端基础键列表无此键，Windows 端因泄漏对冲需要保留）。
-      { label: "Home", keys: ["home"] },
-      { label: "复制", keys: ["control", "c"] },
-      { label: "粘贴", keys: ["control", "v"] },
-      { label: "剪切", keys: ["control", "x"] },
-      { label: "全选", keys: ["control", "a"] },
-      { label: "撤销", keys: ["control", "z"] },
-      { label: "重做", keys: ["control", "y"] },
-      { label: "查找", keys: ["control", "f"] },
-      { label: "保存", keys: ["control", "s"] },
-      { label: "发送", keys: ["control", "enter"] },
-      { label: "换行", keys: ["shift", "enter"] },
-      { label: "右键菜单", keys: ["apps"] },
-      { label: "刷新", keys: ["f5"] },
-    ],
-  },
-  {
-    label: "系统与媒体",
-    items: [
-      { label: "切换窗口", keys: ["alt", "tab"] },
-      { label: "显示桌面", keys: ["left_windows", "d"] },
-      { label: "关闭窗口", keys: ["control", "w"] },
-      { label: "锁定", keys: ["left_windows", "l"] },
-      { label: "搜索", keys: ["left_windows", "s"] },
-      { label: "截图", keys: ["left_windows", "shift", "s"] },
-      { label: "静音", keys: ["volume_mute"] },
-      { label: "音量+", keys: ["volume_up"] },
-      { label: "音量−", keys: ["volume_down"] },
-      { label: "播放/暂停", keys: ["media_play_pause"] },
-      { label: "上一首", keys: ["media_prev"] },
-      { label: "下一首", keys: ["media_next"] },
-    ],
-  },
-];
-
-const selectedAction = computed(() => editingTarget.value ? actionOf(editingTarget.value.button, editingTarget.value.trigger) : null);
-const scrollSteps = computed(() => selectedAction.value?.type === "scroll" ? selectedAction.value.steps ?? 1 : 1);
-const moveDistance = computed(() => selectedAction.value?.type === "mouse_move" ? selectedAction.value.distance : 30);
-const moveSymbols: Record<MoveDirection, string> = { up: "↑", down: "↓", left: "←", right: "→" };
-
-function updateMouseAmount(event: Event, kind: "scroll" | "mouse_move"): void {
-  const input = event.target as HTMLInputElement;
-  const value = input.valueAsNumber;
-  const maximum = kind === "scroll" ? 100 : 2000;
-  if (!Number.isInteger(value) || value < 1 || value > maximum) {
-    statusMessage.value = `请输入 1 到 ${maximum} 之间的整数`;
-    input.value = String(kind === "scroll" ? scrollSteps.value : moveDistance.value);
-    return;
-  }
-  const action = selectedAction.value;
-  if (action?.type === "scroll" && kind === "scroll") void applyAction({ ...action, steps: value });
-  if (action?.type === "mouse_move" && kind === "mouse_move") void applyAction({ ...action, distance: value });
-}
-
-function isActiveScroll(direction: "up" | "down"): boolean {
-  const target = editingTarget.value;
-  if (!target) return false;
-  const action = actionOf(target.button, target.trigger);
-  return action.type === "scroll" && action.direction === direction;
-}
-
-function isActivePreset(keys: KeyCode[]): boolean {
-  const target = editingTarget.value;
-  if (!target) return false;
-  const action = actionOf(target.button, target.trigger);
-  if (action.type !== "shortcut") return false;
-  return action.chord.keys.join("+") === keys.join("+");
-}
-
-/**
- * 编辑器提示（信息性）：Home/TV 已落地"遥控器优先"（2026-09-07 方案 C）——
- * 已配置映射且遥控器连接期间原生按键被接管，任意按压（含闲置后首次）严格
- * 单响应；确定/方向的同键映射仍由泄漏对冲保证单响应，其余配置冷首按附带
- * 一次原生动作（结构性泄漏）。
- */
-const capabilityNote = computed<string | null>(() => {
-  if (!editingTarget.value) return null;
-  const button = editingTarget.value.button;
-  if (button === "home" || button === "tv") {
-    return "提示：保存后本按键启用“遥控器优先”——遥控器连接期间原生按键（Home / `）被接管，任意按压（含闲置后首次）严格单响应；此期间物理键盘上的对应按键将触发映射动作，断开遥控器或删除本键映射即恢复原生。";
-  }
-  if (shortcutCapability(button, "single", remoteModel.value) === "identity") {
-    const identity = identityShortcutByButton[button];
-    const label = identity ? chordLabel({ keys: [identity] }) : "";
-    return `提示：此按键闲置约 4 秒后的首次按压会附带一次原生按键动作（结构性泄漏，调查已归档）；4 秒内连按严格单响应，单击配置为同键映射（${label}）时由引擎对冲为单响应。`;
-  }
-  return null;
-});
-
-let saveQueue: Promise<void> = Promise.resolve();
-let saveRequest = 0;
-async function persist(message?: string): Promise<void> {
-  const request = ++saveRequest;
-  const payload = JSON.parse(JSON.stringify(mappings.value)) as ButtonMappings;
+async function persist(message?: string): Promise<boolean> {
+  const request = ++saveSequence;
+  const source = editingSource.value;
+  const payload = cloneMappings(mappings.value);
   busy.value = true;
   statusMessage.value = null;
-  const task = saveQueue.then(async () => {
-    try {
-      const saved = await saveButtonMappings(payload);
-      savedSnapshot.value = JSON.parse(JSON.stringify(saved)) as ButtonMappings;
-      if (request === saveRequest) {
-        mappings.value = saved;
-        if (message) statusMessage.value = message;
+  reportFrontendEvent({ event: "button_mapping_editor_save", phase: "started", result: "passed", reason: source === "common" ? "common" : "template" });
+  try {
+    const saved = source === "common"
+      ? await saveButtonMappings(payload)
+      : (await updateButtonMappingTemplate(source.slice("template:".length), payload)).mappings;
+    if (request !== saveSequence || editingSource.value !== source) return true;
+    if (configuration.value) {
+      if (source === "common") {
+        configuration.value = { ...configuration.value, commonMappings: saved };
+      } else {
+        const templateId = source.slice("template:".length);
+        configuration.value = {
+          ...configuration.value,
+          templates: configuration.value.templates.map((template) =>
+            template.id === templateId ? { ...template, mappings: saved } : template,
+          ),
+        };
       }
-    } catch (error) {
-      if (request === saveRequest) statusMessage.value = error instanceof Error ? error.message : String(error);
     }
-  });
-  saveQueue = task;
-  await task;
-  if (request === saveRequest) busy.value = false;
+    if (source !== "common") {
+      const id = source.slice("template:".length);
+      templateCatalog.value = templateCatalog.value.map(item => item.id === id ? {...item, buttonMappings: cloneMappings(saved)} : item);
+      if (configuration.value && !configuration.value.templates.some(item => item.id === id)) {
+        configuration.value.templates.push({id, name: templateCatalog.value.find(item => item.id === id)!.name, mappings: cloneMappings(saved)});
+      }
+    }
+    mappings.value = cloneMappings(saved);
+    savedSnapshot.value = cloneMappings(saved);
+    if (message) {
+      statusMessage.value = message;
+    }
+    reportFrontendEvent({ event: "button_mapping_editor_save", phase: "completed", result: "passed", reason: source === "common" ? "common" : "template" });
+    return true;
+  } catch (error) {
+    statusMessage.value = error instanceof Error ? error.message : String(error);
+    reportFrontendEvent({ event: "button_mapping_editor_save", phase: "completed", result: "failed", reason: source === "common" ? "common" : "template" });
+    return false;
+  } finally {
+    if (request === saveSequence) busy.value = false;
+  }
 }
 
 async function restoreDefaults(): Promise<void> {
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const saved = await resetButtonMappings();
-    mappings.value = saved;
-    savedSnapshot.value = JSON.parse(JSON.stringify(saved)) as ButtonMappings;
-    statusMessage.value = "已恢复默认（全部按键保持原始行为）";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
+  if (busy.value) return;
+  const template = activeTemplateEntry.value;
+  if (template?.builtIn) {
+    if (!window.confirm(`只复位“${template.name}”为当前版本默认按键？该模板修改和当前草稿将丢失，其它模板及关联保持不变。`)) return;
+    busy.value = true;
+    try {
+      configuration.value = await resetBuiltinTemplate(template.id);
+      templateCatalog.value = await getTemplateCatalog();
+      const saved = templateCatalog.value.find(item => item.id === template.id)?.buttonMappings;
+      if (saved) { mappings.value = cloneMappings(saved); savedSnapshot.value = cloneMappings(saved); }
+      statusMessage.value = `已复位“${template.name}”`;
+    } catch (error) { statusMessage.value = String(error); } finally { busy.value = false; }
+    return;
   }
+  mappings.value = { enabled: true, actions: {} };
+  statusMessage.value = "已载入默认草稿；点击“保存配置”后写入当前编辑目标";
 }
 
 async function saveConfiguration(): Promise<void> {
   await persist("配置已保存并生效");
 }
 
+function openSaveTemplateDialog(): void {
+  if (busy.value) return;
+  templateNameDraft.value = "";
+  templateNameError.value = null;
+  saveTemplateDialogOpen.value = true;
+}
+
+async function saveAsTemplate(): Promise<void> {
+  const name = templateNameDraft.value.trim();
+  if (!name) {
+    templateNameError.value = "请输入模板名称";
+    return;
+  }
+  busy.value = true;
+  statusMessage.value = null;
+  templateNameError.value = null;
+  const started = performance.now();
+  reportFrontendEvent({ event: "button_template_create", phase: "started", result: "passed", reason: editingSource.value === "common" ? "common_draft" : "template_draft" });
+  try {
+    const template = await saveButtonMappingTemplate(name, cloneMappings(mappings.value));
+    if (configuration.value) {
+      configuration.value = {
+        ...configuration.value,
+        templates: [...configuration.value.templates, template],
+      };
+    }
+    statusMessage.value = `已保存为按键模板“${name}”；可在“模板”页关联程序`;
+    saveTemplateDialogOpen.value = false;
+    reportFrontendEvent({ event: "button_template_create", phase: "completed", result: "passed", reason: editingSource.value === "common" ? "common_draft" : "template_draft", elapsedMs: Math.round(performance.now() - started) });
+  } catch (error) {
+    templateNameError.value = error instanceof Error ? error.message : String(error);
+    reportFrontendEvent({ event: "button_template_create", phase: "completed", result: "failed", reason: editingSource.value === "common" ? "common_draft" : "template_draft", elapsedMs: Math.round(performance.now() - started) });
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function exportConfiguration(): Promise<void> {
+  if (busy.value) return;
   busy.value = true;
-  statusMessage.value = null;
   try {
-    const exported = await exportButtonMappingConfiguration();
-    if (exported) statusMessage.value = "按键映射配置已导出";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
+    const ids = editingSource.value === "common" ? null : [editingSource.value.slice("template:".length)];
+    if (await exportMappingConfiguration(ids)) statusMessage.value = "配置已导出";
+  } catch (error) { statusMessage.value = error instanceof Error ? error.message : String(error); }
+  finally { busy.value = false; }
 }
 
-async function importConfiguration(): Promise<void> {
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const imported = await importButtonMappingConfiguration();
-    if (!imported) return;
-    mappings.value = imported;
-    savedSnapshot.value = JSON.parse(JSON.stringify(imported)) as ButtonMappings;
-    editingTarget.value = null;
-    mappingSnapshot.value = await getButtonMappingSnapshot();
-    statusMessage.value = "按键映射配置已导入并生效";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-/** KeyboardEvent.code → KeyCode（serde snake_case）。 */
-function codeToKeyCode(code: string): KeyCode | null {
-  const modifierMap: Record<string, KeyCode> = {
-    ControlLeft: "left_control",
-    ControlRight: "right_control",
-    ShiftLeft: "left_shift",
-    ShiftRight: "right_shift",
-    AltLeft: "left_alt",
-    AltRight: "right_alt",
-    MetaLeft: "left_windows",
-    MetaRight: "right_windows",
-  };
-  if (modifierMap[code]) return modifierMap[code];
-  const named: Record<string, KeyCode> = {
-    Enter: "enter",
-    Space: "space",
-    Tab: "tab",
-    Backspace: "backspace",
-    Escape: "escape",
-    ArrowLeft: "left",
-    ArrowUp: "up",
-    ArrowRight: "right",
-    ArrowDown: "down",
-    Home: "home",
-    End: "end",
-    PageUp: "page_up",
-    PageDown: "page_down",
-    Insert: "insert",
-    Delete: "delete",
-    ContextMenu: "apps",
-    VolumeMute: "volume_mute",
-    VolumeUp: "volume_up",
-    VolumeDown: "volume_down",
-  };
-  if (named[code]) return named[code];
-  const letter = /^Key([A-Z])$/.exec(code);
-  if (letter) return letter[1].toLowerCase();
-  const digit = /^Digit([0-9])$/.exec(code);
-  if (digit) return `digit${digit[1]}`;
-  const functionKey = /^F([1-9]|1[0-2])$/.exec(code);
-  if (functionKey) return `f${functionKey[1]}`;
-  return null;
-}
-
-const selectedCaptureModifiers = reactive(new Set<KeyCode>());
-const pressedCaptureModifiers = new Set<KeyCode>();
-const MODIFIER_KEYS = new Set<KeyCode>([
-  "left_control",
-  "right_control",
-  "left_shift",
-  "right_shift",
-  "left_alt",
-  "right_alt",
-  "left_windows",
-  "right_windows",
-]);
-const CAPTURE_MODIFIER_OPTIONS: Array<{ key: KeyCode; label: string }> = [
-  { key: "left_control", label: "左 Ctrl" },
-  { key: "left_shift", label: "左 Shift" },
-  { key: "left_alt", label: "左 Alt" },
-  { key: "left_windows", label: "左 Win" },
-  { key: "right_control", label: "右 Ctrl" },
-  { key: "right_shift", label: "右 Shift" },
-  { key: "right_alt", label: "右 Alt" },
-  { key: "right_windows", label: "右 Win" },
-];
-
-function toggleCaptureModifier(key: KeyCode): void {
-  if (!capturingShortcut.value || capturedChord) return;
-  if (selectedCaptureModifiers.has(key)) selectedCaptureModifiers.delete(key);
-  else selectedCaptureModifiers.add(key);
-  captureDisplay.value = [...selectedCaptureModifiers];
-}
-
-async function beginShortcutCapture(): Promise<void> {
-  if (capturingShortcut.value || captureStarting.value) return;
-  const requestId = ++captureRequestId;
-  captureStarting.value = true;
-  statusMessage.value = null;
-  try {
-    await startShortcutCapture();
-    if (unmounted || requestId !== captureRequestId) {
-      await stopShortcutCapture().catch(() => undefined);
-      return;
-    }
-    capturePressedKeys.clear();
-    capturedChord = null;
-    selectedCaptureModifiers.clear();
-    pressedCaptureModifiers.clear();
-    captureDisplay.value = [];
-    capturingShortcut.value = true;
-    if (captureTimeout !== null) window.clearTimeout(captureTimeout);
-    captureTimeout = window.setTimeout(() => {
-      void finishShortcutCapture("录入已超时，请重新录入");
-    }, 15_000);
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    if (requestId === captureRequestId) captureStarting.value = false;
-  }
-}
-
-async function finishShortcutCapture(message?: string): Promise<void> {
-  captureRequestId += 1;
-  captureStarting.value = false;
-  capturingShortcut.value = false;
-  if (captureTimeout !== null) window.clearTimeout(captureTimeout);
-  captureTimeout = null;
-  await stopShortcutCapture().catch(() => undefined);
-  capturePressedKeys.clear();
-  capturedChord = null;
-  pressedCaptureModifiers.clear();
-  if (message) statusMessage.value = message;
-}
-
-function handleCaptureBlur(): void {
-  if (capturingShortcut.value || captureStarting.value) {
-    void finishShortcutCapture("窗口失去焦点，已取消录入");
-  }
-}
-
-function acceptCapturedKey(code: KeyCode, isPressed: boolean, repeat = false): void {
-  if (!capturingShortcut.value) return;
-  if (!isPressed) {
-    capturePressedKeys.delete(code);
-    if (MODIFIER_KEYS.has(code)) pressedCaptureModifiers.delete(code);
-    if (capturedChord) {
-      captureDisplay.value = capturedChord;
-      if (capturePressedKeys.size === 0) {
-        const label = chordLabel({ keys: capturedChord });
-        void finishShortcutCapture(`快捷键已录入：${label}`);
+async function selectEditingSource(event: Event): Promise<void> {
+  const select = event.target as HTMLSelectElement;
+  const requested = select.value as EditingSource;
+  if (requested === editingSource.value) return;
+  if (dirty.value) {
+    if (window.confirm("当前配置有未保存更改。确定将先保存，再切换编辑目标。")) {
+      const saved = await persist("配置已保存");
+      if (!saved) {
+        select.value = editingSource.value;
+        return;
       }
+    } else if (!window.confirm("放弃当前未保存更改并切换编辑目标？")) {
+      select.value = editingSource.value;
+      return;
     } else {
-      captureDisplay.value = safeCaptureMode.value
-        ? [...selectedCaptureModifiers]
-        : [...pressedCaptureModifiers];
+      mappings.value = cloneMappings(savedSnapshot.value);
     }
-    return;
   }
-  if (!repeat) capturePressedKeys.add(code);
-  // 已经拿到终止键后继续保持原生拦截，直到本次组合的所有 DOWN 都收到配对 UP。
-  // 这避免 Win+L 在录入完成但物理键尚未松开时被 Windows 补执行。
-  if (capturedChord) return;
-  if (MODIFIER_KEYS.has(code)) {
-    if (!repeat) pressedCaptureModifiers.add(code);
-    if (safeCaptureMode.value) {
-      statusMessage.value = "安全录入中：请松开键盘修饰键，并在界面中点击选择";
-    } else {
-      captureDisplay.value = [...pressedCaptureModifiers];
-    }
-    return;
-  }
-  if (safeCaptureMode.value && pressedCaptureModifiers.size > 0) {
-    statusMessage.value = "未录入：请不要按住键盘修饰键；先在界面选择修饰键，再单独按主键";
-    return;
-  }
-  const modifiers = safeCaptureMode.value
-    ? [...selectedCaptureModifiers]
-    : [...pressedCaptureModifiers];
-  if (code === "escape" && modifiers.length === 0) {
-    void finishShortcutCapture("已取消录入");
-    return;
-  }
-  const keys = [...modifiers, code];
-  capturedChord = keys;
-  captureDisplay.value = keys;
-  applyAction({ type: "shortcut", chord: { keys } });
-  statusMessage.value = `已录入 ${chordLabel({ keys })}，松开全部按键后完成`;
+  loadEditingSource(requested);
+  select.value = editingSource.value;
 }
 
-function handleCaptureKeydown(event: KeyboardEvent): void {
-  if (!capturingShortcut.value) return;
-  event.preventDefault();
-  event.stopPropagation();
-  const code = codeToKeyCode(event.code);
-  if (code === null) return;
-  acceptCapturedKey(code, true, event.repeat);
-}
 
-function handleCaptureKeyup(event: KeyboardEvent): void {
-  if (!capturingShortcut.value) return;
-  const code = codeToKeyCode(event.code);
-  if (code) acceptCapturedKey(code, false);
-}
-
-watch(capturingShortcut, (active) => {
-  if (!active) {
-    selectedCaptureModifiers.clear();
-    pressedCaptureModifiers.clear();
-    captureDisplay.value = [];
-  }
-});
-
-// 打开编辑面板后滚动到可见位置（Mac ScrollViewReader 同款行为）。
-watch(editingTarget, async (target) => {
-  if (!target) return;
-  await nextTick();
-  editorPanel.value?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
-});
 
 function phaseLabel(phase: RawInputPhase | undefined): string {
   switch (phase) {
@@ -756,7 +613,7 @@ function phaseLabel(phase: RawInputPhase | undefined): string {
     case "stopped":
       return "监听已停止";
     case "awaiting":
-      return "等待遥控器连接（系统 HID 接口未就绪）";
+      return "等待遥控器连接";
     case "unsupported":
       return "当前环境暂不支持";
     default:
@@ -786,27 +643,31 @@ async function toggleListener(): Promise<void> {
 const rawInput = computed(() => props.runtime?.platform.rawInput);
 const connectionInfo = computed(() => props.runtime?.platform.connection);
 
+function refreshCanvasGeometry(width?: number): void {
+  if (width !== undefined) canvasWidth.value = Math.max(CANVAS_MIN_WIDTH, Math.round(width));
+  void nextTick(measureRemoteImageFrame);
+}
+
 onMounted(async () => {
   const setupStarted = performance.now();
-  window.addEventListener("keydown", handleCaptureKeydown, true);
-  window.addEventListener("keyup", handleCaptureKeyup, true);
-  window.addEventListener("blur", handleCaptureBlur);
-  const [loaded, snapshot, apps] = await Promise.all([
-    getButtonMappings(),
+  // Measure before the initial IPC resolves so the first frame uses the real canvas width.
+  if (canvasEl.value) refreshCanvasGeometry(canvasEl.value.clientWidth);
+  const [loaded, snapshot, apps, catalog] = await Promise.all([
+    readMenuConfiguration(),
     getButtonMappingSnapshot(),
     listPresetApps().catch(() => [] as PresetAppInfo[]),
+    getTemplateCatalog(),
   ]);
   if (unmounted) {
     return;
   }
   presetApps.value = apps.filter((app) => app.installed);
   registerPresetAppNames(presetApps.value);
-  mappings.value = loaded;
-  savedSnapshot.value = JSON.parse(JSON.stringify(loaded)) as ButtonMappings;
+  configuration.value = loaded;
+  templateCatalog.value = catalog;
+  loadEditingSource("common");
   mappingSnapshot.value = snapshot;
-  if (rawInput.value?.activeButtons) {
-    activeButtons.value = new Set(rawInput.value.activeButtons);
-  }
+  activeButtons.value = new Set(snapshot.observedButtons);
 
   const stopEdges = await subscribeButtonEdges((edge: ButtonEdge) => {
     const next = new Set(activeButtons.value);
@@ -816,7 +677,7 @@ onMounted(async () => {
       next.delete(edge.button);
     }
     activeButtons.value = next;
-    if (!lockSelection.value && edge.isPressed) {
+    if (!lockSelection.value && edge.isPressed && !menuReserved(edge.button)) {
       selectedButton.value = edge.button;
     }
   });
@@ -840,33 +701,33 @@ onMounted(async () => {
   }
   unlistenGestures = stopGestures;
 
-  const stopShortcutCaptureEvents = await subscribeShortcutCaptureEdges(
-    (edge: ShortcutCaptureEdge) => acceptCapturedKey(edge.key, edge.isPressed),
-  );
-  if (unmounted) {
-    stopShortcutCaptureEvents();
-    return;
-  }
-  unlistenShortcutCapture = stopShortcutCaptureEvents;
-
   snapshotTimer = window.setInterval(async () => {
-    mappingSnapshot.value = await getButtonMappingSnapshot();
-    // 按住集合对账：快照是并集真值（覆盖漏事件漂移）。
-    if (rawInput.value?.activeButtons) {
-      activeButtons.value = new Set(rawInput.value.activeButtons);
-    }
+    if (snapshotPending || unmounted) return;
+    snapshotPending = true;
+    try {
+      const [snapshot] = await Promise.all([getButtonMappingSnapshot(), readMenuConfiguration()]);
+      if (unmounted) return;
+      mappingSnapshot.value = snapshot;
+      // Update only live state, never replace the user's editing draft.
+      activeButtons.value = new Set(snapshot.observedButtons);
+    } finally { snapshotPending = false; }
   }, 1_000);
 
   // 流式画布：观测容器宽（不足最小画布 800px 时保持 800 由 CSS 缩放兜底）。
+  // 首次宽度已在 onMounted 同步段测过（见函数开头），此处只订阅后续变化。
   // jsdom 测试环境无 ResizeObserver，跳过观测。
   if (canvasEl.value && typeof ResizeObserver !== "undefined") {
-    canvasWidth.value = Math.max(CANVAS_MIN_WIDTH, canvasEl.value.clientWidth);
+    refreshCanvasGeometry(canvasEl.value.clientWidth);
     resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        canvasWidth.value = Math.max(CANVAS_MIN_WIDTH, Math.round(entry.contentRect.width));
+        if (entry.target === canvasEl.value) refreshCanvasGeometry(entry.contentRect.width);
       }
+      void nextTick(measureRemoteImageFrame);
     });
     resizeObserver.observe(canvasEl.value);
+    if (remotePhotoEl.value) resizeObserver.observe(remotePhotoEl.value);
+  } else {
+    measureRemoteImageFrame();
   }
   resourcesReady = true;
   reportFrontendEvent({
@@ -892,28 +753,40 @@ onUnmounted(() => {
 
 <template>
   <section class="buttons-page">
-    <!-- 头部对齐 Mac mappingPage：标题 + 启用开关相邻居左，遥控器状态最右
-         （保存按钮移入编辑面板，与"测试一次/关闭"同排）。 -->
+    <div class="buttons-scroll">
     <header class="page-header mapping-header">
-      <div>
-        <div class="mapping-title-row">
-          <h1>按键映射</h1>
-          <label class="toggle-row" title="开启后，遥控器按键按本页配置执行动作；关闭时，遥控器保持原始按键行为。">
-            <span>启用自定义按键功能</span>
-            <input v-model="enabled" type="checkbox" class="toggle-input" :disabled="busy" />
-          </label>
-        </div>
-      </div>
-      <div class="mapping-header-controls">
+      <div class="mapping-heading-row">
+        <h1>按键映射</h1>
+        <label class="toggle-row mapping-toggle-slot" title="开启后，遥控器按键按本页配置执行动作；关闭时，遥控器保持原始按键行为。">
+          <span>启用自定义按键功能</span>
+          <input v-model="enabled" type="checkbox" class="toggle-input" :disabled="busy" />
+        </label>
         <div class="device-chip" :class="{ connected: connectionInfo?.phase === 'ready' || connectionInfo?.phase === 'streaming' }">
           <span class="status-dot" :class="connectionInfo?.phase === 'streaming' ? 'active' : connectionInfo?.phase === 'ready' ? 'success' : 'pending'"></span>
-          <span>{{ connectionInfo?.remoteName ?? "未连接遥控器" }}</span>
+          <span>{{ deviceLabel }}</span>
           <BatteryIndicator :connection="connectionInfo" />
         </div>
       </div>
+      <div class="mapping-header-controls">
+        <div class="current-template-display">
+          <span>当前使用</span>
+          <output aria-label="当前使用的按键模板">{{ !currentTemplate.applied.value ? '正在确认当前模板…' : currentTemplate.templateId.value ? currentTemplate.applied.value.name ?? '当前模板' : '通用配置' }}</output>
+        </div>
+        <label class="editing-source-picker">
+          <span>编辑配置</span>
+          <select :value="editingSource" :disabled="busy" @change="selectEditingSource">
+            <option v-for="option in editingSourceOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
+        </label>
+
+
+      </div>
+      <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
+      <p class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
     </header>
 
-    <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px` }">
+    <div id="global-mapping-panel">
+    <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px`, '--mapping-card-height': `${CARD_HEIGHT}px` }">
       <svg
         class="mapping-connections"
         :width="canvasWidth"
@@ -939,27 +812,27 @@ onUnmounted(() => {
         <polygon :points="arrowPolygon(VOICE_PLACEMENT)" :class="{ active: voiceActive }" />
       </svg>
 
-      <figure class="remote-photo" :style="{ left: `${remoteLeft}px` }">
-        <img src="/RC003-remote-photo@2x.png" alt="小米蓝牙遥控器 2 Pro（RC003）示意图" draggable="false" />
-        <span
-          v-for="placement in PLACEMENTS"
-          :key="placement.button"
-          class="anchor-dot"
-          :class="{ visible: activeButtons.has(placement.button) }"
-          :style="{
-            left: `${photoAnchorPoint(placement).x - 4}px`,
-            top: `${photoAnchorPoint(placement).y - 4}px`,
-          }"
-        ></span>
-        <span
-          class="anchor-dot voice"
-          :class="{ visible: voiceActive }"
-          :style="{
-            left: `${photoAnchorPoint(VOICE_PLACEMENT).x - 4}px`,
-            top: `${photoAnchorPoint(VOICE_PLACEMENT).y - 4}px`,
-          }"
-        ></span>
+      <figure ref="remotePhotoEl" class="remote-photo" :style="{ left: `${remoteLeft}px`, top: `${REMOTE_TOP}px` }">
+        <img ref="remoteImageEl" src="/RC003-remote-photo@2x.png" alt="小米蓝牙语音遥控器 2 Pro（RC003）示意图" draggable="false" @load="measureRemoteImageFrame" />
       </figure>
+      <span
+        v-for="placement in PLACEMENTS"
+        :key="`anchor-${placement.button}`"
+        class="anchor-dot"
+        :class="{ visible: activeButtons.has(placement.button) }"
+        :style="{
+          left: `${anchorPoint(placement).x - 4}px`,
+          top: `${anchorPoint(placement).y - 4}px`,
+        }"
+      ></span>
+      <span
+        class="anchor-dot voice"
+        :class="{ visible: voiceActive }"
+        :style="{
+          left: `${anchorPoint(VOICE_PLACEMENT).x - 4}px`,
+          top: `${anchorPoint(VOICE_PLACEMENT).y - 4}px`,
+        }"
+      ></span>
 
       <article
         v-for="placement in PLACEMENTS"
@@ -971,6 +844,8 @@ onUnmounted(() => {
           selected: selectedButton === placement.button,
           active: activeButtons.has(placement.button),
           flashed: firedFlash?.button === placement.button,
+          'menu-reserved': menuReserved(placement.button),
+          'mapping-readonly': menuReserved(placement.button),
         }"
         :style="{ top: `${cardTop(placement)}px`, width: `${cardWidth}px` }"
         @click="selectButton(placement.button)"
@@ -988,37 +863,48 @@ onUnmounted(() => {
             />
           </svg>
           <strong>{{ buttonLabels[placement.button] }}</strong>
+          <label v-if="placement.button === 'menu'" class="menu-mode-control" @click.stop @keydown.stop @keyup.stop>
+            <input type="checkbox" aria-label="菜单键切换模板" aria-describedby="menu-mode-tooltip menu-mode-feedback" :checked="menuTemplateSwitchEnabled === true" :disabled="busy || menuModePending || menuTemplateSwitchEnabled === null || !configuration" :aria-busy="menuModePending" @change.stop="toggleMenuMode" />
+            <span class="menu-mode-lock">
+              <svg v-if="menuTemplateSwitchEnabled === true" class="readonly-icon" viewBox="0 0 24 24" fill="none" aria-label="固定功能，不可自定义">
+                <path :d="READONLY_ICON" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </span>
+            <span id="menu-mode-tooltip" class="menu-mode-tooltip" role="tooltip">启用后，菜单键用于切换模板；关闭后可自定义。</span>
+          </label>
+          <span v-if="menuReserved(placement.button)" class="menu-reserved-label">{{ menuStateLabel }}</span>
         </div>
-        <div class="mapping-cells">
+        <div class="mapping-cells" :aria-disabled="menuReserved(placement.button) ? true : undefined">
           <button
             v-for="trigger in TRIGGERS"
             :key="trigger"
             type="button"
             class="mapping-cell"
             :class="{
-              set: actionOf(placement.button, trigger).type !== 'disabled',
+              set: !menuReserved(placement.button) && actionOf(placement.button, trigger).type !== 'disabled',
               editing:
                 editingTarget?.button === placement.button && editingTarget?.trigger === trigger,
               flashed: firedFlash?.button === placement.button && firedFlash?.trigger === trigger,
             }"
-            :disabled="UNMAPPABLE_BUTTONS.has(placement.button)"
+            :disabled="busy || menuReserved(placement.button)"
             :title="
-              UNMAPPABLE_BUTTONS.has(placement.button)
-                ? '此按键暂不支持自定义，按键功能保持原样'
+              menuReserved(placement.button)
+                ? menuTemplateSwitchEnabled === true ? menuBehaviorDetail[trigger] : menuStateLabel
                 : `${buttonLabels[placement.button]} · ${buttonTriggerLabel(trigger)}：${actionSummary(actionOf(placement.button, trigger))}`
             "
             @click.stop="openEditor(placement.button, trigger)"
           >
             <small>{{ buttonTriggerLabel(trigger) }}</small>
-            <span>{{ actionSummary(actionOf(placement.button, trigger)) }}</span>
+            <span>{{ cellSummary(placement.button, trigger) }}</span>
           </button>
         </div>
       </article>
 
       <article
-        class="mapping-card voice-card right"
+        class="mapping-card mapping-readonly voice-card center"
+        aria-disabled="true"
         :class="{ active: voiceActive }"
-        :style="{ top: `${cardTop(VOICE_PLACEMENT)}px`, width: `${cardWidth}px` }"
+        :style="{ top: `${VOICE_CARD_TOP}px`, width: `${cardWidth}px` }"
       >
         <div class="mapping-card-title">
           <svg class="mapping-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1034,11 +920,20 @@ onUnmounted(() => {
             />
           </svg>
           <strong>语音键</strong>
+          <svg class="readonly-icon" viewBox="0 0 24 24" fill="none" aria-label="固定功能，不可自定义">
+            <path :d="READONLY_ICON" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
           <span class="badge pending voice-badge" :class="{ active: voiceActive }">按住说话</span>
         </div>
         <p class="voice-note">按下开始、松开结束；不参与自定义映射，不加双击/长按延迟。</p>
       </article>
     </div>
+
+    <div id="menu-mode-feedback" class="menu-mode-feedback" aria-live="polite">
+      <span v-if="menuModePending" class="muted">正在保存…</span>
+      <span v-else-if="menuModeError" class="error-text" role="alert">{{ menuModeError }}</span>
+    </div>
+    <p v-if="menuStateReadFailed" class="menu-reserved-note" role="alert">未能读取菜单功能，暂不可编辑菜单键；正在重新读取，已有映射未更改。</p>
 
     <article v-if="editingTarget" ref="editorPanel" class="card mapping-editor">
       <div class="card-title-row">
@@ -1057,150 +952,21 @@ onUnmounted(() => {
           >
             禁用按键
           </button>
-          <button class="secondary-button" type="button" @click="editingTarget = null">关闭</button>
+          <button class="secondary-button" type="button" :disabled="busy" @click="editingTarget = null">关闭</button>
         </div>
       </div>
-      <div class="action-sections">
-        <p v-if="capabilityNote" class="muted editor-note capability-note">{{ capabilityNote }}</p>
-        <section v-for="group in PRESET_GROUPS" :key="group.label" class="action-section">
-          <h4 class="action-section-title">{{ group.label }}</h4>
-          <div class="preset-grid">
-            <!-- 芯片显示实际按键组合（组合在不同 App 里语义不同，功能描述
-                 只作悬停提示，避免把 Ctrl+C 一类写成"复制"造成误判）。 -->
-            <button
-              v-for="preset in group.items"
-              :key="preset.label"
-              class="chip"
-              :class="{ selected: isActivePreset(preset.keys) }"
-              type="button"
-              :title="preset.label"
-              @click="applyAction({ type: 'shortcut', chord: { keys: [...preset.keys] } })"
-            >
-              {{ chordLabel({ keys: preset.keys }) }}
-            </button>
-          </div>
-        </section>
+      <ButtonActionEditor
+        :key="`${editingSource}:${editingTarget.button}:${editingTarget.trigger}`"
+        :shortcuts-only="editingSource !== 'common'"
+        :mappings="mappings"
+        :button="editingTarget.button"
+        :trigger="editingTarget.trigger"
+        :preset-apps="presetApps"
+        @update="applyAction"
+        @applications="mappings = { ...mappings, applications: $event }"
+        @status="statusMessage = $event"
+      />
 
-        <section class="action-section">
-          <h4 class="action-section-title">鼠标滚轮</h4>
-          <div class="preset-grid">
-            <button v-for="direction in (['up', 'down'] as const)" :key="direction" class="chip"
-              :class="{ selected: isActiveScroll(direction) }" type="button" title="在鼠标当前位置滚动"
-              @click="applyAction({ type: 'scroll', direction, steps: scrollSteps })">{{ direction === "up" ? "滚轮向上" : "滚轮向下" }}</button>
-          </div>
-          <label v-if="selectedAction?.type === 'scroll'" class="mouse-amount">
-            <span>每次滚动</span>
-            <input aria-label="每次滚动格数" type="number" min="1" max="100" step="1" :value="scrollSteps" @change="updateMouseAmount($event, 'scroll')" />
-            <span>格</span>
-          </label>
-        </section>
-
-        <section class="action-section">
-          <h4 class="action-section-title">鼠标点击</h4>
-          <div class="preset-grid">
-            <button v-for="(label, kind) in mouseClickLabels" :key="kind" class="chip" type="button"
-              :class="{ selected: selectedAction?.type === 'mouse_click' && selectedAction.kind === kind }"
-              title="点击鼠标当前位置" @click="applyAction({ type: 'mouse_click', kind })">{{ label }}</button>
-          </div>
-        </section>
-
-        <section class="action-section">
-          <h4 class="action-section-title">鼠标移动</h4>
-          <div class="preset-grid">
-            <button v-for="(label, direction) in mouseMoveLabels" :key="direction" class="chip mouse-direction" type="button"
-              :aria-label="label" :title="label" :class="{ selected: selectedAction?.type === 'mouse_move' && selectedAction.direction === direction }"
-              @click="applyAction({ type: 'mouse_move', direction, distance: moveDistance })">{{ moveSymbols[direction] }}</button>
-          </div>
-          <label v-if="selectedAction?.type === 'mouse_move'" class="mouse-amount">
-            <span>每次移动</span>
-            <input aria-label="每次移动像素" type="number" min="1" max="2000" step="1" :value="moveDistance" @change="updateMouseAmount($event, 'mouse_move')" />
-            <span>像素</span>
-          </label>
-        </section>
-
-        <section class="action-section">
-          <h4 class="action-section-title">打开应用</h4>
-          <div class="preset-grid">
-            <button
-              v-for="app in presetApps"
-              :key="app.id"
-              class="chip"
-              :class="{ selected: openAppTargetOf(editingTarget.button, editingTarget.trigger) === app.id }"
-              type="button"
-              title="已运行则切到该应用窗口，未运行则启动"
-              @click="applyAction({ type: 'open_app', target: app.id })"
-            >
-              {{ app.name }}
-            </button>
-            <button class="chip" type="button" @click="appPickerError = null; appPickerOpen = true">扫描本机应用</button>
-            <button
-              class="chip add-app"
-              type="button"
-              title="从本机选择任意程序或快捷方式"
-              @click="addCustomApp"
-            >
-              ＋ 添加应用
-            </button>
-          </div>
-          <input v-if="customApps.length > 12" v-model="appFilter" class="app-library-search" type="search" aria-label="筛选已添加应用" placeholder="筛选已添加应用" />
-          <div v-if="customApps.length" class="preset-grid saved-app-grid">
-            <button v-for="app in filteredCustomApps" :key="app.path" class="chip" type="button"
-              :class="{ selected: openAppTargetOf(editingTarget.button, editingTarget.trigger) === app.path }"
-              :title="app.name" @click="applyAction({ type: 'open_app', target: app.path })">{{ app.name }}</button>
-          </div>
-        </section>
-
-        <section class="action-section">
-          <h4 class="action-section-title">自定义</h4>
-          <div class="custom-shortcut-row">
-            <button
-              class="chip"
-              :class="{ selected: capturingShortcut }"
-              type="button"
-              :disabled="captureStarting"
-              @click="capturingShortcut ? finishShortcutCapture('已取消录入') : beginShortcutCapture()"
-            >
-              {{ capturingShortcut ? "录入中…（按 Esc 取消）" : "录入自定义快捷键" }}
-            </button>
-            <span v-if="capturingShortcut" class="capture-display">
-              {{ captureDisplay.length ? chordLabel({ keys: captureDisplay }) : (safeCaptureMode ? "先选择修饰键" : "请按下快捷键组合") }}
-            </span>
-          </div>
-          <label
-            class="toggle-row safe-capture-toggle"
-            title="开启后，通过界面选择修饰键，键盘只需按主键。"
-          >
-            <span>安全录入模式</span>
-            <input
-              v-model="safeCaptureMode"
-              type="checkbox"
-              class="toggle-input"
-              :disabled="capturingShortcut || captureStarting"
-            />
-            <small class="muted safe-capture-hint">
-              直接录入无法完成或会触发系统动作时再开启。
-            </small>
-          </label>
-          <template v-if="capturingShortcut && safeCaptureMode">
-            <p class="muted editor-note capture-guide">
-              请用鼠标选择修饰键，再只按一次主键。不要在键盘上按完整组合，系统快捷键不会被执行。
-            </p>
-            <div class="preset-grid capture-modifiers">
-              <button
-                v-for="modifier in CAPTURE_MODIFIER_OPTIONS"
-                :key="modifier.key"
-                class="chip"
-                :class="{ selected: selectedCaptureModifiers.has(modifier.key) }"
-                type="button"
-                @click="toggleCaptureModifier(modifier.key)"
-              >
-                {{ modifier.label }}
-              </button>
-            </div>
-            <p class="capture-display">然后单独按主键（例如选择“左 Win”后，只按 L）</p>
-          </template>
-        </section>
-      </div>
       <p v-if="editingTarget.trigger === 'single'" class="muted editor-note">
         未配置双击与长按时，单击在按下瞬间触发（零延迟）；返回/方向/音量键按住会连续触发。
       </p>
@@ -1209,7 +975,8 @@ onUnmounted(() => {
       </p>
     </article>
 
-    <footer class="card mapping-footer">
+    <div class="card mapping-footer">
+      <small class="muted">按下高亮只表示已收到按键；动作按当前程序的模板执行，未配置则不执行。</small>
       <div class="mapping-footer-status">
         <span class="status-dot" :class="rawInput?.phase === 'ready' ? 'success' : 'pending'"></span>
         <span>{{ phaseLabel(rawInput?.phase) }}</span>
@@ -1223,42 +990,155 @@ onUnmounted(() => {
           {{ rawInput?.phase === "ready" ? "停止监听" : "启动监听" }}
         </button>
         <small v-if="mappingSnapshot && !mappings.enabled" class="muted"> · 总开关关闭（按键保持原样）</small>
+        <small v-if="dirty" class="muted"> · 当前编辑目标有未保存更改</small>
       </div>
       <label class="toggle-row" title="开启后，操作实体遥控器不会切换正在编辑的按键。">
         <span>锁定当前按键</span>
-        <input v-model="lockSelection" type="checkbox" class="toggle-input" />
+        <input :checked="lockSelection" :aria-busy="selectionPreference.pending.value" :aria-disabled="!selectionPreference.loaded.value || selectionPreference.pending.value" @change="selectionPreference.toggleCheckbox" type="checkbox" class="toggle-input" />
       </label>
       <span class="muted lock-hint">按遥控器时保持当前编辑项</span>
+      <span v-if="selectionPreference.error.value" role="alert" class="error-text">{{ selectionPreference.error.value }}</span>
+    </div>
+    </div>
+
+    <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
+    <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
+    </div>
+
+    <footer class="mapping-actions" aria-label="按键配置操作">
       <div class="button-row">
         <button class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
-          保存配置
+          保存当前配置
         </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="importConfiguration">
-          导入配置…
+
+        <button class="secondary-button" type="button" :disabled="busy" @click="openSaveTemplateDialog">
+          保存为模板
         </button>
         <button class="secondary-button" type="button" :disabled="busy" @click="exportConfiguration">
           导出配置…
         </button>
         <button class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
-          恢复默认
+          {{ activeTemplateEntry?.builtIn ? "复位模板" : "恢复默认" }}
         </button>
       </div>
     </footer>
-
-    <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
-    <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
-    <RegisteredAppsDialog v-if="appPickerOpen" :known-apps="mappings.applications ?? []" :saving="busy" :save-error="appPickerError" @close="appPickerOpen = false" @add="addScannedApps" />
   </section>
+
+  <SettingsDialog
+    v-if="saveTemplateDialogOpen"
+    title="保存为完整按键模板"
+    description="保存当前编辑目标的草稿副本；不会开启自动切换或创建程序关联。"
+    :busy="busy"
+    @close="saveTemplateDialogOpen = false"
+  >
+    <label class="save-template-field">模板名称<input v-model="templateNameDraft" :disabled="busy" @keyup.enter="saveAsTemplate" /></label>
+    <p v-if="templateNameError" class="error-text">{{ templateNameError }}</p>
+    <template #actions>
+      <button type="button" :disabled="busy" @click="saveAsTemplate">{{ busy ? "正在保存…" : "保存模板" }}</button>
+      <button type="button" class="secondary-button" :disabled="busy" @click="saveTemplateDialogOpen = false">取消</button>
+    </template>
+  </SettingsDialog>
+
 </template>
 
 <style scoped>
-.mouse-amount { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; font-size: 13px; }
-.mouse-amount input { width: 88px; max-width: 100%; padding: 5px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 4px; }
-.mouse-direction { width: 40px; height: 30px; padding: 0; font-size: 17px; }
-/* 滚动容器顶部会裁掉向上溢出（transform 不产生可滚动区域）：
-   chip:hover 上浮 1px + 阴影会在容器顶边被切，故用内边距留出
-   上浮空间，负外边距补偿保持原网格位置不变。 */
-.saved-app-grid { max-height: 180px; overflow-y: auto; margin: 5px -3px -3px; padding: 3px; align-content: start; }
-.saved-app-grid .chip { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
-.app-library-search { display: block; width: min(300px, 100%); box-sizing: border-box; margin-top: 10px; padding: 6px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid #888; border-radius: 4px; }
+.mapping-card { border-width: 2px; padding: 5px 8px; }
+.mapping-card.mapping-readonly { cursor: default; border-color: transparent; outline: none; box-shadow: none; }
+.mapping-card.mapping-readonly:not(.active):not(.flashed) { background: var(--pending-surface); }
+.mapping-card.mapping-readonly.flashed { background: var(--pressed-surface); }
+.mapping-readonly .mapping-card-title strong,
+.mapping-readonly .mapping-icon { color: var(--text-secondary); }
+.readonly-icon { width: 12px; height: 12px; flex: 0 0 auto; color: var(--text-secondary); }
+.menu-reserved-label { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 11px; }
+.menu-reserved .mapping-cell:disabled { opacity: 1; cursor: default; border-radius: 0; }
+.menu-reserved .mapping-cell:disabled:not(.flashed) { background: transparent; }
+.menu-reserved .mapping-cell span { color: var(--text-secondary); font-size: 11px; }
+.menu-reserved .mapping-cell:last-child span { font-weight: 600; }
+.menu-reserved .mapping-cell:disabled:hover { box-shadow: none; }
+.menu-mode-control { position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; cursor: pointer; }
+.menu-mode-control input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+.menu-mode-lock { display: inline-flex; align-items: center; width: 12px; height: 18px; }
+.menu-mode-tooltip { position: absolute; z-index: 5; bottom: calc(100% + 6px); left: 0; width: 220px; max-width: calc(100vw - 80px); padding: 8px 10px; border-radius: 6px; background: var(--surface-control); color: var(--text-primary); border: 1px solid var(--border-strong); font-size: 12px; font-weight: 400; line-height: 1.5; visibility: hidden; pointer-events: none; }
+.menu-mode-control:hover .menu-mode-tooltip,
+.menu-mode-control:focus-within .menu-mode-tooltip { visibility: visible; }
+.menu-mode-feedback { margin-top: 10px; min-height: 1.5em; font-size: 13px; line-height: 1.5; }
+.menu-reserved-note { margin: 10px 0 12px; line-height: 1.5; font-size: 13px; }
+.buttons-page {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+.buttons-scroll {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 0 var(--content-inline-padding) 16px;
+  scrollbar-gutter: stable;
+}
+.mapping-actions {
+  min-width: 0;
+  /* 与独立正文的槽位对齐；hidden 只预留空间，不显示第二条滚动条。 */
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  padding: 12px var(--content-inline-padding) 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-canvas);
+}
+.mapping-actions .button-row { justify-content: flex-end; }
+.mapping-actions button { max-width: 100%; white-space: normal; }
+.editing-source-picker, .current-template-display {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.editing-source-picker > span, .current-template-display > span {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+.editing-source-picker select { min-height: 36px; min-width: 0; width: 100%; }
+.current-template-display output {
+  display: block;
+  box-sizing: border-box;
+  min-height: 36px;
+  padding: 0 8px;
+  line-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  background: var(--surface-control);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
+.mapping-header {
+  display: grid;
+  gap: 10px;
+  align-items: start;
+}
+.mapping-heading-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 250px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+.mapping-heading-row h1 { white-space: nowrap; }
+.mapping-toggle-slot { justify-self: start; }
+.mapping-toggle-slot.unavailable { color: var(--text-muted); }
+.mapping-heading-row .device-chip { justify-self: end; }
+.mapping-header-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 240px));
+  justify-content: start;
+  gap: 12px;
+  width: 100%;
+}
+.mapping-header-status { min-height: 20px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 620px) {
+  .mapping-heading-row { grid-template-columns: 1fr; gap: 8px; }
+  .mapping-heading-row .device-chip { justify-self: start; }
+}
 </style>

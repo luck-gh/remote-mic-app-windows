@@ -9,10 +9,12 @@ import {
   listAudioEndpoints,
   saveButtonMappings,
   scanPairedRemotes,
+  setAppIcon,
   stopRawInput,
   testButtonMapping,
   type PlatformSnapshot,
 } from "./lib/bridge";
+import { reportFrontendEvent } from "./lib/frontend-diagnostics";
 
 interface RuntimeSimulationReport {
   passed: boolean;
@@ -23,6 +25,23 @@ interface RuntimeSimulationReport {
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+/**
+ * 阶段标记：写进诊断日志（`runtime_simulation phase=completed reason=<stage>`）。
+ *
+ * 2026-10-02 教训：本机仿真超时 60 秒时，报告没写、stdout/stderr 全空，日志里
+ * 只有每秒一条 `tray_icon_state ... ipc_unavailable`，无法判断卡在哪一步——
+ * 是因为那次构建漏了 `VITE_SAYALL_RUNTIME_SIMULATION=1`（仿真前端入口根本没
+ * 编进去）。每个阶段入口留一条日志后，同样的现场一次日志拉取就能定位。
+ */
+function mark(stage: string): void {
+  reportFrontendEvent({
+    event: "runtime_simulation",
+    phase: "started",
+    result: "passed",
+    reason: stage,
+  });
 }
 
 async function waitFor<T>(read: () => T | null, description: string): Promise<T> {
@@ -63,28 +82,65 @@ async function openPage(label: string, heading = label): Promise<void> {
   );
 }
 
-async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
-  // 应用默认打开"按键"页（对齐 Mac 页序），先导航到连接页完成连接旅程。
-  await openPage("连接");
-  await waitFor(
-    () => (document.querySelector("h1")?.textContent?.trim() === "连接" ? true : null),
-    "连接首页",
+/**
+ * 设置页外部入口（官网 / GitHub）的 CI 判据。
+ *
+ * 2026-10-02 用户指定：成功不再显示任何提示，只有失败就地给原因。因此判据是
+ * "在窗口期内要么出现失败原因、要么保持静默"；capability 白名单是产品配置，
+ * 被 opener 拒绝（"Not allowed to open url"）必须报红，runner 上没有可用的
+ * 默认浏览器只是环境差异（失败文案会如实带出来），不制造与本产品无关的红灯。
+ */
+async function recordExternalEntry(label: string, steps: string[]): Promise<void> {
+  await clickButton(label);
+  const deadline = Date.now() + 3_000;
+  let message: string | null = null;
+  while (Date.now() < deadline) {
+    const text = document.querySelector(".link-message")?.textContent?.trim();
+    if (text) {
+      message = text;
+      break;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+  }
+  assert(
+    message === null || !message.includes("Not allowed to open url"),
+    `设置页“${label}”入口被 opener capability 拒绝：${message}`,
   );
+  steps.push(
+    message === null
+      ? `设置页“${label}”入口点击后未显示错误；浏览器可见打开结果 deferred`
+      : `设置页“${label}”入口返回不可用（deferred）：${message}`,
+  );
+}
+
+async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
+  mark("journey_start");
+  // 驱动页允许已连接时重新扫描；连接页在自动连接后会禁用扫描入口。
+  await openPage("驱动", "驱动与配对");
   const runtime = await getRuntimeSnapshot();
   assert(runtime.platform.platform === "windows-ci-simulation", "应用未使用 Windows CI 仿真后端");
   steps.push("Tauri WebView 通过真实 IPC 读取仿真运行快照");
 
-  await clickButton("扫描已配对设备");
+  const pairing = await waitFor(
+    () => document.querySelector<HTMLDetailsElement>(".driver-guide .pairing-guide"),
+    "配对与重新连接区域",
+  );
+  const pairingSummary = pairing.querySelector<HTMLElement>("summary");
+  assert(pairingSummary?.textContent?.trim() === "配对与重新连接", "驱动页缺少配对展开入口");
+  if (!pairing.open) pairingSummary.click();
+  await waitFor(() => (pairing.open ? true : null), "配对与重新连接展开");
+  await clickButton("扫描已配对遥控器");
   await waitFor(
-    () => (document.body.textContent?.includes("找到 2 个已配对的小米遥控器") ? true : null),
+    () => (document.querySelectorAll(".driver-guide .device-list li").length === 2 ? true : null),
     "RC001/RC003 扫描结果",
   );
   const remotes = await scanPairedRemotes();
   assert(remotes.length === 2, "仿真扫描没有同时返回 RC001 和 RC003");
   assert(remotes.some((remote) => remote.model === "rc001"), "仿真扫描缺少 RC001");
   assert(remotes.some((remote) => remote.model === "rc003"), "仿真扫描缺少 RC003");
-  steps.push("连接页面渲染 RC001/RC003 扫描结果");
+  steps.push("驱动页展开配对区域，经扫描按钮渲染 RC001/RC003 结果");
 
+  await openPage("连接");
   const rc001 = remotes.find((remote) => remote.model === "rc001");
   assert(rc001, "找不到 RC001 仿真设备");
   const connection = await connectRemote(rc001.id);
@@ -92,27 +148,24 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(connection.capabilities?.sampleRate === 16_000, "RC001 仿真能力不是 16 kHz");
   steps.push("RC001 连接 command 返回 16 kHz ATVV 就绪状态");
 
-  await waitFor(
-    () => (document.body.textContent?.includes("CABLE Input (CI Simulation)") ? true : null),
-    "仿真音频端点",
-  );
-  // 端点列表默认收起（用户每次只用一个）：自动选择后以"更换设备"入口呈现。
-  await waitFor(
-    () =>
-      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).some((button) =>
-        button.textContent?.trim().includes("更换设备"),
-      )
-        ? true
-        : null,
-    "自动选择仿真 CABLE Input",
-  );
+  const advancedAudio = await waitFor(() => document.querySelector<HTMLDetailsElement>(".audio-advanced"), "高级声音诊断");
+  assert(!advancedAudio.open, "声音写入端不应默认出现在常规界面");
+  assert(document.querySelector("#capture-input-target"), "常规界面缺少目标麦克风选择");
+  assert(!document.querySelector(".endpoint-list"), "常规界面泄漏了播放设备列表");
+  // 仿真后端不提供真实 Capture 拓扑，显式高级选择仅验证原有 WASAPI 通道。
+  advancedAudio.open = true;
+  advancedAudio.dispatchEvent(new Event("toggle"));
+  const renderChoice = await waitFor(() => document.querySelector<HTMLButtonElement>(".audio-advanced .endpoint-list button"), "高级手动写入端");
+  if (!renderChoice.disabled) renderChoice.click();
+  await waitFor(() => document.querySelector<HTMLButtonElement>(".audio-advanced .endpoint-list button")?.textContent?.trim() === "当前设备" ? true : null, "手动声音写入端确认");
   const endpoints = await listAudioEndpoints();
   assert(endpoints.length === 1, "仿真音频端点数量异常");
   const audio = await getAudioSnapshot();
   assert(audio.phase === "ready", "仿真音频端点没有进入 WASAPI 就绪");
-  assert(audio.selectedEndpointId === endpoints[0].id, "仿真 CABLE Input 没有被自动选择");
-  steps.push("连接页面首次检测并自动选择唯一的仿真 CABLE Input");
+  assert(audio.selectedEndpointId === endpoints[0].id, "仿真 CABLE Input 没有被明确选择");
+  steps.push("连接页面仅常规展示目标麦克风；高级显式选择仿真声音写入端，真实通道配对 deferred");
 
+  mark("buttons_page");
   await openPage("按键", "按键映射");
   await waitFor(
     () => (document.body.textContent?.includes("按键监听已就绪") ? true : null),
@@ -147,14 +200,24 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(sendInput.submittedEvents === 4, "Ctrl+C 仿真没有生成四个按下/释放事件");
   steps.push("映射保存、热加载和 SendInput 记录器通过真实 Tauri IPC");
 
-  await openPage("权限");
-  assert(
-    !document.querySelector(".diagnostic-output"),
-    "权限页仍有诊断摘要输出（诊断入口应已迁往关于页）",
+  mark("templates_page");
+  await openPage("模板");
+  await waitFor(
+    () => document.querySelector(".complete-template-panel"),
+    "模板配置与内置目录加载",
   );
-  steps.push("权限页只呈现蓝牙/按键/音频三项权限状态");
+  assert(document.querySelector(".run-modes") !== null, "模板页缺少独立模板切换设置");
+  steps.push("模板页通过真实 IPC 加载完整按键模板与独立切换设置");
 
-  await openPage("关于");
+  mark("drivers_page");
+  await openPage("驱动", "驱动与配对");
+  assert(document.querySelector(".guide-grid") !== null, "驱动页缺少可选增强与配对引导");
+  steps.push("驱动页显示可选增强与配对引导，未启动提权 Helper");
+
+  mark("permissions_page");
+  await openPage("权限");
+  // 诊断摘要 2026-10-01 从关于页迁回权限页（用户指定）：状态与取证入口同页，
+  // 用户看到某一项不对时不必跳页。
   await clickButton("生成摘要");
   await waitFor(
     () =>
@@ -168,7 +231,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(diagnostic.capabilities.bleVoiceReady, "诊断摘要没有反映 ATVV 就绪");
   assert(diagnostic.capabilities.wasapiReady, "诊断摘要没有反映 WASAPI 就绪");
   assert(diagnostic.capabilities.rawInputReady, "诊断摘要没有反映 Raw Input 就绪");
-  steps.push("关于页生成去标识化运行诊断摘要");
+  steps.push("权限页呈现蓝牙/按键/音频三项状态并生成去标识化运行诊断摘要");
 
   // "打开日志目录"刻意**不作成败断言**：它经 ShellExecuteW 交给资源管理器，
   // CI runner 是否有可用的 shell 桌面不在本仓库控制范围内，拿它当门禁只会
@@ -184,9 +247,41 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   );
   steps.push(
     logDirectoryMessage.startsWith("已打开日志目录")
-      ? "关于页“打开日志目录”经真实 IPC 交由资源管理器打开"
-      : `关于页“打开日志目录”返回不可用（deferred）：${logDirectoryMessage}`,
+      ? "权限页“打开日志目录”经真实 IPC 交由资源管理器打开"
+      : `权限页“打开日志目录”返回不可用（deferred）：${logDirectoryMessage}`,
   );
+
+  await openPage("设置");
+  mark("settings_page");
+  // 2026-10-02 设置页改版（对齐 Mac 新设置页）：顶部模块 = 应用标识 + 版本 +
+  // 检查更新；通用 / 问题反馈两个分组在卡外有分组标题。
+  const settingsOverview = document.querySelector<HTMLElement>("article.settings-overview");
+  assert(settingsOverview !== null, "设置页缺少顶部标识与检查更新模块");
+  assert(
+    settingsOverview.textContent?.includes("当前版本") === true,
+    "设置页顶部没有显示当前版本",
+  );
+  assert(
+    document.querySelector("article.settings-overview .check-button") !== null,
+    "设置页顶部没有检查更新入口",
+  );
+  const sectionTitles = Array.from(
+    document.querySelectorAll<HTMLElement>(".settings-section .section-title"),
+  ).map((element) => element.textContent?.trim());
+  assert(
+    sectionTitles.join(" / ") === "通用 / 问题反馈",
+    `设置页分组标题异常：${sectionTitles.join(" / ")}`,
+  );
+  const entryLabels = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".settings-section .button-row button"),
+  ).map((button) => button.textContent?.trim());
+  assert(
+    entryLabels.length === 2 && entryLabels[0] === "官网" && entryLabels[1] === "GitHub",
+    `设置页问题反馈入口异常：${entryLabels.join(" / ")}`,
+  );
+  steps.push("设置页顶部为应用标识/版本/检查更新，问题反馈分组提供官网与 GitHub 入口");
+  await recordExternalEntry("官网", steps);
+  await recordExternalEntry("GitHub", steps);
 
   const darkTheme = await waitFor(
     () =>
@@ -209,11 +304,30 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   systemTheme.click();
   await waitFor(() => (systemTheme.checked && !systemTheme.disabled ? true : null), "系统外观恢复");
   assert(!document.querySelector('[role="alert"]'), "恢复系统外观后显示错误");
-  steps.push("关于页深色/系统外观经 Windows WebView、Tauri capability 与设置持久化闭环");
+  steps.push("设置页深色/系统外观经 Windows WebView、Tauri capability 与设置持久化闭环");
+
+  // 应用图标（2026-10-02）：仿真后端不建托盘，这里证明选项、IPC 与持久化往返
+  // 可用，并且窗口图标接口不报错（真实托盘/任务栏换图属真机验收，见
+  // Testing/WindowsRC003Preview.md 用例十四）。
+  const appIconOption = document.querySelector<HTMLInputElement>(
+    'input[name="app-icon"][value="faceted-duck"]:not(:disabled)',
+  );
+  assert(appIconOption !== null, "设置页缺少应用图标选项");
+  appIconOption.click();
+  await waitFor(() => (appIconOption.checked ? true : null), "应用图标切换");
+  assert(!document.querySelector('[role="alert"]'), "切换应用图标后显示错误");
+  // 直达断言：命令参数契约（前端 `{ identifier }` ↔ Rust 命令参数名）。名字不匹配
+  // 时 Tauri 判成缺参，前端只会看到 "IPC 不可用"（2026-10-02 本机仿真现场教训）。
+  const appliedIcon = await setAppIcon("faceted-duck");
+  assert(appliedIcon === "faceted-duck", `仿真切换应用图标没有生效：${appliedIcon}`);
+  const restoredIcon = await setAppIcon("standard");
+  assert(restoredIcon === "standard", `仿真还原应用图标没有生效：${restoredIcon}`);
+  steps.push("设置页应用图标选项经真实 IPC 与设置持久化往返");
 
   await openPage("连接");
-  steps.push("五个侧栏页面均在 Windows WebView 中完成导航和渲染");
+  steps.push("六个侧栏页面均在 Windows WebView 中完成导航和渲染");
 
+  mark("voice_session");
   const voice = await invoke<PlatformSnapshot>("run_runtime_simulation_voice_session");
   assert(voice.connection.decodedSamples === 240, "40 + 80 字节语音没有解码为 240 个采样");
   assert(voice.connection.generation === 1, "首次仿真语音会话代次不是 1");
@@ -223,6 +337,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
 
   await stopRawInput();
   await disconnectRemote();
+  mark("cleanup");
   const finalSnapshot = await getRuntimeSnapshot();
   assert(finalSnapshot.platform.connection.phase === "disconnected", "仿真连接没有释放");
   assert(finalSnapshot.platform.rawInput.phase === "stopped", "仿真 Raw Input 没有停止");

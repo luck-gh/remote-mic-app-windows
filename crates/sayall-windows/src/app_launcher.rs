@@ -25,69 +25,478 @@ pub struct PresetApp {
     pub name: &'static str,
     /// 进程/窗口匹配用可执行文件名（大小写不敏感；含不同版本命名）。
     pub exe_names: &'static [&'static str],
+    /// 额外安装位置候选（`%ENV%` 模板；探测与启动共用，按顺序取首个存在项）。
+    pub install_paths: &'static [&'static str],
+    /// 开始菜单快捷方式名（不含 .lnk）：覆盖自定义安装目录的兜底探测，
+    /// 命中且解析出的目标 exe 属于 `exe_names` 才算已安装。
+    pub shortcut_names: &'static [&'static str],
 }
 
 /// 预设应用表（对齐 Mac 预设 + Windows 常见项）。无线麦自身排首位
 /// （对齐 Mac `PresetApplication.remoteMic`，恒为已安装）。
+///
+/// 安装探测三级（任一命中即视为已安装）：System32 直存或 App Paths 注册表 →
+/// `install_paths` 候选路径 → 开始菜单快捷方式（解析目标 exe 与 `exe_names`
+/// 比对）。未安装的条目由 UI 过滤，不在"打开应用"列表展示。
 pub const PRESET_APPS: &[PresetApp] = &[
     PresetApp {
         id: "sayall",
         name: "无线麦",
         exe_names: &["sayall-windows-app.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
+    },
+    PresetApp {
+        id: "codex",
+        name: "Codex",
+        exe_names: &["Codex.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
     },
     PresetApp {
         id: "wechat",
         name: "微信",
         exe_names: &["WeChat.exe", "Weixin.exe"],
+        install_paths: &[
+            "%ProgramFiles%\\Tencent\\WeChat\\WeChat.exe",
+            "%ProgramFiles(x86)%\\Tencent\\WeChat\\WeChat.exe",
+        ],
+        shortcut_names: &["微信", "WeChat"],
     },
     PresetApp {
         id: "edge",
         name: "Edge 浏览器",
         exe_names: &["msedge.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
     },
     PresetApp {
         id: "chrome",
         name: "Chrome 浏览器",
         exe_names: &["chrome.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
     },
     PresetApp {
         id: "notepad",
         name: "记事本",
         exe_names: &["notepad.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
     },
     PresetApp {
         id: "calc",
         name: "计算器",
         exe_names: &["calc.exe", "CalculatorApp.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
     },
     PresetApp {
         id: "explorer",
         name: "文件资源管理器",
         exe_names: &["explorer.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
     },
     PresetApp {
         id: "netease_music",
         name: "网易云音乐",
         exe_names: &["cloudmusic.exe"],
+        install_paths: &[],
+        shortcut_names: &[],
+    },
+    // 2026-10-02 扩充：这些应用常装在自定义目录（如 D:\Apps\vokie），
+    // App Paths 与 System32 探测覆盖不到，必须走候选路径/开始菜单兜底。
+    PresetApp {
+        id: "vokie",
+        name: "Vokie",
+        exe_names: &["Vokie.exe"],
+        install_paths: &["%LOCALAPPDATA%\\Programs\\Vokie\\Vokie.exe"],
+        shortcut_names: &["Vokie"],
+    },
+    PresetApp {
+        id: "vscode",
+        name: "Visual Studio Code",
+        exe_names: &["Code.exe"],
+        install_paths: &[
+            "%LOCALAPPDATA%\\Programs\\Microsoft VS Code\\Code.exe",
+            "%ProgramFiles%\\Microsoft VS Code\\Code.exe",
+        ],
+        shortcut_names: &["Visual Studio Code", "VS Code"],
+    },
+    PresetApp {
+        id: "cursor",
+        name: "Cursor",
+        exe_names: &["Cursor.exe"],
+        install_paths: &[
+            "%LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe",
+            "%ProgramFiles%\\cursor\\Cursor.exe",
+        ],
+        shortcut_names: &["Cursor"],
+    },
+    PresetApp {
+        id: "dimagent",
+        name: "DimAgent",
+        exe_names: &["DimAgent.exe"],
+        install_paths: &[
+            "%LOCALAPPDATA%\\Programs\\DimAgent\\DimAgent.exe",
+            "%ProgramFiles%\\DimAgent\\DimAgent.exe",
+        ],
+        shortcut_names: &["DimAgent"],
+    },
+    PresetApp {
+        id: "qq",
+        name: "QQ",
+        exe_names: &["QQ.exe"],
+        install_paths: &[
+            "%ProgramFiles%\\Tencent\\QQNT\\QQ.exe",
+            "%ProgramFiles(x86)%\\Tencent\\QQ\\Bin\\QQ.exe",
+        ],
+        shortcut_names: &["QQ"],
+    },
+    PresetApp {
+        id: "feishu",
+        name: "飞书",
+        exe_names: &["Feishu.exe", "Lark.exe"],
+        install_paths: &[
+            "%LOCALAPPDATA%\\Feishu\\Feishu.exe",
+            "%ProgramFiles%\\Feishu\\Feishu.exe",
+            "%ProgramFiles%\\Lark\\Lark.exe",
+        ],
+        shortcut_names: &["飞书", "Lark"],
+    },
+    PresetApp {
+        id: "hermes",
+        name: "Hermes",
+        exe_names: &["Hermes.exe"],
+        install_paths: &[
+            "%LOCALAPPDATA%\\Programs\\Hermes\\Hermes.exe",
+            "%LOCALAPPDATA%\\hermes\\hermes-agent\\apps\\desktop\\release\\win-unpacked\\Hermes.exe",
+        ],
+        shortcut_names: &["Hermes"],
     },
 ];
+
+/// Windows 蓝牙设置的固定公开协议入口。
+///
+/// 此值不接受前端参数，避免把宿主命令扩大为任意 URI/文件启动器。
+pub const BLUETOOTH_SETTINGS_URI: &str = "ms-settings:bluetooth";
+
+/// 打开 Windows 的“蓝牙和设备”设置页。
+#[cfg(windows)]
+pub fn open_bluetooth_settings() -> Result<(), String> {
+    launch_explicit(BLUETOOTH_SETTINGS_URI, None, None, false)
+}
+
+#[cfg(not(windows))]
+pub fn open_bluetooth_settings() -> Result<(), String> {
+    Err("打开 Windows 蓝牙设置仅在 Windows 上可用".to_owned())
+}
+
+/// 展开 `%VAR%` 形式的安装路径模板；任一变量缺失返回 None。
+fn expand_install_path(template: &str) -> Option<std::path::PathBuf> {
+    let mut expanded = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('%') {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let end = after.find('%')?;
+        let name = &after[..end];
+        if name.is_empty() {
+            return None;
+        }
+        expanded.push_str(&std::env::var(name).ok()?);
+        rest = &after[end + 1..];
+    }
+    expanded.push_str(rest);
+    (!expanded.is_empty()).then(|| std::path::PathBuf::from(expanded))
+}
 
 pub fn preset_app(id: &str) -> Option<&'static PresetApp> {
     PRESET_APPS.iter().find(|app| app.id == id)
 }
 
+/// Stable application identity shared by foreground matching, running-app
+/// discovery and manual selection. Presets keep their portable logical id;
+/// every other executable uses its normalized full path.
+pub fn application_identity_for_path(path: &str) -> String {
+    let path_value = std::path::Path::new(path);
+    let executable = path_value
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(app) = PRESET_APPS.iter().find(|app| {
+        app.exe_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&executable))
+    }) {
+        return app.id.to_owned();
+    }
+    // The packaged Windows Codex desktop app exposes a ChatGPT.exe host. Its
+    // public package directory remains distinguishable from the ordinary
+    // ChatGPT product, so do not classify every ChatGPT.exe as Codex.
+    if executable.eq_ignore_ascii_case("ChatGPT.exe")
+        && path_value.components().any(|component| {
+            let component = component.as_os_str().to_string_lossy();
+            let component = component.to_ascii_lowercase();
+            component.starts_with("openai.codex_") && component.ends_with("__2p2nqsd0c76g0")
+        })
+    {
+        return "codex".to_owned();
+    }
+    path.trim_start_matches(r"\\?\")
+        .replace('/', r"\")
+        .to_lowercase()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningAppInfo {
+    pub application_id: String,
+    pub name: String,
+    pub preset: bool,
+}
+
+#[cfg(windows)]
+pub fn list_running_apps() -> Vec<RunningAppInfo> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Context {
+        process_ids: BTreeSet<u32>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let context = &mut *(lparam.0 as *mut Context);
+        if IsWindowVisible(hwnd).as_bool() {
+            let mut process_id = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+            if process_id != 0 {
+                context.process_ids.insert(process_id);
+            }
+        }
+        BOOL::from(true)
+    }
+
+    let mut context = Context {
+        process_ids: BTreeSet::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut context as *mut Context as isize));
+    }
+    let visible_processes = context.process_ids.len();
+    let mut apps = BTreeMap::new();
+    for process_id in context.process_ids {
+        let Some(path) = process_executable_path(process_id) else {
+            continue;
+        };
+        let application_id = application_identity_for_path(&path);
+        if application_id.is_empty() {
+            continue;
+        }
+        let preset = preset_app(&application_id);
+        let name = preset.map(|app| app.name.to_owned()).unwrap_or_else(|| {
+            std::path::Path::new(&path)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "应用程序".to_owned())
+        });
+        apps.entry(application_id.clone())
+            .or_insert(RunningAppInfo {
+                application_id,
+                name,
+                preset: preset.is_some(),
+            });
+    }
+    crate::ble::gatt_note(format!(
+        "application_discovery phase=completed terminal_result=passed visible_processes={} applications={} inaccessible_skipped={}",
+        visible_processes,
+        apps.len(),
+        visible_processes.saturating_sub(apps.len())
+    ));
+    apps.into_values().collect()
+}
+
+#[cfg(not(windows))]
+pub fn list_running_apps() -> Vec<RunningAppInfo> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub(crate) fn process_executable_path(process_id: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
+        let mut buffer = vec![0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        let queried = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        queried.then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+}
+
 /// 探测预设应用安装状态（System32 直存或 App Paths 注册表命中）。
+/// 预设应用解析出的启动位置（候选路径或开始菜单快捷方式）。
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresetLaunchTarget {
+    exe_path: String,
+    arguments: Option<String>,
+    working_dir: Option<String>,
+    /// 诊断日志用来源：`install_path` | `start_menu_shortcut`。
+    source: &'static str,
+}
+
+/// 开始菜单快捷方式索引：文件名去 `.lnk` 后小写 → 完整路径。
+/// 覆盖自定义安装目录（App Paths/System32 探测不到的应用）。
+#[cfg(windows)]
+fn start_menu_shortcuts() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    for root in [
+        std::env::var_os("APPDATA").map(|value| {
+            std::path::PathBuf::from(value).join(r"Microsoft\Windows\Start Menu\Programs")
+        }),
+        std::env::var_os("ProgramData").map(|value| {
+            std::path::PathBuf::from(value).join(r"Microsoft\Windows\Start Menu\Programs")
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        collect_start_menu_shortcuts(&root, &mut out);
+    }
+    out
+}
+
+/// 递归收集目录下的 `.lnk`（索引构建的独立步骤，便于用临时目录测试）。
+#[cfg(windows)]
+fn collect_start_menu_shortcuts(
+    dir: &std::path::Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_start_menu_shortcuts(&path, out);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.len() <= 4 || !name.to_ascii_lowercase().ends_with(".lnk") {
+            continue;
+        }
+        out.push((name[..name.len() - 4].to_lowercase(), path));
+    }
+}
+
+/// 解析预设应用启动位置：先按 `install_paths` 候选路径（存在即用），
+/// 再按开始菜单快捷方式（名称匹配 + 解析出的 exe 名与 `exe_names` 比对）。
+#[cfg(windows)]
+fn preset_launch_target(
+    app: &PresetApp,
+    shortcuts: &[(String, std::path::PathBuf)],
+) -> Option<PresetLaunchTarget> {
+    for template in app.install_paths {
+        let Some(path) = expand_install_path(template) else {
+            continue;
+        };
+        if path.is_file() {
+            return Some(PresetLaunchTarget {
+                exe_path: path.to_string_lossy().into_owned(),
+                arguments: None,
+                working_dir: None,
+                source: "install_path",
+            });
+        }
+    }
+    if app.shortcut_names.is_empty() {
+        return None;
+    }
+    let wanted: Vec<String> = app
+        .shortcut_names
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+    let exe_names: Vec<String> = app
+        .exe_names
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+    for (stem, path) in shortcuts {
+        if !wanted.iter().any(|name| name == stem) {
+            continue;
+        }
+        let Some(resolved) = resolve_lnk(&path.to_string_lossy()) else {
+            continue;
+        };
+        if resolved.exe_path.is_empty() {
+            continue;
+        }
+        let exe_name = std::path::Path::new(&resolved.exe_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !exe_names.iter().any(|name| *name == exe_name) {
+            continue;
+        }
+        return Some(PresetLaunchTarget {
+            exe_path: resolved.exe_path,
+            arguments: (!resolved.arguments.is_empty()).then_some(resolved.arguments),
+            working_dir: (!resolved.working_dir.is_empty()).then_some(resolved.working_dir),
+            source: "start_menu_shortcut",
+        });
+    }
+    None
+}
+
+/// 启动前解析预设应用的启动位置（自带开始菜单索引）。
+#[cfg(windows)]
+fn resolve_preset_launch_target(app: &PresetApp) -> Option<PresetLaunchTarget> {
+    preset_launch_target(app, &start_menu_shortcuts())
+}
+
+/// 探测预设应用安装状态（System32 直存 / App Paths 注册表 / `install_paths`
+/// 候选路径 / 开始菜单快捷方式，任一命中）。
 /// 无线麦自身恒为已安装（映射运行时它必然在运行）。
 #[cfg(windows)]
 pub fn probe_preset_apps() -> Vec<PresetAppInfo> {
-    PRESET_APPS
+    let started = std::time::Instant::now();
+    // 开始菜单索引只扫一次，供全部条目复用（每页加载调用一次，不能按条目重复遍历）。
+    let shortcuts = start_menu_shortcuts();
+    let apps: Vec<PresetAppInfo> = PRESET_APPS
         .iter()
         .map(|app| PresetAppInfo {
             id: app.id.to_owned(),
             name: app.name.to_owned(),
-            installed: app.id == "sayall" || app.exe_names.iter().any(|exe| exe_resolvable(exe)),
+            installed: app.id == "sayall"
+                || app.exe_names.iter().any(|exe| exe_resolvable(exe))
+                || preset_launch_target(app, &shortcuts).is_some(),
         })
-        .collect()
+        .collect();
+    crate::ble::gatt_note(format!(
+        "app_launcher action=probe_preset_apps phase=completed total={} installed={} elapsed_ms={}",
+        apps.len(),
+        apps.iter().filter(|app| app.installed).count(),
+        started.elapsed().as_millis()
+    ));
+    apps
 }
 
 #[cfg(not(windows))]
@@ -103,6 +512,9 @@ pub struct CustomAppPick {
     pub name: String,
     /// 完整路径（.exe/.lnk）。作为 `OpenApp.target` 持久化。
     pub path: String,
+    /// Foreground matching identity. Presets use a logical id; custom apps use
+    /// the resolved executable's normalized full path.
+    pub application_id: String,
 }
 
 /// 判断 OpenApp 目标是否为自定义路径（非预设 id）。
@@ -181,6 +593,24 @@ pub fn activate_or_launch(id: &str) -> Result<(), String> {
                 return Err("Windows 拒绝将目标应用切换到前台".to_owned());
             }
             RunningActivation::NotFound => {}
+        }
+        if let Some(target) = resolve_preset_launch_target(app) {
+            // 候选路径/开始菜单解析出的完整路径：自定义安装目录的应用
+            // （Vokie、DimAgent、Hermes 等）ShellExecuteW 只拿文件名会找不到。
+            // 日志只记来源与副产品可用性，不落任何个人路径。
+            crate::ble::gatt_note(format!(
+                "app_launcher action=activate_or_launch preset={} phase=launch_target source={} arguments_present={} working_dir_present={}",
+                app.id,
+                target.source,
+                target.arguments.is_some(),
+                target.working_dir.is_some()
+            ));
+            return launch_explicit(
+                &target.exe_path,
+                target.arguments.as_deref(),
+                target.working_dir.as_deref(),
+                true,
+            );
         }
         return launch_new(app.exe_names);
     }
@@ -562,15 +992,105 @@ pub(crate) fn activate_executable_path(executable_path: &str) -> bool {
         )
 }
 
+fn normalized_windows_path(value: &str) -> String {
+    value
+        .strip_prefix(r"\\?\")
+        .unwrap_or(value)
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
 fn process_image_matches_target(image: &str, target: &str) -> bool {
-    fn normalized(value: &str) -> String {
-        value
-            .strip_prefix(r"\\?\")
-            .unwrap_or(value)
-            .replace('/', "\\")
-            .to_ascii_lowercase()
+    normalized_windows_path(image) == normalized_windows_path(target)
+}
+
+/// 启动器式注册目标的「同族进程」判定（纯函数，便于单测）。
+///
+/// 背景（2026-10-02 实测）：`shell:AppsFolder\Kingsoft.Office.WPS` 的
+/// `PKEY_Link_TargetParsingPath` 解析结果是启动器 `...\WPS Office\ksolaunch.exe`，
+/// 而真正承载文档窗口的进程是 `...\WPS Office\<版本>\office6\wps.exe`。此时
+/// 「按精确路径找运行中进程」必然落空，于是每次触发都新开一个窗口。
+///
+/// 判定规则：候选必须位于解析路径的同一安装目录之下（含子目录），且不是解析
+/// 路径本身。返回 `Some(1)` 表示优先候选——exe 基名出现在 AUMID 里（如
+/// `Kingsoft.Office.WPS` ↔ `wps.exe`）；`Some(0)` 表示同目录下的其它可执行文件
+/// （可用但不优先，避免把「WPS 表格」当成「WPS 文字」）；`None` 表示不相干。
+pub fn launcher_family_rank(
+    image_path: &str,
+    resolved_path: &str,
+    app_user_model_id: &str,
+) -> Option<u8> {
+    let image = normalized_windows_path(image_path);
+    let resolved = normalized_windows_path(resolved_path);
+    if image.is_empty() || resolved.is_empty() || image == resolved {
+        return None;
     }
-    normalized(image) == normalized(target)
+    let install_dir = resolved.rsplit_once('\\')?.0;
+    if install_dir.is_empty() || !image.starts_with(&format!("{install_dir}\\")) {
+        return None;
+    }
+    let file_name = image.rsplit('\\').next().unwrap_or_default();
+    let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    let aumid = app_user_model_id.to_ascii_lowercase();
+    if stem.chars().count() >= 2 && aumid.contains(stem) {
+        Some(1)
+    } else {
+        Some(0)
+    }
+}
+
+/// 启动器式目标的兜底激活：在同一安装目录下寻找同族进程并前置其窗口。
+#[cfg(windows)]
+pub(crate) fn activate_install_directory_family(
+    resolved_path: &str,
+    app_user_model_id: &str,
+) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return false;
+    };
+    let mut preferred = std::collections::HashSet::new();
+    let mut fallback = std::collections::HashSet::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more {
+        if let Some(image) = process_image_path(entry.th32ProcessID) {
+            match launcher_family_rank(&image, resolved_path, app_user_model_id) {
+                Some(1) => {
+                    preferred.insert(entry.th32ProcessID);
+                }
+                Some(_) => {
+                    fallback.insert(entry.th32ProcessID);
+                }
+                None => {}
+            }
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    let activated = !preferred.is_empty()
+        && matches!(
+            activate_process_windows(&preferred),
+            RunningActivation::Activated(_)
+        );
+    if activated {
+        return true;
+    }
+    !fallback.is_empty()
+        && matches!(
+            activate_process_windows(&fallback),
+            RunningActivation::Activated(_)
+        )
 }
 
 #[cfg(windows)]
@@ -633,11 +1153,6 @@ fn process_app_user_model_id(pid: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
-pub(crate) fn process_is_foreground(pid: u32) -> bool {
-    unsafe { win_impl::foreground_belongs_to(pid) }
-}
-
-#[cfg(windows)]
 fn activate_process_windows(pids: &std::collections::HashSet<u32>) -> RunningActivation {
     use windows::Win32::Foundation::LPARAM;
     use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
@@ -671,7 +1186,8 @@ fn activate_process_windows(pids: &std::collections::HashSet<u32>) -> RunningAct
 #[cfg(windows)]
 mod win_impl {
     use windows::core::BOOL;
-    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::System::Threading::{
         AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
     };
@@ -680,9 +1196,10 @@ mod win_impl {
         KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_MENU,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE,
-        SW_SHOW, WS_EX_TOOLWINDOW,
+        GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
+        GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE, SW_SHOW,
+        WS_EX_TOOLWINDOW,
     };
 
     pub(super) struct EnumContext<'a> {
@@ -704,6 +1221,94 @@ mod win_impl {
         pub physical_alt_held: bool,
     }
 
+    // 进程/AUMID 只能确定应用身份，不能确定 HWND 的用途。Electron 等应用会
+    // 在同一身份下创建崩溃监视、消息、托盘与渲染辅助窗口；它们也可能无 owner、
+    // 非 WS_EX_TOOLWINDOW。窗口类只排除已知的框架辅助用途，尺寸兜底排除
+    // 尚未布局的消息窗口；仅对 Chromium 主窗口类检查标题是否存在，
+    // 不读取标题内容，也不以应用名称作判断。
+    pub(super) fn window_rejection_reason(
+        class_name: &str,
+        width: i32,
+        height: i32,
+        owned: bool,
+        cloaked: bool,
+        has_title: bool,
+    ) -> Option<&'static str> {
+        if owned {
+            return Some("owned");
+        }
+        if cloaked {
+            return Some("cloaked");
+        }
+        if class_name.starts_with("crashpad_")
+            || class_name == "Base_PowerMessageWindow"
+            || class_name == "Chrome_WidgetWin_0"
+            || class_name.contains("NotifyIconHostWindow")
+            || class_name.contains("SystemPreferencesHostWindow")
+            || class_name == "Chrome_StatusTrayWindow"
+        {
+            return Some("auxiliary_class");
+        }
+        // Chromium/Electron 的无标题 Chrome_WidgetWin_1 也可能是预创建的
+        // 空白 BrowserWindow。即使它有正常尺寸和 WS_EX_APPWINDOW，也不能
+        // 在应用自己的激活契约完成前把它强制显示出来。
+        if class_name == "Chrome_WidgetWin_1" && !has_title {
+            return Some("untitled_chromium_window");
+        }
+        if width < 120 || height < 80 {
+            return Some("small_or_unlaid_out");
+        }
+        None
+    }
+
+    unsafe fn eligible_window(hwnd: HWND) -> bool {
+        let owned = GetWindow(hwnd, GW_OWNER).unwrap_or(HWND::default()).0 != std::ptr::null_mut();
+        let tool = (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) & (WS_EX_TOOLWINDOW.0 as u32) != 0;
+        if tool {
+            crate::ble::gatt_note(
+                "app_launcher action=window_candidate terminal_result=rejected reason=tool_window"
+                    .to_owned(),
+            );
+            return false;
+        }
+        let mut class_buffer = [0u16; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buffer).max(0) as usize;
+        let class_name = String::from_utf16_lossy(&class_buffer[..class_len]);
+        let mut rect = RECT::default();
+        let has_rect = GetWindowRect(hwnd, &mut rect).is_ok();
+        let mut cloaked = 0i32;
+        let cloak_result = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+        let reason = if class_len == 0 {
+            Some("class_unavailable")
+        } else if !has_rect {
+            Some("rect_unavailable")
+        } else if cloak_result.is_err() {
+            Some("cloak_unavailable")
+        } else {
+            window_rejection_reason(
+                &class_name,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                owned,
+                cloaked != 0,
+                GetWindowTextLengthW(hwnd) > 0,
+            )
+        };
+        crate::ble::gatt_note(format!(
+            "app_launcher action=window_candidate terminal_result={} reason={} visible={} size_class={}",
+            if reason.is_none() { "accepted" } else { "rejected" },
+            reason.unwrap_or("main_candidate"),
+            IsWindowVisible(hwnd).as_bool(),
+            if !has_rect { "unknown" } else if rect.right - rect.left < 120 || rect.bottom - rect.top < 80 { "small" } else { "normal" },
+        ));
+        reason.is_none()
+    }
+
     pub(super) unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let context = &mut *(lparam.0 as *mut EnumContext);
         if context.activation.is_some() {
@@ -714,11 +1319,7 @@ mod win_impl {
         if !context.pids.contains(&pid) {
             return BOOL::from(true);
         }
-        // 只认主窗口：无所有者且非工具窗口（排除托盘/弹层/辅助隐藏窗口）。
-        if GetWindow(hwnd, GW_OWNER).unwrap_or(HWND::default()).0 != std::ptr::null_mut() {
-            return BOOL::from(true);
-        }
-        if (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) & (WS_EX_TOOLWINDOW.0 as u32) != 0 {
+        if !eligible_window(hwnd) {
             return BOOL::from(true);
         }
         if IsWindowVisible(hwnd).as_bool() {
@@ -744,10 +1345,9 @@ mod win_impl {
         if context.activation.is_some() {
             return BOOL::from(true);
         }
-        if GetWindow(hwnd, GW_OWNER).unwrap_or(HWND::default()).0 != std::ptr::null_mut()
-            || (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) & (WS_EX_TOOLWINDOW.0 as u32) != 0
-            || !window_app_user_model_id(hwnd)
-                .is_some_and(|value| value.eq_ignore_ascii_case(context.app_user_model_id))
+        if !window_app_user_model_id(hwnd)
+            .is_some_and(|value| value.eq_ignore_ascii_case(context.app_user_model_id))
+            || !eligible_window(hwnd)
         {
             return BOOL::from(true);
         }
@@ -815,7 +1415,7 @@ mod win_impl {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let outcome = super::drive_foreground_activation(|use_alt_unlock| {
-            foreground_attempt(hwnd, target_pid, use_alt_unlock)
+            foreground_attempt(hwnd, use_alt_unlock)
         });
         crate::ble::gatt_note(format!(
             "app_launcher action=show_and_force_foreground terminal_result={} target_result={} self_window={self_window} visible_before={visible_before} took_show_path={took_show_path} attempt_count={} alt_unlock_submitted={} set_foreground_ok={}",
@@ -828,11 +1428,7 @@ mod win_impl {
         outcome
     }
 
-    unsafe fn foreground_attempt(
-        hwnd: HWND,
-        target_pid: u32,
-        use_alt_unlock: bool,
-    ) -> super::ForegroundAttempt {
+    unsafe fn foreground_attempt(hwnd: HWND, use_alt_unlock: bool) -> super::ForegroundAttempt {
         let foreground = GetForegroundWindow();
         let foreground_thread = GetWindowThreadProcessId(foreground, None);
         let current_thread = GetCurrentThreadId();
@@ -856,8 +1452,9 @@ mod win_impl {
             let _ = AttachThreadInput(foreground_thread, current_thread, false);
         }
 
-        // SetForegroundWindow 的 BOOL 不是产品成功判据；读回前台窗口所属进程。
-        let target_is_foreground = foreground_belongs_to(target_pid);
+        // SetForegroundWindow 的 BOOL 不是产品成功判据；读回选定的前台 HWND。
+        let target_is_foreground =
+            foreground_matches_window(GetForegroundWindow().0 as isize, hwnd.0 as isize);
         crate::ble::gatt_note(format!(
             "app_launcher action=foreground_attempt use_alt_unlock={use_alt_unlock} physical_alt_held={} attach_requested={attached} attach_ok={attach_ok} alt_unlock_submitted={} set_foreground_ok={set_foreground_ok} target_is_foreground={target_is_foreground}",
             alt_unlock.physical_alt_held,
@@ -900,14 +1497,8 @@ mod win_impl {
         }
     }
 
-    pub(crate) unsafe fn foreground_belongs_to(target_pid: u32) -> bool {
-        let foreground = GetForegroundWindow();
-        if foreground.0.is_null() {
-            return false;
-        }
-        let mut foreground_pid = 0u32;
-        GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
-        foreground_pid == target_pid
+    pub(super) fn foreground_matches_window(foreground: isize, target: isize) -> bool {
+        foreground != 0 && foreground == target
     }
 
     unsafe fn submit_alt_edge(key_up: bool) -> bool {
@@ -1003,7 +1594,7 @@ fn launch_path(_path: &str) -> Result<(), String> {
 
 /// 按完整路径启动（短命 COM 线程内 ShellExecuteW，支持 .exe/.lnk）。
 #[cfg(windows)]
-fn launch_path(path: &str) -> Result<(), String> {
+pub(crate) fn launch_path(path: &str) -> Result<(), String> {
     launch_explicit(path, None, None, true)
 }
 
@@ -1178,7 +1769,17 @@ pub fn pick_custom_app() -> Option<CustomAppPick> {
                         .file_stem()
                         .map(|stem| stem.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.clone());
-                    Some(CustomAppPick { name, path })
+                    let identity_path = if path.to_ascii_lowercase().ends_with(".lnk") {
+                        resolve_lnk(&path).map(|resolved| resolved.exe_path)?
+                    } else {
+                        path.clone()
+                    };
+                    let application_id = application_identity_for_path(&identity_path);
+                    Some(CustomAppPick {
+                        name,
+                        path,
+                        application_id,
+                    })
                 }
             })();
             unsafe {
@@ -1198,6 +1799,56 @@ pub fn pick_custom_app() -> Option<CustomAppPick> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn window_candidate_rejects_auxiliary_windows_from_real_apps() {
+        use super::win_impl::window_rejection_reason;
+
+        assert_eq!(
+            window_rejection_reason("crashpad_SessionEndWatcher", 136, 39, false, false, false),
+            Some("auxiliary_class")
+        );
+        assert_eq!(
+            window_rejection_reason("Base_PowerMessageWindow", 0, 0, false, false, false),
+            Some("auxiliary_class")
+        );
+        assert_eq!(
+            window_rejection_reason("Chrome_WidgetWin_0", 1920, 1019, false, false, false),
+            Some("auxiliary_class")
+        );
+        assert_eq!(
+            window_rejection_reason("Electron_NotifyIconHostWindow", 0, 0, false, false, false),
+            Some("auxiliary_class")
+        );
+        assert_eq!(
+            window_rejection_reason("Chrome_WidgetWin_1", 960, 720, false, false, true),
+            None
+        );
+        assert_eq!(
+            window_rejection_reason("Chrome_WidgetWin_1", 960, 720, false, false, false),
+            Some("untitled_chromium_window")
+        );
+        assert_eq!(
+            window_rejection_reason("Chrome_WidgetWin_1", 960, 720, true, false, true),
+            Some("owned")
+        );
+        assert_eq!(
+            window_rejection_reason("Chrome_WidgetWin_1", 960, 720, false, true, true),
+            Some("cloaked")
+        );
+        assert_eq!(
+            window_rejection_reason("UnknownWindow", 136, 39, false, false, false),
+            Some("small_or_unlaid_out")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreground_must_be_the_selected_window() {
+        assert!(super::win_impl::foreground_matches_window(42, 42));
+        assert!(!super::win_impl::foreground_matches_window(42, 43));
+    }
 
     #[test]
     fn executable_identity_normalizes_windows_path_forms() {
@@ -1437,6 +2088,223 @@ pub(crate) mod tests {
         assert!(preset_app("nonexistent-app").is_none());
     }
 
+    /// 2026-10-02 扩充的预设应用（Vokie / Visual Studio Code / Cursor / DimAgent /
+    /// QQ / 飞书 / Hermes）：必须带开始菜单快捷方式探测名——这些应用常装在
+    /// 自定义目录（如 D:\Apps），App Paths 与 System32 探测覆盖不到。
+    #[test]
+    fn preset_table_includes_requested_apps() {
+        for (id, name) in [
+            ("vokie", "Vokie"),
+            ("vscode", "Visual Studio Code"),
+            ("cursor", "Cursor"),
+            ("dimagent", "DimAgent"),
+            ("qq", "QQ"),
+            ("feishu", "飞书"),
+            ("hermes", "Hermes"),
+        ] {
+            let app = preset_app(id).unwrap_or_else(|| panic!("预设表缺少 {id}"));
+            assert_eq!(app.name, name, "{id} 的展示名");
+            assert!(
+                !app.shortcut_names.is_empty(),
+                "{id} 需要开始菜单快捷方式兜底探测"
+            );
+        }
+    }
+
+    /// 微信常装在自定义目录（本机 D:\Apps\Weixin）：必须带开始菜单兜底，
+    /// 否则已安装的微信不会出现在"打开应用"列表（2026-10-02 用户反馈）。
+    #[test]
+    fn wechat_preset_falls_back_to_start_menu_shortcut() {
+        let app = preset_app("wechat").expect("微信预设");
+        assert!(
+            app.shortcut_names.contains(&"微信"),
+            "微信需要开始菜单快捷方式兜底探测"
+        );
+    }
+
+    /// 安装候选路径模板展开：正常变量、整串变量与缺失变量。
+    #[test]
+    #[cfg(windows)]
+    fn install_path_templates_expand_environment_variables() {
+        let expanded = expand_install_path("%SystemRoot%\\System32\\notepad.exe")
+            .expect("SystemRoot 应可展开");
+        assert!(expanded.is_file(), "展开结果应指向真实文件：{expanded:?}");
+        assert!(expand_install_path("%SystemRoot%").is_some());
+        assert!(
+            expand_install_path("%SAYALL_MISSING_VAR_PROBE%\\app.exe").is_none(),
+            "变量缺失必须返回 None，不能留下字面量路径"
+        );
+    }
+
+    /// 开始菜单索引：识别 .lnk（大小写不敏感）、递归子目录、忽略其他文件。
+    #[test]
+    #[cfg(windows)]
+    fn start_menu_index_collects_lnk_names() {
+        let root = std::env::temp_dir().join("sayall-start-menu-index-probe");
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("Tools");
+        std::fs::create_dir_all(&nested).expect("创建探测目录");
+        std::fs::write(root.join("readme.txt"), b"x").expect("写入无关文件");
+        std::fs::write(root.join("Hermes.LNK"), b"x").expect("写入快捷方式");
+        std::fs::write(nested.join("Visual Studio Code.lnk"), b"x").expect("写入嵌套快捷方式");
+        let mut out = Vec::new();
+        collect_start_menu_shortcuts(&root, &mut out);
+        let stems: Vec<&str> = out.iter().map(|(stem, _)| stem.as_str()).collect();
+        assert!(stems.contains(&"hermes"), "扩展名大小写不敏感：{stems:?}");
+        assert!(
+            stems.contains(&"visual studio code"),
+            "应递归子目录：{stems:?}"
+        );
+        assert_eq!(out.len(), 2, "非 .lnk 文件不应入索引");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 候选路径存在时启动目标直接取完整路径（自定义安装目录的关键路径）。
+    #[test]
+    #[cfg(windows)]
+    fn preset_launch_target_prefers_existing_install_path() {
+        let probe = std::env::temp_dir().join("sayall-preset-install-path-probe.exe");
+        std::fs::write(&probe, b"x").expect("创建探测文件");
+        let app = PresetApp {
+            id: "probe",
+            name: "probe",
+            exe_names: &["probe.exe"],
+            install_paths: &["%TEMP%\\sayall-preset-install-path-probe.exe"],
+            shortcut_names: &[],
+        };
+        let target = preset_launch_target(&app, &[]).expect("候选路径应命中");
+        assert_eq!(target.source, "install_path");
+        assert!(target
+            .exe_path
+            .to_lowercase()
+            .ends_with("sayall-preset-install-path-probe.exe"));
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// 开始菜单快捷方式：名称命中且目标 exe 名匹配才可用；同名快捷方式
+    /// 指向别的程序时必须拒绝，避免把未安装误报成已安装。
+    #[test]
+    #[cfg(windows)]
+    fn preset_launch_target_resolves_matching_shortcut_only() {
+        let dir = std::env::temp_dir().join("sayall-preset-shortcut-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建探测目录");
+        let target_exe = dir.join("Hermes.exe");
+        std::fs::write(&target_exe, b"x").expect("创建目标 exe 占位文件");
+        let lnk = dir.join("Hermes.lnk");
+        assert!(
+            create_test_shortcut(&lnk, &target_exe.to_string_lossy(), "", ""),
+            "创建探测快捷方式失败"
+        );
+
+        let app = PresetApp {
+            id: "shortcut-probe",
+            name: "shortcut-probe",
+            exe_names: &["Hermes.exe"],
+            install_paths: &[],
+            shortcut_names: &["Hermes"],
+        };
+        let index = vec![("hermes".to_owned(), lnk.clone())];
+        let target = preset_launch_target(&app, &index).expect("快捷方式应命中");
+        assert_eq!(target.source, "start_menu_shortcut");
+        assert!(target.exe_path.to_lowercase().ends_with("hermes.exe"));
+
+        // 同名快捷方式指向不匹配的 exe：拒绝。
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("创建子目录");
+        let other_exe = sub.join("Other.exe");
+        std::fs::write(&other_exe, b"x").expect("创建无关 exe 占位文件");
+        let other_lnk = sub.join("Hermes.lnk");
+        assert!(create_test_shortcut(
+            &other_lnk,
+            &other_exe.to_string_lossy(),
+            "",
+            ""
+        ));
+        let index = vec![("hermes".to_owned(), other_lnk)];
+        assert!(
+            preset_launch_target(&app, &index).is_none(),
+            "目标 exe 与 exe_names 不匹配必须拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探测结果一致性：probe 判定已安装的预设（自身除外）必须能给出
+    /// System32/App Paths 或候选路径/开始菜单启动位置——否则 UI 会展示
+    /// 一个点了打不开的芯片。
+    #[test]
+    #[cfg(windows)]
+    fn installed_preset_apps_expose_launch_targets() {
+        let shortcuts = start_menu_shortcuts();
+        for info in probe_preset_apps() {
+            if !info.installed || info.id == "sayall" {
+                continue;
+            }
+            let app = preset_app(&info.id).expect("probe 只返回预设表内的条目");
+            assert!(
+                app.exe_names.iter().any(|exe| exe_resolvable(exe))
+                    || preset_launch_target(app, &shortcuts).is_some(),
+                "{} 判定已安装却没有可用的启动位置",
+                info.id
+            );
+        }
+    }
+
+    /// 在测试里创建指向指定 exe 的 .lnk（真机 COM 链路，与
+    /// `lnk_resolution_round_trips` 同一套 IShellLinkW + IPersistFile）。
+    #[cfg(windows)]
+    fn create_test_shortcut(
+        lnk: &std::path::Path,
+        target: &str,
+        arguments: &str,
+        working_dir: &str,
+    ) -> bool {
+        let lnk = lnk.to_path_buf();
+        let target = target.to_owned();
+        let arguments = arguments.to_owned();
+        let working_dir = working_dir.to_owned();
+        std::thread::Builder::new()
+            .name("sayall-test-lnk-create".to_owned())
+            .spawn(move || {
+                use windows::core::{Interface, PCWSTR};
+                use windows::Win32::System::Com::IPersistFile;
+                use windows::Win32::System::Com::{
+                    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                    COINIT_APARTMENTTHREADED,
+                };
+                use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+                unsafe {
+                    if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+                        return false;
+                    }
+                }
+                let ok = (|| unsafe {
+                    let link: IShellLinkW =
+                        CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+                    let wide =
+                        |text: &str| -> Vec<u16> { text.encode_utf16().chain(Some(0)).collect() };
+                    let target_wide = wide(&target);
+                    link.SetPath(PCWSTR(target_wide.as_ptr())).ok()?;
+                    let args_wide = wide(&arguments);
+                    link.SetArguments(PCWSTR(args_wide.as_ptr())).ok()?;
+                    let dir_wide = wide(&working_dir);
+                    link.SetWorkingDirectory(PCWSTR(dir_wide.as_ptr())).ok()?;
+                    let persist: IPersistFile = link.cast().ok()?;
+                    let lnk_wide = wide(&lnk.to_string_lossy());
+                    persist.Save(PCWSTR(lnk_wide.as_ptr()), true).ok()?;
+                    Some(())
+                })()
+                .is_some();
+                unsafe {
+                    CoUninitialize();
+                }
+                ok
+            })
+            .expect("spawn create thread failed")
+            .join()
+            .expect("create thread panicked")
+    }
+
     #[test]
     #[cfg(windows)]
     fn custom_path_targets_are_recognized() {
@@ -1553,6 +2421,89 @@ pub(crate) mod tests {
         assert_eq!(apps[0].id, "sayall", "对齐 Mac：自身排首位");
     }
 
+    #[test]
+    fn application_identity_uses_preset_ids_or_normalized_full_paths() {
+        assert_eq!(
+            application_identity_for_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            "chrome"
+        );
+        assert_eq!(
+            application_identity_for_path(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.903.8094.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+            ),
+            "codex"
+        );
+        assert_eq!(
+            application_identity_for_path(r"C:\Program Files\OpenAI\Codex.exe"),
+            "codex"
+        );
+        assert_eq!(
+            application_identity_for_path(
+                r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2.3.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+            ),
+            r"c:\program files\windowsapps\openai.chatgpt-desktop_1.2.3.0_x64__2p2nqsd0c76g0\app\chatgpt.exe"
+        );
+        assert_eq!(
+            application_identity_for_path(r"C:\Program Files\OpenAI\ChatGPT.exe"),
+            r"c:\program files\openai\chatgpt.exe"
+        );
+        assert_eq!(
+            application_identity_for_path(r"\\?\D:/Tools/Reader.EXE"),
+            r"d:\tools\reader.exe"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn running_app_discovery_returns_visible_process_identities() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("SayAll application discovery probe"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                320,
+                180,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("probe window should be created")
+        };
+        let apps = list_running_apps();
+        let current_exe = std::env::current_exe().expect("test process path should be available");
+        let expected = application_identity_for_path(&current_exe.to_string_lossy());
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert!(apps.iter().any(|app| app.application_id == expected));
+        let mut identities = std::collections::HashSet::new();
+        for app in apps {
+            assert!(identities.insert(app.application_id.to_lowercase()));
+            if app.preset {
+                assert!(preset_app(&app.application_id).is_some());
+            } else {
+                assert!(std::path::Path::new(&app.application_id).is_absolute());
+                assert!(app.application_id.to_ascii_lowercase().ends_with(".exe"));
+            }
+            assert!(!app.name.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn bluetooth_settings_uses_only_the_fixed_windows_uri() {
+        assert_eq!(BLUETOOTH_SETTINGS_URI, "ms-settings:bluetooth");
+    }
+
     /// COM 文件对话框管线（创建+标题+过滤器+选项）可用性探针；
     /// Show 的交互行为由真机 UI 验证，此处验证 COM 对象链路本身。
     #[test]
@@ -1640,5 +2591,68 @@ pub(crate) mod tests {
         let directory = std::env::temp_dir().join("sayall-open-directory-probe");
         std::fs::create_dir_all(&directory).expect("创建取证目录失败");
         open_directory(&directory).expect("ShellExecuteW 打开目录应返回成功");
+    }
+
+    #[test]
+    fn launcher_family_rank_prefers_exe_name_matching_aumid() {
+        let resolved = r"C:\Program Files (x86)\WPS Office\ksolaunch.exe";
+        let aumid = "Kingsoft.Office.WPS";
+
+        // 真正的文档进程：同安装目录的版本子目录里，基名 wps 出现在 AUMID 中 → 优先
+        assert_eq!(
+            launcher_family_rank(
+                r"C:\Program Files (x86)\WPS Office\12.1.0.25225\office6\wps.exe",
+                resolved,
+                aumid
+            ),
+            Some(1)
+        );
+        // 同族的表格进程：同目录之下，但基名与 AUMID 不符 → 可用但不优先
+        assert_eq!(
+            launcher_family_rank(
+                r"C:\Program Files (x86)\WPS Office\12.1.0.25225\office6\et.exe",
+                resolved,
+                aumid
+            ),
+            Some(0)
+        );
+        // 表格 AUMID 下，et.exe 反过来是优先候选
+        assert_eq!(
+            launcher_family_rank(
+                r"C:\Program Files (x86)\WPS Office\12.1.0.25225\office6\et.exe",
+                resolved,
+                "Kingsoft.Office.ET"
+            ),
+            Some(1)
+        );
+        // 不在同一安装目录 → 不相干
+        assert_eq!(
+            launcher_family_rank(r"C:\Other\app.exe", resolved, aumid),
+            None
+        );
+        // 解析路径本身由精确匹配负责，不在这里重复判定
+        assert_eq!(launcher_family_rank(resolved, resolved, aumid), None);
+    }
+
+    #[test]
+    fn launcher_family_rank_normalizes_case_separators_and_prefix() {
+        let resolved = r"C:\Program Files (x86)\WPS Office\ksolaunch.exe";
+        assert_eq!(
+            launcher_family_rank(
+                r"\\?\c:/program files (x86)/wps office/12.1.0.25225/office6/WPS.EXE",
+                resolved,
+                "Kingsoft.Office.WPS"
+            ),
+            Some(1)
+        );
+        // 只差一个字符的相邻目录不能算同族（避免误命中同级产品）
+        assert_eq!(
+            launcher_family_rank(
+                r"C:\Program Files (x86)\WPS Office Backup\wps.exe",
+                resolved,
+                "Kingsoft.Office.WPS"
+            ),
+            None
+        );
     }
 }

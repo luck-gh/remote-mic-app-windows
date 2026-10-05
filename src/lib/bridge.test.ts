@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   actionSummary,
@@ -6,12 +7,14 @@ import {
   chordLabel,
   connectionPhaseLabel,
   formatDiagnosticReport,
-  identityShortcutByButton,
+  GITHUB_REPOSITORY_URL,
   isRecommendedVoiceEndpoint,
+  OFFICIAL_WEBSITE_URL,
+  openGitHubRepository,
   openLogDirectory,
+  openOfficialWebsite,
   openVbCableDownloadPage,
   remoteModelLabel,
-  shortcutCapability,
   VB_CABLE_DOWNLOAD_URL,
   type AudioPhase,
   type ConnectionPhase,
@@ -19,55 +22,13 @@ import {
 } from "./bridge";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 describe("mouse actions", () => {
   it("summarizes clicks, movement, and wheel amounts", () => {
     expect(actionSummary({ type: "scroll", direction: "down", steps: 5 })).toBe("滚轮向下 5 格");
     expect(actionSummary({ type: "mouse_move", direction: "left", distance: 75 })).toBe("鼠标向左 75 px");
     expect(actionSummary({ type: "mouse_click", kind: "double_left" })).toBe("左键双击");
-  });
-});
-
-describe("mapping capability matrix（单响应判定，用于信息提示）", () => {
-  it("直接归因族（电源/菜单）全部触发单响应", () => {
-    expect(shortcutCapability("power", "long", "rc003")).toBe("all");
-    expect(shortcutCapability("power", "single", "rc003")).toBe("all");
-    expect(shortcutCapability("menu", "double", "rc003")).toBe("all");
-  });
-
-  it("武装族（确定/方向/主页）单击可同键对冲，双击/长按判定为附带原生动作", () => {
-    expect(shortcutCapability("ok", "single", "rc003")).toBe("identity");
-    expect(shortcutCapability("ok", "double", "rc003")).toBe("none");
-    expect(shortcutCapability("ok", "long", "rc003")).toBe("none");
-    expect(shortcutCapability("up", "single", "rc003")).toBe("identity");
-    expect(shortcutCapability("down", "single", "rc001")).toBe("identity");
-    expect(shortcutCapability("left", "single", "rc003")).toBe("identity");
-    expect(shortcutCapability("left", "double", "rc001")).toBe("none");
-    expect(shortcutCapability("right", "long", "rc001")).toBe("none");
-    expect(shortcutCapability("home", "single", "rc003")).toBe("identity");
-  });
-
-  it("TV 与返回/音量±全型号判定为不可配（2026-09-07 用户决策：两型号行为一致）", () => {
-    expect(shortcutCapability("tv", "single", "rc003")).toBe("none");
-    expect(shortcutCapability("tv", "long", "rc001")).toBe("none");
-    expect(shortcutCapability("back", "single", "rc003")).toBe("none");
-    expect(shortcutCapability("volume_up", "single", "rc003")).toBe("none");
-    expect(shortcutCapability("volume_down", "single", "unknown")).toBe("none");
-    expect(shortcutCapability("back", "single", "unknown")).toBe("none");
-    expect(shortcutCapability("back", "single", "rc001")).toBe("none");
-    expect(shortcutCapability("volume_up", "long", "rc001")).toBe("none");
-    expect(shortcutCapability("volume_down", "double", "rc001")).toBe("none");
-  });
-
-  it("identityShortcutByButton 对齐 Rust native_key（泄漏对冲判定依据）", () => {
-    expect(identityShortcutByButton.ok).toBe("enter");
-    expect(identityShortcutByButton.up).toBe("up");
-    expect(identityShortcutByButton.down).toBe("down");
-    expect(identityShortcutByButton.left).toBe("left");
-    expect(identityShortcutByButton.right).toBe("right");
-    expect(identityShortcutByButton.home).toBe("home");
-    expect(identityShortcutByButton.tv).toBeUndefined();
-    expect(identityShortcutByButton.power).toBeUndefined();
   });
 });
 
@@ -128,8 +89,8 @@ describe("connection phase presentation", () => {
   });
 
   it("展示 RC001、RC003 和未知型号", () => {
-    expect(remoteModelLabel("rc001")).toBe("小米蓝牙遥控器 2");
-    expect(remoteModelLabel("rc003")).toBe("小米蓝牙遥控器 2 Pro");
+    expect(remoteModelLabel("rc001")).toBe("小米蓝牙语音遥控器 2");
+    expect(remoteModelLabel("rc003")).toBe("小米蓝牙语音遥控器 2 Pro");
     expect(remoteModelLabel("unknown")).toBe("连接后显示");
   });
 
@@ -230,6 +191,46 @@ describe("VB-CABLE download guidance", () => {
 
     expect(open).toHaveBeenCalledWith(VB_CABLE_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
     open.mockRestore();
+  });
+});
+
+describe("设置页外部入口（官网 / GitHub）", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(openUrl).mockReset();
+  });
+
+  it("指向已确认的官网与 Windows 仓库地址", () => {
+    // 2026-10-02 用户指定：官网入口带 `?from=win` 来源标记，便于官网区分来客。
+    expect(OFFICIAL_WEBSITE_URL).toBe("https://sayall.app/?from=win");
+    expect(GITHUB_REPOSITORY_URL).toBe("https://github.com/GetSayAll/remote-mic-app-windows");
+  });
+
+  it("浏览器预览下用新标签打开，不调用 Tauri opener", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+
+    await openOfficialWebsite();
+    await openGitHubRepository();
+
+    expect(open).toHaveBeenNthCalledWith(1, OFFICIAL_WEBSITE_URL, "_blank", "noopener,noreferrer");
+    expect(open).toHaveBeenNthCalledWith(2, GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer");
+    expect(openUrl).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("Tauri 运行时交给 opener 插件，地址必须与 capability 白名单逐字一致", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    vi.mocked(openUrl).mockResolvedValue(undefined);
+
+    await openOfficialWebsite();
+    await openGitHubRepository();
+
+    // 传出的字符串与 src-tauri/capabilities/default.json 的 allow 列表是同一份
+    // 契约：多一个字符、少一个尾斜杠都会被插件判为 ForbiddenUrl。
+    expect(vi.mocked(openUrl).mock.calls.map(([url]) => url)).toEqual([
+      OFFICIAL_WEBSITE_URL,
+      GITHUB_REPOSITORY_URL,
+    ]);
   });
 });
 

@@ -9,8 +9,7 @@
 //! 结构（2026-09-10 加固后，单一 Raw Input 注册 + 钩子链头 bump）：
 //! - **钩子线程**：常驻 WH_KEYBOARD_LL 钩子（专职消息泵）。吞键判定只针对
 //!   F5，其余按键一律透传；武装条件（其一）：ATVV 语音会话进行中
-//!   （`set_session_active`，BLE 工作线程调用）、BLE 正处于连接建立/重连
-//!   窗口，或主 Raw Input 监听器在武装宽限（250ms）内观察到来自遥控器的 F5；首个
+//!   （`set_session_active`，BLE 工作线程调用），或主 Raw Input 监听器在武装宽限（250ms）内观察到来自遥控器的 F5；首个
 //!   F5 在回调内有界等待 60ms 等任一武装信号（物理 F5 最坏 +60ms 延迟，
 //!   ZSTDJan 同款取舍）。
 //! - **Raw Input 归因**：由 `raw_input_windows.rs` 的进程唯一注册窗口转发。
@@ -47,8 +46,8 @@ mod windows_impl {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetTimer,
-        SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG,
-        WH_KEYBOARD_LL, WM_APP, WM_QUIT, WM_TIMER,
+        SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+        LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_APP, WM_QUIT, WM_TIMER,
     };
 
     const ARM_GRACE_MS: u64 = 250;
@@ -60,9 +59,6 @@ mod windows_impl {
     const BUMP_TIMER_MS: u32 = 10_000;
 
     static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
-    /// 连接建立/重连阶段临时接管 F5。此时遥控器的原生 F5 可能先于 ATVV
-    /// 控制通知到达；若放行会触发记事本“插入时间/日期”等前台副作用。
-    static LINK_GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
     static ARMED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
     static SWALLOW_MASTER: AtomicBool = AtomicBool::new(false);
     /// 抑制器决策计数（AGENTS.md 功能点日志规范；仅钩子线程原子递增，
@@ -100,14 +96,42 @@ mod windows_impl {
     }
 
     fn swallow_ready() -> bool {
-        decide(
-            VK_F5,
-            false,
-            session_active(),
-            LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
-            armed(),
-            HOLD_NONE,
-        )
+        decide(VK_F5, false, session_active(), armed(), HOLD_NONE)
+    }
+
+    /// 微信输入法自注入的存活标记（break key）：其钩子存活时，吞掉语音和弦的
+    /// LWin 边沿并注入自己的 0xFC 边沿对（extra="WTYP"，见 ATTRIBUTION.md
+    /// 2026-09-05 kb-live 全解码）；钩子休眠时边沿泄漏、无此标记。该标记与
+    /// ConsentStore 开麦时间戳 100% 交叉一致，因此成为**与版本解耦**的存活
+    /// 判据（2026-09-23 issue #118 起 ConsentStore 对 2.1.4.6 失明）。
+    const VK_WETYPE_MARKER: u32 = 0xFC;
+    static WETYPE_MARKER_COUNT: AtomicU64 = AtomicU64::new(0);
+    static WETYPE_MARKER_LAST_EXTRA: AtomicU64 = AtomicU64::new(0);
+
+    /// 纯判定：该键盘事件是否为微信输入法的存活标记（单元测试覆盖）。
+    /// 物理键盘不会产生 0xFC，因此只认注入形态。
+    pub fn is_wetype_marker(vk_code: u32, injected: bool) -> bool {
+        injected && vk_code == VK_WETYPE_MARKER
+    }
+
+    /// 钩子线程内记录（无 IO、无锁、仅原子递增）。extra 是目标程序自定义的
+    /// 魔数（非用户数据），只用于确认归因。
+    fn note_key_event(vk_code: u32, injected: bool, extra: u64) {
+        if is_wetype_marker(vk_code, injected) {
+            WETYPE_MARKER_COUNT.fetch_add(1, Ordering::Relaxed);
+            WETYPE_MARKER_LAST_EXTRA.store(extra, Ordering::Relaxed);
+        }
+    }
+
+    /// 存活标记累计值：会话开始前取基线，检测点取当前值，前进即证明微信输入法
+    /// 已响应本次和弦（判据由 `wetype_revive::reaction_verdict` 合并）。
+    pub fn wetype_marker_count() -> u64 {
+        WETYPE_MARKER_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// 最后一次标记的 extra（诊断用；0 表示尚未观察到任何标记）。
+    pub fn wetype_marker_last_extra() -> u64 {
+        WETYPE_MARKER_LAST_EXTRA.load(Ordering::Relaxed)
     }
 
     /// 纯决策函数：给定状态与按键，是否吞键（单元测试覆盖）。
@@ -118,7 +142,6 @@ mod windows_impl {
         vk_code: u32,
         is_key_up: bool,
         session: bool,
-        link_guard: bool,
         armed_now: bool,
         hold_pairing: u32,
     ) -> bool {
@@ -128,7 +151,7 @@ mod windows_impl {
         if is_key_up {
             return hold_pairing == HOLD_SWALLOWED_ALL;
         }
-        session || link_guard || armed_now
+        session || armed_now
     }
 
     /// 纯状态转移：DOWN 沿裁决后更新配对状态。任一 DOWN 沿泄漏（含 typematic
@@ -150,18 +173,17 @@ mod windows_impl {
             let message = wparam.0 as u32;
             if matches!(message, 0x0100 | 0x0104 | 0x0101 | 0x0105) {
                 let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                // 功能点观测：微信输入法存活标记（只增计数，不参与吞键判定）。
+                note_key_event(
+                    kb.vkCode,
+                    kb.flags.contains(LLKHF_INJECTED),
+                    kb.dwExtraInfo as u64,
+                );
                 if kb.vkCode == VK_F5 {
                     let is_key_up = matches!(message, 0x0101 | 0x0105);
                     if is_key_up {
                         let hold = HOLD_PAIRING.swap(HOLD_NONE, Ordering::Relaxed);
-                        if decide(
-                            VK_F5,
-                            true,
-                            session_active(),
-                            LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
-                            armed(),
-                            hold,
-                        ) {
+                        if decide(VK_F5, true, session_active(), armed(), hold) {
                             return LRESULT(1);
                         }
                         // DOWN 沿曾泄漏进 OS（或配对未知）：放行 UP，防止粘键。
@@ -243,7 +265,10 @@ mod windows_impl {
                 return;
             }
             HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
-            SetTimer(None, BUMP_TIMER_ID, BUMP_TIMER_MS, None);
+            // hWnd=NULL 的线程定时器忽略传入 nIDEvent（Win32 文档），WM_TIMER 的
+            // wParam 是系统分配的 id：必须按 SetTimer 返回值匹配，否则定期链头
+            // bump 永不执行（2026-09-27 key_gate 侧探针实证同款缺陷）。
+            let bump_timer = SetTimer(None, BUMP_TIMER_ID, BUMP_TIMER_MS, None);
             SWALLOW_MASTER.store(true, Ordering::Relaxed);
 
             let mut message = MSG::default();
@@ -251,7 +276,7 @@ mod windows_impl {
                 match message.message {
                     WM_QUIT => break,
                     WM_HOOK_BUMP => bump_to_chain_head(&mut current),
-                    WM_TIMER if message.wParam.0 as usize == BUMP_TIMER_ID => {
+                    WM_TIMER if message.wParam.0 as usize == bump_timer => {
                         bump_to_chain_head(&mut current)
                     }
                     _ => {}
@@ -281,7 +306,6 @@ mod windows_impl {
         /// 启动抑制线程（钩子 + 消息泵；Raw Input 归因由主监听器转发）。
         pub fn start() -> VoiceKeySuppressor {
             SESSION_ACTIVE.store(false, Ordering::Relaxed);
-            LINK_GUARD_ACTIVE.store(false, Ordering::Relaxed);
             ARMED_UNTIL_MS.store(0, Ordering::Relaxed);
             HOLD_PAIRING.store(HOLD_NONE, Ordering::Relaxed);
             let (thread_id_tx, thread_id_rx) = mpsc::channel();
@@ -328,20 +352,6 @@ mod windows_impl {
         }
     }
 
-    /// BLE 连接建立/重连窗口临时保护遥控器原生 F5。就绪、失败、挂起或
-    /// 用户主动断开时关闭，避免长期占用实体键盘 F5。
-    pub fn set_link_guard_active(active: bool) {
-        let previous = LINK_GUARD_ACTIVE.swap(active, Ordering::Relaxed);
-        if previous && !active {
-            ARMED_UNTIL_MS.store(now_ms() + ARM_GRACE_MS, Ordering::Relaxed);
-        }
-        if previous != active {
-            crate::ble::gatt_note(format!(
-                "voice_f5_guard active={active} reason=ble_link_transition"
-            ));
-        }
-    }
-
     /// ATVV 语音会话起止（模块级，供 BleRuntime 工作线程调用）：
     /// 会话期间吞 F5；结束时保留 250ms 宽限覆盖晚到的释放沿。
     /// 会话开始同时请求钩子链头 bump——微信输入法等目标若在本应用之后
@@ -352,13 +362,12 @@ mod windows_impl {
             // 功能点日志：抑制器决策计数快照（自应用启动累计），首按
             // 失败类报障一次日志拉取即可归因（泄漏/等待超时/即时吞下）。
             crate::ble::gatt_note(format!(
-                "suppressor_stats seen={} swallowed={} leaked={} waited_late={} raw_remote_f5={} link_guard={}",
+                "suppressor_stats seen={} swallowed={} leaked={} waited_late={} raw_remote_f5={}",
                 F5_DOWN_SEEN.load(Ordering::Relaxed),
                 F5_DOWN_SWALLOWED.load(Ordering::Relaxed),
                 F5_DOWN_LEAKED.load(Ordering::Relaxed),
                 F5_DOWN_WAITED_ARMED_LATE.load(Ordering::Relaxed),
                 REMOTE_F5_RAW_OBSERVED.load(Ordering::Relaxed),
-                LINK_GUARD_ACTIVE.load(Ordering::Relaxed),
             ));
             let thread_id = HOOK_THREAD_ID.load(Ordering::Relaxed);
             if thread_id != 0 {
@@ -392,66 +401,34 @@ mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    arm_grace, observe_remote_voice_f5, set_link_guard_active, set_remote_hid_activity_notify,
-    set_session_active, VoiceKeySuppressor,
+    arm_grace, observe_remote_voice_f5, set_remote_hid_activity_notify, set_session_active,
+    VoiceKeySuppressor,
 };
 
+#[cfg(windows)]
+pub use windows_impl::{wetype_marker_count, wetype_marker_last_extra};
+
 #[cfg(all(windows, test))]
-pub use windows_impl::{decide, track_down, HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWED_ALL};
+pub use windows_impl::{
+    decide, is_wetype_marker, track_down, HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWED_ALL,
+};
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_armed_session_or_link_guard_f5_down_is_swallowed() {
-        // DOWN 沿：非 F5 一律透传；F5 仅在会话、建链保护或设备归因武装时吞。
+    fn only_remote_or_session_f5_down_is_swallowed() {
+        // DOWN 沿：非 F5 一律透传；F5 仅在会话或武装时吞（配对状态不参与）。
+        assert!(!super::decide(0x41, false, false, false, super::HOLD_NONE));
         assert!(!super::decide(
             0x41,
-            false,
-            false,
-            false,
-            false,
-            super::HOLD_NONE
-        ));
-        assert!(!super::decide(
-            0x41,
-            true,
             true,
             true,
             true,
             super::HOLD_SWALLOWED_ALL
         ));
-        assert!(!super::decide(
-            0x74,
-            false,
-            false,
-            false,
-            false,
-            super::HOLD_NONE
-        ));
-        assert!(super::decide(
-            0x74,
-            false,
-            true,
-            false,
-            false,
-            super::HOLD_NONE
-        ));
-        assert!(super::decide(
-            0x74,
-            false,
-            false,
-            true,
-            false,
-            super::HOLD_NONE
-        ));
-        assert!(super::decide(
-            0x74,
-            false,
-            false,
-            false,
-            true,
-            super::HOLD_NONE
-        ));
+        assert!(!super::decide(0x74, false, false, false, super::HOLD_NONE));
+        assert!(super::decide(0x74, false, true, false, super::HOLD_NONE));
+        assert!(super::decide(0x74, false, false, true, super::HOLD_NONE));
     }
 
     #[test]
@@ -464,33 +441,29 @@ mod tests {
             true,
             false,
             false,
-            false,
             super::HOLD_SWALLOWED_ALL
         ));
-        assert!(!super::decide(
-            0x74,
-            true,
-            true,
-            true,
-            true,
-            super::HOLD_LEAKED
-        ));
-        assert!(!super::decide(
-            0x74,
-            true,
-            true,
-            true,
-            true,
-            super::HOLD_NONE
-        ));
+        assert!(!super::decide(0x74, true, true, true, super::HOLD_LEAKED));
+        assert!(!super::decide(0x74, true, true, true, super::HOLD_NONE));
         assert!(!super::decide(
             0x41,
             true,
             true,
             true,
-            true,
             super::HOLD_SWALLOWED_ALL
         ));
+    }
+
+    #[test]
+    fn only_injected_wetype_marker_counts_as_liveness_evidence() {
+        // 存活标记只认微信输入法自注入的 0xFC：物理 0xFC 不存在，非 0xFC 的
+        // 注入事件（含本应用自己的和弦注入）绝不能被当成存活证据——否则
+        // 门禁会把真休眠误判成存活、恢复阶梯永远不执行。
+        assert!(super::is_wetype_marker(0xFC, true));
+        assert!(!super::is_wetype_marker(0xFC, false));
+        assert!(!super::is_wetype_marker(0x5B, true));
+        assert!(!super::is_wetype_marker(0xA2, true));
+        assert!(!super::is_wetype_marker(0x74, true));
     }
 
     #[test]

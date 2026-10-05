@@ -12,7 +12,7 @@ def p(s=""):
     out.append(str(s))
 
 HKLM = winreg.HKEY_LOCAL_MACHINE
-TARGET_HW = (r"HID\{00001812-0000-1000-8000-00805f9b34fb}"
+TARGET_HW = (r"REDACTED_device_88"
              r"_Dev_VID&012717_PID&32b8_REV&00a4")
 
 def vals(path):

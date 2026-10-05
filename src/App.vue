@@ -13,10 +13,12 @@ import {
   touchLiveness,
   type PageId,
 } from "./navigation";
-import AboutPage from "./pages/AboutPage.vue";
+import SettingsPage from "./pages/SettingsPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
+import DriverGuidePage from "./pages/DriverGuidePage.vue";
 import PermissionsPage from "./pages/PermissionsPage.vue";
+import TemplatesPage from "./pages/TemplatesPage.vue";
 
 const activePage = ref<PageId>(loadPersistedPage() ?? "buttons");
 watch(activePage, (page) => persistActivePage(page));
@@ -48,19 +50,21 @@ function handleWindowKeydown(event: KeyboardEvent): void {
 }
 
 const activeComponent = computed(() => ({
+  drivers: DriverGuidePage,
   buttons: ButtonsPage,
+  templates: TemplatesPage,
   connection: ConnectionPage,
   permissions: PermissionsPage,
-  about: AboutPage,
+  settings: SettingsPage,
 })[activePage.value]);
 
-// 横幅不在"关于"页重复显示（页面内已有完整更新面板）。
+// 横幅不在"设置"页重复显示（页面内已有完整更新面板）。
 const updateBannerVisible = computed(
-  () => bannerVisible.value && activePage.value !== "about",
+  () => bannerVisible.value && activePage.value !== "settings",
 );
 
 function showUpdatePage(): void {
-  activePage.value = "about";
+  activePage.value = "settings";
 }
 
 onMounted(async () => {
@@ -122,8 +126,8 @@ onUnmounted(() => {
 
 <template>
   <div class="app-shell">
-    <Sidebar :active-page="activePage" @select="activePage = $event" />
-    <main class="content">
+    <Sidebar :active-page="activePage" :version="runtime?.appVersion" @select="activePage = $event" />
+    <main class="content" :class="{ 'content-buttons': activePage === 'buttons' }">
       <div v-if="loadError" class="error-banner">无法读取运行状态：{{ loadError }}</div>
       <div v-if="updateBannerVisible" class="update-banner">
         <span>发现新版本 {{ updateInfo?.version }}</span>

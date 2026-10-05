@@ -60,10 +60,9 @@ thread_local! {
     static THREAD_CONTEXT: RefCell<Option<ListenerContext>> = const { RefCell::new(None) };
 }
 
-#[derive(Debug)]
 pub struct RawInputRuntime {
     snapshot: Arc<Mutex<RawInputSnapshot>>,
-    engine: Mutex<Option<Sender<EngineMessage>>>,
+    engine: Sender<EngineMessage>,
     control: Mutex<Option<ListenerControl>>,
 }
 
@@ -73,7 +72,7 @@ impl RawInputRuntime {
         // 直接投递（见 docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md）。
         Self {
             snapshot,
-            engine: Mutex::new(Some(engine)),
+            engine,
             control: Mutex::new(None),
         }
     }
@@ -110,12 +109,9 @@ impl RawInputRuntime {
         let snapshot = Arc::clone(&self.snapshot);
         let thread_stop = Arc::clone(&stop_requested);
         let thread_hwnd = Arc::clone(&hwnd);
-        let engine = self
-            .engine
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or_else(|| mpsc::channel().0);
+        // Each listener lifetime gets a clone; stopping must not consume the
+        // runtime's only sender and disconnect all subsequent starts.
+        let engine = self.engine.clone();
         let join = thread::Builder::new()
             .name("sayall-raw-input".to_owned())
             .spawn(move || {
@@ -485,6 +481,7 @@ fn run_listener(
         }
     };
 
+    stop_requested.store(true, Ordering::Release);
     let removals = [
         RAWINPUTDEVICE {
             usUsagePage: 0x01,
@@ -619,6 +616,7 @@ fn handle_device_change(handle: HRAWINPUT, event: u32) {
                 };
                 if let Ok(found) = select_single_device_path(&paths) {
                     context.selected_path = normalize_device_path(&found);
+                    context.binding_present = true;
                     let mut state = context.snapshot.lock().unwrap();
                     // 真正的"上线边沿"：相位此前不是 Ready，本次才变为 Ready。
                     //

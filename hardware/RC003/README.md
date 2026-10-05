@@ -1,6 +1,8 @@
 # RC003 硬件取证资料
 
-小米蓝牙遥控器 2 Pro / RC003 的**真机取证原始材料**：按键采集日志、设备枚举输出，以及生成它们的探针脚本。
+上游固定提交 `74230bf5f841cac2f099d1c6fd25683dac50131d` 的历史取证对照材料。当前文件树中的设备路径、蓝牙地址和个人路径已脱敏，保留匿名关联；不是本轮重新执行的实测。原始公开来源仍由该提交定位。
+
+`probes/` 仅为历史取证代码，含脱敏占位符，不能直接用于当前设备。本次整合未执行、补造或扩展探针；当前产品来源证明与验收以 `334c372:artifacts/hid-gatt-access-20260919/evidence.md` 为准。
 
 ## 1. 这个目录解决什么问题
 
@@ -47,8 +49,8 @@ hardware/RC003/
 
 | 文件 | 作用 |
 | --- | --- |
-| `driverstack.out` | ★ **两级 PnP 设备树**的完整枚举：`BTHLE\Dev_…` → `BTHLEDEVICE\{…}`（父节点，HIDClass 类，`Service=mshidumdf`）→ `HID\{…}`（子节点，Keyboard 类，`Service=kbdhid`）。父子关系由 `ParentIdPrefix` 与子节点实例名互相印证。**这是"过滤器该挂在哪"的判断依据** |
-| `e2-hwid.out` | 两棵枚举树下 `HardwareID` 的**逐条比对**：确认过滤器匹配串（`HID\{…}_Dev_VID&012717_PID&32b8_REV&00a4`）存在于 `kbdhid` **子节点**，而**不在** `mshidumdf` 父节点 |
+| `driverstack.out` | ★ **两级 PnP 设备树**的完整枚举：`REDACTED_device_20 → `REDACTED_device_33 类，`Service=mshidumdf`）→ `REDACTED_device_97 类，`Service=kbdhid`）。父子关系由 `ParentIdPrefix` 与子节点实例名互相印证。**这是"过滤器该挂在哪"的判断依据** |
+| `e2-hwid.out` | 两棵枚举树下 `HardwareID` 的**逐条比对**：确认过滤器匹配串（`REDACTED_device_42 `kbdhid` **子节点**，而**不在** `mshidumdf` 父节点 |
 | `e2-precheck3.out` | E2-1 前置核查的**注册表直读版**（最快、信息最全）：父/子节点归属、类键、系统状态（Secure Boot、TESTSIGNING、驱动与证书残留、OS 版本） |
 | `e2-precheck.out`、`e2-precheck2.out` | 同一核查的早两版（用 `Get-PnpDevice` 逐设备查属性，超时后改用注册表直读）。保留可见方法演进与失败原因 |
 | `rawinput-types2.out` | ★ Raw Input 设备列表与 `RIDI_DEVICEINFO` 的**双路交叉验证**：目标设备的 `dwType` 两处都是 `1 = RIM_TYPEKEYBOARD`，且其设备接口 GUID 属 **Keyboard 类**（而非 HID 接口类）。**这是排除"假阴性"的关键证据** |
@@ -120,8 +122,8 @@ hardware/RC003/
 | `<USER-HOME>` | 采集机器的用户主目录绝对路径 |
 | `<PROBE-DIR>` | 当时存放本批探针与输出的临时工作目录 |
 
-**保留未改**：各类公开系统常量，例如 `{00001812-0000-1000-8000-00805f9b34fb}`（蓝牙 HID 服务）、
-`{745a17a0-…-00a0c90f57da}`（HIDClass 类）、`{4d36e96b-…-08002be10318}`（Keyboard 类）、
+**保留未改**：各类公开系统常量，例如 `{00001812-0000-1000-8000-REDACTED_peer_105}`（蓝牙 HID 服务）、
+`{745a17a0-…-REDACTED_peer_106}`（HIDClass 类）、`{4d36e96b-…-REDACTED_peer_109}`（Keyboard 类）、
 接口类 GUID，以及 `VID_2717 / PID_32B8 / REV_00A4` 这类产品标识。
 设备实例 ID（如 `9&1748ac9e&0&0000`）是 Windows PnP 生成的**相对标识**，不含设备地址，也保留。
 
