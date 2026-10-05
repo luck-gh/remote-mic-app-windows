@@ -42,3 +42,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "UI_ViewManagement",
 ] }
+
+[target.'cfg(windows)'.dependencies]
+# Already locked through Tauri; use the same maintained COM callbacks.
+webview2-com = "=0.38.2"
