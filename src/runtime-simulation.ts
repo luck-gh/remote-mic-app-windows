@@ -148,26 +148,22 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(connection.capabilities?.sampleRate === 16_000, "RC001 仿真能力不是 16 kHz");
   steps.push("RC001 连接 command 返回 16 kHz ATVV 就绪状态");
 
-  await waitFor(
-    () => (document.body.textContent?.includes("CABLE Input (CI Simulation)") ? true : null),
-    "仿真音频端点",
-  );
-  // 端点列表默认收起（用户每次只用一个）：自动选择后以"更换设备"入口呈现。
-  await waitFor(
-    () =>
-      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).some((button) =>
-        button.textContent?.trim().includes("更换设备"),
-      )
-        ? true
-        : null,
-    "自动选择仿真 CABLE Input",
-  );
+  const advancedAudio = await waitFor(() => document.querySelector<HTMLDetailsElement>(".audio-advanced"), "高级声音诊断");
+  assert(!advancedAudio.open, "声音写入端不应默认出现在常规界面");
+  assert(document.querySelector("#capture-input-target"), "常规界面缺少目标麦克风选择");
+  assert(!document.querySelector(".endpoint-list"), "常规界面泄漏了播放设备列表");
+  // 仿真后端不提供真实 Capture 拓扑，显式高级选择仅验证原有 WASAPI 通道。
+  advancedAudio.open = true;
+  advancedAudio.dispatchEvent(new Event("toggle"));
+  const renderChoice = await waitFor(() => document.querySelector<HTMLButtonElement>(".audio-advanced .endpoint-list button"), "高级手动写入端");
+  if (!renderChoice.disabled) renderChoice.click();
+  await waitFor(() => document.querySelector<HTMLButtonElement>(".audio-advanced .endpoint-list button")?.textContent?.trim() === "当前设备" ? true : null, "手动声音写入端确认");
   const endpoints = await listAudioEndpoints();
   assert(endpoints.length === 1, "仿真音频端点数量异常");
   const audio = await getAudioSnapshot();
   assert(audio.phase === "ready", "仿真音频端点没有进入 WASAPI 就绪");
-  assert(audio.selectedEndpointId === endpoints[0].id, "仿真 CABLE Input 没有被自动选择");
-  steps.push("连接页面首次检测并自动选择唯一的仿真 CABLE Input");
+  assert(audio.selectedEndpointId === endpoints[0].id, "仿真 CABLE Input 没有被明确选择");
+  steps.push("连接页面仅常规展示目标麦克风；高级显式选择仿真声音写入端，真实通道配对 deferred");
 
   mark("buttons_page");
   await openPage("按键", "按键映射");

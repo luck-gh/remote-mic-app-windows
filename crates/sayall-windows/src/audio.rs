@@ -22,6 +22,120 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_MUTE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 static AUDIO_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Default)]
+struct PcmState {
+    accepting_generation: Option<u64>,
+    samples: VecDeque<i16>,
+    in_flight: usize,
+    accepted: u64,
+    packets: u64,
+    peak: usize,
+    wake_coalesced: u64,
+    failure: Option<PlatformError>,
+}
+
+/// One sample budget covers waiting PCM and the worker's current WASAPI write.
+/// The message channel carries wakeups and ordered lifecycle commands only.
+#[derive(Clone, Default)]
+struct PcmBuffer(Arc<Mutex<PcmState>>);
+
+impl PcmBuffer {
+    fn begin(&self, generation: u64) {
+        *lock(&self.0) = PcmState {
+            accepting_generation: Some(generation),
+            ..Default::default()
+        };
+    }
+
+    fn freeze(&self, generation: u64) -> Result<(), PlatformError> {
+        let mut state = lock(&self.0);
+        if state.accepting_generation != Some(generation) {
+            return Err(PlatformError::AudioSessionMismatch);
+        }
+        state.accepting_generation = None;
+        Ok(())
+    }
+
+    fn clear(&self) {
+        let mut state = lock(&self.0);
+        state.accepting_generation = None;
+        state.samples.clear();
+        // Only the WASAPI worker clears after its current write has returned.
+        state.in_flight = 0;
+        state.failure = None;
+    }
+
+    fn stop_accepting(&self) {
+        lock(&self.0).accepting_generation = None;
+    }
+
+    fn enqueue(&self, generation: u64, samples: Vec<i16>) -> Result<(), PlatformError> {
+        let mut state = lock(&self.0);
+        if state.accepting_generation != Some(generation) {
+            return Err(PlatformError::AudioSessionMismatch);
+        }
+        let pending = state.samples.len().saturating_add(state.in_flight);
+        if pending.saturating_add(samples.len()) > MAX_QUEUE_SAMPLES {
+            state.accepting_generation = None;
+            state.failure = Some(PlatformError::AudioQueueOverflow);
+            return Err(PlatformError::AudioQueueOverflow);
+        }
+        state.accepted += samples.len() as u64;
+        state.packets += 1;
+        state.peak = state.peak.max(pending + samples.len());
+        state.samples.extend(samples);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        let state = lock(&self.0);
+        state.samples.len() + state.in_flight
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn take_frames(&self, maximum: usize) -> Vec<i16> {
+        let mut state = lock(&self.0);
+        let count = maximum.min(state.samples.len());
+        state.in_flight += count;
+        state.samples.drain(..count).collect()
+    }
+
+    fn submitted(&self, count: usize) {
+        let mut state = lock(&self.0);
+        debug_assert!(state.in_flight >= count);
+        state.in_flight = state.in_flight.saturating_sub(count);
+    }
+
+    fn accepted(&self) -> u64 {
+        lock(&self.0).accepted
+    }
+
+    fn take_failure(&self) -> Option<PlatformError> {
+        lock(&self.0).failure.take()
+    }
+
+    fn needs_poll(&self) -> bool {
+        let state = lock(&self.0);
+        !state.samples.is_empty() || state.failure.is_some()
+    }
+
+    fn note_start(&self, generation: u64, write: Duration, start: Duration, unmute: Duration) {
+        let (packets, peak, pending, coalesced) = {
+            let state = lock(&self.0);
+            (
+                state.packets,
+                state.peak,
+                state.samples.len() + state.in_flight,
+                state.wake_coalesced,
+            )
+        };
+        crate::ble::gatt_note(format!("audio_startup generation={generation} phase=completed write_ms={} start_ms={} unmute_ms={} producer_packets={packets} peak_pending_samples={peak} pending_samples={pending} wake_coalesced={coalesced}", write.as_millis(), start.as_millis(), unmute.as_millis()));
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AudioBeginGuard {
     release_epoch: Arc<AtomicU64>,
@@ -49,6 +163,7 @@ impl AudioBeginGuard {
 pub struct AudioRuntime {
     pub(crate) capture: crate::capture_input::CaptureInputRuntime,
     sender: SyncSender<AudioMessage>,
+    pcm: PcmBuffer,
     state: Arc<Mutex<AudioSnapshot>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     pub(crate) lifecycle_epoch: Arc<AtomicU64>,
@@ -58,16 +173,19 @@ impl AudioRuntime {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::sync_channel(MESSAGE_QUEUE_CAPACITY);
         let state = Arc::new(Mutex::new(AudioSnapshot::default()));
+        let pcm = PcmBuffer::default();
         let lifecycle_epoch = Arc::new(AtomicU64::new(0));
         let worker_state = Arc::clone(&state);
+        let worker_pcm = pcm.clone();
         let worker = thread::Builder::new()
             .name("sayall-wasapi".to_owned())
-            .spawn(move || worker_loop(receiver, worker_state));
+            .spawn(move || worker_loop(receiver, worker_state, worker_pcm));
 
         match worker {
             Ok(worker) => Self {
                 capture: crate::capture_input::CaptureInputRuntime::new(),
                 sender,
+                pcm,
                 state,
                 worker: Mutex::new(Some(worker)),
                 lifecycle_epoch,
@@ -77,6 +195,7 @@ impl AudioRuntime {
                 Self {
                     capture: crate::capture_input::CaptureInputRuntime::new(),
                     sender,
+                    pcm,
                     state,
                     worker: Mutex::new(None),
                     lifecycle_epoch,
@@ -86,7 +205,9 @@ impl AudioRuntime {
     }
 
     pub fn snapshot(&self) -> AudioSnapshot {
-        lock(&self.state).clone()
+        let mut snapshot = lock(&self.state).clone();
+        snapshot.queued_samples = self.pcm.len() as u64;
+        snapshot
     }
 
     pub fn failure(&self) -> Option<String> {
@@ -116,6 +237,12 @@ impl AudioRuntime {
         })
     }
 
+    pub fn clear_endpoint(&self) -> Result<AudioSnapshot, PlatformError> {
+        self.request(REQUEST_TIMEOUT, |reply| AudioMessage::ClearEndpoint {
+            reply,
+        })
+    }
+
     pub fn restore_endpoint(
         &self,
         endpoint_id: String,
@@ -133,6 +260,22 @@ impl AudioRuntime {
         generation: u64,
         guard: Option<AudioBeginGuard>,
     ) -> Result<AudioSnapshot, PlatformError> {
+        if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
+            return Err(PlatformError::AudioSessionInterrupted);
+        }
+        // The write endpoint and temporary default microphone are committed as
+        // one configuration. Do not start PCM between their change and rollback;
+        // the same gate is checked again by capture.begin before switching roles.
+        let _configuration = match self.capture.config_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::ble::gatt_note(format!(
+                    "audio_session generation={generation} action=begin terminal_result=cancelled reason=configuration_in_progress"
+                ));
+                return Err(PlatformError::AudioBusy);
+            }
+        };
         self.request(REQUEST_TIMEOUT, |reply| AudioMessage::BeginSession {
             generation,
             guard,
@@ -141,21 +284,11 @@ impl AudioRuntime {
     }
 
     pub fn enqueue_samples(&self, generation: u64, samples: Vec<i16>) -> Result<(), PlatformError> {
-        self.sender
-            .try_send(AudioMessage::Samples {
-                generation,
-                samples,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => {
-                    crate::ble::gatt_note(format!("audio_pipeline generation={generation} event=failure failure_origin=message_channel error_code=queue_overflow"));
-                    PlatformError::AudioQueueOverflow
-                },
-                mpsc::TrySendError::Disconnected(_) => PlatformError::AudioWorkerUnavailable,
-            })
+        submit_samples(&self.sender, &self.pcm, generation, samples)
     }
 
     pub fn finish_session(&self, generation: u64) -> Result<AudioSnapshot, PlatformError> {
+        self.pcm.freeze(generation)?;
         self.capture.end();
         self.request(DRAIN_TIMEOUT, |reply| AudioMessage::FinishSession {
             generation,
@@ -164,6 +297,7 @@ impl AudioRuntime {
     }
 
     pub fn interrupt_session(&self) -> Result<AudioSnapshot, PlatformError> {
+        self.pcm.stop_accepting();
         self.capture.end();
         self.request(REQUEST_TIMEOUT, |reply| AudioMessage::Interrupt { reply })
     }
@@ -186,9 +320,41 @@ impl AudioRuntime {
     }
 }
 
+fn submit_samples(
+    sender: &SyncSender<AudioMessage>,
+    pcm: &PcmBuffer,
+    generation: u64,
+    samples: Vec<i16>,
+) -> Result<(), PlatformError> {
+    let incoming = samples.len();
+    if let Err(error) = pcm.enqueue(generation, samples) {
+        if error == PlatformError::AudioQueueOverflow {
+            // Even an oversized first batch must wake a parked worker so its
+            // existing failure path retires the WASAPI client and generation.
+            let _ = sender.try_send(AudioMessage::SamplesReady);
+            crate::ble::gatt_note(format!("audio_pipeline generation={generation} event=failure failure_origin=shared_pcm_queue error_code=queue_overflow pending_samples={} incoming_samples={incoming} limit_samples={MAX_QUEUE_SAMPLES}", pcm.len()));
+        }
+        return Err(error);
+    }
+    match sender.try_send(AudioMessage::SamplesReady) {
+        Ok(()) => Ok(()),
+        // PCM is already in the shared budget. Pending PCM also enables worker
+        // polling if rejected control commands skip their normal pump pass.
+        Err(mpsc::TrySendError::Full(_)) => {
+            lock(&pcm.0).wake_coalesced += 1;
+            Ok(())
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            pcm.clear();
+            Err(PlatformError::AudioWorkerUnavailable)
+        }
+    }
+}
+
 impl Drop for AudioRuntime {
     fn drop(&mut self) {
         self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
+        self.pcm.stop_accepting();
         let _ = self.sender.send(AudioMessage::Shutdown);
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
@@ -197,6 +363,9 @@ impl Drop for AudioRuntime {
 }
 
 enum AudioMessage {
+    ClearEndpoint {
+        reply: Sender<Result<AudioSnapshot, PlatformError>>,
+    },
     ListEndpoints {
         reply: Sender<Result<Vec<AudioEndpoint>, PlatformError>>,
     },
@@ -214,10 +383,7 @@ enum AudioMessage {
         guard: Option<AudioBeginGuard>,
         reply: Sender<Result<AudioSnapshot, PlatformError>>,
     },
-    Samples {
-        generation: u64,
-        samples: Vec<i16>,
-    },
+    SamplesReady,
     FinishSession {
         generation: u64,
         reply: Sender<Result<AudioSnapshot, PlatformError>>,
@@ -228,7 +394,11 @@ enum AudioMessage {
     Shutdown,
 }
 
-fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>>) {
+fn worker_loop(
+    receiver: Receiver<AudioMessage>,
+    state: Arc<Mutex<AudioSnapshot>>,
+    mut queue: PcmBuffer,
+) {
     crate::ble::gatt_note(
         "audio_worker phase=started backend=wasapi direction=render sample_rate=16000 channels=1 sample_format=s16".to_owned(),
     );
@@ -242,11 +412,14 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
     crate::ble::gatt_note("audio_worker phase=ready result=passed com_apartment=mta".to_owned());
     let _apartment = WasapiApartment;
     let mut sink: Option<AudioSink> = None;
-    let mut queue = VecDeque::<i16>::new();
     let mut pending_drain: Option<(u64, Sender<Result<AudioSnapshot, PlatformError>>)> = None;
 
     loop {
-        let is_active = sink.as_ref().is_some_and(AudioSink::is_active) || pending_drain.is_some();
+        // A full control channel may coalesce a PCM wakeup, and a rejected
+        // command can continue before pump. Pending PCM must still wake itself.
+        let is_active = sink.as_ref().is_some_and(AudioSink::is_active)
+            || pending_drain.is_some()
+            || queue.needs_poll();
         let message = if is_active {
             match receiver.recv_timeout(POLL_INTERVAL) {
                 Ok(message) => Some(message),
@@ -262,6 +435,23 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
 
         if let Some(message) = message {
             match message {
+                AudioMessage::ClearEndpoint { reply } => {
+                    let result = if pending_drain.is_some() {
+                        Err(PlatformError::AudioBusy)
+                    } else {
+                        clear_selected_sink(&mut sink, &queue, &state)
+                    };
+                    crate::ble::gatt_note(format!(
+                        "audio_endpoint action=clear terminal_result={} reason={}",
+                        if result.is_ok() { "passed" } else { "failed" },
+                        if result.is_ok() {
+                            "selection_cleared"
+                        } else {
+                            "active_voice_session"
+                        }
+                    ));
+                    let _ = reply.send(result);
+                }
                 AudioMessage::ListEndpoints { reply } => {
                     let started = Instant::now();
                     crate::ble::gatt_note("audio_endpoint action=list phase=requested".to_owned());
@@ -459,24 +649,7 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                     });
                     let _ = reply.send(result);
                 }
-                AudioMessage::Samples {
-                    generation,
-                    samples,
-                } => {
-                    let accepted = samples.len() as u64;
-                    match enqueue_samples(&mut queue, &state, generation, samples) {
-                        Ok(()) => {
-                            if let Some(sink) = sink.as_mut() {
-                                sink.accepted_samples =
-                                    sink.accepted_samples.saturating_add(accepted);
-                            }
-                        }
-                        Err(PlatformError::AudioSessionMismatch) => {}
-                        Err(error) => {
-                            fail_audio(&mut sink, &mut queue, &state, error, &mut pending_drain);
-                        }
-                    }
-                }
+                AudioMessage::SamplesReady => {}
                 AudioMessage::FinishSession { generation, reply } => {
                     crate::ble::gatt_note(format!(
                         "audio_session generation={generation} action=finish phase=requested queued_samples={} submitted_samples={}",
@@ -514,6 +687,7 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                         let _ = pending_reply.send(Err(PlatformError::AudioSessionInterrupted));
                     }
                     let result = interrupt(&mut sink, &mut queue, &state);
+                    let accepted_samples = queue.accepted();
                     if let Err(error @ PlatformError::Audio(_)) = &result {
                         fail_audio(
                             &mut sink,
@@ -525,12 +699,12 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
                     }
                     crate::ble::gatt_note(match &result {
                         Ok(snapshot) => format!(
-                            "audio_session generation={generation} action=interrupt phase=completed terminal_result=passed next_phase={} elapsed_ms={}",
+                            "audio_session generation={generation} action=interrupt phase=completed terminal_result=passed accepted_samples={accepted_samples} next_phase={} elapsed_ms={}",
                             audio_phase_name(snapshot.phase),
                             started.elapsed().as_millis()
                         ),
                         Err(error) => format!(
-                            "audio_session generation={generation} action=interrupt phase=completed terminal_result=failed error_domain=audio error_code={} reason=reset_failed retryable=true elapsed_ms={}",
+                            "audio_session generation={generation} action=interrupt phase=completed terminal_result=failed accepted_samples={accepted_samples} error_domain=audio error_code={} reason=reset_failed retryable=true elapsed_ms={}",
                             audio_error_code(error),
                             started.elapsed().as_millis()
                         ),
@@ -550,9 +724,14 @@ fn worker_loop(receiver: Receiver<AudioMessage>, state: Arc<Mutex<AudioSnapshot>
             }
         }
 
+        if let Some(error) = queue.take_failure() {
+            fail_audio(&mut sink, &mut queue, &state, error, &mut pending_drain);
+            continue;
+        }
         if let Some(active_sink) = sink.as_mut() {
             let draining = pending_drain.is_some();
-            match active_sink.pump(&mut queue, draining) {
+            let generation = lock(&state).generation;
+            match active_sink.pump(&mut queue, draining, generation) {
                 Ok(submitted) => {
                     let mut snapshot = lock(&state);
                     snapshot.queued_samples = queue.len() as u64;
@@ -871,9 +1050,27 @@ fn rebuild_selected_sink<T>(
     }
 }
 
+fn clear_selected_sink<T>(
+    sink: &mut Option<T>,
+    queue: &PcmBuffer,
+    state: &Arc<Mutex<AudioSnapshot>>,
+) -> Result<AudioSnapshot, PlatformError> {
+    if matches!(
+        lock(state).phase,
+        AudioPhase::Streaming | AudioPhase::Draining
+    ) {
+        return Err(PlatformError::AudioBusy);
+    }
+    *sink = None;
+    queue.clear();
+    let snapshot = AudioSnapshot::default();
+    *lock(state) = snapshot.clone();
+    Ok(snapshot)
+}
+
 fn begin_session(
     sink: &mut Option<AudioSink>,
-    queue: &mut VecDeque<i16>,
+    queue: &mut PcmBuffer,
     state: &Arc<Mutex<AudioSnapshot>>,
     generation: u64,
 ) -> Result<AudioSnapshot, PlatformError> {
@@ -896,7 +1093,6 @@ fn begin_session(
         .map_err(|error| audio_error("重置 WASAPI 会话", error))?;
     queue.clear();
     active_sink.session_started_at = Instant::now();
-    active_sink.accepted_samples = 0;
     active_sink.first_nonzero_submit = None;
     active_sink.last_nonzero_submit = None;
     active_sink.zero_available_count = 0;
@@ -908,32 +1104,13 @@ fn begin_session(
     snapshot.submitted_samples = 0;
     snapshot.generation = generation;
     snapshot.last_error = None;
+    queue.begin(generation);
     Ok(snapshot.clone())
-}
-
-fn enqueue_samples(
-    queue: &mut VecDeque<i16>,
-    state: &Arc<Mutex<AudioSnapshot>>,
-    generation: u64,
-    samples: Vec<i16>,
-) -> Result<(), PlatformError> {
-    {
-        let snapshot = lock(state);
-        if snapshot.phase != AudioPhase::Streaming || snapshot.generation != generation {
-            return Err(PlatformError::AudioSessionMismatch);
-        }
-    }
-    if queue.len().saturating_add(samples.len()) > MAX_QUEUE_SAMPLES {
-        return Err(PlatformError::AudioQueueOverflow);
-    }
-    queue.extend(samples);
-    lock(state).queued_samples = queue.len() as u64;
-    Ok(())
 }
 
 fn finish_drain(
     sink: &mut Option<AudioSink>,
-    queue: &mut VecDeque<i16>,
+    queue: &mut PcmBuffer,
     state: &Arc<Mutex<AudioSnapshot>>,
     generation: u64,
 ) -> Result<AudioSnapshot, PlatformError> {
@@ -954,7 +1131,7 @@ fn finish_drain(
     let result = snapshot.clone();
     drop(snapshot);
     crate::ble::gatt_note(format!("audio_flow generation={generation} terminal=normal_finish accepted_samples={} submitted_samples={} queued_samples={} elapsed_ms={} first_submit_ms={} last_submit_age_ms={}",
-        active_sink.accepted_samples, result.submitted_samples, result.queued_samples, active_sink.session_started_at.elapsed().as_millis(),
+        queue.accepted(), result.submitted_samples, result.queued_samples, active_sink.session_started_at.elapsed().as_millis(),
         active_sink.first_nonzero_submit.map(|t| t.saturating_duration_since(active_sink.session_started_at).as_millis().to_string()).unwrap_or_else(|| "none".to_owned()),
         active_sink.last_nonzero_submit.map(|t| t.elapsed().as_millis().to_string()).unwrap_or_else(|| "none".to_owned())));
     Ok(result)
@@ -962,7 +1139,7 @@ fn finish_drain(
 
 fn interrupt(
     sink: &mut Option<AudioSink>,
-    queue: &mut VecDeque<i16>,
+    queue: &mut PcmBuffer,
     state: &Arc<Mutex<AudioSnapshot>>,
 ) -> Result<AudioSnapshot, PlatformError> {
     queue.clear();
@@ -987,7 +1164,7 @@ fn interrupt(
 
 fn fail_cancel_cleanup(
     sink: &mut Option<AudioSink>,
-    queue: &mut VecDeque<i16>,
+    queue: &mut PcmBuffer,
     state: &Arc<Mutex<AudioSnapshot>>,
     error: PlatformError,
     pending_drain: &mut Option<(u64, Sender<Result<AudioSnapshot, PlatformError>>)>,
@@ -1001,11 +1178,14 @@ fn fail_cancel_cleanup(
 
 fn fail_audio(
     sink: &mut Option<AudioSink>,
-    queue: &mut VecDeque<i16>,
+    queue: &mut PcmBuffer,
     state: &Arc<Mutex<AudioSnapshot>>,
     error: PlatformError,
     pending_drain: &mut Option<(u64, Sender<Result<AudioSnapshot, PlatformError>>)>,
 ) {
+    // Freeze producers before collecting terminal counts; a failed write must
+    // not accept samples between its final statistics and queue retirement.
+    queue.stop_accepting();
     let snapshot_before = lock(state).clone();
     let origin = if matches!(error, PlatformError::AudioQueueOverflow) {
         "worker_pcm_queue"
@@ -1018,7 +1198,7 @@ fn fail_audio(
                 .zero_available_since
                 .map(|time| time.elapsed())
                 .unwrap_or_default();
-        crate::ble::gatt_note(format!("audio_flow generation={} failure_origin={origin} accepted_samples={} submitted_samples={} queued_samples={} elapsed_ms={} last_nonzero_submit_age_ms={} zero_available_count={} zero_available_elapsed_ms={}", snapshot_before.generation, sink.accepted_samples, snapshot_before.submitted_samples, queue.len(), sink.session_started_at.elapsed().as_millis(), sink.last_nonzero_submit.map(|time| time.elapsed().as_millis().to_string()).unwrap_or_else(|| "none".to_owned()), sink.zero_available_count, zero_elapsed.as_millis()));
+        crate::ble::gatt_note(format!("audio_flow generation={} failure_origin={origin} accepted_samples={} submitted_samples={} queued_samples={} elapsed_ms={} last_nonzero_submit_age_ms={} zero_available_count={} zero_available_elapsed_ms={}", snapshot_before.generation, queue.accepted(), snapshot_before.submitted_samples, queue.len(), sink.session_started_at.elapsed().as_millis(), sink.last_nonzero_submit.map(|time| time.elapsed().as_millis().to_string()).unwrap_or_else(|| "none".to_owned()), sink.zero_available_count, zero_elapsed.as_millis()));
     }
     if matches!(
         snapshot_before.phase,
@@ -1058,7 +1238,6 @@ struct AudioSink {
     started: bool,
     last_session_mute_check: Instant,
     session_started_at: Instant,
-    accepted_samples: u64,
     first_nonzero_submit: Option<Instant>,
     last_nonzero_submit: Option<Instant>,
     zero_available_count: u64,
@@ -1131,7 +1310,6 @@ impl AudioSink {
             started: false,
             last_session_mute_check: Instant::now(),
             session_started_at: Instant::now(),
-            accepted_samples: 0,
             first_nonzero_submit: None,
             last_nonzero_submit: None,
             zero_available_count: 0,
@@ -1216,7 +1394,12 @@ impl AudioSink {
         self.started
     }
 
-    fn pump(&mut self, queue: &mut VecDeque<i16>, draining: bool) -> Result<usize, PlatformError> {
+    fn pump(
+        &mut self,
+        queue: &mut PcmBuffer,
+        draining: bool,
+        generation: u64,
+    ) -> Result<usize, PlatformError> {
         if self.started && self.last_session_mute_check.elapsed() >= SESSION_MUTE_WATCH_INTERVAL {
             self.ensure_session_unmuted("stream_watch", false)?;
         }
@@ -1238,30 +1421,50 @@ impl AudioSink {
             return Ok(0);
         }
         let mut bytes = Vec::with_capacity(frames * 2);
-        for sample in queue.drain(..frames) {
+        for sample in queue.take_frames(frames) {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
+        let write_started = Instant::now();
         self.render_client
             .write_to_device(frames, &bytes, None)
-            .map_err(|error| audio_error("写入 WASAPI 音频", error))?;
+            .map_err(|error| {
+                note_audio_stage_failure(generation, "write", write_started.elapsed());
+                audio_error("写入 WASAPI 音频", error)
+            })?;
+        let write_elapsed = write_started.elapsed();
         if !self.started {
-            self.client
-                .start_stream()
-                .map_err(|error| audio_error("启动 WASAPI 音频流", error))?;
+            let start_started = Instant::now();
+            self.client.start_stream().map_err(|error| {
+                note_audio_stage_failure(generation, "start", start_started.elapsed());
+                audio_error("启动 WASAPI 音频流", error)
+            })?;
+            let start_elapsed = start_started.elapsed();
             self.started = true;
             crate::ble::gatt_note(format!(
                 "audio_stream phase=started result=passed endpoint_kind={} prebuffer_samples={PREBUFFER_SAMPLES} first_write_frames={frames}",
                 endpoint_kind(&self.endpoint_id, &self.name)
             ));
-            self.ensure_session_unmuted("after_start", true)?;
+            let unmute_started = Instant::now();
+            self.ensure_session_unmuted("after_start", true)
+                .map_err(|error| {
+                    note_audio_stage_failure(generation, "unmute", unmute_started.elapsed());
+                    error
+                })?;
+            queue.note_start(
+                generation,
+                write_elapsed,
+                start_elapsed,
+                unmute_started.elapsed(),
+            );
         }
+        queue.submitted(frames);
         let submitted_at = Instant::now();
         self.first_nonzero_submit.get_or_insert(submitted_at);
         self.last_nonzero_submit = Some(submitted_at);
         Ok(frames)
     }
 
-    fn is_drained(&self, queue: &VecDeque<i16>) -> Result<bool, PlatformError> {
+    fn is_drained(&self, queue: &PcmBuffer) -> Result<bool, PlatformError> {
         if !queue.is_empty() {
             return Ok(false);
         }
@@ -1282,6 +1485,10 @@ impl AudioSink {
         self.started = false;
         Ok(())
     }
+}
+
+fn note_audio_stage_failure(generation: u64, stage: &str, elapsed: Duration) {
+    crate::ble::gatt_note(format!("audio_pipeline generation={generation} phase=failed stage={stage} error_domain=wasapi elapsed_ms={}", elapsed.as_millis()));
 }
 
 fn process_audio_session_volumes(
@@ -1506,26 +1713,265 @@ mod tests {
     }
 
     #[test]
-    fn pcm_queue_accepts_only_the_current_generation() {
-        let state = streaming_state(7);
-        let mut queue = VecDeque::new();
-        enqueue_samples(&mut queue, &state, 7, vec![1, 2, 3]).unwrap();
-        assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    fn startup_burst_below_pcm_limit_survives_paused_consumer() {
+        let (sender, receiver) = mpsc::sync_channel(MESSAGE_QUEUE_CAPACITY);
+        let pcm = PcmBuffer::default();
+        pcm.begin(7);
+        // The WASAPI consumer has not completed its first start yet. Forty
+        // RC003 packets are 9600 samples, within the existing two-second bound.
+        let outcomes: Vec<_> = (0..40)
+            .map(|_| submit_samples(&sender, &pcm, 7, vec![1; 240]))
+            .collect();
+        assert!(
+            outcomes.iter().all(Result::is_ok),
+            "small packets must share the PCM capacity"
+        );
+        assert_eq!(pcm.len(), 9600);
+        assert_eq!(pcm.accepted(), 9600);
+        assert_eq!(receiver.try_iter().count(), MESSAGE_QUEUE_CAPACITY);
+        // Resume the same consumer: no payload is lost when wakeups coalesce.
+        let batch = pcm.take_frames(MAX_QUEUE_SAMPLES);
+        assert_eq!(batch, vec![1; 9600]);
+        pcm.submitted(batch.len());
+        assert!(pcm.is_empty());
+    }
 
-        let mut stale_queue = VecDeque::new();
+    #[test]
+    fn pcm_budget_includes_the_workers_unsubmitted_write() {
+        let pcm = PcmBuffer::default();
+        pcm.begin(7);
+        pcm.enqueue(7, vec![1; MAX_QUEUE_SAMPLES]).unwrap();
+        let in_flight = pcm.take_frames(16_000);
+        assert_eq!(in_flight.len(), 16_000);
+        assert_eq!(pcm.len(), MAX_QUEUE_SAMPLES);
         assert_eq!(
-            enqueue_samples(&mut stale_queue, &state, 6, vec![4]),
+            pcm.enqueue(7, vec![2]),
+            Err(PlatformError::AudioQueueOverflow)
+        );
+        assert_eq!(pcm.take_failure(), Some(PlatformError::AudioQueueOverflow));
+        let pcm = PcmBuffer::default();
+        pcm.begin(8);
+        pcm.enqueue(8, vec![1; MAX_QUEUE_SAMPLES]).unwrap();
+        let in_flight = pcm.take_frames(16_000);
+        pcm.submitted(in_flight.len());
+        pcm.enqueue(8, vec![2; 16_000]).unwrap();
+        assert_eq!(pcm.len(), MAX_QUEUE_SAMPLES);
+    }
+
+    #[test]
+    fn full_control_channel_keeps_pcm_and_fifo_wakeup() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (reply, _response) = mpsc::channel();
+        let pcm = PcmBuffer::default();
+        pcm.begin(7);
+        sender.send(AudioMessage::ListEndpoints { reply }).unwrap();
+        submit_samples(&sender, &pcm, 7, vec![1; 9600]).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            AudioMessage::ListEndpoints { .. }
+        ));
+        // A producer racing just after recv queues another wakeup. The first
+        // consumer pass sees both writes, and the extra wakeup is harmless.
+        submit_samples(&sender, &pcm, 7, vec![2; 240]).unwrap();
+        let batch = pcm.take_frames(MAX_QUEUE_SAMPLES);
+        assert_eq!(batch.len(), 9840);
+        assert_eq!(&batch[9600..], &[2; 240]);
+        pcm.submitted(batch.len());
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            AudioMessage::SamplesReady
+        ));
+        assert!(pcm.is_empty());
+    }
+
+    #[test]
+    fn coalesced_wakeup_survives_rejected_controls_before_stream_start() {
+        let (sender, receiver) = mpsc::sync_channel(MESSAGE_QUEUE_CAPACITY);
+        let pcm = PcmBuffer::default();
+        pcm.begin(7);
+        for _ in 0..MESSAGE_QUEUE_CAPACITY {
+            let (reply, _response) = mpsc::channel();
+            sender
+                .send(AudioMessage::FinishSession {
+                    generation: 6,
+                    reply,
+                })
+                .unwrap();
+        }
+        submit_samples(&sender, &pcm, 7, vec![1; PREBUFFER_SAMPLES]).unwrap();
+        // Stale finish commands take the worker's early-continue path. Once
+        // they are gone there is no SamplesReady left to unblock recv().
+        assert_eq!(receiver.try_iter().count(), MESSAGE_QUEUE_CAPACITY);
+        assert!(pcm.needs_poll());
+        assert!(matches!(
+            receiver.recv_timeout(POLL_INTERVAL),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let batch = pcm.take_frames(MAX_QUEUE_SAMPLES);
+        assert_eq!(batch.len(), PREBUFFER_SAMPLES);
+        pcm.submitted(batch.len());
+        assert!(!pcm.needs_poll());
+    }
+
+    #[test]
+    fn finish_freezes_ingress_and_drains_preceding_pcm_after_wakeups() {
+        let (sender, receiver) = mpsc::sync_channel(MESSAGE_QUEUE_CAPACITY);
+        let pcm = PcmBuffer::default();
+        pcm.begin(7);
+        for _ in 0..40 {
+            submit_samples(&sender, &pcm, 7, vec![1; 240]).unwrap();
+        }
+        pcm.freeze(7).unwrap();
+        assert_eq!(
+            submit_samples(&sender, &pcm, 7, vec![2]),
             Err(PlatformError::AudioSessionMismatch)
         );
-        assert!(stale_queue.is_empty());
+        let (reply, _response) = mpsc::channel();
+        let finish = std::thread::spawn(move || {
+            sender
+                .send(AudioMessage::FinishSession {
+                    generation: 7,
+                    reply,
+                })
+                .unwrap()
+        });
+        let mut wakeups = 0;
+        loop {
+            match receiver.recv().unwrap() {
+                AudioMessage::SamplesReady => wakeups += 1,
+                AudioMessage::FinishSession { generation, .. } => {
+                    assert_eq!(generation, 7);
+                    break;
+                }
+                _ => panic!("unexpected control"),
+            }
+        }
+        finish.join().unwrap();
+        assert_eq!(wakeups, MESSAGE_QUEUE_CAPACITY);
+        assert_eq!(pcm.accepted(), 9600);
+        let batch = pcm.take_frames(MAX_QUEUE_SAMPLES);
+        assert_eq!(batch.len(), 9600);
+        pcm.submitted(batch.len());
+        assert!(pcm.is_empty());
+    }
+
+    #[test]
+    fn interrupted_and_shutdown_generations_reject_late_pcm() {
+        for shutdown in [false, true] {
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let mut pcm = PcmBuffer::default();
+            pcm.begin(7);
+            submit_samples(&sender, &pcm, 7, vec![1; 480]).unwrap();
+            pcm.stop_accepting();
+            let (reply, _response) = mpsc::channel();
+            sender
+                .send(if shutdown {
+                    AudioMessage::Shutdown
+                } else {
+                    AudioMessage::Interrupt { reply }
+                })
+                .unwrap();
+            assert_eq!(
+                submit_samples(&sender, &pcm, 7, vec![2]),
+                Err(PlatformError::AudioSessionMismatch)
+            );
+            assert!(matches!(
+                receiver.recv().unwrap(),
+                AudioMessage::SamplesReady
+            ));
+            assert!(matches!(
+                receiver.recv().unwrap(),
+                AudioMessage::Interrupt { .. } | AudioMessage::Shutdown
+            ));
+            let state = streaming_state(7);
+            interrupt(&mut None, &mut pcm, &state).unwrap();
+            assert!(pcm.is_empty());
+            assert_eq!(
+                pcm.enqueue(7, vec![2]),
+                Err(PlatformError::AudioSessionMismatch)
+            );
+            pcm.begin(8);
+            assert_eq!(pcm.freeze(7), Err(PlatformError::AudioSessionMismatch));
+            assert_eq!(
+                submit_samples(&sender, &pcm, 7, vec![2]),
+                Err(PlatformError::AudioSessionMismatch)
+            );
+            submit_samples(&sender, &pcm, 8, vec![3]).unwrap();
+            assert_eq!(pcm.take_frames(1), vec![3]);
+        }
+    }
+
+    #[test]
+    fn disconnected_consumer_rejects_and_retires_pcm() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let pcm = PcmBuffer::default();
+        pcm.begin(7);
+        drop(receiver);
+        assert_eq!(
+            submit_samples(&sender, &pcm, 7, vec![1]),
+            Err(PlatformError::AudioWorkerUnavailable)
+        );
+        assert!(pcm.is_empty());
+        assert_eq!(
+            pcm.enqueue(7, vec![2]),
+            Err(PlatformError::AudioSessionMismatch)
+        );
+    }
+
+    #[test]
+    fn oversized_first_packet_wakes_worker_and_preserves_failure_cleanup() {
+        let (sender, receiver) = mpsc::sync_channel(MESSAGE_QUEUE_CAPACITY);
+        let mut pcm = PcmBuffer::default();
+        pcm.begin(7);
+        assert_eq!(
+            submit_samples(&sender, &pcm, 7, vec![1; MAX_QUEUE_SAMPLES + 1]),
+            Err(PlatformError::AudioQueueOverflow)
+        );
+        assert!(matches!(
+            receiver.recv_timeout(POLL_INTERVAL).unwrap(),
+            AudioMessage::SamplesReady
+        ));
+        assert!(pcm.needs_poll());
+        let state = streaming_state(7);
+        let mut sink = None;
+        let (reply, response) = mpsc::channel();
+        let mut pending_drain = Some((7, reply));
+        let failure = pcm.take_failure().unwrap();
+        fail_audio(&mut sink, &mut pcm, &state, failure, &mut pending_drain);
+        assert_eq!(lock(&state).phase, AudioPhase::Failed);
+        assert_eq!(
+            response.recv().unwrap(),
+            Err(PlatformError::AudioQueueOverflow)
+        );
+        assert!(!pcm.needs_poll());
+        assert!(pcm.is_empty());
+        assert_eq!(
+            submit_samples(&sender, &pcm, 7, vec![1]),
+            Err(PlatformError::AudioSessionMismatch)
+        );
+    }
+
+    #[test]
+    fn pcm_queue_accepts_only_the_current_generation() {
+        let queue = PcmBuffer::default();
+        queue.begin(7);
+        queue.enqueue(7, vec![1, 2, 3]).unwrap();
+        assert_eq!(queue.take_frames(3), vec![1, 2, 3]);
+        queue.submitted(3);
+        assert_eq!(
+            queue.enqueue(6, vec![4]),
+            Err(PlatformError::AudioSessionMismatch)
+        );
+        assert!(queue.is_empty());
     }
 
     #[test]
     fn pcm_queue_fails_closed_at_its_bounded_capacity() {
-        let state = streaming_state(1);
-        let mut queue = VecDeque::from(vec![0; MAX_QUEUE_SAMPLES]);
+        let queue = PcmBuffer::default();
+        queue.begin(1);
+        queue.enqueue(1, vec![0; MAX_QUEUE_SAMPLES]).unwrap();
         assert_eq!(
-            enqueue_samples(&mut queue, &state, 1, vec![1]),
+            queue.enqueue(1, vec![1]),
             Err(PlatformError::AudioQueueOverflow)
         );
         assert_eq!(queue.len(), MAX_QUEUE_SAMPLES);
@@ -1556,6 +2002,88 @@ mod tests {
     }
 
     #[test]
+    fn clear_endpoint_retires_idle_sink_selection_and_old_pcm() {
+        for phase in [
+            AudioPhase::Ready,
+            AudioPhase::Failed,
+            AudioPhase::Unconfigured,
+        ] {
+            let state = Arc::new(Mutex::new(AudioSnapshot {
+                phase,
+                selected_endpoint_id: Some("old".into()),
+                selected_endpoint_name: Some("old name".into()),
+                ..Default::default()
+            }));
+            let mut sink = Some(());
+            let pcm = PcmBuffer::default();
+            pcm.begin(9);
+            pcm.enqueue(9, vec![1, 2]).unwrap();
+            let cleared = clear_selected_sink(&mut sink, &pcm, &state).unwrap();
+            assert_eq!(cleared.phase, AudioPhase::Unconfigured);
+            assert!(cleared.selected_endpoint_id.is_none());
+            assert!(cleared.selected_endpoint_name.is_none());
+            assert!(sink.is_none());
+            assert!(pcm.is_empty());
+            assert_eq!(
+                pcm.enqueue(9, vec![3]),
+                Err(PlatformError::AudioSessionMismatch)
+            );
+            assert_eq!(
+                clear_selected_sink(&mut sink, &pcm, &state).unwrap().phase,
+                AudioPhase::Unconfigured
+            );
+        }
+    }
+
+    #[test]
+    fn clear_endpoint_refuses_to_discard_a_live_voice_session() {
+        for phase in [AudioPhase::Streaming, AudioPhase::Draining] {
+            let state = Arc::new(Mutex::new(AudioSnapshot {
+                phase,
+                selected_endpoint_id: Some("active".into()),
+                ..Default::default()
+            }));
+            let mut sink = Some(());
+            let pcm = PcmBuffer::default();
+            pcm.begin(5);
+            pcm.enqueue(5, vec![1]).unwrap();
+            assert_eq!(
+                clear_selected_sink(&mut sink, &pcm, &state),
+                Err(PlatformError::AudioBusy)
+            );
+            assert!(sink.is_some());
+            assert_eq!(pcm.len(), 1);
+            assert_eq!(lock(&state).selected_endpoint_id.as_deref(), Some("active"));
+        }
+    }
+
+    #[test]
+    fn begin_rejects_transient_audio_route_configuration_before_opening_a_sink() {
+        let runtime = AudioRuntime::new();
+        let _configuration = lock(&runtime.capture.config_gate);
+        assert_eq!(
+            runtime.begin_session(51, None),
+            Err(PlatformError::AudioBusy)
+        );
+        assert_eq!(runtime.snapshot().phase, AudioPhase::Unconfigured);
+        assert!(runtime.pcm.is_empty());
+    }
+
+    #[test]
+    fn released_begin_stays_cancelled_while_audio_route_configuration_is_locked() {
+        let runtime = AudioRuntime::new();
+        let released = Arc::new(AtomicU64::new(0));
+        let guard = AudioBeginGuard::new(released.clone(), runtime.lifecycle_epoch.clone());
+        let _configuration = lock(&runtime.capture.config_gate);
+        released.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            runtime.begin_session(52, Some(guard)),
+            Err(PlatformError::AudioSessionInterrupted)
+        );
+        assert_eq!(runtime.snapshot().phase, AudioPhase::Unconfigured);
+    }
+
+    #[test]
     fn audio_rebuild_follows_failure_and_interrupt_without_reviving_old_samples() {
         let state = Arc::new(Mutex::new(ready_snapshot(
             "selected".into(),
@@ -1563,7 +2091,9 @@ mod tests {
         )));
         lock(&state).phase = AudioPhase::Streaming;
         lock(&state).generation = 7;
-        let mut queue = VecDeque::from(vec![1; MAX_QUEUE_SAMPLES]);
+        let mut queue = PcmBuffer::default();
+        queue.begin(7);
+        queue.enqueue(7, vec![1; MAX_QUEUE_SAMPLES]).unwrap();
         let (reply, response) = mpsc::channel();
         let mut drain = Some((7, reply));
         let mut real_sink = None;
@@ -1597,7 +2127,7 @@ mod tests {
         assert_eq!(snapshot.generation, 0);
         assert_eq!(snapshot.submitted_samples, 0);
         assert_eq!(
-            enqueue_samples(&mut queue, &state, 7, vec![1]),
+            queue.enqueue(7, vec![1]),
             Err(PlatformError::AudioSessionMismatch)
         );
         rebuild_selected_sink(&mut fake_sink, &state, |_, _, _| {
@@ -1692,7 +2222,9 @@ mod tests {
         )));
         lock(&state).phase = AudioPhase::Streaming;
         lock(&state).generation = 31;
-        let mut queue = VecDeque::from([1, 2]);
+        let mut queue = PcmBuffer::default();
+        queue.begin(31);
+        queue.enqueue(31, vec![1, 2]).unwrap();
         let (reply, response) = mpsc::channel();
         let mut pending = Some((31, reply));
         let mut sink = None;
@@ -1798,9 +2330,10 @@ mod tests {
             .expect("restore exact saved endpoint");
         assert_eq!(runtime.snapshot().phase, AudioPhase::Ready);
         runtime.begin_session(20, None).unwrap();
-        runtime
-            .enqueue_samples(20, vec![0; MAX_QUEUE_SAMPLES + 1])
-            .unwrap();
+        assert_eq!(
+            runtime.enqueue_samples(20, vec![0; MAX_QUEUE_SAMPLES + 1]),
+            Err(PlatformError::AudioQueueOverflow)
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         while runtime.snapshot().phase != AudioPhase::Failed && Instant::now() < deadline {
             thread::sleep(POLL_INTERVAL);

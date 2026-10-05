@@ -111,12 +111,15 @@ impl SettingsStore {
         self.path.with_file_name("capture-input-session.json")
     }
 
-    pub fn save_capture_input(
+    pub fn save_capture_audio(
         &self,
         value: sayall_core::CaptureInputSettings,
+        audio: sayall_windows::AudioSnapshot,
     ) -> Result<(), String> {
         self.update("保存会话输入设备", |settings| {
-            settings.capture_input = value
+            settings.capture_input = value;
+            settings.audio_endpoint_id = audio.selected_endpoint_id;
+            settings.audio_endpoint_name = audio.selected_endpoint_name;
         })
     }
 
@@ -1059,6 +1062,28 @@ mod tests {
             std::env::temp_dir().join(format!("sayall-template-test-{}", new_template_id()));
         fs::create_dir_all(&directory).unwrap();
         SettingsStore::new(directory.join("settings.json"))
+    }
+
+    #[test]
+    fn capture_and_writer_save_together_preserves_unrelated_settings() {
+        let store = template_test_store();
+        store.save_rc003_capture_enabled(true).unwrap();
+        let mut expected = store.load().unwrap();
+        let capture = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-test".into()),
+            endpoint_name: Some("capture-test".into()),
+        };
+        let audio = sayall_windows::AudioSnapshot {
+            selected_endpoint_id: Some("render-test".into()),
+            selected_endpoint_name: Some("render-test".into()),
+            ..Default::default()
+        };
+        expected.capture_input = capture.clone();
+        expected.audio_endpoint_id = audio.selected_endpoint_id.clone();
+        expected.audio_endpoint_name = audio.selected_endpoint_name.clone();
+        store.save_capture_audio(capture, audio).unwrap();
+        assert_eq!(store.load().unwrap(), expected);
     }
 
     #[test]

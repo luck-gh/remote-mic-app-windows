@@ -64,11 +64,45 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+#[derive(Default)]
+struct IoCost {
+    calls: u64,
+    failures: u64,
+    elapsed: Duration,
+}
+impl IoCost {
+    fn record<T>(&mut self, elapsed: Duration, result: &Result<T, String>) {
+        self.calls += 1;
+        self.failures += u64::from(result.is_err());
+        self.elapsed += elapsed;
+    }
+}
+
+#[derive(Default)]
+struct PrepareIo {
+    roles: IoCost,
+    name: IoCost,
+    journal: IoCost,
+    policy: IoCost,
+}
+impl PrepareIo {
+    fn note(&self, generation: u64, result: &Result<(), String>, elapsed: Duration) {
+        let outcome = if result.is_ok() { "passed" } else { "failed" };
+        crate::gatt_note(format!("capture_input generation={generation} action=prepare_io result={outcome} roles_calls={} roles_ms={} roles_failures={} name_calls={} name_ms={} name_failures={} journal_calls={} journal_ms={} journal_failures={} policy_calls={} policy_ms={} policy_failures={} elapsed_ms={}",
+            self.roles.calls, self.roles.elapsed.as_millis(), self.roles.failures,
+            self.name.calls, self.name.elapsed.as_millis(), self.name.failures,
+            self.journal.calls, self.journal.elapsed.as_millis(), self.journal.failures,
+            self.policy.calls, self.policy.elapsed.as_millis(), self.policy.failures,
+            elapsed.as_millis()));
+    }
+}
+
 struct Native {
     enumerator: IMMDeviceEnumerator,
     policy: Option<PolicyConfig>,
     journal: Option<PathBuf>,
     generation: u64,
+    prepare_io: PrepareIo,
     // Only finish() in this process can own automatic zero-write completion.
     // A journal loaded at startup never acquires this ownership.
     normal_recovery: Option<Transaction>,
@@ -82,15 +116,17 @@ impl Native {
             policy: None,
             journal: None,
             generation: 0,
+            prepare_io: PrepareIo::default(),
             normal_recovery: None,
         })
     }
     fn ensure_policy(&mut self) -> Result<(), String> {
         if self.policy.is_none() {
-            self.policy = Some(
-                unsafe { CoCreateInstance(&POLICY_CLIENT, None, CLSCTX_ALL) }
-                    .map_err(|e| api_error("policy_activate", e))?,
-            );
+            let started = Instant::now();
+            let result = unsafe { CoCreateInstance(&POLICY_CLIENT, None, CLSCTX_ALL) }
+                .map_err(|e| api_error("policy_activate", e));
+            self.prepare_io.policy.record(started.elapsed(), &result);
+            self.policy = Some(result?);
         }
         Ok(())
     }
@@ -114,21 +150,26 @@ impl Native {
         }
         Ok(result)
     }
-    fn load_journal(&self) -> Result<Option<Transaction>, String> {
-        let path = self.journal.as_ref().ok_or("journal_not_initialized")?;
-        match fs::read(path) {
-            Ok(bytes) if bytes.len() <= 65536 => {
-                let value: Option<Transaction> =
-                    serde_json::from_slice(&bytes).map_err(|_| "journal_invalid")?;
-                if value.as_ref().is_some_and(|v| v.version != 1) {
-                    return Err("journal_version".into());
+    fn load_journal(&mut self) -> Result<Option<Transaction>, String> {
+        let started = Instant::now();
+        let result = (|| {
+            let path = self.journal.as_ref().ok_or("journal_not_initialized")?;
+            match fs::read(path) {
+                Ok(bytes) if bytes.len() <= 65536 => {
+                    let value: Option<Transaction> =
+                        serde_json::from_slice(&bytes).map_err(|_| "journal_invalid")?;
+                    if value.as_ref().is_some_and(|v| v.version != 1) {
+                        return Err("journal_version".into());
+                    }
+                    Ok(value)
                 }
-                Ok(value)
+                Ok(_) => Err("journal_too_large".into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err("journal_read_failed".into()),
             }
-            Ok(_) => Err("journal_too_large".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err("journal_read_failed".into()),
-        }
+        })();
+        self.prepare_io.journal.record(started.elapsed(), &result);
+        result
     }
 }
 impl RouteBackend for Native {
@@ -147,27 +188,37 @@ impl RouteBackend for Native {
         crate::gatt_note(format!("capture_input generation={} action=role_vector stage={stage} target_mask={target} original_mask={original} expected_mask={expected} transition_mask={group} desired_mask={desired}", tx.generation));
     }
     fn roles(&mut self) -> Result<Roles, String> {
-        let mut roles = [None, None, None];
-        for (i, slot) in roles.iter_mut().enumerate() {
-            let device = unsafe {
-                self.enumerator
-                    .GetDefaultAudioEndpoint(eCapture, ERole(i as i32))
+        let started = Instant::now();
+        let result = (|| {
+            let mut roles = [None, None, None];
+            for (i, slot) in roles.iter_mut().enumerate() {
+                let device = unsafe {
+                    self.enumerator
+                        .GetDefaultAudioEndpoint(eCapture, ERole(i as i32))
+                }
+                .map_err(|e| api_error("default_read", e))?;
+                let id = unsafe { device.GetId() }.map_err(|e| api_error("default_id", e))?;
+                let value = unsafe { id.to_string() };
+                unsafe { CoTaskMemFree(Some(id.0.cast())) };
+                *slot = Some(value.map_err(|_| "default_id_invalid")?);
             }
-            .map_err(|e| api_error("default_read", e))?;
-            let id = unsafe { device.GetId() }.map_err(|e| api_error("default_id", e))?;
-            let value = unsafe { id.to_string() };
-            unsafe { CoTaskMemFree(Some(id.0.cast())) };
-            *slot = Some(value.map_err(|_| "default_id_invalid")?);
-        }
-        Ok(roles)
+            Ok(roles)
+        })();
+        self.prepare_io.roles.record(started.elapsed(), &result);
+        result
     }
     fn active_name(&mut self, id: &str) -> Result<String, String> {
-        // Enumeration is capture + active only. A render ID is never accepted.
-        self.list()?
-            .into_iter()
-            .find(|v| v.id == id)
-            .map(|v| v.name)
-            .ok_or_else(|| "capture_endpoint_missing".into())
+        let started = Instant::now();
+        let result = (|| {
+            // Enumeration is capture + active only. A render ID is never accepted.
+            self.list()?
+                .into_iter()
+                .find(|v| v.id == id)
+                .map(|v| v.name)
+                .ok_or_else(|| "capture_endpoint_missing".into())
+        })();
+        self.prepare_io.name.record(started.elapsed(), &result);
+        result
     }
     fn set(&mut self, role: usize, id: &str) -> Result<(), String> {
         if role >= 3 {
@@ -185,6 +236,7 @@ impl RouteBackend for Native {
             .ok()
         }
         .map_err(|e| api_error("set_default", e));
+        self.prepare_io.policy.record(started.elapsed(), &result);
         note_for(
             self.generation,
             &format!("set_role_{role}"),
@@ -197,26 +249,31 @@ impl RouteBackend for Native {
         result
     }
     fn persist(&mut self, value: Option<&Transaction>) -> Result<(), String> {
-        let path = self.journal.as_ref().ok_or("journal_not_initialized")?;
-        let parent = path.parent().ok_or("journal_parent_invalid")?;
-        fs::create_dir_all(parent).map_err(|_| "journal_directory_failed")?;
-        let pending = path.with_extension("pending");
-        let bytes = serde_json::to_vec(&value).map_err(|_| "journal_encode_failed")?;
-        let mut file = fs::File::create(&pending).map_err(|_| "journal_create_failed")?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "journal_flush_failed")?;
-        drop(file);
-        let from = wide(&pending.to_string_lossy());
-        let to = wide(&path.to_string_lossy());
-        unsafe {
-            MoveFileExW(
-                PCWSTR(from.as_ptr()),
-                PCWSTR(to.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        }
-        .map_err(|e| api_error("journal_replace", e))
+        let started = Instant::now();
+        let result = (|| {
+            let path = self.journal.as_ref().ok_or("journal_not_initialized")?;
+            let parent = path.parent().ok_or("journal_parent_invalid")?;
+            fs::create_dir_all(parent).map_err(|_| "journal_directory_failed")?;
+            let pending = path.with_extension("pending");
+            let bytes = serde_json::to_vec(&value).map_err(|_| "journal_encode_failed")?;
+            let mut file = fs::File::create(&pending).map_err(|_| "journal_create_failed")?;
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "journal_flush_failed")?;
+            drop(file);
+            let from = wide(&pending.to_string_lossy());
+            let to = wide(&path.to_string_lossy());
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(from.as_ptr()),
+                    PCWSTR(to.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(|e| api_error("journal_replace", e))
+        })();
+        self.prepare_io.journal.record(started.elapsed(), &result);
+        result
     }
 }
 
@@ -725,6 +782,7 @@ fn run(
                 }
                 let started = Instant::now();
                 io.generation = b.generation;
+                io.prepare_io = PrepareIo::default();
                 let config = state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -779,6 +837,7 @@ fn run(
                     });
                     apply(&mut io, tx.as_mut().unwrap(), cancelled)
                 })();
+                io.prepare_io.note(b.generation, &result, started.elapsed());
                 note_for(
                     b.generation,
                     "prepare",

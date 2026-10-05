@@ -13,6 +13,7 @@ pub mod app_launcher;
 pub mod application_control;
 #[cfg(windows)]
 mod audio;
+pub mod audio_route;
 #[cfg(windows)]
 pub mod battery;
 #[cfg(windows)]
@@ -512,6 +513,51 @@ impl WindowsPlatform {
             }
         }
     }
+    pub fn audio_route_snapshot(&self) -> audio_route::AudioRouteSnapshot {
+        audio_route::snapshot(
+            &self.capture_input_snapshot().settings,
+            &self.audio_snapshot(),
+        )
+    }
+
+    pub fn resolve_audio_pair(
+        &self,
+        settings: &sayall_core::CaptureInputSettings,
+        preferred: &AudioSnapshot,
+    ) -> Result<Option<AudioEndpoint>, String> {
+        let Some(id) = settings.endpoint_id.as_deref() else {
+            return Ok(None);
+        };
+        let name = settings
+            .endpoint_name
+            .as_deref()
+            .ok_or("目标麦克风身份不完整，请重新选择")?;
+        let result = audio_route::resolve_capture_pair(
+            id,
+            name,
+            preferred
+                .selected_endpoint_id
+                .as_deref()
+                .zip(preferred.selected_endpoint_name.as_deref()),
+        );
+        match result {
+            Ok(endpoint) => {
+                gatt_note("audio_route action=pair result=passed reason=same_cable".into());
+                Ok(Some(endpoint))
+            }
+            Err(audio_route::AudioRouteReason::Unsupported) => {
+                gatt_note("audio_route action=pair result=manual reason=unsupported".into());
+                Ok(None)
+            }
+            Err(reason) => {
+                gatt_note(format!(
+                    "audio_route action=pair result=failed reason={}",
+                    reason.as_str()
+                ));
+                Err(reason.user_message().into())
+            }
+        }
+    }
     pub fn initialize_capture_input(
         &self,
         journal: std::path::PathBuf,
@@ -932,6 +978,17 @@ impl WindowsPlatform {
         #[cfg(not(windows))]
         {
             let _ = (endpoint_id, expected_name);
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn clear_audio_endpoint(&self) -> Result<AudioSnapshot, PlatformError> {
+        #[cfg(windows)]
+        {
+            self.audio.clear_endpoint()
+        }
+        #[cfg(not(windows))]
+        {
             Err(PlatformError::UnsupportedPlatform)
         }
     }

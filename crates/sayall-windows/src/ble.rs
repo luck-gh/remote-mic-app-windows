@@ -2005,6 +2005,15 @@ fn handle_audio(
                 }
             }
             if let Err(error) = audio.enqueue_samples(generation, samples) {
+                // The PCM queue now rejects stale generations at admission,
+                // instead of silently dropping them later on the audio worker.
+                // A late packet must not interrupt the newer audio session.
+                if error == PlatformError::AudioSessionMismatch {
+                    if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.as_mut()) {
+                        flow.stale_audio_samples += sample_count as u64;
+                    }
+                    return;
+                }
                 abort_voice_session(
                     session,
                     pipeline,
@@ -2123,6 +2132,7 @@ struct VoiceFlow {
     max_queue_delay: Duration,
     unattributed_packets: u64,
     unattributed_decoded: u64,
+    stale_audio_samples: u64,
     reordered_callbacks: u64,
     decode_errors: u64,
     stop: Option<(Instant, Option<u8>)>,
@@ -2141,6 +2151,7 @@ impl VoiceFlow {
             max_queue_delay: Duration::ZERO,
             unattributed_packets: 0,
             unattributed_decoded: 0,
+            stale_audio_samples: 0,
             reordered_callbacks: 0,
             decode_errors: 0,
             stop: None,
@@ -2186,11 +2197,11 @@ impl VoiceFlow {
             .map(|b| format!("{b:02X}"))
             .unwrap_or_else(|| "none".to_owned());
         // raw reason is authoritative; a remote claim is not physical key proof.
-        gatt_note(format!("voice_flow generation={} terminal={terminal} elapsed_ms={} callback_packets={} callback_bytes={} decoded_samples={} first_callback_ms={} last_callback_ms={} last_callback_age_ms={} max_callback_gap_ms={} max_worker_queue_delay_ms={} reordered_callbacks={} decode_errors={} unattributed_packets={} unattributed_decoded_samples={} stop_opcode={} stop_reason_raw={raw}",
+        gatt_note(format!("voice_flow generation={} terminal={terminal} elapsed_ms={} callback_packets={} callback_bytes={} decoded_samples={} first_callback_ms={} last_callback_ms={} last_callback_age_ms={} max_callback_gap_ms={} max_worker_queue_delay_ms={} reordered_callbacks={} decode_errors={} unattributed_packets={} unattributed_decoded_samples={} stale_audio_samples={} stop_opcode={} stop_reason_raw={raw}",
             self.generation, end.saturating_duration_since(self.start.at).as_millis(), self.packets, self.bytes, self.decoded,
             ms(self.first), ms(self.last), self.last.map(|t| end.saturating_duration_since(t).as_millis().to_string()).unwrap_or_else(|| "none".to_owned()),
             self.max_gap.as_millis(), self.max_queue_delay.as_millis(), self.reordered_callbacks, self.decode_errors, self.unattributed_packets,
-            self.unattributed_decoded, if self.stop.is_some() { "00" } else { "none" }));
+            self.unattributed_decoded, self.stale_audio_samples, if self.stop.is_some() { "00" } else { "none" }));
     }
 }
 

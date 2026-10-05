@@ -522,14 +522,7 @@ body.pointer-nav .theme-option:has(input:focus-visible) { outline: none; }
 .endpoint-select-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .endpoint-count { font-size: 12.5px; }
 
-/* ---- 连接页改版（2026-09-30 设计稿 v3）：设备行 + 语音输入设置三步 ----
-   设备卡等高并排；设置区通栏三列，切换输入工具时三列联动（组件侧 v-if）。 */
-.device-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.85fr);
-  gap: 14px;
-  align-items: stretch;
-}
+/* 连接页：设备合并为通栏卡片；语音输入设置三列随工具选择联动。 */
 .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .setup-card { margin-top: 14px; }
 .setup-card > .card-title-row p { margin: 3px 0 0; font-size: 13px; }
@@ -663,7 +656,6 @@ body.pointer-nav .theme-option:has(input:focus-visible) { outline: none; }
 @media (max-width: 1020px) {
   .content { --content-inline-padding: 22px; padding: 20px var(--content-inline-padding) 26px; }
   .two-column { grid-template-columns: 1fr; }
-  .device-row { grid-template-columns: 1fr; }
   .setup-columns { grid-template-columns: 1fr; }
   .setup-col + .setup-col {
     padding-left: 0;

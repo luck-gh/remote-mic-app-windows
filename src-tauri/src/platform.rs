@@ -18,6 +18,22 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn capture_input_snapshot(&self) -> sayall_windows::capture_input::CaptureInputSnapshot {
         Default::default()
     }
+    fn audio_route_snapshot(&self) -> sayall_windows::audio_route::AudioRouteSnapshot {
+        sayall_windows::audio_route::snapshot(
+            &self.capture_input_snapshot().settings,
+            &self.audio_snapshot(),
+        )
+    }
+    fn resolve_audio_pair(
+        &self,
+        _settings: &sayall_core::CaptureInputSettings,
+        _preferred: &AudioSnapshot,
+    ) -> Result<Option<AudioEndpoint>, String> {
+        Ok(None)
+    }
+    fn clear_audio_endpoint(&self) -> Result<AudioSnapshot, PlatformError> {
+        Err(PlatformError::UnsupportedPlatform)
+    }
     fn initialize_capture_input(
         &self,
         _journal: std::path::PathBuf,
@@ -50,7 +66,6 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn restore_remote(&self, device_id: String) -> Result<ConnectionSnapshot, PlatformError>;
     fn list_audio_endpoints(&self) -> Result<Vec<AudioEndpoint>, PlatformError>;
     fn select_audio_endpoint(&self, endpoint_id: String) -> Result<AudioSnapshot, PlatformError>;
-    #[cfg(windows)]
     fn restore_audio_endpoint(
         &self,
         endpoint_id: String,
@@ -150,6 +165,19 @@ impl PlatformRuntime for WindowsPlatform {
     fn capture_input_snapshot(&self) -> sayall_windows::capture_input::CaptureInputSnapshot {
         self.capture_input_snapshot()
     }
+    fn audio_route_snapshot(&self) -> sayall_windows::audio_route::AudioRouteSnapshot {
+        WindowsPlatform::audio_route_snapshot(self)
+    }
+    fn resolve_audio_pair(
+        &self,
+        settings: &sayall_core::CaptureInputSettings,
+        preferred: &AudioSnapshot,
+    ) -> Result<Option<AudioEndpoint>, String> {
+        WindowsPlatform::resolve_audio_pair(self, settings, preferred)
+    }
+    fn clear_audio_endpoint(&self) -> Result<AudioSnapshot, PlatformError> {
+        WindowsPlatform::clear_audio_endpoint(self)
+    }
     fn initialize_capture_input(
         &self,
         journal: std::path::PathBuf,
@@ -210,7 +238,6 @@ impl PlatformRuntime for WindowsPlatform {
         self.select_audio_endpoint(endpoint_id)
     }
 
-    #[cfg(windows)]
     fn restore_audio_endpoint(
         &self,
         endpoint_id: String,
@@ -545,7 +572,6 @@ mod simulation {
             Ok(state.audio.clone())
         }
 
-        #[cfg(windows)]
         fn restore_audio_endpoint(
             &self,
             endpoint_id: String,

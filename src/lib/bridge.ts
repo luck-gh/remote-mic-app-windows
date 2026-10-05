@@ -169,6 +169,18 @@ export interface CaptureInputSettings {
   endpointId: string | null;
   endpointName: string | null;
 }
+export interface AudioRouteSnapshot {
+  phase: "paired" | "manual" | "unconfigured" | "unavailable";
+  reason: string | null;
+  captureEndpointId: string | null;
+  captureEndpointName: string | null;
+  renderEndpointId: string | null;
+  renderEndpointName: string | null;
+}
+export async function getAudioRouteSnapshot(): Promise<AudioRouteSnapshot> {
+  if (!isTauriRuntime()) return { phase: "unavailable", reason: "unsupported", captureEndpointId: null, captureEndpointName: null, renderEndpointId: null, renderEndpointName: null };
+  return invoke<AudioRouteSnapshot>("get_audio_route_snapshot");
+}
 export interface CaptureInputSnapshot {
   settings: CaptureInputSettings;
   phase: string;
