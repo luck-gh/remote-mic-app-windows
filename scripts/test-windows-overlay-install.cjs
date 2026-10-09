@@ -7,6 +7,16 @@ const root = path.resolve(__dirname, '..');
 const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
 const code = (s) => s.split(/\r?\n/).map((l) => l.split(';')[0]).join('\n');
 
+test('silent lifecycle uses normal exit and preserves cleanup evidence', () => {
+  const source = read('scripts/test-windows-silent-install.ps1');
+  assert.doesNotMatch(source, /Stop-Process|KillProcess|TerminateProcess|taskkill/);
+  assert.match(source, /OpenExisting\('Local\\SayAll-GracefulExit'\)/);
+  assert.match(source, /WaitForExit\(20000\)/);
+  assert.match(source, /Get-FileHash -LiteralPath \$cleanupPreservationMarker/);
+  assert.doesNotMatch(source, /WriteAllText\([^\n]*session\.token/);
+  assert.match(source, /-not \$normalUninstallCompleted -and \$canUninstall/);
+});
+
 test('interactive reinstall offers both choices while unattended installation stays overlay', () => {
   const config = JSON.parse(read('src-tauri/tauri.conf.json'));
   assert.equal(config.bundle.windows.nsis.template, 'windows/installer.nsi');

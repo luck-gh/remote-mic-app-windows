@@ -714,11 +714,15 @@ mod tests {
         let path = std::path::PathBuf::from(std::env::var_os("SAYALL_GATT_LOG").unwrap());
         note("check.fail stage=endpoint_override_parse error_domain=url error_code=parse_failed reason=invalid_override retryable=false".to_owned());
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = contents
+            .lines()
+            .find(|line| line.contains("updater.check.fail"))
+            .unwrap_or("");
         assert!(
-            contents.contains("updater.check.fail stage=endpoint_override_parse")
-                && contents.contains("error_code=parse_failed")
-                && contents.starts_with("20")
-                && !contents.contains("note="),
+            line.starts_with("20")
+                && line.contains("stage=endpoint_override_parse")
+                && line.contains("error_code=parse_failed")
+                && !line.contains("note="),
             "updater 功能点日志未落盘：{contents}"
         );
     }

@@ -108,6 +108,7 @@ const cableEndpoint: AudioEndpoint = {
 
 const mocks = vi.hoisted(() => ({
   endpoints: [] as AudioEndpoint[],
+  getGainDb: vi.fn(), setGainDb: vi.fn(), getCaptureSupport: vi.fn(), getRc003TaskStatus: vi.fn(), enableRc003Capture: vi.fn(), disableRc003Capture: vi.fn(),
   getCaptureInput: vi.fn(), listCaptureInputs: vi.fn(), setCaptureInput: vi.fn(), resolveCaptureRecovery: vi.fn(),
   captureEdgeHandler: null as ShortcutCaptureHandler | null,
   getConnectionSnapshot: vi.fn(),
@@ -134,6 +135,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/bridge")>();
   return {
     ...original,
+    getGainDb: mocks.getGainDb, setGainDb: mocks.setGainDb, getCaptureSupport: mocks.getCaptureSupport, getRc003TaskStatus: mocks.getRc003TaskStatus, enableRc003Capture: mocks.enableRc003Capture, disableRc003Capture: mocks.disableRc003Capture,
     getCaptureInput: mocks.getCaptureInput, listCaptureInputs: mocks.listCaptureInputs,
     setCaptureInput: mocks.setCaptureInput, resolveCaptureRecovery: mocks.resolveCaptureRecovery,
     getConnectionSnapshot: mocks.getConnectionSnapshot,
@@ -160,6 +162,12 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 describe("VB-CABLE first-launch guidance", () => {
   beforeEach(() => {
     mocks.endpoints = [];
+    mocks.getGainDb.mockResolvedValue(0);
+    mocks.setGainDb.mockImplementation(async value => value);
+    mocks.getCaptureSupport.mockResolvedValue({ available: true, reason: null, nativeArch: "x64", helperExpected: "sayall-helper.exe" });
+    mocks.getRc003TaskStatus.mockResolvedValue({ installed: false, authorizationRequired: true, enabled: false, lastError: null });
+    mocks.enableRc003Capture.mockResolvedValue({ installed: true, authorizationRequired: false, enabled: true, lastError: null });
+    mocks.disableRc003Capture.mockResolvedValue({ installed: true, authorizationRequired: false, enabled: false, lastError: null });
     mocks.getCaptureInput.mockResolvedValue({ settings: { enabled: false, endpointId: null, endpointName: null }, phase: "disabled", recoveryPending: false, lastError: null });
     mocks.listCaptureInputs.mockResolvedValue([{ id: "capture", name: "CABLE Output", isVirtualCableCandidate: true }]);
     mocks.setCaptureInput.mockImplementation(async settings => ({ settings, phase: "idle", recoveryPending: false, lastError: null }));

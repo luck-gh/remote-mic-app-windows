@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repositoryRoot "src-tauri/tauri.conf.json"
@@ -65,6 +65,50 @@ $compatibilitySource = Get-Content -Raw -Encoding UTF8 $compatibilitySourcePath
 if ($compatibilitySource -notmatch 'WindowsVersion::new\(10, 0, 17_763\)') {
     throw "Runtime and NSIS minimum Windows versions must both remain Windows 10 build 17763"
 }
+
+# ── 载荷集合一致性（2026-10-07 issue206，arm64 双载荷）──────────────────
+# 判据：出包时**暂存到 src-tauri/ 的载荷集合**就是安装包实际携带的集合——资源条目
+# 写的是裸文件名，落盘路径即安装根目录（见 stage-bundle-inputs.cjs 顶部）。
+# arm64 两件是可选的：本机/部分环境没有 VS ARM64 工具集时暂存不到，不得因此误报
+# 失败；但只要暂存到了，构建就必须用 arm64 覆盖配置声明它们，否则安装包会静默地
+# 只带 x64——那正是 issue206 要消除的失败模式。
+$srcTauriDir = Split-Path -Parent $configPath
+$receiptPath = Join-Path $repositoryRoot 'target/dev/bundle-staging/payloads.json'
+$receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+$payloadNames = @($receipt.resources | ForEach-Object { $_.name })
+foreach ($resource in $receipt.resources) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $srcTauriDir $resource.name) -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $resource.sha256) { throw "Staged resource changed: $($resource.name)" }
+}
+$stagedPayloads = @($payloadNames | Where-Object { Test-Path -LiteralPath (Join-Path $srcTauriDir $_) -PathType Leaf })
+if ($stagedPayloads -notcontains "sayall-helper.exe" -or $stagedPayloads -notcontains "frida-gadget.dll") {
+    throw "x64 bundle resources were not staged in src-tauri: $srcTauriDir"
+}
+$arm64PayloadNames = @("sayall-helper-arm64.exe", "frida-gadget-arm64.dll")
+$stagedArm64 = @($arm64PayloadNames | Where-Object { $payloadNames -contains $_ })
+if ($stagedArm64.Count -ne 0 -and $stagedArm64.Count -ne $arm64PayloadNames.Count) {
+    throw "Incomplete arm64 payload staging: $($stagedArm64 -join ', ')"
+}
+$arm64PayloadConfigPath = Join-Path $srcTauriDir "tauri.arm64-payload.conf.json"
+if ($stagedArm64.Count -eq $arm64PayloadNames.Count) {
+    if (-not (Test-Path -LiteralPath $arm64PayloadConfigPath -PathType Leaf)) {
+        throw "arm64 payloads are staged but tauri.arm64-payload.conf.json is missing: the installer would silently omit them"
+    }
+    $arm64PayloadConfig = Get-Content -Raw -Encoding UTF8 $arm64PayloadConfigPath | ConvertFrom-Json
+    $declaredPayloads = @($arm64PayloadConfig.bundle.resources)
+    foreach ($name in $payloadNames) {
+        if ($declaredPayloads -notcontains $name) {
+            throw "arm64 payload override must declare $name"
+        }
+    }
+    if ($declaredPayloads.Count -ne $payloadNames.Count) {
+        throw "arm64 payload override must declare exactly $($payloadNames.Count) payloads, observed $($declaredPayloads.Count)"
+    }
+}
+if ($env:SAYALL_REQUIRE_ARM64_PAYLOAD -eq "1" -and $stagedArm64.Count -ne $arm64PayloadNames.Count) {
+    throw "SAYALL_REQUIRE_ARM64_PAYLOAD=1 but arm64 payloads were not staged: the published installer must carry them"
+}
+Write-Host "Verified bundle payload set ($($stagedPayloads.Count)): $($stagedPayloads -join ', ')"
 
 if (-not (Test-Path -LiteralPath $applicationPath -PathType Leaf)) {
     throw "Release application executable is missing: $applicationPath"

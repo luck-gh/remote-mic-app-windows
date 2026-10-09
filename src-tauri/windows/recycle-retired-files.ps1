@@ -1,4 +1,4 @@
-param([string]$InstallDirectory, [switch]$FunctionsOnly, [switch]$ProductFiles)
+﻿param([string]$InstallDirectory, [switch]$FunctionsOnly, [switch]$ProductFiles)
 $ErrorActionPreference = 'Stop'
 
 function Get-SayAllRetiredFiles([string]$Directory, [switch]$ProductFiles) {
@@ -16,6 +16,7 @@ function Get-SayAllRetiredFiles([string]$Directory, [switch]$ProductFiles) {
     if ($ProductFiles) {
         # Current payload only; never enumerate settings, authorization or unknown files.
         $known += @('sayall-windows-app.exe', 'sayall-helper.exe', 'frida-gadget.dll',
+            'sayall-helper-arm64.exe', 'frida-gadget-arm64.dll',
             'licenses/ATTRIBUTION.md', 'licenses/Frida-COPYING.txt', 'uninstall.exe')
     }
     foreach ($relative in $known) {

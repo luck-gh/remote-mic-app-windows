@@ -170,7 +170,13 @@ impl MappingConfiguration {
             if template.mappings.actions.values().any(|actions| {
                 [&actions.single, &actions.double, &actions.long]
                     .iter()
-                    .any(|action| matches!(action, crate::send_input::ButtonAction::OpenApp { .. }))
+                    .any(|action| {
+                        matches!(
+                            action,
+                            crate::send_input::ButtonAction::OpenApp { .. }
+                                | crate::send_input::ButtonAction::FocusInput
+                        )
+                    })
             }) {
                 return Err("模板只支持固定按键或组合键".into());
             }
@@ -408,6 +414,7 @@ fn fixed_keys() -> ButtonMappings {
         enabled: true,
         applications: Vec::new(),
         actions: BTreeMap::new(),
+        ..Default::default()
     };
     for (button, keys) in [
         (RemoteButton::Up, vec![KeyCode::Up]),
@@ -439,6 +446,7 @@ fn fixed_keys() -> ButtonMappings {
             single: shortcut(vec![KeyCode::Home]),
             double: shortcut(vec![KeyCode::Control, KeyCode::Home]),
             long: shortcut(vec![KeyCode::Control, KeyCode::End]),
+            ..Default::default()
         },
     );
     mappings.actions.insert(
@@ -449,6 +457,7 @@ fn fixed_keys() -> ButtonMappings {
             long: ButtonAction::TaskSwitch {
                 view: crate::send_input::TaskSwitchView::Desktops,
             },
+            ..Default::default()
         },
     );
     mappings

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import EnhancedCaptureConfirmDialog from "../components/EnhancedCaptureConfirmDialog.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import type {
@@ -7,6 +8,8 @@ import type {
   AudioSnapshot,
   AudioRouteSnapshot,
   CaptureInputSnapshot,
+  CaptureSupport,
+  Rc003TaskStatus,
   ConnectionSnapshot,
   KeyChord,
   PairedRemote,
@@ -25,7 +28,12 @@ import {
   listCaptureInputs,
   setCaptureInput,
   resolveCaptureRecovery,
+  getCaptureSupport,
+  getRc003TaskStatus,
+  enableRc003Capture,
+  disableRc003Capture,
   getConnectionSnapshot,
+  getGainDb,
   getOtherVoiceHotkey,
   getVoiceHoldHotkey,
   getVoiceInputTool,
@@ -37,6 +45,7 @@ import {
   remoteModelLabel,
   scanPairedRemotes,
   selectAudioEndpoint,
+  setGainDb,
   setOtherVoiceHotkey,
   setVoiceHoldHotkey,
   setVoiceInputTool,
@@ -140,6 +149,17 @@ const audioScanComplete = ref(false);
 const selectingEndpointId = ref("");
 const openingVbCablePage = ref(false);
 const audioMessage = ref("");
+/**
+ * 语音增益（dB，0–24；对齐 Mac 设置页「增益」滑块）：0 = 原始音量。
+ *
+ * 拖动（input）只更新显示，松手（change）才走 IPC 落盘——避免拖一次写几十遍
+ * 设置文件；保存返回的钳制值才回显，失败回到上一次生效值并给出原因。
+ */
+const gainDb = ref(0);
+/** 最后一次确认保存的增益：保存失败时回退到它，不留在"看起来生效"的位置。 */
+const savedGainDb = ref(0);
+const savingGain = ref(false);
+const gainError = ref("");
 const voiceHotkey = ref<KeyChord | null>(null);
 const savingVoiceHotkey = ref(false);
 const voiceHotkeyMessage = ref("");
@@ -366,12 +386,42 @@ async function openVokiePage(): Promise<void> {
   }
 }
 
-/** 打开 Vokie（装了但没运行时）：启动后提示用户点「重新检测」确认在运行。 */
+/** 打开 Vokie 之后的自动复查：间隔 1.5s、最多 8 次（约 12 秒）。 */
+const VOKIE_LAUNCH_POLL_INTERVAL_MS = 1500;
+const VOKIE_LAUNCH_POLL_ATTEMPTS = 8;
+
+/**
+ * 点「打开 Vokie」后替用户等它起来并自动复查。
+ * 2026-10-02 Andy 反馈：点了按钮、Vokie 明明已经打开，但「Vokie 没有运行」的
+ * 提示还挂着，得手动再点一次「重新检测」——因为启动是异步的，点完立刻检测
+ * 多半还是 false。这里轮询到 running=true 就清掉提示（提示区变成「Vokie 已在
+ * 运行。」）；超时仍没起来就明确告诉他可以再点「重新检测」。
+ */
+async function waitForVokieRunning(): Promise<void> {
+  for (let attempt = 0; attempt < VOKIE_LAUNCH_POLL_ATTEMPTS; attempt += 1) {
+    await new Promise<void>((resolve) =>
+      window.setTimeout(resolve, VOKIE_LAUNCH_POLL_INTERVAL_MS),
+    );
+    if (unmounted) return;
+    await refreshVokieInstallation();
+    if (unmounted) return;
+    if (vokieRunning.value === true) {
+      vokieCheckMessage.value = "Vokie 已在运行。";
+      return;
+    }
+  }
+  if (!unmounted) {
+    vokieCheckMessage.value = "还没检测到 Vokie 在运行；如果它已经打开，点“重新检测”。";
+  }
+}
+
+/** 打开 Vokie（装了但没运行时）：启动后自动等待并复查，用户不用再点一次。 */
 async function launchVokieApp(): Promise<void> {
   launchingVokie.value = true;
   try {
     await launchVokie();
-    vokieCheckMessage.value = "已打开 Vokie；等它启动完成后点“重新检测”。";
+    vokieCheckMessage.value = "已打开 Vokie；正在等待它启动…";
+    void waitForVokieRunning();
   } catch (error) {
     vokieCheckMessage.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -395,6 +445,164 @@ async function applyVoiceHotkey(keys: string[]) {
   } finally {
     savingVoiceHotkey.value = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 「支持更多输入工具」开关（2026-09-29 Andy 需求：连接页的第二入口）。
+//
+// **与按键页「全按键支持」是同一个设置项**（AppSettings.rc003_capture_enabled），
+// 不是新状态：两处开关操作同一对 IPC（enable/disable_rc003_capture），状态
+// 由每页挂载时的 getRc003TaskStatus 对账对齐——页面经 <component :is> 切换
+// 时组件重建，每次进页都对账一次，两个入口不会漂移。
+//
+// 判据与文案与 ButtonsPage.toggleRc003Capture 同源：2026-10-03 起**每次
+// 开启都先弹确认**（每次开启都会重新授权、都会弹 Windows 授权窗口），
+// 不再依赖授权判据；关闭方向永远直接执行。开关只在需要它的工具下面板里
+// 出现（豆包必须开、其他工具建议开、微信不需要——见 2026-09-30 设计稿 v3）。
+// ---------------------------------------------------------------------------
+
+const rc003CaptureEnabled = ref<boolean | null>(null);
+const rc003CaptureBusy = ref(false);
+const showCaptureConfirm = ref(false);
+const captureSwitchEl = ref<HTMLInputElement | null>(null);
+const rc003CaptureHint = ref("");
+
+/**
+ * 本机对「全按键支持」（本页叫「支持更多输入工具」）的支持情况（2026-10-07
+ * issue #206）：`null` = 尚未读到，按可用处理，不因一次 IPC 失败把功能锁死。
+ */
+const captureSupport = ref<CaptureSupport | null>(null);
+const captureUnsupported = computed(() => captureSupport.value?.available === false);
+
+/**
+ * 本机不可用时的文案（与按键页同一句，名称随本页入口）：
+ * 用户可见文案的规范来源是 docs/product-copy.md（§2 名称表 / §7 决定索引）。
+ */
+const CAPTURE_UNSUPPORTED_TITLE =
+  "“支持更多输入工具”在这台电脑上暂不可用；新版本支持后会恢复正常。";
+const CAPTURE_UNSUPPORTED_NOTE = "这台电脑暂不支持“支持更多输入工具”，其他按键不受影响。";
+
+/**
+ * 开关右侧的状态字。本机不可用时统一说「暂不可用」——不给「需要开启」这类
+ * 做不到的暗示。两个面板（豆包 / 其他工具）原本的措辞保留（available=true
+ * 时行为不变）。
+ */
+function captureStateLabel(state: "doubao" | "other"): string {
+  if (captureUnsupported.value) return "暂不可用";
+  if (rc003CaptureEnabled.value === true) return "已开启";
+  if (state === "doubao") {
+    return rc003CaptureEnabled.value === false ? "需要开启" : "正在读取…";
+  }
+  return "未开启";
+}
+
+/**
+ * 把开关的 DOM 状态写回绑定值。原生复选框被点击的瞬间浏览器先翻了 checked，
+ * 而操作失败（状态没变）时 Vue 判定 props 无变化、不会生成 DOM 补丁——
+ * 会出现「状态是关、界面是开」（ButtonsPage 2026-09-25 真机实证，同法防御）。
+ */
+function syncCaptureSwitchDom(): void {
+  const el = captureSwitchEl.value;
+  if (el) {
+    el.checked = rc003CaptureEnabled.value === true;
+  }
+}
+
+async function reconcileRc003Capture(): Promise<void> {
+  // 本机支持情况单独取、单独兜（2026-10-07 issue #206）：读不到就保持上一次的
+  // 值，不因为一次 IPC 失败把开关锁成不可用。
+  try {
+    const support = await getCaptureSupport();
+    captureSupport.value = support ?? null;
+  } catch {
+    // 读不到支持情况：保持当前值（按可用处理）。
+  }
+  try {
+    const status = await getRc003TaskStatus();
+    // 首次对账（null → 权威值）直接采纳；此后以本页用户操作为准，
+    // 不被每秒变化无关的 installed 抖动带偏（与 ButtonsPage 同策略）。
+    if (rc003CaptureEnabled.value === null) {
+      rc003CaptureEnabled.value = status.enabled;
+    }
+  } catch {
+    // 对账失败保持 null：开关显示占位符（不可点），不猜状态。
+  }
+}
+
+async function toggleRc003Capture() {
+  if (rc003CaptureBusy.value) return;
+  // 本机不可用（ARM64，issue #206）：开关已置灰，这里再守一道——合成事件与
+  // 键盘操作都可能绕过原生 disabled。不弹确认、不动 IPC，把 DOM 写回绑定值。
+  if (captureUnsupported.value) {
+    syncCaptureSwitchDom();
+    return;
+  }
+  // 与 ButtonsPage.toggleRc003Capture 同源：每次开启都先弹确认
+  // （2026-10-03 定稿：每次开启都重新授权，都会弹 Windows 授权窗口）。
+  // 关闭方向永远直接执行。
+  if (rc003CaptureEnabled.value !== true) {
+    showCaptureConfirm.value = true;
+    // 开关 DOM 在点击瞬间已被浏览器翻转，先写回关闭，等确认后再真正执行。
+    syncCaptureSwitchDom();
+    return;
+  }
+  await applyCaptureToggle();
+}
+
+async function applyCaptureToggle() {
+  if (rc003CaptureBusy.value) return;
+  rc003CaptureBusy.value = true;
+  const wasEnabled = rc003CaptureEnabled.value;
+  try {
+    const next: Rc003TaskStatus =
+      wasEnabled === true ? await disableRc003Capture() : await enableRc003Capture();
+    if (next.lastError) {
+      rc003CaptureHint.value = next.lastError;
+      reportFrontendEvent({
+        event: "rc003_capture_toggle",
+        phase: "completed",
+        result: "failed",
+        reason: `page=connection was_enabled=${String(wasEnabled === true)} error=${next.lastError}`,
+      });
+      return;
+    }
+    rc003CaptureEnabled.value = next.enabled;
+    rc003CaptureHint.value = "";
+    reportFrontendEvent({
+      event: "rc003_capture_toggle",
+      phase: "completed",
+      result: "passed",
+      reason: `page=connection enabled=${String(next.enabled)}`,
+    });
+  } catch (error) {
+    rc003CaptureHint.value = error instanceof Error ? error.message : String(error);
+    reportFrontendEvent({
+      event: "rc003_capture_toggle",
+      phase: "completed",
+      result: "failed",
+      reason: `page=connection was_enabled=${String(wasEnabled === true)} switch_reverted`,
+    });
+    // 同步回退到点击前的状态，并用权威状态校正一次（与 ButtonsPage 同源）。
+    rc003CaptureEnabled.value = wasEnabled === true;
+    void getRc003TaskStatus()
+      .then((status) => {
+        rc003CaptureEnabled.value = status.enabled;
+      })
+      .catch(() => {});
+  } finally {
+    rc003CaptureBusy.value = false;
+    syncCaptureSwitchDom();
+  }
+}
+
+function confirmCaptureDialog(): void {
+  showCaptureConfirm.value = false;
+  void applyCaptureToggle();
+}
+
+function closeCaptureDialog(): void {
+  showCaptureConfirm.value = false;
+  syncCaptureSwitchDom();
 }
 
 /**
@@ -856,6 +1064,26 @@ async function initializeAudio() {
   await Promise.all([detectAudioEndpoints(), scanCaptureInputs(), refreshAudioRoute()]);
 }
 
+function onGainInput(event: Event): void {
+  gainDb.value = Number((event.target as HTMLInputElement).value);
+}
+
+async function onGainCommit(event: Event): Promise<void> {
+  const desired = Number((event.target as HTMLInputElement).value);
+  savingGain.value = true;
+  gainError.value = "";
+  try {
+    // 以保存返回值为准回显：越界值会被后端钳制（0–24 dB），界面不假装存了别的数。
+    savedGainDb.value = await setGainDb(desired);
+    gainDb.value = savedGainDb.value;
+  } catch (error) {
+    gainError.value = error instanceof Error ? error.message : String(error);
+    gainDb.value = savedGainDb.value;
+  } finally {
+    savingGain.value = false;
+  }
+}
+
 onMounted(async () => {
   void refreshCaptureInput();
   window.addEventListener("blur", handleVoiceCaptureBlur);
@@ -863,6 +1091,14 @@ onMounted(async () => {
   void initializeAudio();
   void initializeShortcutSettings();
   void refreshVokieInstallation();
+  void getGainDb()
+    .then((value) => {
+      gainDb.value = value;
+      savedGainDb.value = value;
+    })
+    .catch((error) => {
+      gainError.value = error instanceof Error ? error.message : String(error);
+    });
   pollTimer = setInterval(() => {
     void refreshCaptureInput();
     void refreshConnection();
@@ -1058,6 +1294,28 @@ onUnmounted(() => {
           </template>
         </details>
 
+        <div class="gain-row">
+          <label class="gain-label" for="audio-gain">增益</label>
+          <input
+            id="audio-gain"
+            name="audio-gain"
+            class="gain-slider"
+            type="range"
+            min="0"
+            max="24"
+            step="1"
+            :value="gainDb"
+            :disabled="savingGain"
+            @input="onGainInput"
+            @change="onGainCommit"
+          />
+          <span class="gain-value">{{ gainDb }} dB</span>
+        </div>
+        <p class="muted gain-help">
+          0 dB 保持原始音量；数值越大声音越响，也会放大环境噪声。建议先从 6–12 dB 开始。
+        </p>
+        <p v-if="gainError" class="error-text" role="alert">{{ gainError }}</p>
+
         <div v-if="audioScanComplete && !virtualCableInstalled" class="info-callout warning vb-cable-callout">
           <div>
             <strong>需要安装 VB-CABLE</strong>
@@ -1124,6 +1382,48 @@ onUnmounted(() => {
               <span class="pill" :class="toolChordPill('doubao').ok ? 'ok' : 'warn'">
                 {{ toolChordPill("doubao").label }}
               </span>
+            </div>
+            <div class="switch-line">
+              <label
+                class="toggle-row"
+                for="capture-switch-doubao"
+                :title="captureUnsupported ? CAPTURE_UNSUPPORTED_TITLE : undefined"
+              >
+                <span>支持更多输入工具</span>
+                <span
+                  v-if="rc003CaptureEnabled === null"
+                  class="toggle-placeholder"
+                  aria-hidden="true"
+                ></span>
+                <input
+                  v-else
+                  id="capture-switch-doubao"
+                  ref="captureSwitchEl"
+                  type="checkbox"
+                  class="toggle-input capture-switch"
+                  :checked="rc003CaptureEnabled === true"
+                  :disabled="rc003CaptureBusy || captureUnsupported"
+                  @change="toggleRc003Capture"
+                />
+              </label>
+              <span
+                class="switch-state"
+                :class="rc003CaptureEnabled === true ? 'ok' : 'warn'"
+              >
+                {{ captureStateLabel("doubao") }}
+              </span>
+            </div>
+            <!-- 本机不可用（ARM64，issue #206）：先说清这台电脑用不了，再说别的。
+                 与按键页「全按键支持」同一句口径，只有名称随本页入口变化。 -->
+            <div v-if="captureUnsupported" class="info-callout warning callout-small">
+              {{ CAPTURE_UNSUPPORTED_NOTE }}
+            </div>
+            <div
+              v-else-if="rc003CaptureEnabled === false"
+              class="info-callout warning callout-small"
+            >
+              还差一步：开启后豆包才能收到遥控器语音键。每次开启都会弹出系统授权，请点“是”。
+              已开启：现在按住遥控器语音键，豆包的语音条就会出现。
             </div>
             <div v-if="vokieRunning === true" class="info-callout warning callout-small">
               检测到 Vokie 正在运行：它和豆包用的是同一个快捷键（右 Alt），按住遥控器语音键可能唤起 Vokie。要用豆包，请先退出 Vokie。
@@ -1226,6 +1526,40 @@ onUnmounted(() => {
                 {{ capturingVoiceHotkey ? "录入中…（按 Esc 取消）" : "自定义组合键" }}
               </button>
             </div>
+            <div class="switch-line">
+              <label
+                class="toggle-row"
+                for="capture-switch-other"
+                :title="captureUnsupported ? CAPTURE_UNSUPPORTED_TITLE : undefined"
+              >
+                <span>支持更多输入工具</span>
+                <span
+                  v-if="rc003CaptureEnabled === null"
+                  class="toggle-placeholder"
+                  aria-hidden="true"
+                ></span>
+                <input
+                  v-else
+                  id="capture-switch-other"
+                  ref="captureSwitchEl"
+                  type="checkbox"
+                  class="toggle-input capture-switch"
+                  :checked="rc003CaptureEnabled === true"
+                  :disabled="rc003CaptureBusy || captureUnsupported"
+                  @change="toggleRc003Capture"
+                />
+              </label>
+              <span
+                class="switch-state"
+                :class="rc003CaptureEnabled === true ? 'ok' : 'warn'"
+              >
+                {{ captureStateLabel("other") }}
+              </span>
+            </div>
+            <!-- 本机不可用（ARM64，issue #206）：说明句与豆包面板逐字一致。 -->
+            <p v-if="captureUnsupported" class="tiny muted">{{ CAPTURE_UNSUPPORTED_NOTE }}</p>
+            <p v-else class="tiny muted">建议开启：部分输入工具需要它才能收到遥控器按键。</p>
+            <p v-if="rc003CaptureHint" class="tiny muted">{{ rc003CaptureHint }}</p>
             <p v-if="capturingVoiceHotkey" class="capture-display voice-hotkey-capture">
               {{
                 voiceCaptureDisplay.length
@@ -1290,6 +1624,13 @@ onUnmounted(() => {
       </ul>
     </details>
   </section>
+  <!-- 授权确认弹窗：与 ButtonsPage 共用同一组件（同一设置项、同一授权流程）；
+       每次开启都先出现（toggleRc003Capture 决定，2026-10-03 起无授权判据）。 -->
+  <EnhancedCaptureConfirmDialog
+    v-if="showCaptureConfirm"
+    @confirm="confirmCaptureDialog"
+    @close="closeCaptureDialog"
+  />
 </template>
 
 <style scoped>

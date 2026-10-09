@@ -13,6 +13,19 @@ $preservationMarker = Join-Path $appConfigDirectory "ci-uninstall-preservation-m
 $appProcess = $null
 $normalUninstallCompleted = $false
 
+function Request-GracefulExit {
+    $handle = $null
+    try {
+        $handle = [System.Threading.EventWaitHandle]::OpenExisting('Local\SayAll-GracefulExit')
+        $null = $handle.Set()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $handle) { $handle.Dispose() }
+    }
+}
+
 function Get-PropertyValue($object, [string] $name) {
     $property = $object.PSObject.Properties[$name]
     if ($null -eq $property) {
@@ -136,6 +149,10 @@ try {
     if (-not (Test-Path -LiteralPath $installLocation -PathType Container)) {
         throw "Installed SayAll directory is missing: $installLocation"
     }
+    # 载荷集合断言（2026-10-07，Issue #206）：这条路径是**全新安装**（脚本开头就断言系统里没有
+    # 既有安装），因而是「本包真的把暂存的每一件载荷都装进来了」的判别性判据——安装矩阵走的是
+    # 升级路径，上一版留下的文件会让"缺件"看不出来。NSIS 压缩之后再没有别的办法看出来。
+    & (Join-Path $PSScriptRoot "verify-installed-payload-set.ps1") -InstallDirectory $installLocation
 
     $startMenuRoot = [Environment]::GetFolderPath("StartMenu")
     $startMenuDirectory = Join-Path (Join-Path $startMenuRoot "Programs") $startMenuFolderName
@@ -158,14 +175,27 @@ try {
     $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
     [IO.File]::WriteAllText($preservationMarker, "CI uninstall preservation marker`n", $utf8WithoutBom)
 
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    New-Item -Path $runKey -Force | Out-Null
+    Set-ItemProperty -Path $runKey -Name 'SayAll' -Value "`"$appExecutable`""
+
+    # 当前 fork 保留运行目录及清理记录，不恢复旧 --uninstall-cleanup 递归删除。
+    # 独立标记仅验证目录保留，不伪造会话令牌或实际停止回执。
+    $runtimeDirectory = Join-Path $env:PROGRAMDATA "SayAll\rc003-helper"
+    New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+    $cleanupPreservationMarker = Join-Path $runtimeDirectory 'ci-cleanup-preservation-marker.txt'
+    [IO.File]::WriteAllText($cleanupPreservationMarker, "CI cleanup preservation marker`n", $utf8WithoutBom)
+    $cleanupPreservationHash = (Get-FileHash -LiteralPath $cleanupPreservationMarker -Algorithm SHA256).Hash
+
     $appProcess = Start-Process -FilePath $appExecutable -PassThru
     Start-Sleep -Seconds 8
     $appProcess.Refresh()
     if ($appProcess.HasExited) {
         throw "Installed SayAll exited during the 8-second launch smoke test with code $($appProcess.ExitCode)"
     }
-    Stop-Process -Id $appProcess.Id -Force
-    $appProcess.WaitForExit()
+    if (-not (Request-GracefulExit) -or -not $appProcess.WaitForExit(20000)) {
+        throw 'Installed app did not finish normal exit; lifecycle test is blocked without replacing files'
+    }
     $appProcess = $null
 
     Invoke-SilentUninstall $entry
@@ -186,11 +216,19 @@ try {
     if (-not (Test-Path -LiteralPath $preservationMarker -PathType Leaf)) {
         throw "Silent uninstall unexpectedly removed the SayAll app-config marker"
     }
+    if ($null -ne (Get-ItemProperty -Path $runKey -Name 'SayAll' -ErrorAction SilentlyContinue)) {
+        throw 'SayAll run-at-login entry remains after silent uninstall'
+    }
+    if (-not (Test-Path -LiteralPath $cleanupPreservationMarker -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $cleanupPreservationMarker -Algorithm SHA256).Hash -ne $cleanupPreservationHash) {
+        throw 'Silent uninstall unexpectedly removed or changed retained cleanup evidence'
+    }
 
     Write-Host "Verified silent current-user install and uninstall: $($installers[0].Name)"
     Write-Host "Install location: $installLocation"
     Write-Host "Launch smoke test: process remained alive for 8 seconds"
     Write-Host "App config retained: $appConfigDirectory"
+    Write-Host 'Cleanup evidence directory retained without changing the preservation marker'
     if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
         @"
 ### Windows NSIS lifecycle
@@ -199,16 +237,21 @@ try {
 - HKCU uninstall entry and one Start Menu shortcut: passed
 - installed process alive for 8 seconds: passed
 - `/S` uninstall removed app files, shortcut and uninstall entry: passed
+- normal application exit before uninstall: passed
+- run-at-login entry removed: passed
+- cleanup evidence preservation marker unchanged: passed
 - `%APPDATA%\\$($config.identifier)` marker retained: passed
 
 This does not validate visible UI rendering, SmartScreen, Windows 10 1809, real hardware, or a signed public installer.
 "@ | Add-Content -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
     }
 } finally {
+    $canUninstall = $true
     if ($null -ne $appProcess -and -not $appProcess.HasExited) {
-        Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue
+        $canUninstall = (Request-GracefulExit) -and $appProcess.WaitForExit(20000)
+        if (-not $canUninstall) { Write-Warning 'Normal exit is unconfirmed; leaving the installation and process intact' }
     }
-    if (-not $normalUninstallCompleted) {
+    if (-not $normalUninstallCompleted -and $canUninstall) {
         foreach ($remainingEntry in @(Get-SayAllUninstallEntries)) {
             try {
                 Invoke-SilentUninstall $remainingEntry

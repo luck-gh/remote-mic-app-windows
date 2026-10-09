@@ -1,6 +1,7 @@
 !include WinVer.nsh
 !define SAYALL_CLEANUP_VERIFIER "${__FILEDIR__}\verify-capture-cleanup.ps1"
 !define SAYALL_CLEANUP_HELPER "${__FILEDIR__}\..\sayall-helper.exe"
+!define SAYALL_CLEANUP_HELPER_ARM64 "${__FILEDIR__}\..\sayall-helper-arm64.exe"
 !define SAYALL_RETIRED_RECYCLER "${__FILEDIR__}\recycle-retired-files.ps1"
 
 Var SayAllInstallResultDirectory
@@ -46,6 +47,10 @@ Var SayAllOverlayRadio
     StrCpy $SayAllInstallStage gadget
   !else if "${_name}" == "sayall-helper.exe"
     StrCpy $SayAllInstallStage helper
+  !else if "${_name}" == "sayall-helper-arm64.exe"
+    StrCpy $SayAllInstallStage helper_arm64
+  !else if "${_name}" == "frida-gadget-arm64.dll"
+    StrCpy $SayAllInstallStage gadget_arm64
   !else if "${_name}" == "licenses\ATTRIBUTION.md"
     StrCpy $SayAllInstallStage license_attribution
   !else if "${_name}" == "licenses\Frida-COPYING.txt"
@@ -189,6 +194,8 @@ Var SayAllOverlayRadio
 
 ; The app owns normal shutdown. Confirm its elevated capture Helper has also
 ; released inputs and detached its hook before the installer touches resources.
+; The bundled x64 --cleanup-only path does not inject; it can obtain a fresh
+; stop receipt from the native ARM64 Agent through the same public process/IPC checks.
 !macro SayAllVerifyCaptureCleanup
   Push $R8
   Push $R9

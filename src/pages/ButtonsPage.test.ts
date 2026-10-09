@@ -94,6 +94,8 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       return () => {};
     }),
     startShortcutCapture: vi.fn(async () => undefined),
+    learnFocusTarget: vi.fn(async () => ({ controlType: "edit", automationId: "compose" })),
+    testAppFocus: vi.fn(async () => undefined),
     stopShortcutCapture: vi.fn(async () => undefined),
     subscribeShortcutCaptureEdges: vi.fn(async (handler: ShortcutCaptureHandler) => {
       shortcutCaptureHandler = handler;
@@ -117,6 +119,8 @@ import {
   updateButtonMappingTemplate,
   startShortcutCapture,
   stopShortcutCapture,
+  learnFocusTarget,
+  testAppFocus,
 } from "../lib/bridge";
 import type { ButtonMappings, RuntimeSnapshot } from "../lib/bridge";
 
@@ -1180,5 +1184,140 @@ describe("buttons mapping page", () => {
     expect(page.find(".device-chip").text()).toContain("小米蓝牙语音遥控器");
     expect(page.find(".device-chip").text()).not.toContain("连接后显示");
     page.unmount();
+  });
+});
+
+
+describe("hold repeat and OK click in local editing drafts", () => {
+  it("keeps explicit app focus settings in the common draft until saved", async () => {
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      expect(wrapper.get('[aria-label="应用聚焦方式"]').element).toHaveProperty("value", "open_only");
+      expect(learnFocusTarget).not.toHaveBeenCalled();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("recorded_element");
+      await wrapper.get('[data-testid="learn-app-focus"]').trigger("click");
+      await flushPromises();
+      expect(learnFocusTarget).toHaveBeenCalledOnce();
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(wrapper.get('[data-testid="test-app-focus"]').attributes("disabled")).toBeDefined();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenCalledWith(expect.objectContaining({ focusProfiles: { wechat: { strategy: "recorded_element", recorded: { controlType: "edit", automationId: "compose" } } } }));
+      await wrapper.get('[data-testid="test-app-focus"]').trigger("click");
+      await flushPromises();
+      expect(testAppFocus).toHaveBeenCalledWith("wechat");
+      expect(wrapper.text()).toContain("已提交测试");
+      await wrapper.get(".editing-source-picker select").setValue("template:profile-a");
+      await flushPromises();
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      expect(wrapper.find('[aria-label="应用聚焦方式"]').exists()).toBe(false);
+    } finally { wrapper.unmount(); }
+  });
+
+  it("records an app focus shortcut without replacing the open-app action", async () => {
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("app_shortcut");
+      await wrapper.get('[data-testid="capture-app-focus"]').trigger("click");
+      await flushPromises();
+      shortcutCaptureHandler?.({ key: "left_control", isPressed: true });
+      shortcutCaptureHandler?.({ key: "l", isPressed: true });
+      shortcutCaptureHandler?.({ key: "l", isPressed: false });
+      shortcutCaptureHandler?.({ key: "left_control", isPressed: false });
+      await flushPromises();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenCalledWith(expect.objectContaining({ actions: expect.objectContaining({ ok: expect.objectContaining({ single: { type: "open_app", target: "wechat" } }) }), focusProfiles: { wechat: { strategy: "app_shortcut", shortcut: { keys: ["left_control", "l"] } } } }));
+    } finally { wrapper.unmount(); }
+  });
+
+  it("ignores a learned target returned after the edited app changes", async () => {
+    let resolve!: (value: { controlType: string; automationId: string }) => void;
+    vi.mocked(learnFocusTarget).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      const editor = wrapper.findComponent({ name: "ButtonActionEditor" });
+      editor.vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("recorded_element");
+      await wrapper.get('[data-testid="learn-app-focus"]').trigger("click");
+      editor.vm.$emit("update", { type: "open_app", target: "doubao" });
+      await flushPromises();
+      resolve({ controlType: "edit", automationId: "late" });
+      await flushPromises();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[0]![0].focusProfiles).toEqual({ wechat: { strategy: "recorded_element" } });
+    } finally { wrapper.unmount(); }
+  });
+
+  it("shows a failed recording without saving or claiming a target was recorded", async () => {
+    vi.mocked(learnFocusTarget).mockRejectedValueOnce(new Error("no_editable_target"));
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("recorded_element");
+      await wrapper.get('[data-testid="learn-app-focus"]').trigger("click");
+      await flushPromises();
+      expect(wrapper.text()).toContain("记录输入框失败");
+      expect(wrapper.text()).toContain("尚未记录输入框");
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(wrapper.get('[data-testid="test-app-focus"]').attributes("disabled")).toBeDefined();
+    } finally { wrapper.unmount(); }
+  });
+  it("saves repeat only to the explicitly edited template and reconciles an incompatible long action", async () => {
+    const wrapper = await mountPage();
+    try {
+      await wrapper.get(".editing-source-picker select").setValue("template:profile-a");
+      await flushPromises();
+      const up = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "上")!;
+      await up.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "shortcut", chord: { keys: ["up"] } });
+      await flushPromises();
+      await wrapper.findAll(".repeat-group button").find(button => button.text() === "重复单击动作")!.trigger("click");
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+      expect(wrapper.get('[aria-label="当前使用的按键模板"]').text()).toBe("Agent");
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(updateButtonMappingTemplate).toHaveBeenCalledWith("profile-a", expect.objectContaining({ actions: expect.objectContaining({ up: expect.objectContaining({ holdRepeat: "single" }) }) }));
+      await up.findAll(".mapping-cell")[2]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "shortcut", chord: { keys: ["control", "c"] } });
+      await flushPromises();
+      expect(wrapper.findAll(".repeat-group button")[0]!.classes()).toContain("selected");
+      expect(wrapper.text()).toContain("连续执行”已关闭");
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("keeps contextual OK clicks in a common draft and never exposes them for a template", async () => {
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      await wrapper.get(".ok-click-toggle input").setValue(true);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenCalledWith(expect.objectContaining({ actions: expect.objectContaining({ ok: expect.objectContaining({ okContextClick: true }) }) }));
+      await wrapper.get(".editing-source-picker select").setValue("template:profile-a");
+      await flushPromises();
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      expect(wrapper.find(".ok-click-toggle").exists()).toBe(false);
+      expect(wrapper.get(".voice-card").find(".repeat-group").exists()).toBe(false);
+    } finally { wrapper.unmount(); }
   });
 });

@@ -1,4 +1,4 @@
-param([int]$TimeoutMs = 45000, [string]$CleanupHelperPath, [switch]$SelfTest)
+﻿param([int]$TimeoutMs = 45000, [string]$CleanupHelperPath, [switch]$SelfTest)
 $ErrorActionPreference = 'Stop'
 
 function Test-CleanupInteger($Value) {
@@ -29,14 +29,18 @@ function Request-CaptureStop {
     [IO.File]::WriteAllText((Join-Path $directory 'rc003-capture-stop'), 'stop')
 }
 
+function Test-CurrentCaptureHelperImage([string]$Name) {
+    return $Name -in @('sayall-helper', 'sayall-helper-arm64')
+}
+
 function Get-CaptureHelpers {
     $session = (Get-Process -Id $PID).SessionId
-    foreach ($process in @(Get-Process -Name 'sayall-helper', 'sayall-hid-host-helper', 'sayall-component-helper' -ErrorAction SilentlyContinue)) {
+    foreach ($process in @(Get-Process -Name 'sayall-helper', 'sayall-helper-arm64', 'sayall-hid-host-helper', 'sayall-component-helper' -ErrorAction SilentlyContinue)) {
         if ($process.SessionId -eq $session) {
             [pscustomobject]@{
                 Id = $process.Id
                 Started = ([DateTimeOffset]$process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
-                IsLegacy = $process.ProcessName -ne 'sayall-helper'
+                IsLegacy = -not (Test-CurrentCaptureHelperImage $process.ProcessName)
             }
         }
     }

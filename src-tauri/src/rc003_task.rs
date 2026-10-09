@@ -20,6 +20,12 @@ pub struct TaskStatus {
 const AUTHORIZATION_REQUIRED_ON_EVERY_ENABLE: bool = true;
 
 pub fn locate_helper_exe() -> Option<std::path::PathBuf> {
+    locate_helper_exe_for(sayall_windows::os_arch::native_arch())
+}
+
+pub fn locate_helper_exe_for(
+    arch: sayall_windows::os_arch::NativeArch,
+) -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("SAYALL_RC003_HELPER") {
         let path = std::path::PathBuf::from(path);
         if path.is_file() {
@@ -28,26 +34,84 @@ pub fn locate_helper_exe() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     if let Some(dir) = exe.parent() {
-        let candidate = dir.join("sayall-helper.exe");
+        let candidate = dir.join(arch.helper_file_name());
         if candidate.is_file() {
             return Some(candidate);
         }
+        // 开发布局：沿着父目录向上找仓库根。
         let mut dir = dir.to_path_buf();
         for _ in 0..4 {
             dir = dir.parent()?.to_path_buf();
-            let candidate = dir
+            let mut candidate = dir
                 .join("hardware")
                 .join("RC003")
                 .join("helper")
-                .join("target")
-                .join("release")
-                .join("sayall-helper.exe");
+                .join("target");
+            if let Some(triple) = dev_target_triple(arch) {
+                candidate = candidate.join(triple);
+            }
+            let candidate = candidate.join("release").join("sayall-helper.exe");
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// 该架构的 cargo `--target` 目录名。x64 用默认 target 目录（无 triple），
+/// arm64 必须显式 `--target aarch64-pc-windows-msvc`（交叉编译），因此多一层。
+fn dev_target_triple(arch: sayall_windows::os_arch::NativeArch) -> Option<&'static str> {
+    match arch {
+        sayall_windows::os_arch::NativeArch::Arm64 => Some("aarch64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
+/// 增强捕获在本机的可用性（IPC `get_capture_support` 的返回体）。
+///
+/// 为什么要有它：ARM64 上"打开开关 → 永远停在正在启动"曾经没有任何解释（Issue #206），
+/// 用户与排查者都只能看到 25 秒后的一条失败日志。这里把结论前移：本机架构有没有对应的
+/// 助手 / Gadget，界面据此置灰并说明原因。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureSupport {
+    /// 本机**原生**架构：`x64` / `arm64` / `unknown`（探测失败或不受支持的原生架构）。
+    pub native_arch: String,
+    /// 本架构应当存在的助手文件名（诊断用；界面不显示）。
+    pub helper_expected: String,
+    pub available: bool,
+    /// `arch_unsupported` = 本机原生架构不属于 x64 / arm64；
+    /// `helper_missing` = 架构对得上，但安装包里没有对应的助手（载荷缺失）。
+    pub reason: Option<String>,
+}
+
+/// 可用性判定（纯函数，便于单测覆盖两种不可用原因）。
+pub(crate) fn capture_support_decision(
+    arch: sayall_windows::os_arch::NativeArch,
+    helper_found: bool,
+) -> (bool, Option<&'static str>) {
+    if arch.is_explicitly_unsupported() {
+        return (false, Some("arch_unsupported"));
+    }
+    if !helper_found {
+        return (false, Some("helper_missing"));
+    }
+    (true, None)
+}
+
+/// 本机增强捕获的可用性。探测失败（`unknown`）时沿用 x64 路径与既有行为：
+/// 一次探测失败不足以把功能判死。
+pub fn capture_support() -> CaptureSupport {
+    let arch = sayall_windows::os_arch::native_arch();
+    let helper_found = locate_helper_exe_for(arch).is_some();
+    let (available, reason) = capture_support_decision(arch, helper_found);
+    CaptureSupport {
+        native_arch: arch.as_str().to_string(),
+        helper_expected: arch.helper_file_name().to_string(),
+        available,
+        reason: reason.map(|value| value.to_string()),
+    }
 }
 
 pub fn task_installed() -> bool {
@@ -162,7 +226,7 @@ pub fn task_install_elevated(helper: &std::path::Path) -> Result<(), String> {
     sei.lpVerb = PCWSTR(verb.as_ptr());
     sei.lpFile = PCWSTR(file.as_ptr());
     sei.lpParameters = PCWSTR(parameters.as_ptr());
-    sei.nShow = 1; // SW_SHOWNORMAL；助手带 --hide-window 会自行隐藏
+    sei.nShow = 0; // GUI Helper has no console; keep Shell launch hidden.
 
     if let Err(error) = unsafe { ShellExecuteExW(&mut sei) } {
         let cancelled = error.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0);
@@ -211,6 +275,14 @@ pub fn task_install_elevated(helper: &std::path::Path) -> Result<(), String> {
 pub fn enable_capture(authorization_epoch: u64) -> Result<u64, String> {
     if capture_epoch() != authorization_epoch {
         return Err("全按键支持的启动请求已取消。".into());
+    }
+    let support = capture_support();
+    if !support.available {
+        sayall_windows::gatt_note(format!(
+            "rc003 feature=enhanced-capture action=enable phase=completed terminal_result=failed reason={} native_arch={} helper_expected={} retryable=false",
+            support.reason.as_deref().unwrap_or("unavailable"), support.native_arch, support.helper_expected
+        ));
+        return Err("安装包缺少本机需要的按键组件，或本机架构不受支持。".to_owned());
     }
     settle_pending_registration()?;
     let helper = locate_helper_exe().ok_or_else(|| {
@@ -449,6 +521,11 @@ fn cleanup_presentation(
 }
 
 // Scope process observations to this installation and Windows session.
+fn is_capture_helper_image(name: &str) -> bool {
+    name.eq_ignore_ascii_case("sayall-helper.exe")
+        || name.eq_ignore_ascii_case("sayall-helper-arm64.exe")
+}
+
 fn helper_processes() -> Result<Vec<(u32, u64)>, String> {
     use windows::core::{HRESULT, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME};
@@ -492,8 +569,7 @@ fn helper_processes() -> Result<Vec<(u32, u64)>, String> {
                 .is_ok()
                 && session == current_session;
             if same_session
-                && String::from_utf16_lossy(&entry.szExeFile[..end])
-                    .eq_ignore_ascii_case("sayall-helper.exe")
+                && is_capture_helper_image(&String::from_utf16_lossy(&entry.szExeFile[..end]))
             {
                 let process = match unsafe {
                     OpenProcess(
@@ -771,7 +847,7 @@ fn clear_reauth_marker() {
     let _ = std::fs::remove_file(reauth_marker_path());
 }
 
-fn task_registered_at() -> Option<String> {
+fn task_xml() -> Option<String> {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let bytes = std::fs::read(
         std::path::Path::new(&root)
@@ -784,14 +860,55 @@ fn task_registered_at() -> Option<String> {
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    let text = String::from_utf16(&units).ok()?;
-    extract_task_date(&text)
+    String::from_utf16(&units).ok()
+}
+
+/// 任务的注册时间（任务 XML 的 `<Date>`），作为「任务真的被重装过」的硬判据。
+fn task_registered_at() -> Option<String> {
+    extract_task_date(&task_xml()?)
 }
 
 fn extract_task_date(xml: &str) -> Option<String> {
     let start = xml.find("<Date>")? + "<Date>".len();
     let end = xml[start..].find("</Date>")? + start;
     Some(xml[start..end].to_string())
+}
+
+/// 任务注册的可执行文件名（`<Exec><Command>` 的最后一段路径）。
+/// **只取文件名**：完整路径是个人路径，不进日志。
+fn extract_task_command(xml: &str) -> Option<String> {
+    let start = xml.find("<Command>")? + "<Command>".len();
+    let end = xml[start..].find("</Command>")? + start;
+    let raw = xml[start..end].trim().trim_matches('"');
+    let name = raw.rsplit(|c| c == '\\' || c == '/').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// 计划任务指向的助手是不是**本架构**那一份（纯函数，便于单测）。
+/// `None` = 拿不到命令：那属于"任务缺失"另一条判据，这里不表态。
+pub(crate) fn task_target_verdict(command: Option<&str>, expected: &str) -> Option<bool> {
+    Some(command?.trim().eq_ignore_ascii_case(expected))
+}
+
+/// 计划任务当前指向的助手是否与本机架构相符。
+///
+/// **为什么需要**（2026-10-07 报障人 ARM64 实测发现）：覆盖安装会保留旧版注册的计划任务，
+/// 任务目标写的是**当时那个助手**的路径。从"只有 x64"的版本升到带 arm64 载荷的版本后，
+/// ARM64 机器上的任务仍指向 `sayall-helper.exe`：启动自动拉起会去跑 x64 助手，架构闸门
+/// 会拦下它（文案清楚），但界面要等约 25 秒重试完才失败，用户会以为功能坏了。
+/// 所以启动对账先比一次：不一致就回落开关，等用户拨一次开关重建任务——重装任务要提权，
+/// 不在启动时擅自弹 UAC（与"每次开启都重新授权"的既有语义一致）。
+pub fn task_target_matches(helper_file_name: &str) -> Option<bool> {
+    // 任务不存在时 `task_installed()` 那条判据已经会处理，这里不重复表态。
+    if !task_installed() {
+        return None;
+    }
+    let xml = task_xml()?;
+    task_target_verdict(extract_task_command(&xml).as_deref(), helper_file_name)
 }
 
 pub fn status(enabled: bool) -> TaskStatus {
@@ -1271,5 +1388,124 @@ mod tests {
     #[test]
     fn every_enable_requires_reauthorization() {
         assert!(AUTHORIZATION_REQUIRED_ON_EVERY_ENABLE);
+    }
+    #[test]
+    fn extracts_task_command_file_name_without_paths() {
+        // 真实任务 XML 的形态：<Command> 是完整路径（可能带引号），参数在 <Arguments> 里。
+        // 这里只允许取文件名——完整路径是个人路径，不能进日志。
+        let xml = r#"<?xml version="1.0"?><Task><Actions><Exec>
+            <Command>"C:\Users\someone\AppData\Local\无线麦 SayAll\sayall-helper.exe"</Command>
+            <Arguments>--follow-app</Arguments></Exec></Actions></Task>"#;
+        assert_eq!(
+            extract_task_command(xml).as_deref(),
+            Some("sayall-helper.exe")
+        );
+        // 不带引号 / 正斜杠 / 尾随空白都要能吃下
+        assert_eq!(
+            extract_task_command("<Command>C:/x/sayall-helper-arm64.exe </Command>").as_deref(),
+            Some("sayall-helper-arm64.exe")
+        );
+        // 没有 <Command> 或值为空 → None（交给"任务缺失"那条判据）
+        assert_eq!(extract_task_command("<Task></Task>"), None);
+        assert_eq!(extract_task_command("<Command>   </Command>"), None);
+    }
+
+    #[test]
+    fn task_target_verdict_flags_the_other_arch_helper() {
+        // 2026-10-07 报障人现场：ARM64 机器上任务仍指向 x64 助手（覆盖安装保留了旧任务）
+        assert_eq!(
+            task_target_verdict(Some("sayall-helper.exe"), "sayall-helper-arm64.exe"),
+            Some(false)
+        );
+        assert_eq!(
+            task_target_verdict(Some("sayall-helper-arm64.exe"), "sayall-helper-arm64.exe"),
+            Some(true)
+        );
+        // Windows 路径大小写不敏感
+        assert_eq!(
+            task_target_verdict(Some("SAYALL-HELPER-ARM64.EXE"), "sayall-helper-arm64.exe"),
+            Some(true)
+        );
+        // 拿不到命令 → 不表态
+        assert_eq!(task_target_verdict(None, "sayall-helper.exe"), None);
+    }
+
+    #[test]
+    fn capture_support_reasons_are_stable_strings() {
+        use sayall_windows::os_arch::NativeArch;
+        // 不受支持的原生架构（如 32 位 ARM）：无论助手在不在，都判不可用且原因固定
+        assert_eq!(
+            capture_support_decision(NativeArch::Other, true),
+            (false, Some("arch_unsupported"))
+        );
+        assert_eq!(
+            capture_support_decision(NativeArch::Other, false),
+            (false, Some("arch_unsupported"))
+        );
+        // 架构对得上但载荷缺失：只有这一种情况算 helper_missing
+        assert_eq!(
+            capture_support_decision(NativeArch::X64, false),
+            (false, Some("helper_missing"))
+        );
+        assert_eq!(
+            capture_support_decision(NativeArch::Arm64, false),
+            (false, Some("helper_missing"))
+        );
+        // 正常与"探测失败"都必须可用：探测失败不改既有行为
+        assert_eq!(
+            capture_support_decision(NativeArch::X64, true),
+            (true, None)
+        );
+        assert_eq!(
+            capture_support_decision(NativeArch::Arm64, true),
+            (true, None)
+        );
+        assert_eq!(
+            capture_support_decision(NativeArch::Unknown, true),
+            (true, None)
+        );
+        // 这两条字符串是前端契约（`reason` 字段），改名即破坏界面判据
+        assert_eq!(
+            capture_support_decision(NativeArch::Other, false).1,
+            Some("arch_unsupported")
+        );
+    }
+
+    #[test]
+    fn helper_file_name_follows_the_native_arch() {
+        use sayall_windows::os_arch::NativeArch;
+        // 安装目录里的文件名按架构分（ADR 0003）；开发布局里 cargo 产物名不变，
+        // 只多一层 triple 目录。
+        assert_eq!(NativeArch::X64.helper_file_name(), "sayall-helper.exe");
+        assert_eq!(
+            NativeArch::Arm64.helper_file_name(),
+            "sayall-helper-arm64.exe"
+        );
+        assert_eq!(
+            dev_target_triple(NativeArch::Arm64),
+            Some("aarch64-pc-windows-msvc")
+        );
+        assert_eq!(dev_target_triple(NativeArch::X64), None);
+        assert_eq!(dev_target_triple(NativeArch::Unknown), None);
+    }
+
+    #[test]
+    fn capture_support_reports_a_consistent_shape() {
+        // 本机是 x64 且仓库里就有助手产物（开发布局）——这依赖环境，故只断言形状不变量：
+        // 字段命名是前端契约，available 与 reason 必须自洽。
+        let support = capture_support();
+        assert!(matches!(
+            support.native_arch.as_str(),
+            "x64" | "arm64" | "unknown"
+        ));
+        assert!(support.helper_expected.ends_with(".exe"));
+        assert_eq!(support.available, support.reason.is_none());
+    }
+    #[test]
+    fn current_helpers_include_both_architectures_without_retired_modules() {
+        assert!(is_capture_helper_image("sayall-helper.exe"));
+        assert!(is_capture_helper_image("SAYALL-HELPER-ARM64.EXE"));
+        assert!(!is_capture_helper_image("sayall-hid-host-helper.exe"));
+        assert!(!is_capture_helper_image("other.exe"));
     }
 }

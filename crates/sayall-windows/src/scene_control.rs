@@ -1714,6 +1714,7 @@ fn active_button_mapping_from(state: &State) -> Option<ButtonMappings> {
             enabled: true,
             applications: Vec::new(),
             actions: Default::default(),
+            ..ButtonMappings::default()
         };
         for button in [
             RemoteButton::Up,
@@ -1747,6 +1748,7 @@ fn active_scene_mappings_from(state: &State) -> ButtonMappings {
         enabled: false,
         applications: Vec::new(),
         actions: Default::default(),
+        ..ButtonMappings::default()
     };
     if state.configuration.menu_template_switch_enabled {
         mappings.enabled = true;
@@ -3566,6 +3568,19 @@ mod tests {
             }
             fn launch_app(&self, _: &str) -> Result<(), String> {
                 panic!("unexpected launch")
+            }
+            fn focus_frontmost(&self) -> Result<(), String> {
+                panic!("unexpected focus")
+            }
+            fn launch_app_and_focus(
+                &self,
+                _: &str,
+                _: Option<&crate::focus::AppFocusProfile>,
+            ) -> Result<(), String> {
+                panic!("unexpected launch and focus")
+            }
+            fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+                panic!("unexpected focus learning")
             }
         }
         fn mappings(key: KeyCode) -> ButtonMappings {

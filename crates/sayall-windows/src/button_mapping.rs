@@ -24,7 +24,8 @@
 //! 跳过注入——冷首按单响应；Long/Double 与按住连发始终注入（原生无法
 //! 交付组合语义/连发）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -71,6 +72,9 @@ pub enum EngineMessage {
     Barrier(Sender<bool>),
     /// UI metadata is published only after earlier mapping updates were consumed.
     MappingNotice(MappingNoticeCallback),
+    /// 临时暂挂（向导第⑥步"只看不动"）：仍观察边沿与手势，但不执行任何动作。
+    /// 内存态、不落盘；进程结束自然消失。
+    SetSuspended(bool),
     Shutdown,
 }
 
@@ -90,21 +94,154 @@ pub trait MappingInjector: Send + Sync {
     fn mouse_move(&self, direction: MoveDirection, distance: u16) -> Result<(), String>;
     /// 打开/激活预设应用（生产实现调用 app_launcher）。
     fn launch_app(&self, target: &str) -> Result<(), String>;
+    /// 聚焦当前前台应用的可编辑输入框。
+    ///
+    /// **异步受理**：返回 `Ok` 只表示请求已交给聚焦服务（它会按时间表重试并
+    /// 独立汇报结果），不代表已经聚焦成功——聚焦结果见 [`Self::focus_report`]。
+    fn focus_frontmost(&self) -> Result<(), String>;
+    /// 打开/激活应用后按聚焦档案聚焦（`None` 或 `open_only` 等同只打开）。
+    fn launch_app_and_focus(
+        &self,
+        target: &str,
+        profile: Option<&crate::focus::AppFocusProfile>,
+    ) -> Result<(), String>;
+    /// 取消异步聚焦/学习；没有后台资源的实现无需操作。
+    fn cancel_focus(&self) {}
+    /// 正常退出后永久关闭当前平台实例的聚焦入口。
+    fn close_focus(&self) {
+        self.cancel_focus();
+    }
+    /// 最近一次聚焦结果（供 UI 状态与诊断）；无该能力的实现返回 `None`。
+    fn focus_report(&self) -> Option<crate::focus_service::FocusReport> {
+        None
+    }
+    /// 「学习输入框」：在 3 秒窗口内轮询系统焦点，返回稳定命中的可编辑目标。
+    ///
+    /// 同步阻塞（窗口期内），调用方必须放在后台任务里。
+    fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String>;
 }
 
 /// 生产注入器：批量 SendInput tap（DOWN+UP），部分交付时由 send_input 层回滚。
 pub struct SendInputInjector {
     runtime: Arc<crate::send_input_windows::SendInputRuntime>,
+    /// 聚焦服务：单线程串行执行 UIA 聚焦（不阻塞按键/手势线程）。
+    focus: Mutex<Option<crate::focus_service::FocusRunner>>,
+    focus_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    focus_generation: AtomicU64,
+    focus_closed: AtomicBool,
+    focus_policy: crate::focus_service::FocusRetryPolicy,
 }
 
 impl SendInputInjector {
     #[cfg(windows)]
     pub fn new(runtime: Arc<crate::send_input_windows::SendInputRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            focus: Mutex::new(None),
+            focus_cancel: Mutex::new(None),
+            focus_generation: AtomicU64::new(0),
+            focus_closed: AtomicBool::new(false),
+            focus_policy: crate::focus_service::FocusRetryPolicy::default(),
+        }
+    }
+
+    /// 惰性启动聚焦服务（首次用到时才创建线程）。
+    #[cfg(windows)]
+    fn with_focus_runner<T>(
+        &self,
+        task: impl FnOnce(&crate::focus_service::FocusRunner) -> T,
+    ) -> Option<T> {
+        let generation = self.focus_generation.load(Ordering::Acquire);
+        self.with_focus_runner_generation(generation, task)
+    }
+
+    #[cfg(windows)]
+    fn with_focus_runner_generation<T>(
+        &self,
+        generation: u64,
+        task: impl FnOnce(&crate::focus_service::FocusRunner) -> T,
+    ) -> Option<T> {
+        let mut slot = self
+            .focus
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.focus_closed.load(Ordering::Acquire)
+            || self.focus_generation.load(Ordering::Acquire) != generation
+        {
+            crate::ble::gatt_note(
+                "focus_request phase=cancelled reason=stale_generation".to_owned(),
+            );
+            return None;
+        }
+        if slot.as_ref().is_some_and(|runner| runner.is_cancelled()) {
+            slot.take();
+        }
+        if slot.is_none() {
+            let backend: Arc<dyn crate::focus_service::FocusBackend> =
+                Arc::new(crate::focus_windows::WindowsFocusBackend::new());
+            let runner = crate::focus_service::FocusRunner::spawn(backend, self.focus_policy);
+            *self.focus_cancel.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(runner.cancellation_signal());
+            *slot = Some(runner);
+        }
+        // 创建线程期间发生取消：其 signal 可能尚未发布，必须自行退役。
+        if self.focus_closed.load(Ordering::Acquire)
+            || self.focus_generation.load(Ordering::Acquire) != generation
+        {
+            slot.take();
+            crate::ble::gatt_note(
+                "focus_request phase=cancelled reason=stale_generation".to_owned(),
+            );
+            return None;
+        }
+        slot.as_ref().map(task)
+    }
+
+    #[cfg(not(windows))]
+    fn with_focus_runner_generation<T>(
+        &self,
+        _generation: u64,
+        _task: impl FnOnce(&crate::focus_service::FocusRunner) -> T,
+    ) -> Option<T> {
+        None
+    }
+
+    /// 非 Windows 平台没有 UIA 后端：聚焦服务不可用。
+    #[cfg(not(windows))]
+    fn with_focus_runner<T>(
+        &self,
+        _task: impl FnOnce(&crate::focus_service::FocusRunner) -> T,
+    ) -> Option<T> {
+        None
     }
 }
 
 impl MappingInjector for SendInputInjector {
+    fn close_focus(&self) {
+        self.focus_closed.store(true, Ordering::Release);
+        self.cancel_focus();
+    }
+
+    fn cancel_focus(&self) {
+        self.focus_generation.fetch_add(1, Ordering::AcqRel);
+        let signal = self
+            .focus_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(signal) = &signal {
+            signal.store(true, Ordering::Relaxed);
+        }
+        // 学习调用持有 focus 锁等待服务结果，取消不得等待该锁。
+        if let Ok(mut slot) = self.focus.try_lock() {
+            slot.take();
+        }
+        crate::ble::gatt_note(format!(
+            "focus_cancel phase=requested runner_present={}",
+            signal.is_some()
+        ));
+    }
+
     fn scroll(&self, direction: ScrollDirection, steps: u16) -> Result<(), String> {
         self.runtime
             .scroll(direction, steps)
@@ -135,6 +272,69 @@ impl MappingInjector for SendInputInjector {
 
     fn launch_app(&self, target: &str) -> Result<(), String> {
         crate::app_launcher::activate_or_launch(target)
+    }
+
+    fn focus_frontmost(&self) -> Result<(), String> {
+        self.with_focus_runner(|runner| runner.submit(crate::focus_service::FocusTask::Frontmost))
+            .flatten()
+            .map(|_| ())
+            .ok_or_else(|| "聚焦服务不可用".to_owned())
+    }
+
+    fn launch_app_and_focus(
+        &self,
+        target: &str,
+        profile: Option<&crate::focus::AppFocusProfile>,
+    ) -> Result<(), String> {
+        let generation = self.focus_generation.load(Ordering::Acquire);
+        if self.focus_closed.load(Ordering::Acquire) {
+            return Err("应用正在退出".to_owned());
+        }
+        self.launch_app(target)?;
+        if self.focus_closed.load(Ordering::Acquire)
+            || self.focus_generation.load(Ordering::Acquire) != generation
+        {
+            return Err("聚焦请求已取消".to_owned());
+        }
+        let strategy = profile
+            .map(|profile| profile.strategy)
+            .unwrap_or(crate::focus::FocusStrategy::OpenOnly);
+        match strategy {
+            crate::focus::FocusStrategy::OpenOnly => Ok(()),
+            crate::focus::FocusStrategy::AppShortcut => {
+                let chord = profile
+                    .and_then(|profile| profile.shortcut.clone())
+                    .ok_or_else(|| "该应用未录入聚焦快捷键".to_owned())?;
+                self.tap(&chord)
+            }
+            crate::focus::FocusStrategy::RecordedElement => {
+                let recorded = profile
+                    .and_then(|profile| profile.recorded.clone())
+                    .ok_or_else(|| "该应用还没有学习过输入框".to_owned())?;
+                self.with_focus_runner_generation(generation, |runner| {
+                    runner.submit(crate::focus_service::FocusTask::LaunchThenFocus(
+                        crate::focus::FocusChoice::Recorded(recorded),
+                    ))
+                })
+                .flatten()
+                .map(|_| ())
+                .ok_or_else(|| "聚焦服务不可用".to_owned())
+            }
+        }
+    }
+
+    fn focus_report(&self) -> Option<crate::focus_service::FocusReport> {
+        let slot = self
+            .focus
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.as_ref().and_then(|runner| runner.last_report())
+    }
+
+    fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+        self.with_focus_runner(|runner| runner.learn_target())
+            .unwrap_or(Err(crate::focus_service::FocusFailure::Cancelled))
+            .map_err(|reason| reason.as_str().to_owned())
     }
 }
 
@@ -178,6 +378,9 @@ pub struct ButtonMappingSnapshot {
     pub fired_gestures: u64,
     pub last_fired: Option<FiredGesture>,
     pub last_error: Option<String>,
+    /// 最近一次「聚焦输入框」的结果（未使用过该功能时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_focus: Option<crate::focus_service::FocusReport>,
 }
 
 #[derive(Debug, Default)]
@@ -185,6 +388,8 @@ struct EngineState {
     fired_gestures: u64,
     last_fired: Option<FiredGesture>,
     last_error: Option<String>,
+    /// 向导等场景的临时暂挂：观察照旧，动作不执行。
+    suspended: bool,
 }
 
 /// UI observation is a union of normal input and verified host reports. Mapping
@@ -280,6 +485,8 @@ pub struct ButtonMappingRuntime {
     edge_callbacks: Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     gesture_callbacks: Arc<RwLock<Vec<ButtonGestureCallback>>>,
     gesture_handler: Arc<RwLock<Option<GestureHandler>>>,
+    /// 与引擎工作线程共享的注入器句柄（用于读取最近一次聚焦结果、触发测试聚焦）。
+    injector: Arc<dyn MappingInjector>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -330,6 +537,8 @@ fn merge_recognition_mappings(
     merged.enabled = execution.enabled || scene.enabled;
     for (button, scene_actions) in &scene.actions {
         let actions = merged.actions.entry(*button).or_default();
+        // Scene controls own this button before common contextual clicks.
+        actions.ok_context_click = false;
         merge_recognition_action(&mut actions.single, &scene_actions.single);
         merge_recognition_action(&mut actions.double, &scene_actions.double);
         merge_recognition_action(&mut actions.long, &scene_actions.long);
@@ -415,6 +624,7 @@ impl ButtonMappingRuntime {
             edge_callbacks: Arc::clone(&edge_callbacks),
             gesture_callbacks: Arc::clone(&gesture_callbacks),
             gesture_handler: Arc::clone(&gesture_handler),
+            injector: Arc::clone(&injector),
             worker: None,
         };
 
@@ -693,6 +903,12 @@ impl ButtonMappingRuntime {
         }
     }
 
+    /// 临时暂挂：观察照旧（边沿与手势回调不受影响），动作不执行。
+    /// 只存在于引擎内存、不写入用户配置；用于向导第⑥步的"只看不动"。
+    pub fn set_suspended(&self, suspended: bool) {
+        let _ = self.sender.send(EngineMessage::SetSuspended(suspended));
+    }
+
     pub fn mappings(&self) -> ButtonMappings {
         self.configuration
             .lock()
@@ -721,6 +937,7 @@ impl ButtonMappingRuntime {
             fired_gestures: state.fired_gestures,
             last_fired: state.last_fired,
             last_error: state.last_error.clone(),
+            last_focus: self.injector.focus_report(),
         }
     }
 
@@ -734,6 +951,27 @@ impl ButtonMappingRuntime {
     }
 
     /// 订阅执行边沿，供菜单生命周期使用；不含只观察的增强报告。
+    /// UI「测试」按钮：走与手势分发相同的注入器路径（异步受理，结果见快照）。
+    pub fn close_focus(&self) {
+        self.injector.close_focus();
+    }
+
+    pub fn focus_frontmost_now(&self) -> Result<(), String> {
+        self.injector.focus_frontmost()
+    }
+
+    /// UI「测试打开与聚焦」：先打开/激活目标应用，再按其聚焦档案聚焦。
+    pub fn launch_app_and_focus_now(&self, target: &str) -> Result<(), String> {
+        let profile = self.mappings().focus_profiles.get(target).cloned();
+        self.injector.launch_app_and_focus(target, profile.as_ref())
+    }
+
+    /// UI「开始学习输入框」：阻塞至多 3 秒，返回捕获到的输入框特征。
+    pub fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+        self.injector.learn_focus_target()
+    }
+
+    /// 订阅语义按键边沿（Tauri 层转发为前端事件；画布高亮数据源）。
     pub fn subscribe_button_edges(&self, callback: ButtonEdgeCallback) {
         self.edge_callbacks
             .write()
@@ -794,6 +1032,121 @@ fn ignore_host_owned_keyboard(
     })
 }
 
+/// 「按住连续触发」一趟的日志聚合（按钮 → 触发方式、拍数、起始时刻）。
+type RepeatRuns = BTreeMap<RemoteButton, (ButtonTrigger, u64, Instant)>;
+
+/// OK 键「移动光标后按 OK 点击」的判定窗口：用遥控器移动过光标后的 5 秒内，
+/// 按 OK 直接点击光标位置（方案见 `docs/plan/2026-10-06-ok-context-click.md`）。
+const OK_CONTEXT_CLICK_WINDOW: Duration = Duration::from_secs(5);
+
+/// 上下文点击是否命中窗口（纯函数，便于按合成时间测试边界）。
+fn ok_context_click_window_hit(enabled: bool, last_move: Option<Instant>, now: Instant) -> bool {
+    enabled
+        && last_move.is_some_and(|at| now.saturating_duration_since(at) <= OK_CONTEXT_CLICK_WINDOW)
+}
+
+/// OK 按下沿的上下文点击判定与注入：命中窗口时注入一次左键单击并返回 `true`
+/// （调用方据此吞掉本次按压）；未命中或注入失败返回 `false`（走原本的手势路径，
+/// 注入失败时用户至少还能拿到原动作）。
+///
+/// 只对 OK 键生效；开关关闭时不留日志，避免每次按 OK 都刷一行。
+fn ok_context_click_applies(
+    edge: &ButtonEdge,
+    mappings: &Arc<RwLock<ButtonMappings>>,
+    last_remote_move_at: Option<Instant>,
+    now: Instant,
+    injector: &Arc<dyn MappingInjector>,
+) -> bool {
+    if !edge.is_pressed || edge.button != RemoteButton::Ok {
+        return false;
+    }
+    let (mappings_enabled, switch_on) = {
+        let mappings = read_lock(mappings);
+        (
+            mappings.enabled,
+            mappings.actions(RemoteButton::Ok).ok_context_click,
+        )
+    };
+    if !mappings_enabled || !switch_on {
+        return false;
+    }
+    let elapsed = last_remote_move_at.map(|at| now.saturating_duration_since(at));
+    if !ok_context_click_window_hit(true, last_remote_move_at, now) {
+        crate::ble::gatt_note(match elapsed {
+            Some(elapsed) => format!(
+                "map_ok_click action=skip reason=window_expired elapsed_ms={} window_ms={}",
+                elapsed.as_millis(),
+                OK_CONTEXT_CLICK_WINDOW.as_millis()
+            ),
+            None => "map_ok_click action=skip reason=no_recent_move".to_owned(),
+        });
+        return false;
+    }
+    // 门控未运行时不注入：原始键可能未被吞（同 map_skip_inject 的理由）。
+    if !key_gate::is_gate_thread_alive() {
+        crate::ble::gatt_note("map_ok_click action=skip reason=gate_not_alive".to_owned());
+        return false;
+    }
+    match injector.mouse_click(MouseClickKind::Left) {
+        Ok(()) => {
+            crate::ble::gatt_note(format!(
+                "map_ok_click action=click elapsed_ms={}",
+                elapsed.map(|value| value.as_millis()).unwrap_or(0)
+            ));
+            true
+        }
+        Err(error) => {
+            crate::ble::gatt_note(format!(
+                "map_ok_click action=skip reason=inject_failed error_domain=send_input error={error}"
+            ));
+            false
+        }
+    }
+}
+
+/// 记录一次连续触发拍：首拍落 start 日志，尾拍在结束日志里带出总拍数。
+fn note_repeat_beat(repeat_runs: &mut RepeatRuns, button: RemoteButton, trigger: ButtonTrigger) {
+    if !repeat_runs.contains_key(&button) {
+        crate::ble::gatt_note(format!(
+            "map_repeat start button={button:?} trigger={trigger:?} interval_ms={}",
+            button
+                .repeat_interval()
+                .map(|interval| interval.as_millis())
+                .unwrap_or(0)
+        ));
+        repeat_runs.insert(button, (trigger, 0, Instant::now()));
+    }
+    if let Some(run) = repeat_runs.get_mut(&button) {
+        run.1 = run.1.saturating_add(1);
+    }
+}
+
+/// 结束一趟连续触发并落聚合日志（`reason` = release / reset / reconfigure / shutdown）。
+fn finish_repeat_run(repeat_runs: &mut RepeatRuns, button: RemoteButton, reason: &str) {
+    if let Some((trigger, beats, started)) = repeat_runs.remove(&button) {
+        crate::ble::gatt_note(format!(
+            "map_repeat end button={button:?} trigger={trigger:?} beats={beats} duration_ms={} reason={reason}",
+            started.elapsed().as_millis()
+        ));
+    }
+}
+
+fn finish_all_repeat_runs(repeat_runs: &mut RepeatRuns, reason: &str) {
+    let buttons: Vec<RemoteButton> = repeat_runs.keys().copied().collect();
+    for button in buttons {
+        finish_repeat_run(repeat_runs, button, reason);
+    }
+}
+
+/// 把定时器到期的**连续拍**并入聚合；`advance_with_ticks` 的第二返回值以外
+/// 的手势（双击窗补发的单击、首次长按）是一次性手势，不进聚合
+/// （2026-10-05 评审发现 1：避免把点按记成 `map_repeat`，污染拍数与时长）。
+fn note_advance_ticks(repeat_runs: &mut RepeatRuns, ticks: Vec<(RemoteButton, ButtonTrigger)>) {
+    for (button, trigger) in ticks {
+        note_repeat_beat(repeat_runs, button, trigger);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn engine_worker(
     receiver: Receiver<EngineMessage>,
@@ -819,6 +1172,10 @@ fn engine_worker(
     let mut gesture_input = GestureInputState::default();
     let mut enhancement_active = false;
     let mut mapping_notice: Option<MappingNoticeCallback> = None;
+    // 「按住连续触发」统计：起拍建条目，释放/复位时聚合落一行。
+    let mut repeat_runs: RepeatRuns = BTreeMap::new();
+    // OK 键上下文点击：最近一次由遥控器注入成功的鼠标移动时刻（5 秒窗口）。
+    let mut last_remote_move_at: Option<Instant> = None;
 
     loop {
         let timeout = recognizer
@@ -829,7 +1186,11 @@ fn engine_worker(
                 Ok(message) => message,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
-                    for (button, trigger) in recognizer.advance(now) {
+                    // 只有连续触发计时器产生的拍才计入 map_repeat 聚合；
+                    // 双击窗补发的单击与首次长按是一次性手势（2026-10-05 评审发现 1）。
+                    let (fired, ticks) = recognizer.advance_with_ticks(now);
+                    note_advance_ticks(&mut repeat_runs, ticks);
+                    for (button, trigger) in fired {
                         if fire_gesture(
                             button,
                             trigger,
@@ -840,11 +1201,13 @@ fn engine_worker(
                             &gesture_handler,
                             &injector,
                             &mut native_pending,
+                            &mut last_remote_move_at,
                         ) {
                             reset_after_terminal_action(
                                 "lock_workstation",
                                 &mut merger,
                                 &mut recognizer,
+                                &mut repeat_runs,
                                 &snapshot,
                                 &edge_callbacks,
                                 &mut native_pending,
@@ -854,11 +1217,19 @@ fn engine_worker(
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // 引擎线程收尾：把仍在进行中的连续触发聚合日志补齐
+                    // （2026-10-05 评审发现 2）。
+                    finish_all_repeat_runs(&mut repeat_runs, "shutdown");
+                    break;
+                }
             },
             None => match receiver.recv() {
                 Ok(message) => message,
-                Err(_) => break,
+                Err(_) => {
+                    finish_all_repeat_runs(&mut repeat_runs, "shutdown");
+                    break;
+                }
             },
         };
 
@@ -918,6 +1289,8 @@ fn engine_worker(
                     &usage,
                     &mut native_pending,
                     &mut gesture_input,
+                    &mut repeat_runs,
+                    &mut last_remote_move_at,
                 );
             }
             EngineMessage::HidUsages(usages) => {
@@ -952,6 +1325,8 @@ fn engine_worker(
                     &usage,
                     &mut native_pending,
                     &mut gesture_input,
+                    &mut repeat_runs,
+                    &mut last_remote_move_at,
                 );
             }
             EngineMessage::GateEdge(edge) | EngineMessage::DriverEdge(edge) => {
@@ -981,9 +1356,12 @@ fn engine_worker(
                     &usage,
                     &mut native_pending,
                     &mut gesture_input,
+                    &mut repeat_runs,
+                    &mut last_remote_move_at,
                 );
             }
             EngineMessage::ListenerStopped | EngineMessage::DeviceRemoved => {
+                injector.cancel_focus();
                 observation.clear();
                 crate::ble::gatt_note(format!(
                     "map_reset source={}",
@@ -997,12 +1375,16 @@ fn engine_worker(
                 cancel_gesture_input(&merger, &mut gesture_input, &snapshot, &edge_callbacks);
                 native_pending.clear();
                 key_gate::cancel_pending_holds();
+                finish_all_repeat_runs(&mut repeat_runs, "reset");
             }
             EngineMessage::MappingsChanged {
                 execution,
                 recognition,
                 enhanced,
             } => {
+                if !recognition.enabled {
+                    injector.cancel_focus();
+                }
                 enhancement_active = enhanced;
                 cancel_gesture_input(&merger, &mut gesture_input, &snapshot, &edge_callbacks);
                 recognizer.release_all();
@@ -1026,6 +1408,7 @@ fn engine_worker(
                 let mappings = read_lock(&recognition_mappings).clone();
                 // 配置变化重置全部手势状态：挂起的泄漏对冲标记一并失效。
                 native_pending.clear();
+                finish_all_repeat_runs(&mut repeat_runs, "reconfigure");
                 let configured = crate::raw_input::ALL_BUTTONS
                     .iter()
                     .filter(|button| {
@@ -1042,12 +1425,21 @@ fn engine_worker(
                 }
             }
             EngineMessage::Shutdown => {
+                injector.close_focus();
+                finish_all_repeat_runs(&mut repeat_runs, "shutdown");
                 observation.clear();
                 recognizer.release_all();
                 cancel_gesture_input(&merger, &mut gesture_input, &snapshot, &edge_callbacks);
                 key_gate::cancel_pending_holds();
                 key_gate::configure(false, 0);
                 break;
+            }
+            EngineMessage::SetSuspended(suspended) => {
+                if suspended {
+                    injector.cancel_focus();
+                }
+                lock_state(&state).suspended = suspended;
+                crate::ble::gatt_note(format!("map_suspension suspended={suspended}"));
             }
         }
     }
@@ -1096,6 +1488,8 @@ fn handle_edges(
     usage: &Arc<UsageCounters>,
     native_pending: &mut BTreeSet<RemoteButton>,
     gesture_input: &mut GestureInputState,
+    repeat_runs: &mut RepeatRuns,
+    last_remote_move_at: &mut Option<Instant>,
 ) {
     if edges.is_empty() {
         return;
@@ -1150,10 +1544,27 @@ fn handle_edges(
             ));
         }
         let fired = if edge.is_pressed {
-            recognizer.press(edge.button, now)
+            // OK 上下文点击：命中窗口时立即点击光标位置，并吞掉本次按压
+            // （单击/双击/长按都不执行）；注入失败则回落到正常路径。
+            if !lock_state(state).suspended
+                && !native_pending.contains(&edge.button)
+                && read_lock(recognition_mappings)
+                    .actions(edge.button)
+                    .ok_context_click
+                && ok_context_click_applies(&edge, &mappings, *last_remote_move_at, now, injector)
+            {
+                recognizer.swallow_press(edge.button);
+                Vec::new()
+            } else {
+                recognizer.press(edge.button, now)
+            }
         } else {
             recognizer.release(edge.button, now)
         };
+        if !edge.is_pressed {
+            // 含「按住连续触发」的一趟结束：落聚合日志（拍数/时长）。
+            finish_repeat_run(repeat_runs, edge.button, "release");
+        }
         for trigger in fired {
             if fire_gesture(
                 edge.button,
@@ -1165,11 +1576,13 @@ fn handle_edges(
                 gesture_handler,
                 injector,
                 native_pending,
+                last_remote_move_at,
             ) {
                 reset_after_terminal_action(
                     "lock_workstation",
                     merger,
                     recognizer,
+                    repeat_runs,
                     snapshot,
                     edge_callbacks,
                     native_pending,
@@ -1187,6 +1600,7 @@ fn reset_after_terminal_action(
     reason: &str,
     merger: &mut ButtonStateMerger,
     recognizer: &mut GestureRecognizer,
+    repeat_runs: &mut RepeatRuns,
     snapshot: &Arc<Mutex<RawInputSnapshot>>,
     edge_callbacks: &Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     native_pending: &mut BTreeSet<RemoteButton>,
@@ -1194,6 +1608,7 @@ fn reset_after_terminal_action(
     recognizer.release_all();
     let releases = merger.release_all();
     native_pending.clear();
+    finish_all_repeat_runs(repeat_runs, "reset");
     crate::ble::gatt_note(format!(
         "map_reset source=terminal_action reason={reason} synthetic_releases={}",
         releases.len()
@@ -1230,15 +1645,21 @@ fn fire_gesture(
     gesture_handler: &Arc<RwLock<Option<GestureHandler>>>,
     injector: &Arc<dyn MappingInjector>,
     native_pending: &mut BTreeSet<RemoteButton>,
+    last_remote_move_at: &mut Option<Instant>,
 ) -> bool {
     let fired = FiredGesture { button, trigger };
-    {
+    let suspended = {
         let mut state = lock_state(state);
         state.fired_gestures = state.fired_gestures.saturating_add(1);
         state.last_fired = Some(fired);
-    }
+        state.suspended
+    };
     for callback in read_callbacks(gesture_callbacks).iter() {
         callback(fired);
+    }
+    // 暂挂（向导第⑥步）：手势仍被观察与广播，但不执行任何注入/动作。
+    if suspended {
+        return false;
     }
 
     let recognition = read_lock(recognition_mappings).clone();
@@ -1329,8 +1750,11 @@ fn fire_gesture(
             crate::ble::gatt_note(format!(
                 "map_fire button={button:?} trigger={trigger:?} action=mouse_move direction={direction:?} distance={distance}"
             ));
-            if let Err(error) = injector.mouse_move(direction, distance) {
-                lock_state(state).last_error = Some(format!("鼠标移动失败：{error}"));
+            // 只有注入成功才算"用户刚刚用遥控器移动过光标"：OK 上下文点击
+            // 的窗口据此刷新（失败不刷新，见 map_ok_click 的 skip 日志）。
+            match injector.mouse_move(direction, distance) {
+                Ok(()) => *last_remote_move_at = Some(Instant::now()),
+                Err(error) => lock_state(state).last_error = Some(format!("鼠标移动失败：{error}")),
             }
         }
         ButtonAction::Shortcut { chord } => {
@@ -1346,9 +1770,22 @@ fn fire_gesture(
                     .collect::<Vec<_>>()
                     .join("+")
             ));
+            // 成功判据分两层（Issue #195，2026-10-08）：`tap` 的 Ok 只表示事件
+            // 已入队（SendInput 提交数 = 计划数），不能当成"前台收到了键"——
+            // 0.5.0 现场就是 `map_inject result=ok` 与"测试页一个键都没有"同时
+            // 成立。这里补上第二层：本进程键钩子宿主看到的注入事件回声
+            // （`echo_delta`/`last_*`，见 key_gate::InjectedEcho）。
+            let echo_before = crate::key_gate::injected_event_count();
             match injector.tap(&chord) {
                 Ok(()) => {
-                    crate::ble::gatt_note("map_inject result=ok".to_owned());
+                    // 锁屏动作走 Win32 API（LockWorkStation），不进输入流：
+                    // 没有可观测的注入回声，不得套用 SendInput 分支的判据。
+                    if terminal_action {
+                        crate::ble::gatt_note(LOCK_WORKSTATION_INJECT_NOTE.to_owned());
+                    } else {
+                        let echo = observe_injection_echo(echo_before);
+                        crate::ble::gatt_note(shortcut_injection_note(echo));
+                    }
                     return terminal_action;
                 }
                 Err(error) => {
@@ -1363,26 +1800,100 @@ fn fire_gesture(
             } else {
                 "preset"
             };
+            let profile = mappings.focus_profiles.get(&target).cloned();
+            let strategy = profile
+                .as_ref()
+                .map(|profile| profile.strategy.as_str())
+                .unwrap_or("none");
             crate::ble::gatt_note(format!(
-                "map_fire button={:?} trigger={:?} action=open_app target_kind={target_kind}",
+                "map_fire button={:?} trigger={:?} action=open_app target_kind={target_kind} focus_strategy={strategy}",
                 button, trigger,
             ));
-            match injector.launch_app(&target) {
+            match injector.launch_app_and_focus(&target, profile.as_ref()) {
                 Ok(()) => crate::ble::gatt_note(format!(
-                    "map_launch result=ok target_kind={}",
-                    target_kind
+                    "map_launch result=ok target_kind={} focus_strategy={}",
+                    target_kind, strategy
                 )),
                 Err(error) => {
                     crate::ble::gatt_note(format!(
-                        "map_launch result=err target_kind={} error_domain=shell error_code=launch_failed reason=target_unavailable retryable=true",
-                        target_kind
+                        "map_launch result=err target_kind={} focus_strategy={} error_domain=shell error_code=launch_failed reason=target_unavailable retryable=true",
+                        target_kind, strategy
                     ));
                     lock_state(state).last_error = Some(format!("打开应用失败：{error}"));
                 }
             }
         }
+        ButtonAction::FocusInput => {
+            crate::ble::gatt_note(format!(
+                "map_fire button={:?} trigger={:?} action=focus_input",
+                button, trigger
+            ));
+            // 异步受理：聚焦要重试并读回，结果由聚焦服务经 focus_report 汇报，
+            // 这里只记录「已受理/无法受理」。
+            match injector.focus_frontmost() {
+                Ok(()) => crate::ble::gatt_note(
+                    "map_focus_input phase=accepted terminal_result=deferred".to_owned(),
+                ),
+                Err(error) => {
+                    crate::ble::gatt_note(
+                        "map_focus_input phase=requested terminal_result=failed reason=service_unavailable"
+                            .to_owned(),
+                    );
+                    lock_state(state).last_error = Some(format!("聚焦输入框失败：{error}"));
+                }
+            }
+        }
     }
     false
+}
+
+/// 锁屏动作（Win+L）不走 SendInput：`map_inject` 行必须显式说明"无回声是
+/// 设计如此"，否则会被读成"钩子没看到注入"（那是 SendInput 分支的失败判据）。
+const LOCK_WORKSTATION_INJECT_NOTE: &str =
+    "map_inject result=queued note=lock_workstation_via_api_no_sendinput_echo";
+
+/// 注入回声的有界等待预算：与门控的 60ms 有界等待同源——注入事件要先经
+/// 系统输入流回到宿主钩子，再由宿主经本机 IPC 送回主进程读线程；引擎线程
+/// 在这里做有界轮询，等到即返回（正常路径首轮即命中，不引入固定延迟）。
+const INJECTION_ECHO_WAIT_MS: u64 = 60;
+
+/// 等待并读取本次注入的回声读数。门控未运行（宿主钩子未安装/已断开）时
+/// 不等待：此时"没有回声"是预期的，直接记录读数即可（避免白等 60ms）。
+fn observe_injection_echo(before: u64) -> crate::key_gate::InjectedEcho {
+    // 单测环境没有真实宿主钩子，等也等不到回声：直接读数，不给每个注入
+    // 用例强加 60ms（诊断路径的测试豁免，不影响生产行为）。
+    if cfg!(test) || !crate::key_gate::is_gate_thread_alive() {
+        return crate::key_gate::injected_echo_since(before);
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(INJECTION_ECHO_WAIT_MS);
+    loop {
+        let echo = crate::key_gate::injected_echo_since(before);
+        if echo.count > 0 || Instant::now() >= deadline {
+            return echo;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// `map_inject` 日志行（纯函数，含回声分支）：
+/// - `result=queued`：事件已入队，**不声称成功**；
+/// - `echo_delta>0`：宿主钩子确实看到注入事件经过系统输入流（`last_*` 是
+///   最后一条的 vk/扫描码/flags，可当场核对目标键与扫描码）；
+/// - `echo_delta=0`：这次注入没有被宿主钩子看到——要么宿主/钩子不在，
+///   要么事件在到达本进程钩子之前就被别的钩子丢掉了。前台是否可见都不能
+///   由本行推出，仍需真机验收。
+fn shortcut_injection_note(echo: crate::key_gate::InjectedEcho) -> String {
+    if echo.count == 0 {
+        "map_inject result=queued echo_delta=0 note=hook_did_not_observe_injected_key".to_owned()
+    } else {
+        format!(
+            "map_inject result=queued echo_delta={} last_vk=0x{:02X} last_scan=0x{:02X} last_flags=0x{:X}",
+            echo.count,
+            echo.vk & 0xFF,
+            echo.scan & 0xFF,
+            echo.flags
+        )
+    }
 }
 
 fn read_lock<T>(mutex: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -2456,10 +2967,27 @@ mod tests {
         scrolls: StdMutex<Vec<(ScrollDirection, u16)>>,
         clicks: StdMutex<Vec<MouseClickKind>>,
         moves: StdMutex<Vec<(MoveDirection, u16)>>,
+        focus_requests: StdMutex<Vec<FocusCall>>,
+        focus_cancellations: StdMutex<u32>,
+        learn_results: StdMutex<Vec<Result<crate::focus::RecordedFocusTarget, String>>>,
         fail: bool,
     }
 
+    /// 测试注入器收到的聚焦类调用（区分「只聚焦」与「打开+聚焦」）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FocusCall {
+        Frontmost,
+        LaunchThenFocus {
+            target: String,
+            strategy: &'static str,
+        },
+    }
+
     impl MappingInjector for RecordingInjector {
+        fn cancel_focus(&self) {
+            *self.focus_cancellations.lock().unwrap() += 1;
+        }
+
         fn scroll(&self, direction: ScrollDirection, steps: u16) -> Result<(), String> {
             if self.fail {
                 return Err("wheel injection failed (test)".to_owned());
@@ -2498,6 +3026,51 @@ mod tests {
             }
             self.launches.lock().unwrap().push(target.to_owned());
             Ok(())
+        }
+
+        fn focus_frontmost(&self) -> Result<(), String> {
+            if self.fail {
+                return Err("聚焦服务不可用（测试）".to_owned());
+            }
+            self.focus_requests
+                .lock()
+                .unwrap()
+                .push(FocusCall::Frontmost);
+            Ok(())
+        }
+
+        fn launch_app_and_focus(
+            &self,
+            target: &str,
+            profile: Option<&crate::focus::AppFocusProfile>,
+        ) -> Result<(), String> {
+            if self.fail {
+                return Err("打开应用失败（测试）".to_owned());
+            }
+            let strategy = profile
+                .map(|profile| profile.strategy.as_str())
+                .unwrap_or("none");
+            self.launches.lock().unwrap().push(target.to_owned());
+            self.focus_requests
+                .lock()
+                .unwrap()
+                .push(FocusCall::LaunchThenFocus {
+                    target: target.to_owned(),
+                    strategy,
+                });
+            Ok(())
+        }
+        fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+            if self.fail {
+                return Err("学习输入框失败（测试）".to_owned());
+            }
+            self.learn_results.lock().unwrap().pop().unwrap_or_else(|| {
+                Ok(crate::focus::RecordedFocusTarget {
+                    control_type: "Edit".to_owned(),
+                    automation_id: "chat-input".to_owned(),
+                    ..Default::default()
+                })
+            })
         }
     }
 
@@ -2584,6 +3157,8 @@ mod tests {
             RemoteButton::Up,
             ButtonActions {
                 single: single(KeyCode::Up),
+                // 场景 5 断言按住连续触发 4 拍：按新模型显式开启开关。
+                hold_repeat: Some(ButtonTrigger::Single),
                 ..ButtonActions::default()
             },
         );
@@ -2610,6 +3185,8 @@ mod tests {
                 single: single(KeyCode::Enter),
                 double: single(KeyCode::Space),
                 long: ButtonAction::Disabled,
+                hold_repeat: None,
+                ok_context_click: false,
             },
         );
         // 电源→Win+L：锁屏会让真实 UP 延迟到解锁后，引擎须在成功请求锁屏后
@@ -2771,6 +3348,39 @@ mod tests {
         drop(gate);
     }
 
+    /// Issue #195：`map_inject` 的成功判据分两层——入队（queued）与回声
+    /// （宿主钩子是否看到这次注入）。日志模板必须同时覆盖"看到"与"没看到"
+    /// 两种形态，且不得再出现「result=ok」这种只证明入队的措辞。
+    #[test]
+    fn shortcut_injection_note_reports_queue_and_hook_echo() {
+        let observed = shortcut_injection_note(crate::key_gate::InjectedEcho {
+            count: 2,
+            vk: 0x1B,
+            scan: 0x01,
+            flags: 0x90,
+        });
+        assert_eq!(
+            observed,
+            "map_inject result=queued echo_delta=2 last_vk=0x1B last_scan=0x01 last_flags=0x90"
+        );
+        assert!(
+            !observed.contains("result=ok"),
+            "不得再把入队当成功：{observed}"
+        );
+
+        let missing = shortcut_injection_note(crate::key_gate::InjectedEcho::default());
+        assert_eq!(
+            missing,
+            "map_inject result=queued echo_delta=0 note=hook_did_not_observe_injected_key"
+        );
+
+        // 锁屏动作没有 SendInput 回声，措辞必须自证"设计如此"。
+        assert_eq!(
+            LOCK_WORKSTATION_INJECT_NOTE,
+            "map_inject result=queued note=lock_workstation_via_api_no_sendinput_echo"
+        );
+    }
+
     #[test]
     fn hid_press_release_drives_single_action_tap() {
         let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2823,6 +3433,58 @@ mod tests {
         assert_eq!(snapshot.last_button, Some(RemoteButton::Ok));
     }
 
+    /// 向导第⑥步：暂挂期间手势仍被观察（回调照发），但不执行注入；解除后恢复。
+    #[test]
+    fn suspended_engine_observes_gestures_without_injecting() {
+        let _gate_lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        runtime.set_mappings(mappings_with_single(RemoteButton::Ok, KeyCode::Enter));
+        let fired = Arc::new(StdMutex::new(Vec::new()));
+        let fired_sink = Arc::clone(&fired);
+        runtime.subscribe_button_gestures(Arc::new(move |gesture| {
+            fired_sink.lock().unwrap().push(gesture);
+        }));
+
+        let sender = runtime.sender();
+        let tap_count = || injector.taps.lock().unwrap().len();
+
+        runtime.set_suspended(true);
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            fired.lock().unwrap().len(),
+            1,
+            "暂挂期间手势仍应被观察（回调照发）"
+        );
+        assert_eq!(tap_count(), 0, "暂挂期间不得注入任何按键");
+
+        runtime.set_suspended(false);
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(fired.lock().unwrap().len(), 2, "解除暂挂后手势继续被观察");
+        assert_eq!(tap_count(), 1, "解除暂挂后应恢复注入");
+
+        drop(runtime);
+        drop(gate);
+    }
+
     /// 打开应用动作：门控运行时，手势触发应调用 launch_app 而非 tap。
     #[test]
     fn open_app_action_launches_instead_of_tap() {
@@ -2865,6 +3527,108 @@ mod tests {
         assert!(
             injector.taps.lock().unwrap().is_empty(),
             "打开应用动作不得注入按键"
+        );
+        drop(gate);
+    }
+
+    #[test]
+    fn focus_input_action_requests_frontmost_focus_without_tapping() {
+        let _gate_lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let snapshot = Arc::new(StdMutex::new(RawInputSnapshot::default()));
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            snapshot,
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: ButtonAction::FocusInput,
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(
+            injector.focus_requests.lock().unwrap().as_slice(),
+            &[FocusCall::Frontmost],
+            "聚焦输入框动作应请求聚焦当前前台应用"
+        );
+        assert!(injector.taps.lock().unwrap().is_empty());
+        assert!(injector.launches.lock().unwrap().is_empty());
+        drop(gate);
+    }
+
+    /// 打开应用带聚焦档案：分发侧必须把档案一起交给注入器（策略在档案里）。
+    #[test]
+    fn open_app_with_focus_profile_forwards_strategy() {
+        let _gate_lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let snapshot = Arc::new(StdMutex::new(RawInputSnapshot::default()));
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            snapshot,
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: ButtonAction::OpenApp {
+                    target: "notepad".to_owned(),
+                },
+                ..ButtonActions::default()
+            },
+        );
+        mappings.focus_profiles.insert(
+            "notepad".to_owned(),
+            crate::focus::AppFocusProfile {
+                strategy: crate::focus::FocusStrategy::RecordedElement,
+                shortcut: None,
+                recorded: Some(crate::focus::RecordedFocusTarget {
+                    control_type: "Edit".to_owned(),
+                    automation_id: "chat-input".to_owned(),
+                    ..Default::default()
+                }),
+            },
+        );
+        runtime.set_mappings(mappings);
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(
+            injector.focus_requests.lock().unwrap().as_slice(),
+            &[FocusCall::LaunchThenFocus {
+                target: "notepad".to_owned(),
+                strategy: "recorded_element",
+            }],
+            "带档案的打开应用必须把策略交给注入器"
+        );
+        assert_eq!(
+            injector.launches.lock().unwrap().as_slice(),
+            &["notepad".to_owned()]
         );
         drop(gate);
     }
@@ -2957,6 +3721,8 @@ mod tests {
                     },
                 },
                 long: ButtonAction::Disabled,
+                hold_repeat: None,
+                ok_context_click: false,
             },
         );
         runtime.set_mappings(mappings);
@@ -2983,6 +3749,84 @@ mod tests {
             "监听器停止后挂起的双击窗口不得触发单击"
         );
         assert!(snapshot.lock().unwrap().active_buttons.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn focus_request_waiting_for_lock_cannot_restart_after_cancel() {
+        let injector = Arc::new(SendInputInjector::new(Arc::new(
+            crate::send_input_windows::SendInputRuntime::new(),
+        )));
+        let queued_generation = injector.focus_generation.load(Ordering::Acquire);
+        let slot = injector.focus.lock().unwrap();
+        let request = Arc::clone(&injector);
+        let queued = std::thread::spawn(move || {
+            request.with_focus_runner_generation(queued_generation, |_| true)
+        });
+        // 旧请求已取得代次，取消不等待其持有者正在等待的 focus 锁。
+        injector.cancel_focus();
+        drop(slot);
+        assert_eq!(
+            queued.join().unwrap(),
+            None,
+            "取消前的排队请求不得重开聚焦服务"
+        );
+        assert!(injector.focus.lock().unwrap().is_none());
+        assert_eq!(
+            injector.with_focus_runner(|_| true),
+            Some(true),
+            "取消后的新明确请求仍可启动服务"
+        );
+        injector.cancel_focus();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn focus_shutdown_rejects_new_manual_requests() {
+        let injector =
+            SendInputInjector::new(Arc::new(crate::send_input_windows::SendInputRuntime::new()));
+        injector.close_focus();
+        assert_eq!(injector.with_focus_runner(|_| true), None);
+        assert!(injector.focus_frontmost().is_err());
+        assert!(injector.learn_focus_target().is_err());
+        assert_eq!(
+            injector.launch_app_and_focus("never-launch-during-exit", None),
+            Err("应用正在退出".to_owned())
+        );
+        assert!(injector.focus.lock().unwrap().is_none());
+        injector.close_focus();
+        assert_eq!(injector.with_focus_runner(|_| true), None);
+    }
+
+    #[test]
+    fn lifecycle_boundaries_cancel_pending_focus() {
+        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        flush(&runtime);
+        let initial = *injector.focus_cancellations.lock().unwrap();
+        let sender = runtime.sender();
+        sender.send(EngineMessage::ListenerStopped).unwrap();
+        sender.send(EngineMessage::DeviceRemoved).unwrap();
+        sender.send(EngineMessage::SetSuspended(true)).unwrap();
+        sender.send(EngineMessage::SetSuspended(false)).unwrap();
+        let mut disabled = ButtonMappings::default();
+        disabled.enabled = false;
+        sender
+            .send(EngineMessage::MappingsChanged {
+                execution: disabled.clone(),
+                recognition: disabled,
+                enhanced: false,
+            })
+            .unwrap();
+        flush(&runtime);
+        assert_eq!(*injector.focus_cancellations.lock().unwrap(), initial + 4);
+        drop(runtime);
+        assert_eq!(*injector.focus_cancellations.lock().unwrap(), initial + 5);
     }
 
     #[test]
@@ -3092,5 +3936,307 @@ mod tests {
                 },
             },
         );
+    }
+
+    /// 「按住连续触发」引擎路径（2026-10-05）：门控边沿驱动的连续拍注入、
+    /// 释放即停；配置变化取消进行中的一趟、不得迟到拍。
+    #[test]
+    fn hold_repeat_long_injects_beats_until_release_or_reconfigure() {
+        let _gate_lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gate: Option<crate::key_gate::KeyGate> = Some(crate::key_gate::KeyGate::start());
+        let ensure_gate = |gate: &mut Option<crate::key_gate::KeyGate>| {
+            if !crate::key_gate::is_gate_thread_alive() {
+                *gate = None;
+                std::thread::sleep(Duration::from_millis(50));
+                *gate = Some(crate::key_gate::KeyGate::start());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let mut mappings = ButtonMappings::default();
+        // 长按=退格 + 开关=长按：550ms 触发后按 50ms 间隔连拍。
+        mappings.actions.insert(
+            RemoteButton::Back,
+            ButtonActions {
+                long: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Backspace],
+                    },
+                },
+                hold_repeat: Some(ButtonTrigger::Long),
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+
+        let sender = runtime.sender();
+        let taps = || injector.taps.lock().unwrap().clone();
+
+        ensure_gate(&mut gate);
+        let base = taps().len();
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: true,
+            }))
+            .unwrap();
+        // 550ms 触发长按 + 50ms 间隔：三拍预算放宽到 2000ms（慢机每拍有延迟）。
+        let got_three = wait_until(|| taps().len() >= base + 3, Duration::from_millis(2000));
+        assert!(
+            got_three,
+            "长按连续触发应注入 ≥3 拍，实际 {}",
+            taps().len() - base
+        );
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: false,
+            }))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let after_release = taps().len() - base;
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(taps().len() - base, after_release, "释放后不得再有连续拍");
+
+        // 配置变化取消进行中的一趟：置空映射后不得再有拍。
+        let before_hold = taps().len();
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: true,
+            }))
+            .unwrap();
+        assert!(
+            wait_until(|| taps().len() > before_hold, Duration::from_millis(2000)),
+            "第二次按住应先注入拍"
+        );
+        runtime.set_mappings(ButtonMappings::default());
+        let after_reconfigure = taps().len();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(taps().len(), after_reconfigure, "配置变化后不得再有连续拍");
+
+        drop(runtime);
+        drop(gate);
+    }
+
+    #[test]
+    fn repeat_run_signals_ignore_one_shot_gestures() {
+        use crate::button_gestures::GestureRecognizer;
+        use crate::send_input::{ButtonTrigger, KeyChord};
+
+        // 评审发现 1 回归：双击窗补发的单击与按住确认的首次单击都不得计成
+        // map_repeat 拍，只有连续触发计时器产生的拍才进聚合。
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Back,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Delete],
+                    },
+                },
+                double: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Space],
+                    },
+                },
+                long: ButtonAction::Disabled,
+                hold_repeat: Some(ButtonTrigger::Single),
+                ok_context_click: false,
+            },
+        );
+        let mut recognizer = GestureRecognizer::new();
+        recognizer.configure(&mappings);
+        let mut runs: RepeatRuns = BTreeMap::new();
+        let t0 = Instant::now();
+
+        // 快速点按 → 双击窗超时补发的单击：不是拍。
+        recognizer.press(RemoteButton::Back, t0);
+        assert!(recognizer
+            .release(RemoteButton::Back, t0 + Duration::from_millis(60))
+            .is_empty());
+        let (_, ticks) = recognizer.advance_with_ticks(t0 + Duration::from_millis(360));
+        note_advance_ticks(&mut runs, ticks);
+        assert!(runs.is_empty(), "双击窗补发的单击不得计成连续拍");
+
+        // 按住 → 300ms 的按住确认不是拍，350ms 起拍才是。
+        let t1 = t0 + Duration::from_secs(2);
+        recognizer.press(RemoteButton::Back, t1);
+        let (_, ticks) = recognizer.advance_with_ticks(t1 + Duration::from_millis(300));
+        note_advance_ticks(&mut runs, ticks);
+        assert!(runs.is_empty(), "按住确认的首次单击不得计成连续拍");
+        let (_, ticks) = recognizer.advance_with_ticks(t1 + Duration::from_millis(350));
+        note_advance_ticks(&mut runs, ticks);
+        assert_eq!(runs.get(&RemoteButton::Back).map(|run| run.1), Some(1));
+        assert!(recognizer
+            .release(RemoteButton::Back, t1 + Duration::from_millis(400))
+            .is_empty());
+        finish_repeat_run(&mut runs, RemoteButton::Back, "release");
+        assert!(runs.is_empty(), "释放后该趟聚合必须收尾");
+    }
+
+    #[test]
+    fn ok_context_click_window_boundaries() {
+        let t0 = Instant::now();
+        assert!(ok_context_click_window_hit(true, Some(t0), t0));
+        assert!(ok_context_click_window_hit(
+            true,
+            Some(t0),
+            t0 + OK_CONTEXT_CLICK_WINDOW
+        ));
+        assert!(
+            !ok_context_click_window_hit(
+                true,
+                Some(t0),
+                t0 + OK_CONTEXT_CLICK_WINDOW + Duration::from_millis(1)
+            ),
+            "超过 5 秒必须落空"
+        );
+        assert!(!ok_context_click_window_hit(false, Some(t0), t0));
+        assert!(!ok_context_click_window_hit(true, None, t0));
+    }
+
+    #[test]
+    fn ok_context_click_fires_after_a_remote_move_and_swallows_the_press() {
+        let _gate_lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gate: Option<crate::key_gate::KeyGate> = Some(crate::key_gate::KeyGate::start());
+        let ensure_gate = |gate: &mut Option<crate::key_gate::KeyGate>| {
+            if !crate::key_gate::is_gate_thread_alive() {
+                *gate = None;
+                std::thread::sleep(Duration::from_millis(50));
+                *gate = Some(crate::key_gate::KeyGate::start());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let mut mappings = ButtonMappings::default();
+        // 上键单击 = 移动光标（移动注入成功会刷新 OK 点击窗口）。
+        mappings.actions.insert(
+            RemoteButton::Up,
+            ButtonActions {
+                single: ButtonAction::MouseMove {
+                    direction: MoveDirection::Right,
+                    distance: 40,
+                },
+                ..ButtonActions::default()
+            },
+        );
+        // OK：单击 = 回车（原动作）+ 开启上下文点击。
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Enter],
+                    },
+                },
+                ok_context_click: true,
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+
+        let sender = runtime.sender();
+        let clicks = || injector.clicks.lock().unwrap().clone();
+        let taps = || injector.taps.lock().unwrap().len();
+
+        // 1) 遥控器移动光标：注入成功 → 窗口刷新。
+        ensure_gate(&mut gate);
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Up,
+                is_pressed: true,
+            }))
+            .unwrap();
+        assert!(
+            wait_until(
+                || !injector.moves.lock().unwrap().is_empty(),
+                Duration::from_millis(1000)
+            ),
+            "上键应注入一次鼠标移动"
+        );
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Up,
+                is_pressed: false,
+            }))
+            .unwrap();
+
+        // 2) 窗口内按 OK：注入左键单击；不注入原动作（回车）。
+        let taps_before = taps();
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Ok,
+                is_pressed: true,
+            }))
+            .unwrap();
+        assert!(
+            wait_until(|| !clicks().is_empty(), Duration::from_millis(1000)),
+            "窗口内按 OK 应注入一次点击"
+        );
+        assert_eq!(clicks(), vec![MouseClickKind::Left]);
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Ok,
+                is_pressed: false,
+            }))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(taps(), taps_before, "上下文点击不得再执行 OK 的原动作");
+        assert_eq!(clicks().len(), 1, "一次按压只点一次");
+
+        // 3) 关闭开关后：按 OK 走原动作，不再点击。
+        let mut off = ButtonMappings::default();
+        off.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Enter],
+                    },
+                },
+                ok_context_click: false,
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(off);
+        std::thread::sleep(Duration::from_millis(50));
+        let taps_before_off = taps();
+        let clicks_before_off = clicks().len();
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Ok,
+                is_pressed: true,
+            }))
+            .unwrap();
+        assert!(
+            wait_until(|| taps() > taps_before_off, Duration::from_millis(1000)),
+            "开关关闭后按 OK 应执行原动作"
+        );
+        sender
+            .send(EngineMessage::GateEdge(ButtonEdge {
+                button: RemoteButton::Ok,
+                is_pressed: false,
+            }))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(clicks().len(), clicks_before_off, "开关关闭后不得点击");
+
+        drop(runtime);
+        drop(gate);
     }
 }

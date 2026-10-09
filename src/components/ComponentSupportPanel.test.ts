@@ -5,6 +5,7 @@ import ComponentSupportPanel from "./ComponentSupportPanel.vue";
 const mocks = vi.hoisted(() => ({
   getComponentStatus: vi.fn(), performComponentAction: vi.fn(),
   getRc003BridgeSnapshot: vi.fn(), getRc003TaskStatus: vi.fn(),
+  getCaptureSupport: vi.fn(),
   enableRc003Capture: vi.fn(), disableRc003Capture: vi.fn(),
 }));
 vi.mock("../lib/bridge", async (importOriginal) => ({ ...(await importOriginal<typeof import("../lib/bridge")>()), ...mocks }));
@@ -18,12 +19,22 @@ describe("unified button support and audio component", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mocks.getComponentStatus.mockResolvedValue(status);
+    mocks.getCaptureSupport.mockResolvedValue({ available: true, reason: null, nativeArch: "x64", helperExpected: "sayall-helper.exe" });
     mocks.getRc003TaskStatus.mockResolvedValue(disabled);
     mocks.getRc003BridgeSnapshot.mockResolvedValue(listening);
     mocks.enableRc003Capture.mockResolvedValue({ ...disabled, enabled: true });
     mocks.disableRc003Capture.mockResolvedValue(disabled);
   });
   afterEach(() => { for (const wrapper of wrappers.splice(0)) wrapper.unmount(); vi.useRealTimers(); });
+  it("disables the local support entry on an unsupported host without requesting authorization", async () => {
+    mocks.getCaptureSupport.mockResolvedValue({ available: false, reason: "arch_unsupported", nativeArch: "arm64", helperExpected: "sayall-helper.exe" });
+    const wrapper = await panel();
+    expect(wrapper.get('[role="status"]').text()).toContain("暂不可用");
+    expect(button(wrapper, "开启全按键支持").attributes("disabled")).toBeDefined();
+    await button(wrapper, "开启全按键支持").trigger("click");
+    expect(wrapper.find("dialog").exists()).toBe(false);
+    expect(mocks.enableRc003Capture).not.toHaveBeenCalled();
+  });
   it("requires explicit confirmation on every enable even with an existing task", async () => {
     const wrapper = await panel();
     expect(wrapper.text()).toContain("全按键支持");

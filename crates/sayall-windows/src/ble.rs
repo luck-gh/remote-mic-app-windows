@@ -190,6 +190,7 @@ impl BleRuntime {
         voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
         connection_context: ConnectionContextCallback,
         voice_input_tool: Arc<Mutex<Option<VoiceInputTool>>>,
+        gain_db: Arc<Mutex<f32>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ConnectionSnapshot::default()));
@@ -209,6 +210,7 @@ impl BleRuntime {
                     voice_hold_hotkey,
                     connection_context,
                     voice_input_tool,
+                    gain_db,
                 )
             });
 
@@ -412,6 +414,7 @@ fn worker_loop(
     voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
     connection_context: ConnectionContextCallback,
     voice_input_tool: Arc<Mutex<Option<VoiceInputTool>>>,
+    gain_db: Arc<Mutex<f32>>,
 ) {
     let mut context_publisher = ConnectionContextPublisher::default();
     // 进程级资源基线（2026-09-16）：与后续 episode_start / system_resume 对比，
@@ -431,6 +434,7 @@ fn worker_loop(
     let mut session: Option<BleSession> = None;
     let mut pipeline = AtvvVoicePipeline::default();
     let mut active_voice_samples = 0_u64;
+    let mut voice_gain_log: Option<(u64, f32)> = None;
     let mut connection_generation = 0_u64;
     let mut capabilities_deadline: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -972,6 +976,8 @@ fn worker_loop(
                         &mut held_hotkey,
                         &mut active_voice_samples,
                         stamp,
+                        &gain_db,
+                        &mut voice_gain_log,
                         &bytes,
                     );
                 }
@@ -1802,7 +1808,9 @@ fn handle_control(
                 // An unset preference keeps the established default Ctrl+Win path;
                 // explicit tools win, and arbitrary custom chords imply no IME.
                 if let Some(tool) = session_ime_tool {
-                    if let Err(error) = crate::ime::ensure_session_ime(tool) {
+                    if let Err(error) =
+                        crate::ime::ensure_session_ime(tool, crate::ime::ImeSwitchScope::VoicePress)
+                    {
                         lock(state).last_error = Some(error);
                     }
                 }
@@ -1954,6 +1962,15 @@ fn handle_control(
     }
 }
 
+/// 每会话生效增益的日志去重（2026-10-04）：返回 true 表示这一批音频的
+/// `(generation, gain_db)` 组合还没记过，需要写一条 `audio_gain action=apply`。
+///
+/// 为什么要有它：用户报"增益好像没效果"时，日志必须能直接回答"这一轮说话用的
+/// 是多少 dB"，而不是从 IPC 保存记录反推（会话和保存的时间关系肉眼不可靠）。
+fn should_log_voice_gain(previous: Option<(u64, f32)>, generation: u64, gain_db: f32) -> bool {
+    previous != Some((generation, gain_db))
+}
+
 fn handle_audio(
     session: &mut Option<BleSession>,
     pipeline: &mut AtvvVoicePipeline,
@@ -1963,10 +1980,23 @@ fn handle_audio(
     held_hotkey: &mut Option<KeyChord>,
     active_voice_samples: &mut u64,
     stamp: CallbackStamp,
+    gain_db: &Mutex<f32>,
+    voice_gain_log: &mut Option<(u64, f32)>,
     bytes: &[u8],
 ) {
     if pipeline.state() != VoiceSessionState::Streaming {
         return;
+    }
+    // 增益逐批刷新（对齐 Mac 每帧读 settings.gainDB 的语义）：用户在滑块上改动后，
+    // 下一批音频立即按新值处理，不需要重开会话；重连后的新管道也因此拿到当前值。
+    let effective_gain_db = *lock(gain_db);
+    pipeline.set_gain_db(effective_gain_db);
+    let generation = pipeline.generation();
+    if should_log_voice_gain(*voice_gain_log, generation, effective_gain_db) {
+        *voice_gain_log = Some((generation, effective_gain_db));
+        gatt_note(format!(
+            "audio_gain action=apply phase=completed terminal_result=passed generation={generation} gain_db={effective_gain_db}"
+        ));
     }
     if let Some(error) = audio.failure() {
         abort_voice_session(
@@ -3053,7 +3083,10 @@ pub fn initialize_diagnostic_log(
         .unwrap_or(false);
     let _ = DIAGNOSTIC_LOG_PATH.set(path);
     let _ = DIAGNOSTIC_LOG_METADATA.set(metadata);
-    parent_ready && gatt_sink().is_some()
+    parent_ready
+        && diagnostic_log_path()
+            .map(|path| crate::diagnostic_log::probe(&path))
+            .unwrap_or(false)
 }
 
 /// 诊断日志实际落盘目录（供"打开日志目录"入口定位）。
@@ -3077,55 +3110,50 @@ pub fn diagnostic_log_directory() -> Option<std::path::PathBuf> {
 /// ATVV 诊断日志（宿主默认写入 LocalAppData；SAYALL_GATT_LOG 可覆盖路径）。
 /// 控制通知与 TRANSMIT 写入保留长度及有限预览用于协议取证；音频通知不在这里
 /// 逐包落盘，防止泄露语音内容并避免高频刷盘，改由音频会话终态聚合记录。
-fn gatt_sink() -> Option<&'static Mutex<std::fs::File>> {
-    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    SINK.get_or_init(|| {
-        let path = DIAGNOSTIC_LOG_PATH
-            .get()
-            .cloned()
-            .or_else(|| std::env::var_os("SAYALL_GATT_LOG").map(std::path::PathBuf::from))?;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-            .map(Mutex::new)
-    })
-    .as_ref()
+///
+/// 2026-10-08 起改为**每次写入重新打开文件**（`diagnostic_log::append_line`），原因有二：
+///
+/// ① 轮转：单个文件超过 10 MB 就换新文件；主程序与提权助手共用同一份日志，
+///    任何长句柄都会在**对方**轮转之后继续写给已被改名的旧文件，导致新文件缺行；
+/// ② 自愈：旧实现用 `OnceLock` 钉住句柄，首次调用若没有 env/路径就把"无 sink"
+///    永久冻结（2026-10-04 修订为延迟判定；2026-10-05 评审把"同进程内先后设置
+///    SAYALL_GATT_LOG 的测试互不绑定"钉进了回归）。每次重开的语义天然满足这条回归。
+fn diagnostic_log_append(line: &str) -> bool {
+    let Some(path) = DIAGNOSTIC_LOG_PATH
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("SAYALL_GATT_LOG").map(std::path::PathBuf::from))
+    else {
+        return false;
+    };
+    crate::diagnostic_log::append_line(&path, line)
 }
 
 fn gatt_log(kind: &str, bytes: &[u8]) {
-    use std::io::Write as _;
     // 原始音频包既是高频数据又可能承载语音内容，生产诊断日志绝不落盘。
     // 会话级音频统计由 audio.rs 在开始、排空、失败时聚合记录。
     if kind == "A" {
         return;
     }
-    if let Some(sink) = gatt_sink() {
-        if let Ok(mut file) = sink.lock() {
-            let timestamp = utc_timestamp();
-            let metadata = DIAGNOSTIC_LOG_METADATA.get();
-            let preview: String = bytes
-                .iter()
-                .take(24)
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let _ = writeln!(
-                file,
-                "{timestamp} pid={} ver={} build={} component=gatt event=packet direction={kind} byte_count={} preview=[{preview}]",
-                std::process::id(),
-                metadata
-                    .map(|value| value.app_version.as_str())
-                    .unwrap_or("unknown"),
-                metadata
-                    .map(|value| value.app_build.as_str())
-                    .unwrap_or("unknown"),
-                bytes.len()
-            );
-            let _ = file.flush();
-        }
-    }
+    let timestamp = utc_timestamp();
+    let metadata = DIAGNOSTIC_LOG_METADATA.get();
+    let preview: String = bytes
+        .iter()
+        .take(24)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let _ = diagnostic_log_append(&format!(
+        "{timestamp} pid={} ver={} build={} component=gatt event=packet direction={kind} byte_count={} preview=[{preview}]",
+        std::process::id(),
+        metadata
+            .map(|value| value.app_version.as_str())
+            .unwrap_or("unknown"),
+        metadata
+            .map(|value| value.app_build.as_str())
+            .unwrap_or("unknown"),
+        bytes.len()
+    ));
 }
 
 /// 功能点结构化诊断标记（同 SAYALL_GATT_LOG 开关；AGENTS.md"功能点必须自带
@@ -3135,34 +3163,27 @@ fn gatt_log(kind: &str, bytes: &[u8]) {
 /// 2026-09-05 起对 src-tauri 应用层公开（应用内更新流程等非 GATT 功能点
 /// 复用同一日志载体与格式），保持"一次日志拉取"覆盖全部功能点。
 pub fn gatt_note(note: String) {
-    use std::io::Write as _;
-    if let Some(sink) = gatt_sink() {
-        if let Ok(mut file) = sink.lock() {
-            let timestamp = utc_timestamp();
-            let metadata = DIAGNOSTIC_LOG_METADATA.get();
-            let _ = writeln!(
-                file,
-                "{timestamp} pid={} ver={} build={} source_revision={} build_channel={} release_tag={} {note}",
-                std::process::id(),
-                metadata
-                    .map(|value| value.app_version.as_str())
-                    .unwrap_or("unknown"),
-                metadata
-                    .map(|value| value.app_build.as_str())
-                    .unwrap_or("unknown"),
-                metadata
-                    .map(|value| value.source_revision.as_str())
-                    .unwrap_or("unknown"),
-                metadata
-                    .map(|value| value.build_channel.as_str())
-                    .unwrap_or("unknown"),
-                metadata
-                    .map(|value| value.release_tag.as_str())
-                    .unwrap_or("unknown"),
-            );
-            let _ = file.flush();
-        }
-    }
+    let timestamp = utc_timestamp();
+    let metadata = DIAGNOSTIC_LOG_METADATA.get();
+    let _ = diagnostic_log_append(&format!(
+        "{timestamp} pid={} ver={} build={} source_revision={} build_channel={} release_tag={} {note}",
+        std::process::id(),
+        metadata.map(|value| value.app_version.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.app_build.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.source_revision.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.build_channel.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.release_tag.as_str()).unwrap_or("unknown"),
+    ));
+}
+
+/// 轮转文件名用的紧凑 UTC 时间戳（形如 `20261008T063158984Z`）：只保留 ASCII
+/// 字母数字——既可做 Windows 文件名，也可按字典序当时间序（`diagnostic_log::prune`
+/// 依赖这一点）。
+pub(crate) fn utc_stamp_compact() -> String {
+    utc_timestamp()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
 }
 
 fn utc_timestamp() -> String {
@@ -3887,6 +3908,17 @@ mod tests {
         ] {
             assert_eq!(voice_session_ime_tool(None, &KeyChord { keys }), None);
         }
+    }
+
+    #[test]
+    fn voice_gain_logs_once_per_session_and_on_value_changes() {
+        // 每会话首次音频记一条；同一会话同一值不再重复；会话内改值再记一条；
+        // 新会话（generation +1）即使值相同也要重新记（对应"这一轮说话"的判读）。
+        assert!(should_log_voice_gain(None, 1, 0.0));
+        assert!(!should_log_voice_gain(Some((1, 0.0)), 1, 0.0));
+        assert!(should_log_voice_gain(Some((1, 0.0)), 1, 24.0));
+        assert!(!should_log_voice_gain(Some((1, 24.0)), 1, 24.0));
+        assert!(should_log_voice_gain(Some((1, 24.0)), 2, 24.0));
     }
 
     #[test]

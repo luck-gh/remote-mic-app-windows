@@ -30,6 +30,11 @@ describe("mouse actions", () => {
     expect(actionSummary({ type: "mouse_move", direction: "left", distance: 75 })).toBe("鼠标向左 75 px");
     expect(actionSummary({ type: "mouse_click", kind: "double_left" })).toBe("左键双击");
   });
+
+  it("summarizes the focus-input action", () => {
+    // 动作摘要会显示在按键格子上，文案即用户可见串（product-copy 口径）。
+    expect(actionSummary({ type: "focus_input" })).toBe("聚焦输入框");
+  });
 });
 
 describe("voice endpoint recommendation", () => {
@@ -118,8 +123,13 @@ describe("connection phase presentation", () => {
 describe("diagnostic report presentation", () => {
   it("adds an explicit generation time without changing the captured report", () => {
     const report: DiagnosticReport = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       appVersion: "0.1.0",
+      appBuild: "1001",
+      sourceRevision: "0123456789012345678901234567890123456789",
+      buildChannel: "local-test",
+      windowsVersion: "10.0.26100",
+      processArchitecture: "x86_64",
       platform: "windows",
       verificationStatus: "待真机验证",
       capabilities: {

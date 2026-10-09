@@ -1,4 +1,5 @@
 use button_mapping::{ButtonMappingRuntime, ButtonMappingSnapshot, MappingInjector};
+use focus::RecordedFocusTarget;
 use raw_input::{RawInputPhase, RawInputSnapshot};
 use sayall_core::settings::VoiceInputTool;
 use sayall_core::{AtvvCapabilities, VoiceSessionState};
@@ -27,10 +28,27 @@ pub mod button_mapping;
 pub mod capture_input;
 pub mod compatibility;
 pub mod component_support;
+mod diagnostic_log;
 pub mod file_dialog;
+/// 聚焦输入框的纯逻辑（跨平台可编译、可单测）。
+pub mod focus;
+/// 聚焦请求的执行编排（重试、预算与失败分类；不触碰平台 API）。
+pub mod focus_service;
+/// Windows UI Automation 后端（MTA 工作线程；非 Windows 平台不参与编译）。
+#[cfg(windows)]
+pub mod focus_windows;
+/// "前台窗口是不是我们自己"——诊断心跳的门（只比较进程号，不记录窗口身份）。
+pub mod foreground;
 #[cfg(windows)]
 pub mod graceful_exit;
+#[cfg(windows)]
+pub mod instance_signal;
+/// 按键宿主进程（LL 钩子迁出主进程；见 Bugs/2026-10-04-ll-hooks-break-in-app-ime-voice.md）。
+pub mod key_host;
 pub mod rc003_bridge;
+// 硬件信号脚本（仿真回放用；见模块注释）：解析模拟器导出的信号脚本。
+// 无副作用、不进入基础路径，仅仿真平台消费。
+pub mod hardware_script;
 pub mod registered_apps;
 #[cfg(windows)]
 pub use ble::{
@@ -69,6 +87,8 @@ pub mod key_gate;
 mod key_suppressor;
 #[cfg(windows)]
 mod lock_open_with_guard;
+/// 本机的原生系统架构（x64 / arm64），与"本进程的仿真架构"区分开。
+pub mod os_arch;
 #[cfg(windows)]
 mod power;
 pub mod raw_input;
@@ -85,6 +105,7 @@ pub mod send_input;
 #[cfg(windows)]
 pub mod send_input_windows;
 pub mod templates;
+pub mod tray_icons;
 /// Vokie 安装检测（2026-10-01）：连接页“选择输入工具”用它决定是否显示官网入口。
 pub mod vokie;
 #[cfg(windows)]
@@ -268,6 +289,14 @@ pub struct WindowsPlatform {
     /// 用户在连接页选的语音输入工具：决定语音会话开始前把哪个输入法
     /// 切进当前会话（`ime::ensure_session_ime`）；Vokie / 其他工具不切。
     voice_input_tool: Arc<Mutex<Option<VoiceInputTool>>>,
+    /// 语音增益（dB，0–24）：BLE 工作线程每批音频前读取，改动下一批即生效
+    /// （对齐 Mac 逐帧读 `settings.gainDB` 的语义）。持久化由设置层负责。
+    gain_db: Arc<Mutex<f32>>,
+    /// 「选中工具后的一次性输入法对齐」：自身窗口在前台时不能切（TSF 会话切换曾致
+    /// WebView2 整页重载，Bugs/2026-09-12），此时只布防；本应用窗口失去焦点后由
+    /// `align_ime_after_tool_selection` 取走并执行一次（2026-10-03，Andy 要求消除
+    /// "换工具后第一按必拉不起"的窗口期）。
+    ime_align_pending: Arc<Mutex<Option<(VoiceInputTool, std::time::Instant)>>>,
     button_mapping: Arc<ButtonMappingRuntime>,
     scene_control: Arc<scene_control::SceneController>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
@@ -310,6 +339,22 @@ struct UnsupportedInjector;
 impl MappingInjector for UnsupportedInjector {
     fn tap(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
         Err("SendInput 仅在 Windows 上可用".to_owned())
+    }
+
+    fn focus_frontmost(&self) -> Result<(), String> {
+        Err("聚焦输入框仅在 Windows 上可用".to_owned())
+    }
+
+    fn launch_app_and_focus(
+        &self,
+        _target: &str,
+        _profile: Option<&crate::focus::AppFocusProfile>,
+    ) -> Result<(), String> {
+        Err("打开应用仅在 Windows 上可用".to_owned())
+    }
+
+    fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+        Err("学习输入框仅在 Windows 上可用".to_owned())
     }
 }
 
@@ -360,6 +405,8 @@ impl Default for WindowsPlatform {
         let usage = Arc::new(UsageCounters::default());
         let voice_hold_hotkey = Arc::new(Mutex::new(None));
         let voice_input_tool = Arc::new(Mutex::new(None));
+        let gain_db = Arc::new(Mutex::new(0.0));
+        let ime_align_pending = Arc::new(Mutex::new(None));
         let raw_input_snapshot = Arc::new(Mutex::new(RawInputSnapshot::default()));
         #[cfg(windows)]
         {
@@ -412,6 +459,7 @@ impl Default for WindowsPlatform {
                     }
                 }),
                 Arc::clone(&voice_input_tool),
+                Arc::clone(&gain_db),
             ));
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
@@ -433,6 +481,8 @@ impl Default for WindowsPlatform {
                 usage,
                 voice_hold_hotkey,
                 voice_input_tool,
+                gain_db,
+                ime_align_pending,
                 button_mapping,
                 scene_control,
                 raw_input_snapshot,
@@ -471,6 +521,8 @@ impl Default for WindowsPlatform {
                 usage,
                 voice_hold_hotkey,
                 voice_input_tool,
+                gain_db,
+                ime_align_pending,
                 button_mapping,
                 scene_control,
                 raw_input_snapshot,
@@ -679,15 +731,80 @@ impl WindowsPlatform {
         *lock(&self.voice_hold_hotkey) = hotkey;
     }
 
-    /// 更新「你在用的输入工具」：BLE 工作线程在**按住语音键**的那一刻按它决定把
-    /// 哪个输入法切进当前会话（`ime::ensure_session_ime`，唯一切换时机——不做
-    /// 聚焦/离开窗口时的预切，2026-10-01 Andy 明确要求）。
+    /// 更新「你在用的输入工具」：BLE 工作线程在按下语音键时按它决定把哪个输入法
+    /// 切进当前会话（`ime::ensure_session_ime`，按下时兜底切换）；并且**选中即对齐**——
+    /// 用户刚选过工具时立即尝试把系统输入法切到该工具（自身窗口在前台时改为布防，
+    /// 待窗口失去焦点后执行一次）。
+    ///
+    /// 为什么要有"选中即对齐"（2026-10-03 Andy）：报告层合成在按下帧到达时立即改写
+    /// （早于应用知情一个 BLE 往返），若按下时系统输入法还不是所选工具，这一按必然
+    /// 赶不上切换——表现为"换工具后第一按拉不起"。选中即对齐把该窗口期清零；
+    /// 按下时的兜底切换保留（覆盖用户手动改走输入法的情况）。
     pub fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
         *lock(&self.voice_input_tool) = tool;
+        let Some(tool) = tool else {
+            *lock(&self.ime_align_pending) = None;
+            return;
+        };
+        // Vokie / 其他工具明确不切输入法（`ime_target_for` 为 None），也不布防。
+        let Some(target) = ime::ime_target_for(tool) else {
+            *lock(&self.ime_align_pending) = None;
+            crate::ble::gatt_note(
+                "ime_tool_select action=skipped reason=unsupported_tool".to_owned(),
+            );
+            return;
+        };
+        if ime::foreground_is_self() {
+            // 自身窗口在前台：现在切会触发 TSF 会话切换的 WebView 整页重载
+            //（Bugs/2026-09-12），改为布防——窗口失去焦点（用户回到自己的应用）
+            // 后由 `align_ime_after_tool_selection` 执行一次。
+            *lock(&self.ime_align_pending) = Some((tool, std::time::Instant::now()));
+            crate::ble::gatt_note(format!(
+                "ime_tool_select action=pending_self_foreground tool={}",
+                target.label,
+            ));
+        } else {
+            crate::ble::gatt_note(format!(
+                "ime_tool_select action=immediate tool={}",
+                target.label,
+            ));
+            std::thread::Builder::new()
+                .name("sayall-ime-tool-select".to_owned())
+                .spawn(move || {
+                    let _ = ime::ensure_session_ime(tool, ime::ImeSwitchScope::ToolSelect);
+                })
+                .ok();
+        }
+    }
+
+    /// 工具选择后的一次性输入法对齐：本应用窗口失去焦点时调用
+    /// （src-tauri `WindowEvent::Focused(false)`）。未布防时 no-op；布防时取走
+    /// 并执行一次切换（`ensure_session_ime` 内部仍会跳过自身仍在前台的情况）。
+    pub fn align_ime_after_tool_selection(&self) {
+        let Some((tool, armed_at)) = lock(&self.ime_align_pending).take() else {
+            return;
+        };
+        crate::ble::gatt_note(format!(
+            "ime_tool_select action=fired trigger=window_blur waited_ms={}",
+            armed_at.elapsed().as_millis(),
+        ));
+        let _ = std::thread::Builder::new()
+            .name("sayall-ime-prealign".to_owned())
+            .spawn(move || {
+                let _ = ime::ensure_session_ime(tool, ime::ImeSwitchScope::ToolSelect);
+            });
     }
 
     pub fn voice_input_tool(&self) -> Option<VoiceInputTool> {
         *lock(&self.voice_input_tool)
+    }
+
+    /// 语音增益（dB，0–24）：写入共享值供 BLE 工作线程逐批读取。
+    ///
+    /// 取值先经 `sayall_core::normalize_gain_db` 钳制——IPC 层已钳过一次，
+    /// 这里再钳一次是为了让"从任何入口进来"的平台状态都落在同一区间。
+    pub fn set_gain_db(&self, gain_db: f32) {
+        *lock(&self.gain_db) = sayall_core::normalize_gain_db(gain_db);
     }
 
     pub fn snapshot(&self) -> PlatformSnapshot {
@@ -850,6 +967,7 @@ impl WindowsPlatform {
     /// has been cancelled. The barrier is bounded so normal exit cannot wait
     /// forever for the mapping worker.
     pub fn quiesce_input(&self) -> Result<(), PlatformError> {
+        self.button_mapping.close_focus();
         self.scene_control.cancel_task_switch("normal_exit");
         self.button_mapping
             .set_input_context(RemoteModel::Unknown, false);
@@ -873,6 +991,27 @@ impl WindowsPlatform {
         self.button_mapping.snapshot()
     }
 
+    /// UI「测试」按钮：聚焦当前前台应用输入框（异步受理，结果在快照的 `last_focus`）。
+    pub fn test_focus_input(&self) -> Result<(), PlatformError> {
+        self.button_mapping
+            .focus_frontmost_now()
+            .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「测试打开与聚焦」：打开/激活目标并按档案聚焦。
+    pub fn test_app_focus(&self, target: &str) -> Result<(), PlatformError> {
+        self.button_mapping
+            .launch_app_and_focus_now(target)
+            .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「开始学习输入框」：阻塞至多 3 秒捕获当前系统焦点对应的可编辑目标。
+    pub fn learn_focus_target(&self) -> Result<focus::RecordedFocusTarget, PlatformError> {
+        self.button_mapping
+            .learn_focus_target()
+            .map_err(PlatformError::SendInput)
+    }
+
     /// 订阅语义按键边沿（画布高亮数据源）。
     pub fn subscribe_button_edges(&self, callback: button_mapping::ButtonEdgeCallback) {
         self.button_mapping.subscribe_button_observations(callback);
@@ -881,6 +1020,34 @@ impl WindowsPlatform {
     /// 订阅已触发手势（单击/双击/长按反馈）。
     pub fn subscribe_button_gestures(&self, callback: button_mapping::ButtonGestureCallback) {
         self.button_mapping.subscribe_button_gestures(callback);
+    }
+
+    /// 向导第⑥步：按键映射临时暂挂（只观察、不注入；内存态、不改用户配置）。
+    pub fn set_mapping_suspension(&self, suspended: bool) {
+        self.button_mapping.set_suspended(suspended);
+    }
+
+    /// 向导第⑤步前置（探针④）：打开物理键观察窗口（计数语义见 key_gate）。
+    /// 钩子未运行时返回 0（不可用）——调用方按未知处理。
+    pub fn begin_key_observation(&self, exclude_vks: &[u32]) -> u64 {
+        if !key_gate::is_gate_thread_alive() {
+            return 0;
+        }
+        key_gate::begin_key_observation(exclude_vks)
+    }
+
+    /// 关闭物理键观察窗口并取回计数。None = 计量不可靠（窗口过期、钩子
+    /// 中途停止），调用方 fail-open，不得据此判定手动输入。
+    pub fn end_key_observation(&self, window_id: u64) -> Option<u64> {
+        match key_gate::end_key_observation(window_id) {
+            Some(count) if key_gate::is_gate_thread_alive() => Some(count),
+            _ => None,
+        }
+    }
+
+    /// 观察窗口诊断（见 `key_gate::observed_last_vk`）：最后一次计入的虚拟键码。
+    pub fn observed_last_key(&self) -> Option<u32> {
+        key_gate::observed_last_vk()
     }
 
     pub fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError> {
