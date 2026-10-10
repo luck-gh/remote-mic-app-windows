@@ -296,7 +296,7 @@ pub struct WindowsPlatform {
     /// WebView2 整页重载，Bugs/2026-09-12），此时只布防；本应用窗口失去焦点后由
     /// `align_ime_after_tool_selection` 取走并执行一次（2026-10-03，Andy 要求消除
     /// "换工具后第一按必拉不起"的窗口期）。
-    ime_align_pending: Arc<Mutex<Option<(VoiceInputTool, std::time::Instant)>>>,
+    ime_align_pending: Arc<Mutex<Option<(VoiceInputTool, std::time::Instant, u64)>>>,
     button_mapping: Arc<ButtonMappingRuntime>,
     scene_control: Arc<scene_control::SceneController>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
@@ -727,6 +727,8 @@ impl WindowsPlatform {
     }
 
     pub fn set_voice_hold_hotkey(&self, hotkey: Option<send_input::KeyChord>) {
+        #[cfg(windows)]
+        ime::note_hotkey_change();
         // ATVV 与输入设备读回继续拥有语音生命周期；普通按键增强不改语音路径。
         *lock(&self.voice_hold_hotkey) = hotkey;
     }
@@ -741,7 +743,11 @@ impl WindowsPlatform {
     /// 赶不上切换——表现为"换工具后第一按拉不起"。选中即对齐把该窗口期清零；
     /// 按下时的兜底切换保留（覆盖用户手动改走输入法的情况）。
     pub fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+        // 诊断时间基线（2026-10-09）：失败样本全部来自"切完工具、快速切到目标
+        // 窗口"，按下时"距选工具多久"由此起算并进 `voice_attempt`。
+        ime::note_tool_select();
         *lock(&self.voice_input_tool) = tool;
+        let selection_epoch = ime::recovery_epoch();
         let Some(tool) = tool else {
             *lock(&self.ime_align_pending) = None;
             return;
@@ -758,12 +764,14 @@ impl WindowsPlatform {
             // 自身窗口在前台：现在切会触发 TSF 会话切换的 WebView 整页重载
             //（Bugs/2026-09-12），改为布防——窗口失去焦点（用户回到自己的应用）
             // 后由 `align_ime_after_tool_selection` 执行一次。
-            *lock(&self.ime_align_pending) = Some((tool, std::time::Instant::now()));
+            *lock(&self.ime_align_pending) =
+                Some((tool, std::time::Instant::now(), selection_epoch));
             crate::ble::gatt_note(format!(
                 "ime_tool_select action=pending_self_foreground tool={}",
                 target.label,
             ));
         } else {
+            let target_ticket = ime::RecoveryTicket::capture_at(selection_epoch);
             crate::ble::gatt_note(format!(
                 "ime_tool_select action=immediate tool={}",
                 target.label,
@@ -771,7 +779,11 @@ impl WindowsPlatform {
             std::thread::Builder::new()
                 .name("sayall-ime-tool-select".to_owned())
                 .spawn(move || {
-                    let _ = ime::ensure_session_ime(tool, ime::ImeSwitchScope::ToolSelect);
+                    let _ = ime::ensure_session_ime_for_target(
+                        tool,
+                        ime::ImeSwitchScope::ToolSelect,
+                        target_ticket,
+                    );
                 })
                 .ok();
         }
@@ -779,19 +791,46 @@ impl WindowsPlatform {
 
     /// 工具选择后的一次性输入法对齐：本应用窗口失去焦点时调用
     /// （src-tauri `WindowEvent::Focused(false)`）。未布防时 no-op；布防时取走
-    /// 并执行一次切换（`ensure_session_ime` 内部仍会跳过自身仍在前台的情况）。
+    /// 并执行一次切换。
+    ///
+    /// 2026-10-09（真机实证）：旧实现取走布防后**立刻**在新线程里调
+    /// `ensure_session_ime`——但失焦事件到达时新窗口往往还没完成激活，
+    /// `GetForegroundWindow()` 仍指向我们自己，于是被 `skipped_self_foreground`
+    /// 跳过；布防是 `take()` 一次性的，对齐就此永久丢失（日志
+    /// `last_switch_age_ms=never`）。现在改为**有界等待**：轮询到"前台不再是自己"
+    /// 再执行一次；始终不变则照旧跳过（保留 2026-09-12 的 WebView 整页重载保护）。
     pub fn align_ime_after_tool_selection(&self) {
-        let Some((tool, armed_at)) = lock(&self.ime_align_pending).take() else {
+        let Some((tool, armed_at, selection_epoch)) = lock(&self.ime_align_pending).take() else {
             return;
         };
-        crate::ble::gatt_note(format!(
-            "ime_tool_select action=fired trigger=window_blur waited_ms={}",
-            armed_at.elapsed().as_millis(),
-        ));
+        let tool_now = std::sync::Arc::clone(&self.voice_input_tool);
         let _ = std::thread::Builder::new()
             .name("sayall-ime-prealign".to_owned())
             .spawn(move || {
-                let _ = ime::ensure_session_ime(tool, ime::ImeSwitchScope::ToolSelect);
+                let settle = ime::wait_until_foreground_settles(
+                    ime::PREALIGN_SETTLE_BUDGET_MS,
+                    ime::PREALIGN_SETTLE_POLL_MS,
+                );
+                let probe = ime::foreground_probe();
+                crate::ble::gatt_note(format!(
+                    "ime_tool_select action=fired trigger=window_blur waited_ms={} settle_ms={} polls={} still_self={} fg_present={} fg_self={}",
+                    armed_at.elapsed().as_millis(),
+                    settle.elapsed_ms,
+                    settle.polls,
+                    settle.still_self,
+                    probe.present,
+                    probe.self_process,
+                ));
+                if settle.still_self {
+                    return;
+                }
+                // 若等待期间用户已重新选择工具（当前值不同于布防值），本次让位给新选择。
+                let superseded = !ime::recovery_current(selection_epoch) || *lock(&tool_now) != Some(tool);
+                if superseded {
+                    crate::ble::gatt_note("ime_tool_select action=superseded".to_owned());
+                    return;
+                }
+                let _ = ime::ensure_session_ime_at(tool, ime::ImeSwitchScope::ToolSelect, selection_epoch);
             });
     }
 
@@ -968,6 +1007,8 @@ impl WindowsPlatform {
     /// forever for the mapping worker.
     pub fn quiesce_input(&self) -> Result<(), PlatformError> {
         self.button_mapping.close_focus();
+        #[cfg(windows)]
+        ime::stop_recovery();
         self.scene_control.cancel_task_switch("normal_exit");
         self.button_mapping
             .set_input_context(RemoteModel::Unknown, false);

@@ -2,7 +2,10 @@
 //! Updates leave historical executable entries behind; enumeration order is
 //! unrelated to the version that is currently recording.
 
-use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+use crate::ConnectionSnapshot;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, HWND};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
     REG_QWORD, REG_VALUE_TYPE,
@@ -155,6 +158,15 @@ fn read_qword(key: HKEY, name: &str) -> Option<u64> {
 
 /// Missing or partially unreadable observations must not trigger recovery.
 pub(crate) fn wetype_mic_observation() -> Option<MicObservation> {
+    mic_observation_for("wetype")
+}
+
+/// 指定标记（ConsentStore 条目名子串，**须小写**）的麦克风观测，语义与微信版一致：
+/// 缺条目、条目不可读一律返回 None（调用方不得据此做任何推断）。
+///
+/// 2026-10-09 起供 `voice_verify` 复用：豆包=`doubao`（本机实测条目
+/// `ImeService.exe` 路径含该片段，录音启停更新时间戳）、Vokie=`vokie`。
+pub(crate) fn mic_observation_for(marker: &str) -> Option<MicObservation> {
     let subkey = wide(CONSENT_NONPACKAGED);
     let mut root = HKEY::default();
     if unsafe {
@@ -197,7 +209,7 @@ pub(crate) fn wetype_mic_observation() -> Option<MicObservation> {
         }
         index += 1;
         let entry = String::from_utf16_lossy(&name[..len as usize]);
-        if !entry.to_ascii_lowercase().contains("wetype") {
+        if !entry.to_ascii_lowercase().contains(marker) {
             continue;
         }
         let mut key = HKEY::default();
@@ -232,6 +244,189 @@ pub(crate) fn wetype_mic_observation() -> Option<MicObservation> {
     (complete && observation.entries > 0).then_some(observation)
 }
 
+/// 连续"未响应"计数（跨按下累计；任一按下判为 Observed 即归零）。
+static IME_HEAL_STEPS: AtomicU32 = AtomicU32::new(0);
+
+/// 连续救回上限（防循环的行为卫生上限；用户每重按一次至多触发一次救回）。
+const IME_HEAL_STEP_CAP: u32 = 4;
+
+/// Restore the exact original focused child, never whichever window is foreground later.
+pub(crate) fn focus_bounce(ticket: &crate::ime::RecoveryTicket) -> String {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if !ticket.can_recover() {
+        return "terminal_result=cancelled reason=stale_target_or_session".into();
+    }
+    if ticket.focus == 0 {
+        return "terminal_result=cancelled reason=no_focused_child".into();
+    }
+    unsafe {
+        let focus = HWND(ticket.focus as *mut _);
+        let target_thread = GetWindowThreadProcessId(focus, None);
+        let current_thread = GetCurrentThreadId();
+        if !AttachThreadInput(current_thread, target_thread, true).as_bool() {
+            return "terminal_result=failed reason=attach_failed".into();
+        }
+        let outcome = (|| {
+            if !ticket.can_recover() || GetFocus() != focus {
+                return "terminal_result=cancelled reason=focus_changed".to_owned();
+            }
+            let _ = SetFocus(None);
+            let cleared = GetFocus().0.is_null();
+            if !cleared {
+                return "terminal_result=failed reason=focus_clear_unconfirmed".into();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            // Restore only our own clear; respect user focus/window changes even during the pulse.
+            if !ticket.same_window() || !GetFocus().0.is_null() {
+                return "terminal_result=cancelled reason=target_changed_during_bounce".into();
+            }
+            let _ = SetFocus(Some(focus));
+            if !ticket.epoch_current() {
+                return format!("terminal_result=cancelled reason=session_changed_during_bounce focus_restored={}", GetFocus() == focus);
+            }
+            format!(
+                "terminal_result={} focus_restored={} mic_result=unknown",
+                if GetFocus() == focus {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                GetFocus() == focus
+            )
+        })();
+        let detached = AttachThreadInput(current_thread, target_thread, false).as_bool()
+            || AttachThreadInput(current_thread, target_thread, false).as_bool();
+        if !detached {
+            return format!(
+                "terminal_result=failed reason=detach_unconfirmed focus_result=[{outcome}]"
+            );
+        }
+        format!("{outcome} detached={detached}")
+    }
+}
+
+/// 自动救回的上下文：仅当按下目标工具有可切换的输入法目标时携带。
+pub(crate) struct ImeHealContext {
+    pub state: Arc<Mutex<ConnectionSnapshot>>,
+    pub ticket: crate::ime::RecoveryTicket,
+}
+
+/// 是否执行自动救回（纯函数，单测覆盖）：仅在"确认未响应"且具备条件时动作。
+fn should_heal(verdict: MicResponse, eligible: bool) -> bool {
+    eligible && verdict == MicResponse::NotObserved
+}
+
+/// 有界等待语音会话结束（结束才注入，避免与按住中的和弦叠加）。
+fn wait_session_end(
+    state: &Arc<Mutex<ConnectionSnapshot>>,
+    ticket: &crate::ime::RecoveryTicket,
+    budget_ms: u64,
+) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if !ticket.current() {
+            return false;
+        }
+        let idle = {
+            let guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.voice_state == sayall_core::VoiceSessionState::Idle
+        };
+        if idle {
+            return true;
+        }
+        if started.elapsed().as_millis() as u64 >= budget_ms {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// 每次语音按下的"输入法是否真的开麦"验证（2026-10-09 Andy：日志需要增加）。
+///
+/// 在固定延迟点读回 ConsentStore 观测，与按下前的基线比对，落
+/// `voice_verify ... mic=observed|not_observed|unknown`。
+/// `observed` = 输入法在按下后确实开始/持续录音（语音条被拉起的客观旁证）；
+/// `unknown` = 观测不可用，不得据此推断（如该输入法不写 ConsentStore）。
+///
+/// 2026-10-10 起附带**自动救回**（直达、用户无感）：两轮判据均确认未响应 →
+/// 等会话结束后对前台窗口做一次程序化"焦点往返"（`focus_bounce_foreground`，
+/// 不切换输入法、不改前台窗口）。恢复（observed）即计数归零；连续未恢复
+/// 达到 cap 上限后停止继续动作（防循环）。
+pub(crate) fn spawn_mic_verify(
+    session: u64,
+    tool: &'static str,
+    marker: &'static str,
+    baseline: Option<MicObservation>,
+    heal: Option<ImeHealContext>,
+) {
+    const SAMPLES_MS: [u64; 2] = [800, 2500];
+    let observation_epoch = crate::ime::recovery_epoch();
+    let _ = std::thread::Builder::new()
+        .name("sayall-mic-verify".to_owned())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let mut verdict = MicResponse::Unknown;
+            let mut both_not_observed = true;
+            for delay in SAMPLES_MS {
+                let elapsed = started.elapsed().as_millis() as u64;
+                if elapsed < delay {
+                    std::thread::sleep(std::time::Duration::from_millis(delay - elapsed));
+                }
+                if !crate::ime::recovery_current(observation_epoch) || heal.as_ref().is_some_and(|h| !h.ticket.current()) {
+                    crate::ble::gatt_note(format!("voice_verify session={session} tool={tool} terminal_result=cancelled reason=stale_target_or_session"));
+                    return;
+                }
+                verdict = response_since(baseline, mic_observation_for(marker));
+                both_not_observed &= verdict == MicResponse::NotObserved;
+                crate::ble::gatt_note(format!(
+                    "voice_verify session={session} tool={tool} marker={marker} at_ms={} mic={}",
+                    started.elapsed().as_millis(),
+                    verdict.as_log_str(),
+                ));
+            }
+            if verdict == MicResponse::Observed && heal.as_ref().is_none_or(|h| h.ticket.current()) {
+                // 真正被唤起过一次：整套状态健康，救回计数归零。
+                IME_HEAL_STEPS.store(0, Ordering::Relaxed);
+            }
+            let eligible = heal.is_some() && both_not_observed;
+            if !should_heal(verdict, eligible) {
+                return;
+            }
+            let Some(heal) = heal else { return };
+            if !wait_session_end(&heal.state, &heal.ticket, 6000) {
+                crate::ble::gatt_note(format!(
+                    "voice_heal session={session} tool={tool} action=focus_bounce skipped=session_active"
+                ));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            let steps = IME_HEAL_STEPS.load(Ordering::Relaxed);
+            if steps >= IME_HEAL_STEP_CAP {
+                crate::ble::gatt_note(format!(
+                    "voice_heal session={session} tool={tool} action=focus_bounce skipped=cap steps={steps} cap={IME_HEAL_STEP_CAP}"
+                ));
+                return;
+            }
+            if crate::ime::foreground_is_self() {
+                crate::ble::gatt_note(format!(
+                    "voice_heal session={session} tool={tool} action=focus_bounce skipped=self_foreground"
+                ));
+                return;
+            }
+            let outcome = focus_bounce(&heal.ticket);
+            if !outcome.contains("terminal_result=cancelled") { IME_HEAL_STEPS.fetch_add(1, Ordering::Relaxed); }
+            crate::ble::gatt_note(format!(
+                "voice_heal session={session} tool={tool} action=focus_bounce step={} cap={} {outcome}",
+                IME_HEAL_STEPS.load(Ordering::Relaxed),
+                IME_HEAL_STEP_CAP,
+            ));
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +446,14 @@ mod tests {
         let mut result = MicObservation::default();
         result.record(start, start + 1);
         result
+    }
+
+    #[test]
+    fn should_heal_only_on_confirmed_not_observed_and_eligible() {
+        assert!(should_heal(MicResponse::NotObserved, true));
+        assert!(!should_heal(MicResponse::NotObserved, false));
+        assert!(!should_heal(MicResponse::Observed, true));
+        assert!(!should_heal(MicResponse::Unknown, true));
     }
 
     #[test]

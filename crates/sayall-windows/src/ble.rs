@@ -1516,6 +1516,7 @@ fn schedule_reconnect(
 }
 
 fn publish_disconnected(state: &Arc<Mutex<ConnectionSnapshot>>, reconnecting: bool) {
+    crate::ime::cancel_recovery();
     let mut snapshot = lock(state);
     snapshot.phase = if reconnecting {
         ConnectionPhase::Reconnecting
@@ -1699,6 +1700,7 @@ fn handle_control(
             session_id,
             generation,
         } => {
+            crate::ime::voice_started();
             if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
                 abort_voice_session(
                     session,
@@ -1782,6 +1784,11 @@ fn handle_control(
             std::thread::sleep(Duration::from_millis(20));
             // 按住说话快捷键（参考 ZSTDJan/Voice_VibeCoding）：先注入快捷键
             // DOWN；WASAPI 准备已完成，注入失败直接中止并统一释放。
+            let attempt_tool = *lock(voice_input_tool);
+            let verify_marker = crate::ime::mic_marker_for(attempt_tool);
+            let verify_baseline = verify_marker.and_then(crate::wetype_revive::mic_observation_for);
+            let recovery_ticket = crate::ime::RecoveryTicket::capture();
+            gatt_note(format!("voice_attempt session={session_id} tool={} path={} synth=off synth_confirmed=false fg_self={} since_tool_select_ms={} since_hotkey_change_ms={} since_ime_switch_ms={}", crate::ime::tool_label(attempt_tool), if lock(voice_hold_hotkey).is_some() { "send_input" } else { "none" }, crate::ime::foreground_is_self(), crate::ime::age_label(crate::ime::tool_select_age_ms()), crate::ime::age_label(crate::ime::hotkey_change_age_ms()), crate::ime::age_label(crate::ime::last_switch_age_ms())));
             if let Some(chord) = lock(voice_hold_hotkey).clone() {
                 let configured_tool = *lock(voice_input_tool);
                 let session_ime_tool = voice_session_ime_tool(configured_tool, &chord);
@@ -1907,6 +1914,27 @@ fn handle_control(
                 );
                 return;
             }
+            if let Some(marker) = verify_marker {
+                let heal = if attempt_tool.and_then(crate::ime::ime_target_for).is_some()
+                    && !lock(voice_hold_hotkey)
+                        .as_ref()
+                        .is_some_and(is_wetype_voice_hotkey)
+                {
+                    recovery_ticket.map(|ticket| crate::wetype_revive::ImeHealContext {
+                        state: Arc::clone(state),
+                        ticket,
+                    })
+                } else {
+                    None
+                };
+                crate::wetype_revive::spawn_mic_verify(
+                    u64::from(session_id),
+                    crate::ime::tool_label(attempt_tool),
+                    marker,
+                    verify_baseline,
+                    heal,
+                );
+            }
             crate::key_suppressor::set_session_active(true);
             *extend_deadline = Some(Instant::now() + MICROPHONE_EXTEND_INTERVAL);
             let mut snapshot = lock(state);
@@ -1916,6 +1944,7 @@ fn handle_control(
             snapshot.last_error = None;
         }
         PipelineOutput::StreamStopped { generation, .. } => {
+            crate::ime::voice_ended();
             if let Some(session) = session {
                 session.microphone_opened = false;
             }
@@ -2112,6 +2141,7 @@ fn abort_voice_session(
 fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
     // This helper is the existing common cleanup boundary for normal stop,
     // abort, disconnect, sleep and shutdown. The notification is idempotent.
+    crate::ime::voice_ended();
     crate::scene_control::notify_voice_activity(false);
     crate::key_suppressor::set_session_active(false);
     if let Some(chord) = held_hotkey.take() {
