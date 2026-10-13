@@ -122,7 +122,20 @@ import {
   learnFocusTarget,
   testAppFocus,
 } from "../lib/bridge";
-import type { ButtonMappings, RuntimeSnapshot } from "../lib/bridge";
+import type { ButtonMappings, RuntimeSnapshot, SceneSnapshot } from "../lib/bridge";
+
+function voiceSnapshot(pressed: boolean): SceneSnapshot {
+  return { mappingNoticeEnabled: true, mappingNotice: null, mappingNoticeRevision: 1,
+    enabled: true, generation: 1, foregroundGeneration: 1, applicationId: null,
+    templateId: null, panel: null, updateDefault: false, selectedIndex: null,
+    menuItems: [], waitingForRelease: false, voiceActive: false,
+    voiceButtonPressed: pressed, status: null };
+}
+
+function voiceRuntime(overrides: Partial<RuntimeSnapshot["platform"]["connection"]>): RuntimeSnapshot {
+  return { ...runtime, platform: { ...runtime.platform,
+    connection: { ...runtime.platform.connection, ...overrides } } };
+}
 
 const runtime: RuntimeSnapshot = {
   appVersion: "0.1.0",
@@ -221,6 +234,84 @@ beforeEach(() => {
 });
 
 describe("buttons mapping page", () => {
+  it("shows a received voice key before audio is ready and retains the failure after release", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
+    await flushPromises();
+    expect(wrapper.get('.voice-card').classes()).toContain('active');
+    expect(wrapper.get('.anchor-dot.voice').classes()).toContain('visible');
+    expect(wrapper.get('.voice-feedback').text()).toContain('已收到语音键');
+    expect(wrapper.get('.voice-feedback').element.closest('header')).not.toBeNull();
+    expect(wrapper.get('.voice-badge').text()).not.toContain('语音进行中');
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ lastError: 'select an output endpoint before starting voice' }) });
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.voice-feedback').text()).toContain('声音通道尚未就绪');
+    expect(wrapper.get('.voice-feedback').text()).toContain('连接与语音');
+    expect(wrapper.get('.voice-feedback').text()).not.toContain('select an output');
+    wrapper.unmount();
+  });
+
+  it("keeps evidence of a quick voice press without extending the pressed state", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(false) });
+    await flushPromises();
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.voice-feedback').text()).toContain('已收到语音键');
+    wrapper.unmount();
+  });
+
+  it("does not turn streaming or a stale error into an observed voice key", async () => {
+    const wrapper = await mountPage();
+    await wrapper.setProps({ runtime: voiceRuntime({ lastError: '旧的声音通道错误' }) });
+    expect(wrapper.find('.voice-feedback').exists()).toBe(false);
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'streaming', lastError: null }) });
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.voice-badge').text()).toBe('语音进行中');
+    wrapper.unmount();
+  });
+
+  it("clears voice observation on a cancelled or disconnected scene", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
+    await flushPromises();
+    expect(wrapper.get('.voice-card').classes()).toContain('active');
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ phase: 'disconnected', voiceState: 'idle' }) });
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.anchor-dot.voice').classes()).not.toContain('visible');
+    wrapper.unmount();
+  });
+
+  it("replaces the previous failure with the next observed streaming session", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(true) });
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ lastError: '声音通道暂不可用' }) });
+    expect(wrapper.get('.voice-feedback').text()).toContain('声音通道暂不可用');
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(true) });
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'streaming', lastError: null }) });
+    expect(wrapper.get('.voice-feedback').text()).toBe('已收到语音键，语音进行中。');
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime });
+    expect(wrapper.get('.voice-feedback').text()).toBe('已收到语音键，语音已结束。');
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    wrapper.unmount();
+  });
+
+  it("shows an idle voice failure even when the preceding runtime snapshot was streaming", async () => {
+    const wrapper = await mountPage();
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'streaming', lastError: null }) });
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(true) });
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'idle', lastError: 'select an output endpoint before starting voice' }) });
+    expect(wrapper.get('.voice-feedback').text()).toContain('连接与语音');
+    expect(wrapper.get('.voice-feedback').text()).not.toContain('语音已结束');
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    wrapper.unmount();
+  });
+
   it("shows the applied template separately from the editing draft and follows runtime changes", async () => {
     const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
     const current = wrapper.get('output[aria-label="当前使用的按键模板"]');

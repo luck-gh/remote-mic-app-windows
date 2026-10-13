@@ -4,8 +4,11 @@ import { getSceneSnapshot, subscribeSceneEvents, type MappingNotice, type SceneS
 /** Applied mapping notices are authoritative; menu candidates and editor drafts are not. */
 export function useCurrentTemplate() {
   const applied = ref<MappingNotice | null>(null);
+  const sceneSnapshot = ref<SceneSnapshot | null>(null);
   const error = ref("");
   let revision = -1;
+  let snapshotEvents = 0;
+  let readRequest = 0;
   let disposed = false;
   let unlisten: (() => void) | undefined;
 
@@ -15,16 +18,23 @@ export function useCurrentTemplate() {
     revision = nextRevision;
   }
   function acceptSnapshot(snapshot: SceneSnapshot | null) {
-    if (snapshot) acceptNotice(snapshot.mappingNotice, snapshot.mappingNoticeRevision);
+    if (disposed || !snapshot) return;
+    sceneSnapshot.value = snapshot;
+    acceptNotice(snapshot.mappingNotice, snapshot.mappingNoticeRevision);
   }
   async function refresh() {
+    const request = ++readRequest;
+    const eventsAtRequest = snapshotEvents;
     try {
       const snapshot = await getSceneSnapshot();
-      if (disposed) return;
-      acceptSnapshot(snapshot);
+      if (disposed || request !== readRequest) return;
+      // Physical edges can share the same scene generation. A read started
+      // before an event must never overwrite the newer pressed/released state.
+      if (snapshotEvents === eventsAtRequest) acceptSnapshot(snapshot);
+      else if (snapshot) acceptNotice(snapshot.mappingNotice, snapshot.mappingNoticeRevision);
       error.value = "";
     } catch (reason) {
-      if (!disposed) error.value = reason instanceof Error ? reason.message : String(reason);
+      if (!disposed && request === readRequest) error.value = reason instanceof Error ? reason.message : String(reason);
     }
   }
 
@@ -32,7 +42,10 @@ export function useCurrentTemplate() {
     try {
       const stop = await subscribeSceneEvents(event => {
         if (event.type === "mapping_applied") acceptNotice(event.notice, event.revision);
-        else if (event.type === "snapshot") acceptSnapshot(event.snapshot);
+        else if (event.type === "snapshot") {
+          ++snapshotEvents;
+          acceptSnapshot(event.snapshot);
+        }
       });
       if (disposed) { stop(); return; }
       unlisten = stop;
@@ -44,5 +57,5 @@ export function useCurrentTemplate() {
   });
   onUnmounted(() => { disposed = true; unlisten?.(); });
 
-  return { applied, templateId: computed(() => applied.value?.templateId ?? null), error, refresh };
+  return { applied, sceneSnapshot, templateId: computed(() => applied.value?.templateId ?? null), error, refresh };
 }

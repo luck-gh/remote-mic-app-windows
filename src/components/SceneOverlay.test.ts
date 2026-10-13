@@ -11,7 +11,7 @@ const direct: MappingNotice = { kind: "direct", templateId: "actual", name: "实
 function snapshot(panel: SceneSnapshot["panel"] = null): SceneSnapshot {
   return { mappingNoticeEnabled: true, mappingNotice: null, mappingNoticeRevision: 0, enabled: true, generation: 1,
     foregroundGeneration: 1, applicationId: "notepad", templateId: null, updateDefault:false, panel, selectedIndex: null, menuItems: [],
-    waitingForRelease: false, voiceActive: false, status: null };
+    waitingForRelease: false, voiceActive: false, voiceButtonPressed: false, status: null };
 }
 beforeEach(() => {
   vi.useFakeTimers(); vi.clearAllMocks();

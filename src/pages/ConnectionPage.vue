@@ -8,6 +8,7 @@ import type {
   AudioSnapshot,
   AudioRouteSnapshot,
   CaptureInputSnapshot,
+  CaptureInputSettings,
   CaptureSupport,
   Rc003TaskStatus,
   ConnectionSnapshot,
@@ -102,6 +103,7 @@ function reportAudioRoute(phase: string, reason: string | null) {
 const captureInput = ref<CaptureInputSnapshot>({ settings: { enabled: false, endpointId: null, endpointName: null }, phase: "disabled", recoveryPending: false, lastError: null });
 const captureEndpoints = ref<AudioEndpoint[]>([]);
 const captureBusy = ref(false);
+const pendingCapture = ref<CaptureInputSettings | null>(null);
 let captureRevision = 0;
 const captureMessage = ref("");
 const capturePhase = computed(() => ({ active: "本次说话正在使用所选输入设备", relinquished: "检测到外部改选，本次已让出控制", recovery_required: "上次会话未完整恢复，请选择如何处理", failed: "输入设备服务不可用", unsupported: "仅 Windows 应用支持" }[captureInput.value.phase] ?? (captureInput.value.settings.enabled ? "已开启，仅在遥控器说话期间切换" : "已关闭")));
@@ -117,17 +119,26 @@ async function scanCaptureInputs() {
   catch (error) { captureMessage.value = String(error); }
   finally { captureBusy.value = false; }
 }
-async function changeCaptureInput(enabled: boolean, endpointId = captureInput.value.settings.endpointId) {
+async function changeCaptureInput(enabled: boolean, endpointId = pendingCapture.value?.endpointId ?? captureInput.value.settings.endpointId) {
+  if (captureBusy.value || selectingEndpointId.value) return;
   const endpoint = captureEndpoints.value.find(e => e.id === endpointId);
+  const config = { enabled, endpointId, endpointName: endpointId ? (endpoint?.name ?? captureInput.value.settings.endpointName) : null };
   const revision = ++captureRevision;
   captureBusy.value = true; captureMessage.value = "";
   try {
-    const result = await setCaptureInput({ enabled, endpointId, endpointName: endpointId ? (endpoint?.name ?? captureInput.value.settings.endpointName) : null });
+    const result = await setCaptureInput(config);
     if (revision === captureRevision) {
       captureInput.value = result;
+      pendingCapture.value = null;
       await Promise.all([refreshAudio(), refreshAudioRoute()]);
     }
-  } catch (error) { captureMessage.value = String(error); await refreshCaptureInput(); }
+  } catch (error) {
+    captureMessage.value = String(error);
+    // Keep the user's explicit target as an unsaved draft, separate from runtime.
+    pendingCapture.value = endpoint ? config : null;
+    if (pendingCapture.value) showAdvancedAudio.value = true;
+    try { captureInput.value = await getCaptureInput(); } catch { /* keep last confirmed state */ }
+  }
   finally { captureBusy.value = false; }
 }
 async function recoverCaptureInput(restore: boolean) {
@@ -1033,17 +1044,28 @@ async function scanAudio() {
 }
 
 async function chooseAudioEndpoint(endpoint: AudioEndpoint) {
+  if (captureBusy.value || selectingEndpointId.value || captureInput.value.recoveryPending) return;
   selectingEndpointId.value = endpoint.id;
   audioMessage.value = "正在打开语音设备…";
   try {
-    audio.value = await selectAudioEndpoint(endpoint.id);
+    if (pendingCapture.value) {
+      captureBusy.value = true;
+      captureInput.value = await setCaptureInput(pendingCapture.value, endpoint.id);
+      pendingCapture.value = null;
+      captureMessage.value = "";
+      await refreshAudio();
+    } else {
+      audio.value = await selectAudioEndpoint(endpoint.id);
+    }
     audioMessage.value = "手动写入端已保存；请按目标麦克风实际收到的声音验证。";
     await refreshAudioRoute();
   } catch (error) {
     audioMessage.value = error instanceof Error ? error.message : String(error);
     await refreshAudio();
+    try { captureInput.value = await getCaptureInput(); } catch { /* keep last confirmed state */ }
   } finally {
     selectingEndpointId.value = "";
+    captureBusy.value = false;
   }
 }
 
@@ -1231,7 +1253,7 @@ onUnmounted(() => {
           <div class="capture-input-target">
           <label for="capture-input-target">目标麦克风输入</label>
           <div class="button-row">
-            <select id="capture-input-target" :value="captureInput.settings.endpointId ?? ''" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending"
+            <select id="capture-input-target" :value="pendingCapture?.endpointId ?? captureInput.settings.endpointId ?? ''" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending"
               @change="changeCaptureInput(captureInput.settings.enabled, ($event.target as HTMLSelectElement).value || null)">
               <option value="">请选择输入设备</option>
               <option v-if="captureInput.settings.endpointId && !captureEndpoints.some(e => e.id === captureInput.settings.endpointId)" :value="captureInput.settings.endpointId">{{ captureInput.settings.endpointName }}</option>
@@ -1240,6 +1262,7 @@ onUnmounted(() => {
             <button type="button" class="secondary-button" :disabled="captureBusy || !runtime?.platform.windowsApiAvailable" @click="scanCaptureInputs">读取输入设备</button>
           </div>
           <p aria-live="polite">{{ capturePhase }}</p>
+          <p v-if="pendingCapture" role="status">所选麦克风尚未保存。请在高级诊断中明确选择同一条音频线的声音写入端，两端将一起保存。</p>
           <button v-if="audioRoute?.phase === 'unavailable' && captureInput.settings.endpointId" type="button" class="secondary-button" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending" @click="changeCaptureInput(captureInput.settings.enabled)">重新连接声音通道</button>
           </div>
           <div class="capture-input-behavior">
@@ -1264,7 +1287,7 @@ onUnmounted(() => {
           </div>
         </section>
         </div>
-        <details class="audio-advanced" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open">
+        <details class="audio-advanced" :open="showAdvancedAudio" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open">
           <summary>高级：声音传输诊断</summary>
           <template v-if="showAdvancedAudio">
           <p class="muted">手动写入端只用于诊断或已有特殊配置。它决定遥控器声音写到哪里，不改变 Windows 默认扬声器；选择扬声器可能直接播放声音，不能代表目标麦克风已收到声音。</p>
@@ -1278,12 +1301,14 @@ onUnmounted(() => {
             </div>
             <button
               type="button"
-              :disabled="audioBusy || Boolean(selectingEndpointId) || audio.selectedEndpointId === endpoint.id"
+              :disabled="captureBusy || captureInput.recoveryPending || audioBusy || Boolean(selectingEndpointId) || (!pendingCapture && audio.selectedEndpointId === endpoint.id)"
               @click="chooseAudioEndpoint(endpoint)"
             >
               {{
                 selectingEndpointId === endpoint.id
                   ? "正在启用…"
+                  : pendingCapture
+                    ? "选择并保存两端"
                   : audio.selectedEndpointId === endpoint.id
                     ? "当前设备"
                     : "选择"

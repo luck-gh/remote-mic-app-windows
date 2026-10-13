@@ -1168,6 +1168,7 @@ fn worker_loop(
                 }
             }
             WorkerMessage::Shutdown => {
+                crate::scene_control::clear_voice_button("shutdown");
                 context_publisher.stop(&connection_context);
                 release_voice_hold_hotkey(&send_input, &mut held_hotkey);
                 let _ = audio.interrupt_session();
@@ -1177,6 +1178,7 @@ fn worker_loop(
             }
         }
     }
+    crate::scene_control::clear_voice_button("worker_stopped");
 }
 
 fn nearest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
@@ -1370,6 +1372,7 @@ fn invalidate_connection(
     connection_generation: &mut u64,
 ) -> Result<(), PlatformError> {
     *connection_generation = connection_generation.wrapping_add(1);
+    crate::scene_control::clear_voice_button("connection_invalidated");
     release_voice_hold_hotkey(send_input, held_hotkey);
     let mut cleanup_errors = Vec::new();
     if let Err(error) = audio.interrupt_session() {
@@ -1516,6 +1519,7 @@ fn schedule_reconnect(
 }
 
 fn publish_disconnected(state: &Arc<Mutex<ConnectionSnapshot>>, reconnecting: bool) {
+    crate::scene_control::clear_voice_button("disconnected");
     crate::ime::cancel_recovery();
     let mut snapshot = lock(state);
     snapshot.phase = if reconnecting {
@@ -1650,6 +1654,9 @@ fn handle_control(
     stamp: CallbackStamp,
     bytes: &[u8],
 ) {
+    // WorkerMessage::Control has already rejected stale connection generations.
+    // Observe STOP even after audio preparation aborted the pipeline to Idle.
+    crate::scene_control::observe_voice_control(bytes);
     if bytes.first() == Some(&0x00) && pipeline.state() == VoiceSessionState::Idle {
         return;
     }

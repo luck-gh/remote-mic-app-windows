@@ -56,6 +56,12 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
         Err("capture_routing_unsupported".into())
     }
+    fn restore_capture_input_configuration(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+        self.configure_capture_input(settings)
+    }
     fn usage_counters(&self) -> Arc<UsageCounters>;
     fn snapshot(&self) -> PlatformSnapshot;
     fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError>;
@@ -246,6 +252,12 @@ impl PlatformRuntime for WindowsPlatform {
         restore: bool,
     ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
         self.resolve_capture_recovery(restore)
+    }
+    fn restore_capture_input_configuration(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+        self.restore_capture_input_configuration(settings)
     }
 
     fn usage_counters(&self) -> Arc<UsageCounters> {

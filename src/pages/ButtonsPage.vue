@@ -422,6 +422,36 @@ function loadEditingSource(source: EditingSource): boolean {
 const voiceActive = computed(
   () => props.runtime?.platform.connection.voiceState === "streaming",
 );
+const voiceButtonPressed = computed(() => currentTemplate.sceneSnapshot.value?.voiceButtonPressed === true);
+const voiceReceived = ref(false);
+const voiceStarted = ref(false);
+// Observe each edge synchronously: a quick DOWN/UP may share a Vue render tick.
+// Keep the receipt visible after UP without inventing a longer physical hold.
+watch(voiceButtonPressed, (pressed) => {
+  if (pressed) {
+    voiceReceived.value = true;
+    voiceStarted.value = voiceActive.value;
+  }
+  reportFrontendEvent({ event: "buttons_voice_observation", phase: "completed", result: "passed", reason: pressed ? "pressed" : "released" });
+}, { flush: "sync" });
+watch(voiceActive, (active) => {
+  if (active && voiceReceived.value) voiceStarted.value = true;
+}, { flush: "sync" });
+const voiceFeedback = computed(() => {
+  if (!voiceReceived.value) return "";
+  if (voiceActive.value) return "已收到语音键，语音进行中。";
+  const error = props.runtime?.platform.connection.lastError;
+  if (error) {
+    const detail = error === "select an output endpoint before starting voice"
+      ? "声音通道尚未就绪，请到“连接与语音”选择可用的声音通道。"
+      : error === "the selected audio endpoint is temporarily unavailable; its saved selection is retained"
+        ? "所选声音通道暂不可用，请到“连接与语音”检查。"
+        : error;
+    return `已收到语音键。当前语音状态：${detail}`;
+  }
+  if (voiceStarted.value) return "已收到语音键，语音已结束。";
+  return voiceButtonPressed.value ? "已收到语音键，正在等待语音开始。" : "已收到语音键，未观察到语音开始。";
+});
 
 function actionsOf(button: RemoteButton): ButtonActions {
   return (
@@ -1018,6 +1048,7 @@ onUnmounted(() => {
 
       </div>
       <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
+      <p v-if="voiceFeedback" class="voice-feedback" role="status">{{ voiceFeedback }}</p>
       <p class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
     </header>
 
@@ -1042,10 +1073,10 @@ onUnmounted(() => {
         </template>
         <path
           :d="connectionPath(VOICE_PLACEMENT)"
-          :class="{ active: voiceActive }"
+          :class="{ active: voiceButtonPressed }"
           fill="none"
         />
-        <polygon :points="arrowPolygon(VOICE_PLACEMENT)" :class="{ active: voiceActive }" />
+        <polygon :points="arrowPolygon(VOICE_PLACEMENT)" :class="{ active: voiceButtonPressed }" />
       </svg>
 
       <figure ref="remotePhotoEl" class="remote-photo" :style="{ left: `${remoteLeft}px`, top: `${REMOTE_TOP}px` }">
@@ -1063,7 +1094,7 @@ onUnmounted(() => {
       ></span>
       <span
         class="anchor-dot voice"
-        :class="{ visible: voiceActive }"
+        :class="{ visible: voiceButtonPressed }"
         :style="{
           left: `${anchorPoint(VOICE_PLACEMENT).x - 4}px`,
           top: `${anchorPoint(VOICE_PLACEMENT).y - 4}px`,
@@ -1139,7 +1170,7 @@ onUnmounted(() => {
       <article
         class="mapping-card mapping-readonly voice-card center"
         aria-disabled="true"
-        :class="{ active: voiceActive }"
+        :class="{ active: voiceButtonPressed }"
         :style="{ top: `${VOICE_CARD_TOP}px`, width: `${cardWidth}px` }"
       >
         <div class="mapping-card-title">
@@ -1159,7 +1190,7 @@ onUnmounted(() => {
           <svg class="readonly-icon" viewBox="0 0 24 24" fill="none" aria-label="固定功能，不可自定义">
             <path :d="READONLY_ICON" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
-          <span class="badge pending voice-badge" :class="{ active: voiceActive }">按住说话</span>
+          <span class="badge pending voice-badge" :class="{ active: voiceButtonPressed }">{{ voiceActive ? '语音进行中' : voiceButtonPressed ? '已收到按键' : '按住说话' }}</span>
         </div>
         <p class="voice-note">按下开始、松开结束；不参与自定义映射，不加双击/长按延迟。</p>
       </article>
@@ -1436,6 +1467,7 @@ onUnmounted(() => {
   width: 100%;
 }
 .mapping-header-status { min-height: 20px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-feedback { min-height: 20px; margin: 0; font-size: 13px; line-height: 20px; }
 @media (max-width: 620px) {
   .mapping-heading-row { grid-template-columns: 1fr; gap: 8px; }
   .mapping-heading-row .device-chip { justify-self: start; }

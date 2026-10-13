@@ -34,6 +34,20 @@ pub(crate) fn notify_voice_activity(active: bool) {
     }
 }
 
+pub(crate) fn observe_voice_control(bytes: &[u8]) {
+    let scene = VOICE_SCENE.get().and_then(|slot| lock(slot).upgrade());
+    if let Some(scene) = scene {
+        scene.observe_voice_control(bytes);
+    }
+}
+
+pub(crate) fn clear_voice_button(reason: &'static str) {
+    let scene = VOICE_SCENE.get().and_then(|slot| lock(slot).upgrade());
+    if let Some(scene) = scene {
+        scene.set_voice_button_pressed(false, reason);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScenePanel {
@@ -68,6 +82,8 @@ pub struct SceneSnapshot {
     pub menu_items: Vec<SceneMenuItem>,
     pub waiting_for_release: bool,
     pub voice_active: bool,
+    /// ATVV start/stop observation, independent of successful audio preparation.
+    pub voice_button_pressed: bool,
     pub status: Option<String>,
 }
 
@@ -172,6 +188,7 @@ struct State {
     handled_in_cycle: BTreeSet<RemoteButton>,
     waiting_for_release: bool,
     voice_active: bool,
+    voice_button_pressed: bool,
     status: Option<String>,
 }
 
@@ -209,6 +226,7 @@ impl Default for State {
             handled_in_cycle: BTreeSet::new(),
             waiting_for_release: false,
             voice_active: false,
+            voice_button_pressed: false,
             status: None,
         }
     }
@@ -561,6 +579,33 @@ impl SceneController {
             self.refresh_foreground();
         }
         result
+    }
+
+    fn observe_voice_control(&self, bytes: &[u8]) {
+        use sayall_core::AtvvControlEvent;
+        match AtvvControlEvent::parse(bytes) {
+            Ok(AtvvControlEvent::StreamStarted { .. }) => {
+                self.set_voice_button_pressed(true, "atvv_start");
+            }
+            Ok(AtvvControlEvent::StreamStopped) => {
+                self.set_voice_button_pressed(false, "atvv_stop");
+            }
+            _ => {}
+        }
+    }
+
+    fn set_voice_button_pressed(&self, pressed: bool, reason: &'static str) {
+        {
+            let mut state = lock(&self.state);
+            if state.voice_button_pressed == pressed {
+                return;
+            }
+            state.voice_button_pressed = pressed;
+        }
+        crate::gatt_note(format!(
+            "voice_button_observation pressed={pressed} reason={reason} result=observed"
+        ));
+        self.emit_snapshot();
     }
 
     pub fn notify_voice_active(&self, active: bool) {
@@ -1827,6 +1872,7 @@ fn snapshot_from(state: &State) -> SceneSnapshot {
             .map_or_else(Vec::new, |p| menu_items(state, p.kind)),
         waiting_for_release: state.waiting_for_release,
         voice_active: state.voice_active,
+        voice_button_pressed: state.voice_button_pressed,
         status: state.status.clone(),
     }
 }
@@ -2058,6 +2104,92 @@ mod tests {
             foreground_watcher: Mutex::new(None),
         }
     }
+
+    #[test]
+    fn voice_button_observation_is_distinct_from_streaming_state() {
+        let controller = controller();
+        controller.notify_voice_active(true);
+        let snapshot = serde_json::to_value(controller.snapshot()).unwrap();
+        assert_eq!(snapshot["voiceActive"], true);
+        assert_eq!(snapshot["voiceButtonPressed"], false);
+    }
+
+    #[test]
+    fn voice_button_observation_survives_audio_abort_and_releases_while_pipeline_idle() {
+        use sayall_core::{AtvvVoicePipeline, VoiceSessionState};
+        let controller = controller();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        controller.subscribe(Arc::new(move |event| {
+            if let SceneEvent::Snapshot { snapshot } = event {
+                lock(&sink).push(snapshot.voice_button_pressed);
+            }
+        }));
+        let mut pipeline = AtvvVoicePipeline::default();
+        pipeline
+            .handle_control(&[0x0B, 0x01, 0x00, 0x02, 0x03, 0, 120])
+            .unwrap();
+        controller.observe_voice_control(&[0x04, 0x03, 0x02, 0x01]);
+        pipeline.handle_control(&[0x04, 0x03, 0x02, 0x01]).unwrap();
+        // The production preparation failure releases the session gate and
+        // interrupts the pipeline, but has not observed the remote's STOP yet.
+        controller.notify_voice_active(true);
+        controller.notify_voice_active(false);
+        pipeline.interrupt();
+        assert_eq!(pipeline.state(), VoiceSessionState::Idle);
+        assert!(controller.snapshot().voice_button_pressed);
+        assert!(!controller.snapshot().voice_active);
+
+        controller.observe_voice_control(&[0x00]);
+        assert!(!controller.snapshot().voice_button_pressed);
+        assert_eq!(lock(&observed).first(), Some(&true));
+        assert_eq!(lock(&observed).last(), Some(&false));
+    }
+
+    #[test]
+    fn voice_button_observation_publishes_fast_edges_once_and_ignores_other_controls() {
+        let controller = controller();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        controller.subscribe(Arc::new(move |event| {
+            if let SceneEvent::Snapshot { snapshot } = event {
+                lock(&sink).push(snapshot.voice_button_pressed);
+            }
+        }));
+        for bytes in [
+            &[0x04, 0x03, 0x02, 0x01][..],
+            &[0x04],
+            &[0x0B, 0x01, 0x00, 0x02, 0x03, 0, 120],
+            &[0x08],
+            &[0x0A],
+            &[0x74], // An F5 virtual key value is not an ATVV voice control.
+            &[],
+            &[0x00],
+            &[0x00],
+        ] {
+            controller.observe_voice_control(bytes);
+        }
+        assert_eq!(*lock(&observed), vec![true, false]);
+        assert!(!controller.snapshot().voice_button_pressed);
+        assert!(!controller.snapshot().voice_active);
+    }
+
+    #[test]
+    fn voice_button_observation_clears_idempotently_before_connection_teardown() {
+        let controller = controller();
+        for reason in [
+            "connection_invalidated",
+            "disconnected",
+            "shutdown",
+            "worker_stopped",
+        ] {
+            controller.observe_voice_control(&[0x04]);
+            controller.set_voice_button_pressed(false, reason);
+            controller.set_voice_button_pressed(false, reason);
+            assert!(!controller.snapshot().voice_button_pressed);
+        }
+    }
+
     #[derive(Default)]
     struct TaskBackend {
         current: Mutex<Option<WindowToken>>,

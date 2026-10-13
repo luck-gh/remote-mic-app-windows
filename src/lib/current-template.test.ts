@@ -6,7 +6,7 @@ import { useCurrentTemplate } from "./current-template";
 
 vi.mock("./bridge", () => ({ getSceneSnapshot: vi.fn(), selectCurrentTemplate: vi.fn(), subscribeSceneEvents: vi.fn(), isTauriRuntime: () => false }));
 const consumers = new Set<(event: SceneEvent) => void>();
-const snapshot = (id: string | null, revision = 1): SceneSnapshot => ({ mappingNoticeEnabled: true, mappingNotice: { kind: id ? "template" : "common", templateId: id, name: id, actionsAvailable: true }, mappingNoticeRevision: revision, enabled: true, generation: revision, foregroundGeneration: 1, applicationId: "app", templateId: id, panel: null, updateDefault: false, selectedIndex: null, menuItems: [], waitingForRelease: false, voiceActive: false, status: null });
+const snapshot = (id: string | null, revision = 1): SceneSnapshot => ({ mappingNoticeEnabled: true, mappingNotice: { kind: id ? "template" : "common", templateId: id, name: id, actionsAvailable: true }, mappingNoticeRevision: revision, enabled: true, generation: revision, foregroundGeneration: 1, applicationId: "app", templateId: id, panel: null, updateDefault: false, selectedIndex: null, menuItems: [], waitingForRelease: false, voiceActive: false, voiceButtonPressed: false, status: null });
 const Harness = defineComponent({ setup: () => ({ state: useCurrentTemplate() }), template: '<span>{{ state.applied.value ? state.templateId.value ?? "common" : "unknown" }}</span>' });
 
 describe("applied template state", () => {
@@ -35,6 +35,23 @@ describe("applied template state", () => {
     for (const callback of consumers) callback({ type: "snapshot", snapshot: snapshot("newer", 3) });
     resolve(snapshot("older", 2)); await flushPromises();
     expect(wrapper.text()).toBe("newer"); wrapper.unmount();
+  });
+
+  it("does not let an initial read with the same generation erase a voice observation", async () => {
+    let resolve!: (value: SceneSnapshot) => void;
+    vi.mocked(getSceneSnapshot).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    let state!: ReturnType<typeof useCurrentTemplate>;
+    const wrapper = mount(defineComponent({ setup: () => { state = useCurrentTemplate(); return {}; }, template: '<span />' }));
+    await flushPromises();
+    const down = { ...snapshot('first'), voiceButtonPressed: true };
+    for (const callback of consumers) callback({ type: 'snapshot', snapshot: down });
+    resolve({ ...down, voiceButtonPressed: false });
+    await flushPromises();
+    expect(state.sceneSnapshot.value?.voiceButtonPressed).toBe(true);
+    const lateCallback = [...consumers][0]!;
+    wrapper.unmount();
+    lateCallback({ type: 'snapshot', snapshot: { ...down, voiceButtonPressed: false } });
+    expect(state.sceneSnapshot.value?.voiceButtonPressed).toBe(true);
   });
 
   it("shows common when the mapping engine confirms common is applied", async () => {

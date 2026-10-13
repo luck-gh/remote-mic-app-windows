@@ -456,6 +456,20 @@
 
 2026-10-11 菜单失效追加核查：[Frida Gadget Script 官方文档](https://frida.re/docs/gadget/#script) 明确 `on_change` 默认 `ignore`，脚本只加载一次；Listen 与 Script 为不同交互模式。当前 Helper 的 `serde_like_config` 仅写 script/parameters，旧 Agent 只有应用自建 JSON 命令，没有 reload 或 Frida 控制服务。对照 [Frida 17.18.0 Gadget 实现](https://github.com/frida/frida-core/blob/17.18.0/lib/gadget/gadget.vala#L360-L403)，重复 load 不重新初始化已加载实例。本结论用于解释当日已安装新文件但旧脚本仍驻留的阻碍，不授权强制卸载、第二实例或重新启用已证实误捕获的旧脚本，也不将官方生命周期说明当作本地新脚本功能验收。当前无在线换代实现，12 日通过用户重启结束旧宿主后取得新代次实证，不凭猜测添加热更新补丁。
 
+### 2026-10-12 虚拟音频设备名称与严格配对
+
+2026-10-13 blame复核：数字前缀和 `16 Ch` 名称识别遗漏来自本地严格配对检查点 `1150a34154c7994364d9945a17a150976eb78c47`（2026-10-05）；按键页语音高亮仅依赖streaming来自上游 `e3450bff`（2026-09-05）。两者分别是本地识别缺口与上游原有状态耦合，不归因为0.8.6合并；旧适配器Code10仍是原因未知的独立设备边界。
+
+只读查询本机现有 VB-Audio 3.3.1.7 驱动包 `oem88.inf` 与公开 CoreAudio 属性，确认 Windows 在接口友好名上添加数字实例前缀，以及官方 pin 拼写 `CABLE In 16 Ch`。本地 `audio_route.rs` 只补这两种精确识别，配对仍要求相同 PnP 适配器；没有复制驱动实现或按相似名称重选设备。沿用 [VB-Audio 官方产品说明](https://vb-audio.com/Cable/) 的输入/输出方向，不把同家族名称当作同一条线的身份。
+
+参考微软 [PKEY_AudioEndpoint_Association](https://learn.microsoft.com/en-us/windows/win32/coreaudio/pkey-audioendpoint-association) 核查另一写入端的类别，但本机没有取得足以证明标准 pin 的对应值，因此没有新增“扬声器”猜选规则。旧保存端点公开 Parent 精确对应 Code 10 适配器；[微软 Code 10 说明](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/cm-prob-failed-start) 用于区分启动失败和底层 ProblemStatus，不凭设备忙错误码推定重复安装或资源竞争的完整根因。
+
+本轮两端恢复事务复用本仓库同线 resolver、配置锁与控制器取消/代次保护，没有复制外部实现或新增依赖。配置身份恢复与硬件可用性分开：旧端点失效不阻断恢复已提交身份，语音准备仍执行真实设备验证，不以相似名称选择另一线。真实 Windows worker 缺失/阻塞/取消注入与宿主、UI 回归先红后绿，审查超时缺陷已修复；实际失效设备 UI 验收保留 deferred。构建身份指纹及真实安装日志对照归 [组合 Preview](Testing/WindowsRC003Preview.md#2026-10-12-音频两端恢复与构建身份组合交付)，不关闭旧设备 Code 10 或捕获升级未知点。
+
+两个识别回归先红后绿、13 项路由单测通过；真实只读显式同线 16Ch 配对通过，标准 pin 自动配对仍拒绝，均未写默认音频设备或开启音频流。实际语音恢复、配置及候选身份归 [输入切换专项](Testing/CaptureInputSession.md) 和 [当前 Bug](Bugs/2026-10-03-foreground-input-regression.md#同次重启后的语音端点失效与识别修复)，不将只读配对解释为端到端录音通过。
+
+同日经用户明确选择后，当前本地候选已正常覆盖安装并使用该显式同线通道，四次 RC003 真实语音均完成供音、按键配对与默认角色恢复；用户确认按键反馈和语音输入正常。语音键反馈修复独立复用本仓库 ATVV 控制观察、连接代次与 scene snapshot，不复制外部实现、不引入依赖或更改语音控制时序。该实测不解决原 Code 10、标准 pin 自动识别、两端选择 UI 循环及旧失效目标回滚的剩余边界，也不外推其他型号或完整冷态矩阵。
+
 ### 2026-10-12 无长按动作时默认连续单击
 
 用户本次明确要求替代此前缺省关闭语义。参考微软 [Keyboard Input Overview / Keystroke Messages](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#keystroke-messages) 的持键自动重复与释放终止行为；该参考仅解释键盘交互，不把 Windows 原生重复误当遥控器已支持。实现复用本仓库 `GestureRecognizer`、动作白名单和原 Mac 来源时序，不改延迟或系统键盘设置、不复制新外部代码或增加依赖。缺省自动与显式关闭分别保存；旧缺字段同时代表未设置和历史关闭，无法恢复历史意图，按用户新规则解释。当前合同与场景占位边界归原长按方案，实机与回归结果归原连发手册，不用上游 10 月 6 日结果外推本地新候选。

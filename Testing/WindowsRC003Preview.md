@@ -290,6 +290,21 @@
 
 ### 2026-10-10 晚共享宿主来源修复、本地安装与旧代次拒绝
 
+### 2026-10-12 音频通道识别与语音键反馈修复
+
+本候选仍基于合并 SHA `af710b757897cb0567b63c63a7ceb40f62426652` 加保留的未提交工作；新增识别修复、独立语音按键观察与页面反馈也未提交。版本 0.8.6，`build_channel=local`，包元数据 `sourceCommit=null`，不能仅以 HEAD 或版本号表示完整源码身份。
+
+- 安装包：`target/release/bundle/nsis/无线麦_0.8.6_x64-setup.exe`，12,848,921 字节，SHA256 `a3ec31552954347c6b3dbc3b4df426f92ea50fdacc2ccf9a5fcdc9d9dac94b4c`，未签名本地候选，不用于公开发布。
+- 安装主程序 SHA256 `10f62ab982b9e962d22ce5a98029807f6d92df4180a86505fc4843d8c69cb297`；与构建主程序等长，仅差 3 个预期 NSIS 标记字节。Helper 仍为 `f9ede074f96b56c99e2468ca7137af6c45168c557934d6f4186fe7971ef9cce2`；四项实际载荷/许可与 staging 一致。
+- **passed（自动化）**：新端点识别回归先红后绿；语音观察四项后端回归、前端新增反馈及错误优先回归先红后绿，最终定向 78 项；完整 `pnpm test` 355 项/28 文件，生产构建中的 `pnpm build`、`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo check --workspace` 与 `cargo check -p sayall-windows-app --features runtime-simulation` 全部通过。Windows 库 493 passed / 22 ignored，宿主 143 passed / 1 ignored；不把 ignored 硬件测试或仿真编译当作真实设备验收。
+- **passed（正常退出/覆盖/普通启动）**：11:13:22.950–23.635（UTC+08:00）原主程序 10780 与 Helper 29896 正常结束，增强释放、BLE 与输入路由收尾通过，overall 684ms、failed_stages=0。11:14 覆盖安装完成，设置、按键映射、向导、恢复 journal 四文件在安装阶段字节不变。用户明确选择后才更新两端 ID/name 四字段；其他全部设置语义保持、切麦克风仍 enabled=true，模板和向导未变。配置替换第一次因 PowerShell 空字符串参数失败，核实原文件与备份一致后完成待替换文件并读回，未重复安装。11:16:18.412 新主程序 30736 由 Explorer 12848 启动，两者 TokenElevation=0；按键宿主 43264、Helper 42984，原设备宿主 12192 中同版 `2026-10-10.request-source` 再武装和鉴权通过，无强杀/重启/无线电操作。
+- **passed（启动路由及 RC003 本机实际观察）**：新选择的 Capture/16Ch 精确同 PnP 适配器，11:16:19.539 startup passed，前端报告 paired。11:19:00–50 四次真实会话分别提交 23,040 / 41,280 / 35,760 / 40,560 samples，均 queued_samples=0 完成；四次先确认默认麦克风角色，再进入语音链；每次结束均恢复 original_mask=7，journal=null。按下/松开观察与前端日志各四组配对；实际自身 UIA 读回收到按键与结束提示，用户明确确认“按键反馈和语音输入都正常”。首轮为启动约 161 秒后的第一次语音，不扩大为所有工具的长闲置冷态通过。
+- **仍 failed / deferred**：原保存声卡 Code 10 的底层原因未知；当前另一写入端不能证明为标准 pin，标准自动配对实机仍 RenderMissing，显式 16Ch 才 passed。两端 UI 选择循环及旧失效目标的回滚边界仍归输入切换专项；新包错误通道的受控 UI 实机、RC001、ARM64、断连/睡眠、各输入工具冷态和显式连发开启矩阵未覆盖。模板未改、连发未自动开启。
+
+根因、事件时序与回归边界归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#同次重启后的语音端点失效与识别修复)，输入切换归 [专项](CaptureInputSession.md)。最小材料复用 `target/dev/foreground-input/` 的 `audio-feedback-lifecycle.log`、`audio-fix-*`/`audio-feedback-*` 检查、`voice-feedback-*` 回归与包校验；已知菜单/键盘通过的 `source-confirmed-04ba26c6-setup.exe` 仅留作当前差异回退对照。剩余边界关闭且候选被替代后按 LOGGING 回收；不新增源码副本、台账、提交、推送或发布。
+
+收尾已核对引用、用途和占用，将本次不再需要的局部截图、工具启动失败短输出、一次性配置脚本及已被验证的新配置替代的私有旧配置备份移入回收站。先红后绿的真实测试输出、原故障现场与上述必要对照仍保留；未清理应用原始日志、历史材料或构建缓存。
+
 ### 2026-10-12 默认长按连续单击修订
 
 用户明确要求未配置长按时默认连续单击，替代此前缺省关闭规则；不是重复迁移或把旧关闭配置误诊为引擎丢拍。模型新增独立关闭值，缺省自动仅作用于原有可重复按键和动作，长按动作优先；编辑器显示自动/关闭/重复单击/重复长按。菜单与任务识别占位明确关闭，原捕获来源、语音、时序和成对释放路径保持。完整规则与分项结果归 [连发手册](WindowsButtonGestureRepeat.md#2026-10-12-用户调整无长按动作时默认连续单击)。
@@ -303,6 +318,18 @@
 本次必要输出仍复用 `target/dev/foreground-input/hold-default-*`，含原状态、先红后绿、完整检查、配置哈希与唯一生命周期日志；当前包仍在既定 `target/release/bundle/nsis/`。上一语音正常包 `voice-confirmed-a3ec3155-setup.exe` 仅作本次默认规则差异对照，关闭剩余模式验收或候选被替代后回收；旧格式无法理解新显式关闭，不能把对照包直接安装当成安全降级。没有源码副本、额外 worktree、自动提交、推送或发布。
 
 收尾回收本次空格式检查输出和已被完整前端检查覆盖的重复定向通过日志；先红证据、最终检查与实体现场保留，未动原始应用日志、用户配置、历史材料或构建缓存。
+
+### 2026-10-12 音频两端恢复与构建身份组合交付
+
+- **音频成果**：未保存的显式 Capture 草稿与高级写入端一次事务提交，严格同线、失败回滚已提交身份；真实控制器阻塞旧设备读回的审查返工已先红后绿并复审关闭。自动化与剩余失效实机边界唯一归 [输入切换专项](CaptureInputSession.md#2026-10-12-两端恢复事务与失败回滚)，不改默认输入授权、模板、捕获协议或更新源。
+- **构建身份成果**：包 SHA-256 `228f6221b6d6c4d3a319b1920af91f5942619c7ba43c44f031192187a64f2957`，12,854,543 字节；raw 与安装 EXE 均为 `1ec6e08bf1794a9f1ead82b774b313b1b7c90313e16493e4ccabff89c935c6e0`，20,699,648 字节。基线 `af710b757897cb0567b63c63a7ceb40f62426652`、`sourceCommit=null`、`sourceState=dirty`、输入指纹 `2d04106f183aafa8feb480f70e30f758e8da939b47cd241f4ae3e4dd15a9db6e`、`local`、`payloadInputs=included`。实际安装 App 48072 日志的五字段逐项匹配当轮 manifest/包 metadata，四项 installed payload 匹配 staging 回执；不把单一基线 SHA 当作 dirty 完整可重建提交。输入 allowlist 是约定源码范围，回执纳入实际包载荷，不涵盖任意磁盘文件。
+- **passed（检查）**：全部前端 363 项 / 28 文件、类型检查/实际 `dist-build`、Rust workspace 692 passed / 23 ignored、fmt、workspace 与 runtime-simulation check；SHA helper 修复后受影响身份夹具通过。10 个前端资源嵌入与实际打包路径的生产仿真隔离通过。首次严格打包发现 Cargo 调用环境缺 `Get-FileHash`，原作者改 .NET 文件流 SHA256 并复审；没有重跑未变的功能套件。
+- **打包边界**：生产编译与严格身份门禁 passed；首次 NSIS 解压跨盘失败，只对本次子进程复用既有 `target/.tauri-local-temp` 与 `target/.tauri`，使用参数文件重封装已编译应用。NSIS 实际生成并独立核验 passed；Tauri 总命令因不存在本地 updater 私钥最终退出 1，无 `.sig`，不能称完整命令 passed。候选未签名，仅本地验证；未生成密钥、改更新配置或发布。
+- **passed（正常退出/覆盖/启动）**：15:52:28.414–29.041（UTC+08:00）旧 App 46728、子 40748 与 Helper 25884 正常结束，overall passed / 627ms / failed_stages=0，held_keys=0、capture_route passed，Helper cleanup passed / module_unloaded=false。覆盖后四份配置字节保持（以安装前最新映射为准），四项载荷一致。15:53:28 后通过 `Shell.Application.ShellExecute` 的 Explorer Shell 路径启动 App 48072 / 子 23688，两者 TokenElevation=0；启动父 15400 随后已退出，未取得其 token，不写成仍运行的桌面 Explorer 12848 父子关系。Helper 24372 对原设备宿主 12192 中 `2026-10-10.request-source` 鉴权成功。严格同线 startup passed；真实连接页 UIA 读回目标下拉、paired 与无未保存草稿。无强杀、重启或无线电操作。
+- **passed（本包当前 PC / RC003 用户复验）**：用户确认遥控方向/返回连发与松开停止、实体键盘实际键与方向长按、闲置首次与连续语音及反馈正常。本包日志在15:57–58有真实语音 generation 3–5，供音分别193200 / 73440 / 39600 samples，终态队列均0，三次均先默认角色确认，释放后 original_mask=7；不用前包的四次语音或七趟连发充作本包证据。用户闲置首用确认仅属本机此次观察，不外推全部输入工具或更长冷态。
+- **failed（本包菜单）**：用户报告 Codex 前台菜单按下出现、释放瞬间消失；误触主页打开无线麦后切回 Codex，菜单随后正常。15:56:21–23首批日志 return_target generation15–18为external_window，focus verified=false、`foreground_verified requested=false/result=false`（旧合并字段，不是单独记录的激活 API 原生结果）；不将 snapshot_applied 或随后恢复当作首次菜单通过。最小现场保留 `audio-recovery-menu-regression-evidence.log`（548行，199,632字节），补齐隐藏、文档加载与主页关键事件，关闭早于UP等时序归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md)。原始当前及轮转日志未改、未重启重装。旧 Code 10、标准 pin 原因、历史三轮/17:56 未知、RC001/ARM64/完整睡眠断连及暂停的捕获换代/租约边界仍未关闭；后续诊断结果见同页菜单诊断候选节。
+
+包仍位于 `target/release/bundle/nsis/无线麦_0.8.6_x64-setup.exe`；本轮必要红测、manifest、metadata、实际生命周期及回退包复用 `target/dev/foreground-input/`，回退目的和清理条件归输入切换专项。不创建源码副本，不提交、推送或发布。
 
 ### 上游历史记录（不代表本 fork 当前合并候选通过）
 

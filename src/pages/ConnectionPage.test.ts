@@ -303,6 +303,53 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(mocks.setCaptureInput).toHaveBeenLastCalledWith({ enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' });
     wrapper.unmount();
   });
+
+  it("keeps an unsaved microphone choice for explicit same-line writer recovery", async () => {
+    const previous = { settings: { enabled: true, endpointId: 'missing', endpointName: 'Old cable' }, phase: 'failed', recoveryPending: false, lastError: null };
+    mocks.getCaptureInput.mockResolvedValue(previous);
+    mocks.endpoints = [cableEndpoint];
+    mocks.setCaptureInput.mockRejectedValueOnce(new Error('未找到同一条虚拟音频线的声音写入端。'));
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+    await wrapper.get('#capture-input-target').setValue('capture');
+    await flushPromises();
+    expect(wrapper.text()).toContain('尚未保存');
+    expect((wrapper.get('#capture-input-target').element as HTMLSelectElement).value).toBe('capture');
+    await wrapper.get('details.audio-advanced').trigger('toggle');
+    await flushPromises();
+    await wrapper.findAll('.audio-advanced button').find(button => button.text().includes('选择'))!.trigger('click');
+    await flushPromises();
+    expect(mocks.setCaptureInput).toHaveBeenLastCalledWith({ enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' }, cableEndpoint.id);
+    expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("retains the draft after transaction failure and serializes explicit recovery", async () => {
+    const previous = { settings: { enabled: true, endpointId: 'missing', endpointName: 'Old cable' }, phase: 'failed', recoveryPending: false, lastError: null };
+    mocks.getCaptureInput.mockResolvedValue(previous);
+    mocks.endpoints = [cableEndpoint];
+    mocks.setCaptureInput.mockRejectedValueOnce(new Error('render_missing'));
+    mocks.setCaptureInput.mockRejectedValueOnce(new Error('disk_failed'));
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+    await wrapper.get('#capture-input-target').setValue('capture');
+    await flushPromises();
+    const choose = wrapper.findAll('.audio-advanced button').find(button => button.text().includes('选择'))!;
+    await choose.trigger('click');
+    await flushPromises();
+    expect(wrapper.text()).toContain('尚未保存');
+    expect(wrapper.text()).toContain('disk_failed');
+    expect((wrapper.get('.capture-input-settings input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true);
+    let finish!: (value: typeof previous) => void;
+    mocks.setCaptureInput.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await choose.trigger('click');
+    await choose.trigger('click');
+    expect(mocks.setCaptureInput).toHaveBeenCalledTimes(3);
+    finish({ ...previous, settings: { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' }, phase: 'idle' });
+    await flushPromises();
+    expect(wrapper.text()).not.toContain('尚未保存');
+    wrapper.unmount();
+  });
   it("does not silently restore a crash journal", async () => {
     mocks.getCaptureInput.mockResolvedValue({ settings: { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' }, phase: 'recovery_required', recoveryPending: true, lastError: null });
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();

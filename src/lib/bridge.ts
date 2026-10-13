@@ -255,9 +255,9 @@ export async function listCaptureInputs(): Promise<AudioEndpoint[]> {
   if (!isTauriRuntime()) return [];
   return invoke<AudioEndpoint[]>("list_capture_inputs");
 }
-export async function setCaptureInput(config: CaptureInputSettings): Promise<CaptureInputSnapshot> {
+export async function setCaptureInput(config: CaptureInputSettings, writerEndpointId?: string): Promise<CaptureInputSnapshot> {
   if (!isTauriRuntime()) throw new Error("请在 Windows 应用中设置会话输入设备");
-  return invoke<CaptureInputSnapshot>("set_capture_input", { config });
+  return invoke<CaptureInputSnapshot>("set_capture_input", { config, ...(writerEndpointId ? { writerEndpointId } : {}) });
 }
 export async function resolveCaptureRecovery(restore: boolean): Promise<CaptureInputSnapshot> {
   if (!isTauriRuntime()) throw new Error("请在 Windows 应用中恢复输入设备");
@@ -281,7 +281,7 @@ export interface MappingConfiguration {
 export interface MappingConfigurationImportPreview { token: string; sourceToken: string | null; formatVersion: number; configuration: MappingConfiguration; builtinTemplateIds: string[]; templateNameConflicts: string[]; unresolvedApplicationIds: string[]; }
 export interface SceneMenuItem { applicationId:string|null; templateId:string; label:string; running:boolean; }
 export interface MappingNotice { kind:string; templateId:string|null; name:string|null; actionsAvailable:boolean; defaultSaveStatus?:string|null; }
-export interface SceneSnapshot { mappingNoticeEnabled:boolean; mappingNotice:MappingNotice|null; mappingNoticeRevision:number; enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; panel:"template"|null; updateDefault:boolean; preferencePending?:boolean; preferenceError?:boolean; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; status:string|null; }
+export interface SceneSnapshot { mappingNoticeEnabled:boolean; mappingNotice:MappingNotice|null; mappingNoticeRevision:number; enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; panel:"template"|null; updateDefault:boolean; preferencePending?:boolean; preferenceError?:boolean; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; voiceButtonPressed:boolean; status:string|null; }
 export type SceneEvent =
   | { type:"mapping_notice_enabled"; enabled:boolean }
   | { type:"snapshot"; snapshot:SceneSnapshot }

@@ -441,42 +441,87 @@ async fn list_capture_inputs(
 async fn set_capture_input(
     state: tauri::State<'_, AppState>,
     config: sayall_core::CaptureInputSettings,
+    writer_endpoint_id: Option<String>,
 ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
     let platform = state.platform.clone();
     let settings = state.settings.clone();
     let operation = state.capture_config_operation.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        capture_config_transaction(&operation, platform.as_ref(), config, |value, audio| {
-            settings.save_capture_audio(value, audio)
-        })
+        capture_audio_config_transaction(
+            &operation,
+            platform.as_ref(),
+            config,
+            writer_endpoint_id,
+            |value, audio| settings.save_capture_audio(value, audio),
+        )
     })
     .await
     .map_err(|_| "输入设备设置任务失败".to_owned())?
 }
+#[cfg(test)]
 fn capture_config_transaction(
     operation: &Mutex<()>,
     platform: &dyn PlatformRuntime,
     config: sayall_core::CaptureInputSettings,
     persist: impl FnOnce(sayall_core::CaptureInputSettings, AudioSnapshot) -> Result<(), String>,
 ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+    capture_audio_config_transaction(operation, platform, config, None, persist)
+}
+
+fn capture_audio_config_transaction(
+    operation: &Mutex<()>,
+    platform: &dyn PlatformRuntime,
+    config: sayall_core::CaptureInputSettings,
+    writer_endpoint_id: Option<String>,
+    persist: impl FnOnce(sayall_core::CaptureInputSettings, AudioSnapshot) -> Result<(), String>,
+) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
     let _operation = operation.lock().unwrap_or_else(|e| e.into_inner());
     let previous = platform.capture_input_snapshot().settings;
     let previous_audio = platform.audio_snapshot();
+    let explicit_writer = writer_endpoint_id
+        .map(|id| {
+            platform
+                .list_audio_endpoints()
+                .map_err(|_| "无法读取声音写入设备".to_owned())?
+                .into_iter()
+                .find(|endpoint| endpoint.id == id)
+                .ok_or_else(|| "所选声音写入设备当前不可用".to_owned())
+        })
+        .transpose()?;
+    let preferred = explicit_writer
+        .as_ref()
+        .map(|endpoint| AudioSnapshot {
+            selected_endpoint_id: Some(endpoint.id.clone()),
+            selected_endpoint_name: Some(endpoint.name.clone()),
+            ..Default::default()
+        })
+        .unwrap_or_else(|| previous_audio.clone());
     // Pair from a fresh inventory before changing either side. The toggle controls
     // default-microphone switching only; a selected cable still needs its write end.
     let disable_only = previous.enabled
         && !config.enabled
         && config.endpoint_id == previous.endpoint_id
         && config.endpoint_name == previous.endpoint_name;
-    let paired = if disable_only {
+    let paired = if disable_only && explicit_writer.is_none() {
         None
     } else {
-        platform.resolve_audio_pair(&config, &previous_audio)?
+        platform.resolve_audio_pair(&config, &preferred)?
     };
+    if let Some(writer) = explicit_writer {
+        if paired
+            .as_ref()
+            .is_none_or(|endpoint| endpoint.id != writer.id || endpoint.name != writer.name)
+        {
+            sayall_windows::gatt_note(
+                "audio_route action=config_pair result=failed reason=render_mismatch".into(),
+            );
+            return Err("所选写入端与目标麦克风不属于同一条音频线".into());
+        }
+    }
     match platform.configure_capture_input(config.clone()) {
         Ok(_) => {}
         Err(error) => {
-            let rollback = platform.configure_capture_input(previous);
+            let rollback = platform.restore_capture_input_configuration(previous);
             sayall_windows::gatt_note(format!(
                 "capture_input action=config_apply result=failed rollback_ok={}",
                 rollback.is_ok()
@@ -486,7 +531,7 @@ fn capture_config_transaction(
     };
     if let Some(endpoint) = paired {
         if let Err(error) = apply_audio_endpoint(platform, endpoint) {
-            let rollback_capture = platform.configure_capture_input(previous);
+            let rollback_capture = platform.restore_capture_input_configuration(previous);
             let rollback_audio = restore_audio_selection(platform, previous_audio);
             sayall_windows::gatt_note(format!(
                 "audio_route action=apply result=failed rollback_capture_ok={} rollback_audio_ok={}",
@@ -496,7 +541,7 @@ fn capture_config_transaction(
         }
     }
     if persist(config, platform.audio_snapshot()).is_err() {
-        let rollback = platform.configure_capture_input(previous);
+        let rollback = platform.restore_capture_input_configuration(previous);
         let rollback_audio = restore_audio_selection(platform, previous_audio);
         sayall_windows::gatt_note(format!(
             "capture_input action=config_persist result=failed rollback_ok={} rollback_audio_ok={}",
@@ -505,6 +550,7 @@ fn capture_config_transaction(
         ));
         return Err("保存输入设备设置失败，请重新检查设置".to_owned());
     }
+    sayall_windows::gatt_note("audio_route action=config_persist result=passed".into());
     Ok(platform.capture_input_snapshot())
 }
 
@@ -5353,10 +5399,20 @@ mod lifecycle_tests {
         fn resolve_audio_pair(
             &self,
             settings: &sayall_core::CaptureInputSettings,
-            _preferred: &AudioSnapshot,
+            preferred: &AudioSnapshot,
         ) -> Result<Option<AudioEndpoint>, String> {
             match settings.endpoint_id.as_deref() {
                 Some("capture-missing") => Err("capture_missing".into()),
+                Some("capture-explicit")
+                    if preferred.selected_endpoint_id.as_deref() == Some("render-explicit") =>
+                {
+                    Ok(Some(AudioEndpoint {
+                        id: "render-explicit".into(),
+                        name: "CABLE In 16 Ch".into(),
+                        is_virtual_cable_candidate: true,
+                    }))
+                }
+                Some("capture-explicit") => Err("render_missing".into()),
                 Some("capture-cable") => Ok(Some(AudioEndpoint {
                     id: "render-cable".into(),
                     name: "CABLE Input".into(),
@@ -5381,6 +5437,16 @@ mod lifecycle_tests {
             }
         }
         fn configure_capture_input(
+            &self,
+            settings: sayall_core::CaptureInputSettings,
+        ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+            if settings.enabled && settings.endpoint_id.as_deref() == Some("capture-missing") {
+                return Err("capture_target_unavailable".into());
+            }
+            *self.capture.lock().unwrap() = settings;
+            Ok(self.capture_input_snapshot())
+        }
+        fn restore_capture_input_configuration(
             &self,
             settings: sayall_core::CaptureInputSettings,
         ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
@@ -5427,7 +5493,11 @@ mod lifecycle_tests {
         }
 
         fn list_audio_endpoints(&self) -> Result<Vec<AudioEndpoint>, PlatformError> {
-            Ok(Vec::new())
+            Ok(vec![AudioEndpoint {
+                id: "render-explicit".into(),
+                name: "CABLE In 16 Ch".into(),
+                is_virtual_cable_candidate: true,
+            }])
         }
 
         fn select_audio_endpoint(
@@ -5443,7 +5513,7 @@ mod lifecycle_tests {
             expected_name: String,
         ) -> Result<AudioSnapshot, PlatformError> {
             *self.audio.lock().unwrap() = AudioSnapshot {
-                phase: if endpoint_id == "render-unready" {
+                phase: if matches!(endpoint_id.as_str(), "render-unready" | "render-missing") {
                     sayall_windows::AudioPhase::Failed
                 } else {
                     sayall_windows::AudioPhase::Ready
@@ -5591,6 +5661,140 @@ mod lifecycle_tests {
             worker: Mutex::new(None),
             spawn_failed: false,
         }
+    }
+
+    #[test]
+    fn capture_missing_old_pair_writer_failure_restores_old_identities_as_unavailable() {
+        let platform = TestPlatform::default();
+        let previous = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-missing".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        *platform.capture.lock().unwrap() = previous.clone();
+        platform
+            .restore_audio_endpoint("render-missing".into(), "missing writer".into())
+            .unwrap();
+        assert!(capture_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            sayall_core::CaptureInputSettings {
+                enabled: true,
+                endpoint_id: Some("capture-unready".into()),
+                endpoint_name: Some("new".into())
+            },
+            |_, _| panic!("unready must not persist")
+        )
+        .is_err());
+        assert_eq!(platform.capture_input_snapshot().settings, previous);
+        assert_eq!(
+            platform.audio_snapshot().selected_endpoint_id.as_deref(),
+            Some("render-missing")
+        );
+        assert_eq!(
+            platform.audio_snapshot().phase,
+            sayall_windows::AudioPhase::Failed
+        );
+    }
+
+    #[test]
+    fn capture_explicit_writer_cannot_override_resolved_other_line() {
+        let platform = TestPlatform::default();
+        assert!(capture_audio_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            sayall_core::CaptureInputSettings {
+                endpoint_id: Some("capture-cable".into()),
+                ..Default::default()
+            },
+            Some("render-explicit".into()),
+            |_, _| panic!("cross-line must not persist")
+        )
+        .is_err());
+        assert_eq!(
+            platform.capture_input_snapshot().settings,
+            Default::default()
+        );
+        assert_eq!(platform.audio_snapshot(), AudioSnapshot::default());
+    }
+
+    #[test]
+    fn capture_explicit_pair_repeated_save_holds_gate_until_persisted() {
+        let platform = TestPlatform::default();
+        let gate = Mutex::new(());
+        for _ in 0..2 {
+            capture_audio_config_transaction(
+                &gate,
+                &platform,
+                sayall_core::CaptureInputSettings {
+                    enabled: true,
+                    endpoint_id: Some("capture-explicit".into()),
+                    endpoint_name: Some("CABLE Output".into()),
+                },
+                Some("render-explicit".into()),
+                |_, audio| {
+                    assert!(gate.try_lock().is_err());
+                    assert_eq!(audio.phase, sayall_windows::AudioPhase::Ready);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_explicit_two_end_recovery_retains_default_switch_authorization() {
+        let platform = TestPlatform::default();
+        *platform.capture.lock().unwrap() = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-missing".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        let next = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-explicit".into()),
+            endpoint_name: Some("CABLE Output".into()),
+        };
+        capture_audio_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            next.clone(),
+            Some("render-explicit".into()),
+            |config, audio| {
+                assert_eq!(config, next);
+                assert_eq!(
+                    audio.selected_endpoint_id.as_deref(),
+                    Some("render-explicit")
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(platform.capture_input_snapshot().settings, next);
+    }
+
+    #[test]
+    fn capture_missing_old_target_save_failure_restores_settings_without_enabling_new_target() {
+        let platform = TestPlatform::default();
+        let previous = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-missing".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        *platform.capture.lock().unwrap() = previous.clone();
+        assert!(capture_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            sayall_core::CaptureInputSettings {
+                enabled: true,
+                endpoint_id: Some("capture-cable".into()),
+                endpoint_name: Some("CABLE Output".into()),
+            },
+            |_, _| Err("disk_failed".into())
+        )
+        .is_err());
+        assert_eq!(platform.capture_input_snapshot().settings, previous);
+        assert_eq!(platform.audio_snapshot(), AudioSnapshot::default());
     }
 
     #[test]

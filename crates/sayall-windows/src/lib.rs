@@ -665,6 +665,23 @@ impl WindowsPlatform {
             Err("仅 Windows 支持输入设备切换".into())
         }
     }
+    /// Restore configuration identity after a failed settings transaction. This
+    /// does not activate the device or authorize changing system defaults.
+    pub fn restore_capture_input_configuration(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<capture_input::CaptureInputSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.restore_configuration(settings)?;
+            Ok(self.audio.capture.snapshot())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = settings;
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
     pub fn usage_counters(&self) -> Arc<UsageCounters> {
         Arc::clone(&self.usage)
     }
