@@ -743,6 +743,12 @@ impl WindowsPlatform {
         lock(&self.voice_hold_hotkey).clone()
     }
 
+    pub fn cancel_voice_test(&self) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        self.runtime.cancel_voice_test()?;
+        Ok(())
+    }
+
     pub fn set_voice_hold_hotkey(&self, hotkey: Option<send_input::KeyChord>) {
         #[cfg(windows)]
         ime::note_hotkey_change();

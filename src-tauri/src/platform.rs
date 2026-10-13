@@ -115,6 +115,9 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn open_bluetooth_settings(&self) -> Result<(), PlatformError>;
     fn voice_hold_hotkey(&self) -> Option<KeyChord>;
     fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>);
+    fn cancel_voice_test(&self) -> Result<(), PlatformError> {
+        Ok(())
+    }
     fn set_rc003_capture_enabled(&self, _enabled: bool) {}
     fn rc003_bridge_snapshot(&self) -> sayall_windows::rc003_bridge::BridgeSnapshot {
         Default::default()
@@ -382,6 +385,10 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>) {
         WindowsPlatform::set_voice_hold_hotkey(self, hotkey)
+    }
+
+    fn cancel_voice_test(&self) -> Result<(), PlatformError> {
+        WindowsPlatform::cancel_voice_test(self)
     }
 
     fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
@@ -1111,6 +1118,26 @@ mod simulation {
             *lock(&self.voice_hold_hotkey) = hotkey;
         }
 
+        fn cancel_voice_test(&self) -> Result<(), PlatformError> {
+            let mut state = lock(&self.state);
+            state.pipeline.interrupt();
+            state.connection.voice_state = sayall_core::VoiceSessionState::Idle;
+            if matches!(
+                state.connection.phase,
+                ConnectionPhase::Streaming | ConnectionPhase::Draining
+            ) {
+                state.connection.phase = ConnectionPhase::Ready;
+            }
+            state.audio.queued_samples = 0;
+            if matches!(
+                state.audio.phase,
+                AudioPhase::Streaming | AudioPhase::Draining
+            ) {
+                state.audio.phase = AudioPhase::Ready;
+            }
+            Ok(())
+        }
+
         fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
             *lock(&self.voice_input_tool) = tool;
         }
@@ -1361,6 +1388,46 @@ mod simulation {
         }
 
         /// 回放硬件信号：ATVV 控制/音频走生产流水线，快照里能看到会话与解码采样。
+        #[test]
+        fn cancelling_onboarding_voice_retires_pipeline_and_preserves_configuration() {
+            use sayall_windows::hardware_script::HardwareSignalEvent;
+            let platform = SimulatedPlatform::default();
+            let chord = KeyChord {
+                keys: vec![sayall_windows::send_input::KeyCode::RightAlt],
+            };
+            platform.set_voice_hold_hotkey(Some(chord.clone()));
+            platform
+                .apply_hardware_signal(&HardwareSignalEvent::BleConnected)
+                .unwrap();
+            platform
+                .apply_hardware_signal(&HardwareSignalEvent::VoiceControl {
+                    data_hex: "0b010002030078".into(),
+                })
+                .unwrap();
+            platform
+                .apply_hardware_signal(&HardwareSignalEvent::VoiceControl {
+                    data_hex: "04030201".into(),
+                })
+                .unwrap();
+            platform.cancel_voice_test().unwrap();
+            platform.cancel_voice_test().unwrap();
+            let before = platform.snapshot();
+            assert!(platform
+                .apply_hardware_signal(&HardwareSignalEvent::VoiceAudio {
+                    data_hex: "11".repeat(120)
+                })
+                .is_err());
+            let after = platform.snapshot();
+            assert_eq!(after.connection.voice_state, VoiceSessionState::Idle);
+            assert_eq!(after.connection.phase, ConnectionPhase::Ready);
+            assert_eq!(
+                after.connection.decoded_samples,
+                before.connection.decoded_samples
+            );
+            assert_eq!(after.audio.queued_samples, 0);
+            assert_eq!(platform.voice_hold_hotkey(), Some(chord));
+        }
+
         #[test]
         fn hardware_script_voice_session_updates_snapshot_through_production_pipeline() {
             use sayall_windows::hardware_script::HardwareSignalEvent;

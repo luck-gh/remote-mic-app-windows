@@ -23,6 +23,31 @@ function tracker(attemptId = 1) {
 }
 
 describe("voice attempt tracker", () => {
+  it("does not finish on the mixed startup snapshot before the connection publishes streaming", () => {
+    const attempt = tracker();
+    attempt.arm(frame(), 0);
+    expect(attempt.observe(frame({ audioPhase: "streaming", generation: 2 }), 150)).toBeNull();
+    expect(attempt.state()).toBe("streaming");
+    attempt.notifyTranscript(200);
+    expect(attempt.observe(frame({ voiceState: "streaming", audioPhase: "streaming", decodedSamples: 240, submittedSamples: 240, generation: 2 }), 300)).toBeNull();
+    expect(attempt.observe(frame({ decodedSamples: 240, submittedSamples: 240, generation: 2 }), 600)?.result).toBe("passed");
+  });
+
+  it("waits for the audio drain to finish when connection idle arrives before the audio snapshot", () => {
+    const attempt = tracker();
+    attempt.arm(frame(), 0);
+    attempt.observe(frame({ voiceState: "streaming", audioPhase: "streaming", decodedSamples: 240, submittedSamples: 200 }), 100);
+    attempt.notifyTranscript(150);
+    expect(attempt.observe(frame({ audioPhase: "draining", decodedSamples: 240, submittedSamples: 200, queuedSamples: 40 }), 200)).toBeNull();
+    expect(attempt.observe(frame({ decodedSamples: 240, submittedSamples: 240, queuedSamples: 0 }), 400)?.result).toBe("passed");
+  });
+
+  it("keeps the drain deadline for an idle connection with audio that never finishes draining", () => {
+    const attempt = tracker();
+    attempt.arm(frame(), 0);
+    expect(attempt.observe(frame({ audioPhase: "draining", decodedSamples: 240, queuedSamples: 240 }), 100)).toBeNull();
+    expect(attempt.observe(frame({ audioPhase: "draining", decodedSamples: 240, queuedSamples: 240 }), 8200)?.code).toBe("voice.session_not_ended");
+  });
   it("passes a full session with delivery evidence and transcript in window", () => {
     const attempt = tracker();
     attempt.arm(frame({ decodedSamples: 100 }), 0);

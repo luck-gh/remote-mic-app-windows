@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { assertOnboardingCanRestart, onboardingExternalState, waitForOnboardingCleanup } from "../onboarding/lifecycle";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -841,7 +842,7 @@ export async function setOtherVoiceHotkey(keys: KeyCode[]): Promise<KeyCode[] | 
 /**
  * 首次使用向导状态（Rust `onboarding.json`，设计稿 §6）。
  *
- * `isActive` = 未完成当前流程版本；完成前不允许进入主界面。步骤 token 由
+ * `isActive` = 当前流程版本尚未处理（验证完成或用户主动稍后设置都会关闭自动展示）。步骤 token 由
  * `src/onboarding/flow.ts` 的 `normalizeStep` 归一化（未知值 → welcome）。
  */
 export interface OnboardingState {
@@ -878,10 +879,15 @@ export async function saveOnboardingStep(step: string): Promise<OnboardingState>
 
 /** 设置页「重新运行设置向导」：只重置向导进度，不清除设备/映射/音频/其他设置。 */
 export async function restartOnboarding(): Promise<OnboardingState> {
+  assertOnboardingCanRestart();
+  await waitForOnboardingCleanup();
+  assertOnboardingCanRestart();
   if (!isTauriRuntime()) {
     return { ...BROWSER_ONBOARDING_STATE };
   }
-  return invoke<OnboardingState>("restart_onboarding");
+  const state = await invoke<OnboardingState>("restart_onboarding");
+  onboardingExternalState.value = null;
+  return state;
 }
 
 export async function completeOnboarding(): Promise<OnboardingState> {
@@ -889,6 +895,18 @@ export async function completeOnboarding(): Promise<OnboardingState> {
     return { ...BROWSER_ONBOARDING_STATE };
   }
   return invoke<OnboardingState>("complete_onboarding");
+}
+
+/** 退出/跳过结束不提交未验证绑定；保留进入向导前的有效工具与快捷键。 */
+export async function dismissOnboarding(): Promise<OnboardingState> {
+  if (!isTauriRuntime()) return { ...BROWSER_ONBOARDING_STATE };
+  return invoke<OnboardingState>("dismiss_onboarding");
+}
+
+/** 停止本轮实际语音测试，释放注入按键与临时音频会话。 */
+export async function cancelVoiceTest(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  return invoke<void>("cancel_voice_test");
 }
 
 /**

@@ -9,10 +9,12 @@ import {
   formatDiagnosticReport,
   isRecommendedVoiceEndpoint,
   openLogDirectory,
-  openOfficialWebsite,
+  setCaptureInput,
+  openVokieHomepage,
   openVbCableDownloadPage,
   remoteModelLabel,
   VB_CABLE_DOWNLOAD_URL,
+  VOKIE_HOMEPAGE_URL,
   type AudioPhase,
   type ConnectionPhase,
   type DiagnosticReport,
@@ -243,5 +245,18 @@ describe("诊断日志目录入口", () => {
   it("浏览器预览下明确不可用而不是静默失败", async () => {
     await expect(openLogDirectory()).rejects.toThrow("当前是浏览器预览，无法打开日志目录");
     expect(invoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("explicit capture and writer transaction", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(invoke).mockReset();
+  });
+  it("submits both explicit endpoint choices in one IPC request", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const config = { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' };
+    await setCaptureInput(config, 'render-16');
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('set_capture_input', { config, writerEndpointId: 'render-16' });
   });
 });

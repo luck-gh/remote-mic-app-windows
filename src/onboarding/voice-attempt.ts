@@ -194,7 +194,9 @@ export function createVoiceAttemptTracker(
         return finish("failed", "voice.session_not_ended", false, now);
       }
 
-      const ended = input.voiceState === "idle";
+      // connection/audio 是分开读取的快照；启动与排空期间可能暂时只有一侧更新。
+      // 音频仍在 streaming/draining 时，idle 不能证明本轮已经结束。
+      const ended = input.voiceState === "idle" && input.audioPhase !== "streaming" && input.audioPhase !== "draining";
       if (!ended) {
         state = "streaming";
         return null;

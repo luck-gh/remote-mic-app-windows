@@ -256,6 +256,12 @@ impl BleRuntime {
         self.request(|reply| WorkerMessage::Disconnect { reply })
     }
 
+    /// 向导离开语音测试：取消准备中的回调，但保留 BLE 连接与用户配置。
+    pub fn cancel_voice_test(&self) -> Result<ConnectionSnapshot, PlatformError> {
+        self.audio_lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
+        self.request(|reply| WorkerMessage::CancelVoiceTest { reply })
+    }
+
     pub fn restore(&self, device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
         self.audio_lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         self.request(|reply| WorkerMessage::Restore { device_id, reply })
@@ -319,6 +325,9 @@ impl Drop for BleRuntime {
 }
 
 pub(crate) enum WorkerMessage {
+    CancelVoiceTest {
+        reply: Sender<Result<ConnectionSnapshot, PlatformError>>,
+    },
     Connect {
         device_id: String,
         reply: Sender<Result<ConnectionSnapshot, PlatformError>>,
@@ -442,6 +451,7 @@ fn worker_loop(
     let mut system_suspended = false;
     let mut backoff = ReconnectBackoff::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
     let mut held_hotkey: Option<KeyChord> = None;
+    let mut pending_microphone_close: Option<(u64, u16, u8)> = None;
     let mut extend_deadline: Option<Instant> = None;
     // 语音会话纪元：每次会话开始（StreamStarted）+1。wetype_check 重试
     // 阶梯（最长 ~7.4s）用它区分"本会话仍在流式"与"旧会话已结束、
@@ -1167,6 +1177,54 @@ fn worker_loop(
                     *lock(&state) = ConnectionSnapshot::default();
                 }
             }
+            WorkerMessage::CancelVoiceTest { reply } => {
+                extend_deadline = None;
+                voice_session_epoch.fetch_add(1, Ordering::SeqCst);
+                crate::ime::cancel_recovery();
+                crate::scene_control::clear_voice_button("onboarding_cancelled");
+                release_voice_hold_hotkey(&send_input, &mut held_hotkey);
+                let requested_close = pipeline
+                    .capabilities()
+                    .zip(pipeline.session_id())
+                    .map(|(capabilities, id)| (capabilities.version, id));
+                let microphone_result = retry_cancelled_microphone_close(
+                    &mut pending_microphone_close,
+                    connection_generation,
+                    requested_close,
+                    |version, id| {
+                        session
+                            .as_mut()
+                            .ok_or(PlatformError::WorkerUnavailable)?
+                            .request_microphone_close(version, id)
+                    },
+                );
+                let audio_result = audio.interrupt_session();
+                // 两侧均执行，关闭失败不能妨碍 UP/音频清理，也不能假报 cancelled。
+                let result = microphone_result.and(audio_result);
+                if let Some(flow) = session.as_mut().and_then(|s| s.voice_flow.take()) {
+                    flow.emit("cancelled");
+                }
+                pipeline.interrupt();
+                active_voice_samples = 0;
+                let mut snapshot = lock(&state);
+                snapshot.voice_state = VoiceSessionState::Idle;
+                if matches!(
+                    snapshot.phase,
+                    ConnectionPhase::Streaming | ConnectionPhase::Draining
+                ) {
+                    snapshot.phase = ConnectionPhase::Ready;
+                }
+                gatt_note(format!(
+                    "onboarding event=voice_cancel terminal_result={} audio_generation={}",
+                    if result.is_ok() {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    },
+                    snapshot.generation
+                ));
+                let _ = reply.send(result.map(|_| snapshot.clone()));
+            }
             WorkerMessage::Shutdown => {
                 crate::scene_control::clear_voice_button("shutdown");
                 context_publisher.stop(&connection_context);
@@ -1187,6 +1245,37 @@ fn nearest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Ins
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
         (None, None) => None,
     }
+}
+
+fn retry_cancelled_microphone_close(
+    pending: &mut Option<(u64, u16, u8)>,
+    generation: u64,
+    requested: Option<(u16, u8)>,
+    close: impl FnOnce(u16, u8) -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    if let Some((version, id)) = requested {
+        *pending = Some((generation, version, id));
+    }
+    let Some((owner, version, id)) = *pending else {
+        return Ok(());
+    };
+    if owner != generation {
+        *pending = None;
+        gatt_note(
+            "onboarding event=microphone_close result=cancelled reason=connection_retired".into(),
+        );
+        return Ok(());
+    }
+    let result = close(version, id);
+    if result.is_ok() {
+        *pending = None;
+    }
+    gatt_note(format!(
+        "onboarding event=microphone_close result={} generation={generation} retryable={}",
+        if result.is_ok() { "passed" } else { "failed" },
+        result.is_err()
+    ));
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4562,4 +4651,25 @@ mod tests {
             );
         }
     }
+}
+#[test]
+fn cancelled_microphone_close_failure_retains_target_for_retry() {
+    let mut pending = None;
+    let failure = retry_cancelled_microphone_close(&mut pending, 5, Some((0x100, 7)), |_, _| {
+        Err(PlatformError::WorkerUnavailable)
+    });
+    assert!(failure.is_err());
+    assert_eq!(pending, Some((5, 0x100, 7)));
+    retry_cancelled_microphone_close(&mut pending, 5, None, |version, id| {
+        assert_eq!((version, id), (0x100, 7));
+        Ok(())
+    })
+    .unwrap();
+    assert!(pending.is_none());
+    retry_cancelled_microphone_close(&mut pending, 5, None, |_, _| panic!("already closed"))
+        .unwrap();
+    pending = Some((5, 0x100, 7));
+    retry_cancelled_microphone_close(&mut pending, 6, None, |_, _| panic!("old connection"))
+        .unwrap();
+    assert!(pending.is_none());
 }

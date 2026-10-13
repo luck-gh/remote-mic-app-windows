@@ -30,6 +30,7 @@ export type OnboardingEventKind =
   | "migration"
   | "step_entered"
   | "step_passed"
+  | "step_skipped"
   | "step_blocked"
   | "step_retry"
   | "step_recovered"
@@ -48,7 +49,7 @@ export type OnboardingEventKind =
 
 export interface OnboardingEventInput {
   kind: OnboardingEventKind;
-  result: "passed" | "failed" | "unknown";
+  result: "passed" | "failed" | "unknown" | "skipped" | "cancelled";
   /** 稳定英文 token（snake_case），说明"发生了什么"。 */
   reason: string;
   /** 事件所属步骤（导航事件里表示"从哪一步"）。 */

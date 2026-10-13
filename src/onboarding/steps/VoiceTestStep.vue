@@ -42,7 +42,8 @@ function clearBox(): void {
   }
 }
 
-defineExpose({ focusBox, clearBox });
+function hasText(): boolean { return Boolean(box.value?.value.trim()); }
+defineExpose({ focusBox, clearBox, hasText });
 </script>
 
 <template>

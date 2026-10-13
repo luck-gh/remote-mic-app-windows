@@ -11,6 +11,9 @@ import type {
   VoiceSessionState,
 } from "../lib/bridge";
 import OnboardingPage from "./OnboardingPage.vue";
+import App from "../App.vue";
+import { restartOnboarding } from "../lib/bridge";
+import { onboardingExternalState, trackOnboardingExternalOperation } from "../onboarding/lifecycle";
 
 const mocks = vi.hoisted(() => ({
   reportFrontendEvent: vi.fn(),
@@ -40,6 +43,8 @@ const mocks = vi.hoisted(() => ({
   stageOnboardingVoiceBinding: vi.fn(),
   setMappingSuspension: vi.fn(),
   completeOnboarding: vi.fn(),
+  dismissOnboarding: vi.fn(),
+  cancelVoiceTest: vi.fn(),
   getRuntimeSnapshot: vi.fn(),
   getDiagnosticReport: vi.fn(),
   beginKeyObservation: vi.fn(),
@@ -89,6 +94,8 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     stageOnboardingVoiceBinding: mocks.stageOnboardingVoiceBinding,
     setMappingSuspension: mocks.setMappingSuspension,
     completeOnboarding: mocks.completeOnboarding,
+    dismissOnboarding: mocks.dismissOnboarding,
+    cancelVoiceTest: mocks.cancelVoiceTest,
     getRuntimeSnapshot: mocks.getRuntimeSnapshot,
     getDiagnosticReport: mocks.getDiagnosticReport,
     beginKeyObservation: mocks.beginKeyObservation,
@@ -298,6 +305,8 @@ function resetWizardMocks(): void {
     mocks.stageOnboardingVoiceBinding.mockReset();
     mocks.setMappingSuspension.mockReset();
     mocks.completeOnboarding.mockReset();
+    mocks.dismissOnboarding.mockReset();
+    mocks.cancelVoiceTest.mockReset();
     mocks.getRuntimeSnapshot.mockReset();
     mocks.getDiagnosticReport.mockReset();
     mocks.beginKeyObservation.mockReset();
@@ -359,6 +368,8 @@ function resetWizardMocks(): void {
     mocks.stageOnboardingVoiceBinding.mockImplementation(async () => activeState("voice_tool"));
     mocks.setMappingSuspension.mockImplementation(async suspended => suspended);
     mocks.completeOnboarding.mockImplementation(async () => activeState("complete"));
+    mocks.dismissOnboarding.mockResolvedValue({ ...activeState("complete"), isActive: false, completedVersion: 1 });
+    mocks.cancelVoiceTest.mockResolvedValue(undefined);
     mocks.getRuntimeSnapshot.mockImplementation(async () => runtimeWith());
     mocks.getDiagnosticReport.mockImplementation(async () => diagnosticReport());
     let observationId = 0;
@@ -410,6 +421,8 @@ describe("Onboarding wizard shell", () => {
   it("advances from welcome to remote and persists the new step", async () => {
     const wrapper = await mountWizard(runtimeWith());
     expect(wrapper.text()).toContain("欢迎使用无线麦");
+    expect(wrapper.text()).toContain("个人版");
+    expect(wrapper.text()).not.toContain("SayAll");
     // 标题位置稳定（2026-10-05 要求）：第①步没有上一步，但保留同高占位，
     // 各步标题固定在同一位置、切换时不抖动。
     expect(wrapper.find(".onboarding-back--placeholder").exists()).toBe(true);
@@ -542,6 +555,174 @@ describe("Onboarding wizard shell", () => {
       .trigger("click");
     await flushPromises();
     expect(mocks.openVbCableDownloadPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the saved temporary microphone switch choice without rewriting it", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("audio"));
+    mocks.listCaptureInputs.mockResolvedValue([cableEndpoint]);
+    mocks.getAudioSnapshot.mockResolvedValue({
+      phase: "ready",
+      selectedEndpointId: cableEndpoint.id,
+      selectedEndpointName: "CABLE Input",
+      queuedSamples: 0,
+      submittedSamples: 0,
+      generation: 1,
+      lastError: null,
+    } satisfies AudioSnapshot);
+    mocks.getCaptureInput.mockResolvedValue({
+      settings: { enabled: true, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      phase: "idle",
+      recoveryPending: false,
+      lastError: null,
+    });
+    mocks.getAudioRouteSnapshot.mockResolvedValue({
+      phase: "paired",
+      reason: null,
+      captureEndpointId: cableEndpoint.id,
+      captureEndpointName: "CABLE Output",
+      renderEndpointId: cableEndpoint.id,
+      renderEndpointName: "CABLE Input",
+    });
+
+    const wrapper = await mountWizard(runtimeWith());
+
+    const toggle = wrapper.find(".onboarding-capture-switch input");
+    expect(toggle.exists()).toBe(true);
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+  });
+
+  it("enables temporary microphone switching through the saved capture input setting", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("audio"));
+    mocks.listCaptureInputs.mockResolvedValue([cableEndpoint]);
+    mocks.getAudioSnapshot.mockResolvedValue({
+      phase: "ready",
+      selectedEndpointId: cableEndpoint.id,
+      selectedEndpointName: "CABLE Input",
+      queuedSamples: 0,
+      submittedSamples: 0,
+      generation: 1,
+      lastError: null,
+    } satisfies AudioSnapshot);
+    mocks.getCaptureInput.mockResolvedValue({
+      settings: { enabled: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      phase: "idle",
+      recoveryPending: false,
+      lastError: null,
+    });
+    mocks.getAudioRouteSnapshot.mockResolvedValue({
+      phase: "paired",
+      reason: null,
+      captureEndpointId: cableEndpoint.id,
+      captureEndpointName: "CABLE Output",
+      renderEndpointId: cableEndpoint.id,
+      renderEndpointName: "CABLE Input",
+    });
+    mocks.setCaptureInput.mockImplementationOnce(async settings => ({
+      settings,
+      phase: "idle",
+      recoveryPending: false,
+      lastError: null,
+    }));
+
+    const wrapper = await mountWizard(runtimeWith());
+    const toggle = wrapper.find(".onboarding-capture-switch input");
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+
+    await toggle.setValue(true);
+    await flushPromises();
+
+    expect(mocks.setCaptureInput).toHaveBeenCalledExactlyOnceWith({
+      enabled: true,
+      endpointId: cableEndpoint.id,
+      endpointName: "CABLE Output",
+    });
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("keeps the last confirmed switch state and reports failure when saving it fails", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("audio"));
+    mocks.listCaptureInputs.mockResolvedValue([cableEndpoint]);
+    mocks.getAudioSnapshot.mockResolvedValue({
+      phase: "ready",
+      selectedEndpointId: cableEndpoint.id,
+      selectedEndpointName: "CABLE Input",
+      queuedSamples: 0,
+      submittedSamples: 0,
+      generation: 1,
+      lastError: null,
+    } satisfies AudioSnapshot);
+    mocks.getCaptureInput.mockResolvedValue({
+      settings: { enabled: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      phase: "idle",
+      recoveryPending: false,
+      lastError: null,
+    });
+    mocks.getAudioRouteSnapshot.mockResolvedValue({
+      phase: "paired",
+      reason: null,
+      captureEndpointId: cableEndpoint.id,
+      captureEndpointName: "CABLE Output",
+      renderEndpointId: cableEndpoint.id,
+      renderEndpointName: "CABLE Input",
+    });
+    mocks.setCaptureInput.mockRejectedValueOnce(new Error("保存输入设备设置失败"));
+
+    const wrapper = await mountWizard(runtimeWith());
+    const toggle = wrapper.find(".onboarding-capture-switch input");
+    await toggle.setValue(true);
+    await flushPromises();
+
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+    expect(wrapper.text()).toContain("保存输入设备设置失败");
+  });
+
+  it("disables the switch during a save and ignores repeated changes", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("audio"));
+    mocks.listCaptureInputs.mockResolvedValue([cableEndpoint]);
+    mocks.getAudioSnapshot.mockResolvedValue({
+      phase: "ready",
+      selectedEndpointId: cableEndpoint.id,
+      selectedEndpointName: "CABLE Input",
+      queuedSamples: 0,
+      submittedSamples: 0,
+      generation: 1,
+      lastError: null,
+    } satisfies AudioSnapshot);
+    mocks.getCaptureInput.mockResolvedValue({
+      settings: { enabled: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      phase: "idle",
+      recoveryPending: false,
+      lastError: null,
+    });
+    mocks.getAudioRouteSnapshot.mockResolvedValue({
+      phase: "paired",
+      reason: null,
+      captureEndpointId: cableEndpoint.id,
+      captureEndpointName: "CABLE Output",
+      renderEndpointId: cableEndpoint.id,
+      renderEndpointName: "CABLE Input",
+    });
+    let finishSave!: (snapshot: { settings: { enabled: boolean; endpointId: string; endpointName: string }; phase: string; recoveryPending: boolean; lastError: null }) => void;
+    mocks.setCaptureInput.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
+
+    const wrapper = await mountWizard(runtimeWith());
+    const toggle = wrapper.find(".onboarding-capture-switch input");
+    await toggle.setValue(true);
+    expect((toggle.element as HTMLInputElement).disabled).toBe(true);
+
+    await toggle.trigger("change");
+    expect(mocks.setCaptureInput).toHaveBeenCalledOnce();
+
+    finishSave({
+      settings: { enabled: true, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      phase: "idle",
+      recoveryPending: false,
+      lastError: null,
+    });
+    await flushPromises();
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
   });
 
   it("auto-selects the only recommended endpoint and unlocks the audio gate when ready", async () => {
@@ -751,13 +932,13 @@ describe("Onboarding input tool step", () => {
 
     await wrapper.findAll("button").find((button) => button.text() === "右 Alt")!.trigger("click");
     await flushPromises();
-    expect(mocks.setOtherVoiceHotkey).toHaveBeenCalledWith(["right_alt"]);
+    expect(mocks.setOtherVoiceHotkey).not.toHaveBeenCalled();
     expect(mocks.stageOnboardingVoiceBinding).toHaveBeenCalledWith("other", { keys: ["right_alt"] });
     expect(continueButton.attributes("data-gate-ready")).toBe("true");
 
     await wrapper.findAll("button").find((button) => button.text() === "不按键")!.trigger("click");
     await flushPromises();
-    expect(mocks.setOtherVoiceHotkey).toHaveBeenLastCalledWith([]);
+    expect(mocks.setOtherVoiceHotkey).not.toHaveBeenCalled();
     expect(mocks.stageOnboardingVoiceBinding).toHaveBeenLastCalledWith("other", null);
     expect(continueButton.attributes("data-gate-ready")).toBe("true");
   });
@@ -946,6 +1127,54 @@ describe("Onboarding voice test step", () => {
       ...patch,
     });
 
+  it("waits through audio startup and logs both generations before accepting delivered audio and text", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
+    mocks.getVoiceInputTool.mockResolvedValue("wechat");
+    const initial = runtimeWith({ connectionPhase: "ready", bleVoiceReady: true, audioPhase: "ready", decodedSamples: 100, connectionGeneration: 1 });
+    initial.platform.audio.generation = 1;
+    const preparing = runtimeWith({ connectionPhase: "ready", bleVoiceReady: true, audioPhase: "streaming", decodedSamples: 100, connectionGeneration: 1 });
+    preparing.platform.audio.generation = 2;
+    const active = streamingFrame({ decodedSamples: 340, submittedSamples: 240, connectionGeneration: 2 });
+    active.platform.audio.generation = 2;
+    const ended = runtimeWith({ connectionPhase: "ready", bleVoiceReady: true, audioPhase: "ready", decodedSamples: 340, submittedSamples: 240, connectionGeneration: 2 });
+    ended.platform.audio.generation = 2;
+    queueSnapshots(initial, preparing, active, ended);
+    const wrapper = await mountWizard(connectedRuntime(), { attach: true });
+    try {
+      await vi.advanceTimersByTimeAsync(200);
+      expect(onboardingEvents("voice_attempt").some(event => event.result === "failed")).toBe(false);
+      await wrapper.get("input.onboarding-voice-input").setValue("模拟识别结果");
+      await vi.advanceTimersByTimeAsync(400);
+      await flushPromises();
+      expect(wrapper.get(".onboarding-actions .primary-button").attributes("disabled")).toBeUndefined();
+      expect(onboardingEvents("voice_attempt").find(event => event.reason === "armed_frame")?.detail).toContain("cg1_ag1_d100");
+      const mixed = onboardingEvents("voice_attempt").find(event => event.reason === "runtime_frame" && typeof event.detail === "string" && event.detail.includes("cg1_ag2"));
+      expect(mixed?.code).toBe("v_idle_a_streaming_p1_e0");
+      expect(onboardingEvents("voice_attempt").find(event => event.reason === "terminal_context")?.detail).toContain("cg2_ag2_text1_pair1");
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
+  it("does not let an unfocused mixed startup frame bypass the input-target gate", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
+    const preparing = runtimeWith({ connectionPhase: "ready", bleVoiceReady: true, audioPhase: "streaming" });
+    queueSnapshots(
+      runtimeWith(), preparing,
+      streamingFrame({ decodedSamples: 240, submittedSamples: 240 }),
+      runtimeWith({ connectionPhase: "ready", bleVoiceReady: true, audioPhase: "ready", decodedSamples: 240, submittedSamples: 240 }),
+    );
+    const wrapper = await mountWizard(connectedRuntime(), { attach: true });
+    try {
+      await wrapper.get("input.onboarding-voice-input").trigger("blur");
+      await vi.advanceTimersByTimeAsync(200);
+      await wrapper.get("input.onboarding-voice-input").setValue("模拟识别结果");
+      await vi.advanceTimersByTimeAsync(400);
+      await flushPromises();
+      expect(onboardingEvents("voice_attempt").some(event => event.reason === "voice.input_target_not_ready" && event.result === "failed")).toBe(true);
+      expect(onboardingEvents("voice_attempt").some(event => event.result === "passed")).toBe(false);
+      expect(wrapper.get(".onboarding-actions .primary-button").attributes("disabled")).toBeDefined();
+    } finally { wrapper.unmount(); await flushPromises(); }
+  });
+
   it("passes a held session once delivered samples and text are observed", async () => {
     mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
     mocks.getVoiceInputTool.mockResolvedValue("wechat");
@@ -982,6 +1211,7 @@ describe("Onboarding voice test step", () => {
 
     await continueButton.trigger("click");
     await flushPromises();
+    expect(mocks.cancelVoiceTest).toHaveBeenCalledOnce();
     expect(wrapper.text()).toContain("按一下遥控器的普通按键");
     wrapper.unmount();
   });
@@ -1223,5 +1453,296 @@ describe("Onboarding strict audio pairing and cleanup", () => {
     resolve(91);
     await flushPromises();
     expect(mocks.endKeyObservation).toHaveBeenCalledWith(91);
+  });
+});
+
+describe("Onboarding skip and defer", () => {
+  installWizardHooks();
+
+  it.each([false, true])("shows the external operation pending and late terminal on the main screen (failed=%s)", async failed => {
+    mocks.getOnboardingState.mockResolvedValue({ ...activeState("voice_tool"), isActive: false, completedVersion: 1 });
+    let resolve!: (status: typeof mocks.rc003Disabled) => void;
+    let reject!: (error: Error) => void;
+    trackOnboardingExternalOperation(new Promise<typeof mocks.rc003Disabled>((done, fail) => { resolve = done; reject = fail; }));
+    const wrapper = mount(App, { global: { stubs: {
+      Sidebar: true, SettingsPage: true, ButtonsPage: true, ConnectionPage: true,
+      DriverGuidePage: true, PermissionsPage: true, TemplatesPage: true, OnboardingPage: true,
+    } } });
+    try {
+      await flushPromises();
+      expect(wrapper.get('[role="status"]').text()).toContain("Windows 授权或增强设置仍在处理中");
+      expect(wrapper.get('[role="status"]').text()).toContain("若授权成功，增强设置仍会生效");
+      if (failed) reject(new Error("external failed"));
+      else resolve({ ...mocks.rc003Disabled, enabled: true });
+      await flushPromises();
+      expect(wrapper.get('[role="status"]').text()).toContain(failed ? "增强设置操作失败" : "增强设置操作已完成");
+      expect(wrapper.find("onboarding-page-stub").exists()).toBe(false);
+    } finally {
+      resolve(mocks.rc003Disabled);
+      wrapper.unmount();
+      await flushPromises();
+    }
+  });
+
+  it.each([false, true])("leaves while an external capture operation never settles (enabled=%s)", async enabled => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_tool"));
+    mocks.getVoiceInputTool.mockResolvedValue("doubao");
+    mocks.getRc003TaskStatus.mockResolvedValue({ ...mocks.rc003Disabled, enabled });
+    let resolve!: (status: typeof mocks.rc003Disabled) => void;
+    const operation = enabled ? mocks.disableRc003Capture : mocks.enableRc003Capture;
+    operation.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountWizard(runtimeWith());
+    try {
+      await wrapper.get('input[type="checkbox"]').trigger("change");
+      if (!enabled) await wrapper.findAll("button").find(button => button.text() === "开启")!.trigger("click");
+      expect(operation).toHaveBeenCalledOnce();
+      await wrapper.get(".onboarding-exit").trigger("click");
+      await flushPromises();
+      expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
+      expect(wrapper.emitted("completed")).toHaveLength(1);
+      expect(mocks.completeOnboarding).not.toHaveBeenCalled();
+      await expect(restartOnboarding()).rejects.toThrow("Windows 授权或增强设置仍在处理中");
+      wrapper.unmount();
+      resolve({ ...mocks.rc003Disabled, enabled: !enabled });
+      await flushPromises();
+      expect(onboardingEvents("completed")).toHaveLength(1);
+      expect(onboardingEvents("authorization").some(event => event.result === "passed")).toBe(true);
+      expect(onboardingExternalState.value).toBe("passed");
+      await expect(restartOnboarding()).resolves.toBeDefined();
+    } finally {
+      resolve({ ...mocks.rc003Disabled, enabled });
+      wrapper.unmount();
+      await flushPromises();
+    }
+  });
+
+  it("keeps a late capture failure observable after leaving without navigating again", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_tool"));
+    mocks.getVoiceInputTool.mockResolvedValue("doubao");
+    let reject!: (error: Error) => void;
+    mocks.enableRc003Capture.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+    const wrapper = await mountWizard(runtimeWith());
+    await wrapper.get('input[type="checkbox"]').trigger("change");
+    await wrapper.findAll("button").find(button => button.text() === "开启")!.trigger("click");
+    await wrapper.get(".onboarding-exit").trigger("click");
+    await flushPromises();
+    expect(wrapper.emitted("completed")).toHaveLength(1);
+    wrapper.unmount();
+    mocks.getRc003TaskStatus.mockClear();
+    reject(new Error("external task failed"));
+    await flushPromises();
+    expect(onboardingExternalState.value).toBe("failed");
+    expect(onboardingEvents("authorization").some(event => event.reason === "switch_error" && event.result === "failed")).toBe(true);
+    expect(onboardingEvents("completed")).toHaveLength(1);
+    expect(mocks.getRc003TaskStatus).not.toHaveBeenCalled();
+    await expect(restartOnboarding()).resolves.toBeDefined();
+  });
+
+  it.each(["welcome", "remote", "audio", "voice_tool", "voice_test", "controls", "complete"])(
+    "can defer from %s without reporting verification or committing the draft",
+    async current => {
+      mocks.getOnboardingState.mockResolvedValue(activeState(current));
+      const wrapper = await mountWizard(runtimeWith());
+      try {
+        await wrapper.get(".onboarding-exit").trigger("click");
+        await flushPromises();
+        expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
+        expect(mocks.completeOnboarding).not.toHaveBeenCalled();
+        expect(wrapper.emitted("completed")).toHaveLength(1);
+        expect(onboardingEvents("completed").some(event => event.result === "cancelled")).toBe(true);
+      } finally { wrapper.unmount(); }
+    },
+  );
+
+  it("skips every blocked step and leaves a blocked completion page without forging passes", async () => {
+    const wrapper = await mountWizard(runtimeWith());
+    try {
+      const steps = ["remote", "audio", "voice_tool", "voice_test", "controls", "complete"];
+      for (const target of steps) {
+        await wrapper.get(".onboarding-skip").trigger("click");
+        await flushPromises();
+        expect(mocks.saveOnboardingStep).toHaveBeenLastCalledWith(target);
+      }
+      expect(wrapper.get(".onboarding-actions .primary-button").attributes("disabled")).toBeDefined();
+      await wrapper.get(".onboarding-skip").trigger("click");
+      await flushPromises();
+      expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
+      expect(mocks.completeOnboarding).not.toHaveBeenCalled();
+      expect(onboardingEvents("step_passed")).toHaveLength(0);
+      expect(onboardingEvents("step_skipped")).toHaveLength(7);
+      expect(mocks.cancelVoiceTest).toHaveBeenCalled();
+      expect(wrapper.emitted("completed")).toHaveLength(1);
+    } finally { wrapper.unmount(); }
+  });
+
+  it("can leave when reading or persisting progress fails", async () => {
+    mocks.getOnboardingState.mockRejectedValue(new Error("read failed"));
+    mocks.dismissOnboarding.mockRejectedValue(new Error("write failed"));
+    const wrapper = await mountWizard(runtimeWith());
+    try {
+      await wrapper.get(".onboarding-exit").trigger("click");
+      await flushPromises();
+      expect(wrapper.emitted("completed")).toHaveLength(1);
+      expect(onboardingEvents("persist").some(event => event.reason === "dismiss_save_failed")).toBe(true);
+    } finally { wrapper.unmount(); }
+  });
+
+  it("closes a late button subscription after exiting", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("remote"));
+    let resolve!: (unsubscribe: () => void) => void;
+    mocks.subscribeButtonEdges.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const unsubscribe = vi.fn();
+    const wrapper = await mountWizard(runtimeWith());
+    await wrapper.get(".onboarding-exit").trigger("click");
+    await flushPromises();
+    resolve(unsubscribe);
+    await flushPromises();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(mocks.setMappingSuspension).toHaveBeenLastCalledWith(false);
+    wrapper.unmount();
+  });
+
+  it("shows observed text independently from a failed audio verification", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
+    const wrapper = await mountWizard(connectedRuntime());
+    try {
+      await wrapper.get("input.onboarding-voice-input").setValue("识别结果");
+      await flushPromises();
+      const row = wrapper.findAll(".onboarding-crow").find(item => item.text().includes("文字已经出现"))!;
+      expect(row.attributes("data-state")).toBe("ok");
+      expect(wrapper.get(".onboarding-actions .primary-button").attributes("disabled")).toBeDefined();
+      expect(onboardingEvents("voice_attempt").some(event => event.reason === "transcript_observed")).toBe(true);
+    } finally { wrapper.unmount(); }
+  });
+
+  it("does not auto-select audio from an old step after skipping a pending refresh", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("audio"));
+    let resolve!: (endpoints: AudioEndpoint[]) => void;
+    mocks.listCaptureInputs.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountWizard(runtimeWith());
+    await wrapper.get(".onboarding-skip").trigger("click");
+    await flushPromises();
+    resolve([cableEndpoint]);
+    await flushPromises();
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("waits for a submitted temporary binding before rolling it back on exit", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_tool"));
+    let resolve!: (state: ReturnType<typeof activeState>) => void;
+    mocks.stageOnboardingVoiceBinding.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountWizard(runtimeWith());
+    const wechat = wrapper.findAll("button").find(item => item.text().includes("微信输入法"))!;
+    await wechat.trigger("click");
+    await wrapper.get(".onboarding-exit").trigger("click");
+    expect(mocks.dismissOnboarding).not.toHaveBeenCalled();
+    resolve(activeState("voice_tool"));
+    await flushPromises();
+    expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
+    expect(onboardingEvents("tool_selected")).toHaveLength(0);
+    expect(mocks.completeOnboarding).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("does not let unmount cleanup resume mappings after a new wizard suspends them", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("remote"));
+    let release!: (value: boolean) => void;
+    mocks.setMappingSuspension.mockImplementationOnce(() => new Promise(done => { release = done; }));
+    const old = await mountWizard(runtimeWith());
+    old.unmount();
+    const current = await mountWizard(runtimeWith());
+    expect(mocks.setMappingSuspension).toHaveBeenCalledTimes(1);
+    release(true);
+    await flushPromises();
+    await flushPromises();
+    expect(mocks.setMappingSuspension.mock.calls.map(call => call[0])).toEqual([true, false, true]);
+    expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
+    current.unmount();
+    await flushPromises();
+  });
+
+  it("stops a real voice test once when repeated skip clicks race", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
+    let release!: () => void;
+    mocks.cancelVoiceTest.mockImplementationOnce(() => new Promise<void>(done => { release = done; }));
+    const wrapper = await mountWizard(connectedRuntime());
+    await wrapper.get(".onboarding-skip").trigger("click");
+    await wrapper.get(".onboarding-skip").trigger("click");
+    expect(mocks.cancelVoiceTest).toHaveBeenCalledOnce();
+    release();
+    await flushPromises();
+    expect(mocks.saveOnboardingStep).toHaveBeenLastCalledWith("controls");
+    expect(onboardingEvents("step_skipped")).toHaveLength(1);
+    wrapper.unmount();
+    await flushPromises();
+  });
+
+  it("waits for pending tool staging before skipping into the voice verification", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_tool"));
+    let resolve!: (state: ReturnType<typeof activeState>) => void;
+    mocks.stageOnboardingVoiceBinding.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountWizard(runtimeWith());
+    await wrapper.findAll("button").find(item => item.text().includes("微信输入法"))!.trigger("click");
+    await wrapper.get(".onboarding-skip").trigger("click");
+    await flushPromises();
+    expect(mocks.getRuntimeSnapshot).not.toHaveBeenCalled();
+    expect(mocks.saveOnboardingStep).not.toHaveBeenCalledWith("voice_test");
+    resolve(activeState("voice_tool"));
+    await flushPromises();
+    expect(mocks.saveOnboardingStep).toHaveBeenLastCalledWith("voice_test");
+    expect(mocks.getRuntimeSnapshot).toHaveBeenCalled();
+    wrapper.unmount();
+    await flushPromises();
+  });
+
+  it("retries a failed mapping resume and warns if cleanup stays unconfirmed", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("remote"));
+    mocks.setMappingSuspension.mockImplementation(async suspended => {
+      if (!suspended) throw new Error("resume failed");
+      return true;
+    });
+    const wrapper = await mountWizard(runtimeWith());
+    await wrapper.get(".onboarding-exit").trigger("click");
+    await flushPromises();
+    expect(mocks.setMappingSuspension.mock.calls.filter(call => call[0] === false)).toHaveLength(2);
+    expect(wrapper.emitted("completed")?.[0]?.[0]).toContain("按键执行状态");
+    wrapper.unmount();
+  });
+
+  it("registers explicit exit cleanup before unmount so a new wizard waits for the old draft rollback", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_tool"));
+    let resolve!: (state: ReturnType<typeof activeState>) => void;
+    mocks.stageOnboardingVoiceBinding.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const old = await mountWizard(runtimeWith());
+    await old.findAll("button").find(item => item.text().includes("微信输入法"))!.trigger("click");
+    await old.get(".onboarding-exit").trigger("click");
+    old.unmount();
+    mocks.getOnboardingState.mockClear();
+    const current = await mountWizard(runtimeWith());
+    expect(mocks.getOnboardingState).not.toHaveBeenCalled();
+    resolve(activeState("voice_tool"));
+    await flushPromises();
+    await flushPromises();
+    expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
+    expect(mocks.getOnboardingState).toHaveBeenCalledOnce();
+    current.unmount();
+    await flushPromises();
+  });
+
+  it("rejects a second tool mutation after skipping starts waiting for the first", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_tool"));
+    let resolve!: (state: ReturnType<typeof activeState>) => void;
+    mocks.stageOnboardingVoiceBinding.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountWizard(runtimeWith());
+    await wrapper.findAll("button").find(item => item.text().includes("微信输入法"))!.trigger("click");
+    await wrapper.get(".onboarding-skip").trigger("click");
+    await wrapper.findAll("button").find(item => item.text().includes("豆包"))!.trigger("click");
+    expect(mocks.stageOnboardingVoiceBinding).toHaveBeenCalledTimes(1);
+    resolve(activeState("voice_tool"));
+    await flushPromises();
+    expect(mocks.saveOnboardingStep).toHaveBeenLastCalledWith("voice_test");
+    wrapper.unmount();
+    await flushPromises();
   });
 });

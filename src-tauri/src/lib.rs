@@ -638,6 +638,7 @@ async fn resolve_capture_recovery(
 
 struct AppState {
     capture_config_operation: Arc<Mutex<()>>,
+    onboarding_operation: Arc<Mutex<()>>,
     platform: Arc<dyn PlatformRuntime>,
     exit_cleanup: ExitCleanup,
     settings: SettingsStore,
@@ -3095,7 +3096,19 @@ async fn restart_onboarding(
     state: tauri::State<'_, AppState>,
 ) -> Result<onboarding::OnboardingStateView, String> {
     let settings = state.settings.clone();
-    match tauri::async_runtime::spawn_blocking(move || settings.restart_onboarding()).await {
+    let platform = state.platform.clone();
+    let operation = state.onboarding_operation.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let restarted = settings.restart_onboarding()?;
+        platform.set_voice_input_tool(settings.load()?.voice_input_tool);
+        platform.set_voice_hold_hotkey(settings.load_voice_hold_hotkey()?);
+        Ok::<_, String>(restarted)
+    })
+    .await
+    {
         Ok(Ok(value)) => Ok(value.view()),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(onboarding_blocking_failure("restart")),
@@ -3107,11 +3120,66 @@ async fn complete_onboarding(
     state: tauri::State<'_, AppState>,
 ) -> Result<onboarding::OnboardingStateView, String> {
     let settings = state.settings.clone();
-    match tauri::async_runtime::spawn_blocking(move || settings.complete_onboarding()).await {
+    let operation = state.onboarding_operation.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        settings.complete_onboarding()
+    })
+    .await
+    {
         Ok(Ok(value)) => Ok(value.view()),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(onboarding_blocking_failure("complete")),
     }
+}
+
+#[tauri::command]
+async fn cancel_voice_test(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let platform = state.platform.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        platform
+            .cancel_voice_test()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| onboarding_blocking_failure("voice_cancel"))?
+}
+
+#[tauri::command]
+async fn dismiss_onboarding(
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let settings = state.settings.clone();
+    let platform = state.platform.clone();
+    let operation = state.onboarding_operation.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cancelled = platform
+            .cancel_voice_test()
+            .map_err(|_| "voice_cleanup_failed".to_owned());
+        let dismissed = settings
+            .dismiss_onboarding()
+            .map_err(|_| "settings_restore_failed".to_owned())?;
+        platform.set_voice_input_tool(
+            settings
+                .load()
+                .map_err(|_| "settings_restore_failed".to_owned())?
+                .voice_input_tool,
+        );
+        platform.set_voice_hold_hotkey(
+            settings
+                .load_voice_hold_hotkey()
+                .map_err(|_| "settings_restore_failed".to_owned())?,
+        );
+        cancelled?;
+        Ok(dismissed.view())
+    })
+    .await
+    .map_err(|_| onboarding_blocking_failure("dismiss"))?
 }
 
 /// 第④步暂存语音绑定：落回滚快照 + 应用正式配置，并把工具/快捷键推给平台。
@@ -3126,7 +3194,11 @@ async fn stage_onboarding_voice_binding(
 ) -> Result<onboarding::OnboardingStateView, String> {
     let settings = state.settings.clone();
     let platform = state.platform.clone();
+    let operation = state.onboarding_operation.clone();
     match tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let staged = settings.stage_onboarding_voice_binding(tool, hotkey.clone())?;
         platform.set_voice_input_tool(Some(tool));
         platform.set_voice_hold_hotkey(hotkey);
@@ -5011,6 +5083,7 @@ pub fn run() {
             let exit_cleanup = ExitCleanup::new(Arc::clone(&platform), supervisor);
             app.manage(AppState {
                 capture_config_operation: platform.capture_config_gate(),
+                onboarding_operation: Arc::new(Mutex::new(())),
                 platform: Arc::clone(&platform),
                 exit_cleanup,
                 settings: settings.clone(),
@@ -5229,6 +5302,8 @@ pub fn run() {
         save_onboarding_step,
         restart_onboarding,
         complete_onboarding,
+        dismiss_onboarding,
+        cancel_voice_test,
         stage_onboarding_voice_binding,
         get_theme_preference,
         set_theme_preference,
@@ -5336,6 +5411,8 @@ pub fn run() {
         save_onboarding_step,
         restart_onboarding,
         complete_onboarding,
+        dismiss_onboarding,
+        cancel_voice_test,
         stage_onboarding_voice_binding,
         get_theme_preference,
         set_theme_preference,

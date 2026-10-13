@@ -21,7 +21,7 @@ export type OnboardingStep =
 
 export type OnboardingPhase = "prepare" | "setup" | "try_it";
 
-/** 顺序即导航顺序；不提供「跳过」，完成前没有进入主界面的旁路。 */
+/** 顺序即导航顺序；正常继续由门禁裁决，主动跳过/退出由页面独立记录。 */
 export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
   "welcome",
   "remote",

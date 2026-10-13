@@ -298,6 +298,22 @@ impl SettingsStore {
         Ok(state)
     }
 
+    /// 退出或跳过未完成验证：撤销临时绑定，再关闭自动展示。
+    /// completed_version 表示本版向导已处理；只有 complete_onboarding 宣称验证通过。
+    pub fn dismiss_onboarding(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        self.restore_onboarding_staged_binding_unlocked("wizard_dismissed")?;
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+        state.completed_version = state.flow_version;
+        self.write_onboarding_state(&state)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=dismissed terminal_result=cancelled flow_version={} step={} binding=restored",
+            state.flow_version, state.step.as_str()
+        ));
+        Ok(state)
+    }
+
     fn write_onboarding_state(&self, state: &OnboardingState) -> Result<(), String> {
         let path = onboarding::state_path(&self.path);
         if let Some(parent) = path.parent() {
@@ -2597,6 +2613,38 @@ mod tests {
             .restore_onboarding_staged_binding("test_restore_again")
             .unwrap());
 
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_dismiss_rolls_back_binding_without_claiming_verification() {
+        let base = onboarding_test_dir("dismiss-rollback");
+        let store = SettingsStore::new(base.join("settings.json"));
+        store.ensure_onboarding_state().unwrap();
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        let original = store.load_voice_hold_hotkey().unwrap();
+        store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, None)
+            .unwrap();
+        store
+            .save_onboarding_step(OnboardingStep::VoiceTest)
+            .unwrap();
+        let state = store.dismiss_onboarding().unwrap();
+        assert!(!state.is_active());
+        assert_eq!(state.step, OnboardingStep::VoiceTest);
+        assert!(state.staged.is_none());
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Wechat)
+        );
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), original);
+        assert!(!store.dismiss_onboarding().unwrap().is_active());
+        assert!(store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, None)
+            .is_err());
+        assert!(store.restart_onboarding().unwrap().is_active());
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -18,6 +18,7 @@ import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
 import DriverGuidePage from "./pages/DriverGuidePage.vue";
 import OnboardingPage from "./pages/OnboardingPage.vue";
+import { onboardingExternalState } from "./onboarding/lifecycle";
 import PermissionsPage from "./pages/PermissionsPage.vue";
 import TemplatesPage from "./pages/TemplatesPage.vue";
 
@@ -32,6 +33,15 @@ let initialRuntimeReported = false;
 
 /** 未完成首次设置时进入向导。 */
 const showOnboarding = ref(false);
+const onboardingNotice = ref("");
+const onboardingReturnNotice = computed(() => {
+  const external = onboardingExternalState.value;
+  const message = external === "pending"
+    ? "向导已退出，Windows 授权或增强设置仍在处理中；操作结束前不能重新运行向导。若授权成功，增强设置仍会生效。"
+    : external === "passed" ? "先前请求的增强设置操作已完成；现在可以重新运行向导。"
+    : external === "failed" ? "先前请求的增强设置操作失败；请检查增强设置，或重新运行向导。" : "";
+  return [onboardingNotice.value, message].filter(Boolean).join(" ");
+});
 
 /**
  * 运行时仿真冒烟（构建期 `VITE_SAYALL_RUNTIME_SIMULATION=1`）跑的是**主界面**旅程
@@ -43,7 +53,8 @@ const showOnboarding = ref(false);
  */
 const runtimeSimulationBuild = import.meta.env.VITE_SAYALL_RUNTIME_SIMULATION === "1";
 
-function onOnboardingCompleted(): void {
+function onOnboardingCompleted(notice = ""): void {
+  onboardingNotice.value = notice;
   showOnboarding.value = false;
   // 完成后落到「连接」页：先看到四项就绪状态，再开始日常使用。
   // 完成事件由向导壳在提交成功处上报（带耗时），这里不重复上报。
@@ -52,6 +63,7 @@ function onOnboardingCompleted(): void {
 
 /** 设置页「重新运行向导」：向导状态已由设置页重置为进行中，这里切回向导。 */
 function onRestartOnboarding(): void {
+  onboardingNotice.value = "";
   showOnboarding.value = true;
 }
 
@@ -175,6 +187,7 @@ onUnmounted(() => {
     <Sidebar :active-page="activePage" :version="runtime?.appVersion" @select="activePage = $event" />
     <main class="content" :class="{ 'content-buttons': activePage === 'buttons' }">
       <div v-if="loadError" class="error-banner">无法读取运行状态：{{ loadError }}</div>
+      <div v-if="onboardingReturnNotice" class="error-banner" role="status">{{ onboardingReturnNotice }}</div>
       <div v-if="updateBannerVisible" class="update-banner">
         <span>发现新版本 {{ updateInfo?.version }}</span>
         <button type="button" class="link-button" @click="showUpdatePage">查看</button>

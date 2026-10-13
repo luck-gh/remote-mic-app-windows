@@ -3,7 +3,7 @@
     <h1>欢迎使用无线麦</h1>
     <p class="onboarding-muted personal-build">个人版</p>
     <p class="onboarding-lede">
-      接下来会完成真实的设置和验证，不是走一遍页面教程。每一步都确认可用后才会放行。
+      接下来会设置并验证遥控器、语音和按键。准备好后可以继续，也可以暂时跳过或稍后设置。
     </p>
 
     <div class="onboarding-card">
@@ -39,7 +39,7 @@
     </div>
 
     <p class="onboarding-muted">
-      设置中途可以随时退出；下次打开会回到这里继续。设备和语音设置会保存供后续使用。
+      退出时撤销未验证的工具与快捷键，保留已保存的设备设置。以后可在「设置 → 首次设置」重新运行向导。
     </p>
   </section>
 </template>

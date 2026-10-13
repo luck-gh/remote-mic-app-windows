@@ -17,19 +17,32 @@ const props = defineProps<{
   scanning: boolean;
   message: string;
   selectingEndpointId: string;
+  temporaryCaptureSwitchBusy: boolean;
+  temporaryCaptureSwitchDisabled: boolean;
   openingVbCablePage: boolean;
   /** 当前门禁失败码（只用于显示修复卡；判据仍由 flow.evaluateGate 独裁）。 */
   gateCode: string | null;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   select: [endpoint: AudioEndpoint];
+  setTemporaryCaptureSwitch: [enabled: boolean];
   refresh: [];
   openDownload: [];
 }>();
 
+function requestTemporaryCaptureSwitch(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const requested = input.checked;
+  input.checked = props.capture?.settings.enabled ?? false;
+  emit("setTemporaryCaptureSwitch", requested);
+}
+
 const recommended = computed(() => props.endpoints.filter(endpoint => endpoint.isVirtualCableCandidate));
 const selectedId = computed(() => props.capture?.settings.endpointId ?? null);
+const selectedEndpointAvailable = computed(() =>
+  Boolean(selectedId.value && props.endpoints.some(endpoint => endpoint.id === selectedId.value)),
+);
 const ready = computed(() => props.audio?.phase === "ready" && isPairedAudioRoute(props.route, props.capture, props.audio));
 
 const FIX_TITLES: Record<string, string> = {
@@ -104,6 +117,25 @@ const fixTitle = computed(() =>
         </button>
       </div>
     </template>
+
+    <section
+      v-if="capture?.settings.endpointId"
+      class="onboarding-card onboarding-capture-setting"
+      aria-label="临时切换麦克风输入"
+    >
+      <label class="onboarding-capture-switch">
+        <span>遥控器说话时临时切换麦克风输入</span>
+        <input
+          type="checkbox"
+          :checked="capture.settings.enabled"
+          :disabled="temporaryCaptureSwitchDisabled || temporaryCaptureSwitchBusy || !selectedEndpointAvailable"
+          @change="requestTemporaryCaptureSwitch"
+        />
+      </label>
+      <p>
+        选择上方目标只连接语音通道，不会立即更改 Windows 默认麦克风。勾选后，按住遥控器语音键时切换到所选麦克风，松开后恢复；其他应用或你手动改选时，会保留新的选择。软件自行指定麦克风的语音工具不受此开关控制。
+      </p>
+    </section>
 
     <div v-if="fixTitle" class="onboarding-card warn">
       <h4>{{ fixTitle }}</h4>

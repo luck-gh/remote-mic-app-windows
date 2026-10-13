@@ -43,6 +43,7 @@ export interface SidePanelContext {
   voicePhase: VoiceAttemptState;
   voiceTerminalCode: string | null;
   voiceResultPassed: boolean;
+  transcriptObserved?: boolean;
   voiceEvidence: {
     decodedSamples: number;
     submittedSamples: number;
@@ -169,7 +170,7 @@ export function buildSidePanel(step: OnboardingStep, ctx: SidePanelContext): Sid
             : inSession
               ? "busy"
               : "pending";
-      const transcriptState: StatusRowState = ctx.voiceResultPassed
+      const transcriptState: StatusRowState = ctx.transcriptObserved || ctx.voiceResultPassed
         ? "ok"
         : terminal === "voice.no_transcript"
           ? "warn"

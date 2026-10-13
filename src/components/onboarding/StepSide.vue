@@ -40,6 +40,7 @@ const WAVE = [14, 30, 46, 30, 54, 22, 34];
         <span class="side-done-badge" aria-hidden="true">✓</span>
       </span>
       <span v-if="props.panel.caption" class="side-caption">{{ props.panel.caption }}</span>
+      <span v-if="props.panel.visual !== 'remote'" class="side-caption personal-build">个人版</span>
     </div>
 
     <section
