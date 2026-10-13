@@ -47,7 +47,7 @@ onMounted(() => { void refreshConnection(); });
             <div class="button-row"><button type="button" class="secondary-button" :disabled="scanning" @click="openSettings">打开 Windows 蓝牙设置</button><button type="button" class="secondary-button" :disabled="scanning" @click="scan">{{ scanning ? "扫描中…" : "扫描已配对遥控器" }}</button></div>
           </div>
         </details>
-        <ul v-if="devices.length" class="device-list"><li v-for="device in devices" :key="device.id"><div><strong>{{ device.name }}</strong><small>{{ device.isSupportedCandidate ? `${remoteModelLabel(device.model)} · Windows 已配对并被 SayAll 发现` : "不支持的设备" }}</small></div><button type="button" :disabled="Boolean(connectingDeviceId) || !device.isSupportedCandidate" @click="connect(device)">{{ connectingDeviceId === device.id ? "连接中…" : "连接" }}</button></li></ul>
+        <ul v-if="devices.length" class="device-list"><li v-for="device in devices" :key="device.id"><div><strong>{{ device.name }}</strong><small>{{ device.isSupportedCandidate ? `${remoteModelLabel(device.model)} · Windows 已配对并被无线麦发现` : "不支持的设备" }}</small></div><button type="button" :disabled="Boolean(connectingDeviceId) || !device.isSupportedCandidate" @click="connect(device)">{{ connectingDeviceId === device.id ? "连接中…" : "连接" }}</button></li></ul>
         <p v-if="message" class="operation-message" aria-live="polite">{{ message }}</p>
       </article>
     </div>

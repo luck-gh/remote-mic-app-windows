@@ -1,6 +1,7 @@
 <template>
   <section class="onboarding-step">
     <h1>欢迎使用无线麦</h1>
+    <p class="onboarding-muted personal-build">个人版</p>
     <p class="onboarding-lede">
       接下来会完成真实的设置和验证，不是走一遍页面教程。每一步都确认可用后才会放行。
     </p>

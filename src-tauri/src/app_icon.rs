@@ -1,28 +1,5 @@
-//! 应用图标：把用户选择的应用图标应用到所有显示它的地方（2026-10-02）。
-//!
-//! 对齐 Mac main 的 `Sources/RemoteMic/AppIconController.swift`：
-//!
-//! - 稳定语义 ID + 目录解析：`standard`（水彩鸭）与 `faceted-duck`（几何鸭，
-//!   来自 Mac `Resources/AppIcons/faceted-duck.png`，由
-//!   `scripts/generate-app-icons.py` 派生为 Windows 用的尺寸档；**2026-10-04 起
-//!   新装默认选中它**）；认不出的 ID 一律回落 `standard`
-//!   （Mac `AppIconCatalog.resolvedIdentifier(for:)` 同款语义）；
-//! - 落日志 `app_icon action=apply phase=... result=applied|fallback reason=...`
-//!   （对应 Mac 的 `APP_ICON CHANGE`）；
-//! - Mac 换的是 `NSApplication.applicationIconImage`（Dock / 应用切换器 / 设置窗口）；
-//!   Windows 上等价的"各个地方" = **主窗口图标（任务栏 + Alt-Tab + 标题栏）、通知
-//!   区域托盘图标、以及开始菜单 / 桌面 / 固定到任务栏的快捷方式图标**，设置页顶部
-//!   标识由前端按同一选择实时渲染。
-//! - **exe 与安装包自身的图标是安装产物，运行期不可改**：2026-10-04 起构建时就取
-//!   几何鸭（`tauri.conf.json` 的 `bundle.icon`、installerIcon、uninstallerIcon =
-//!   `icons/app-icons/faceted-duck.ico`，用户定稿），所以窗口/托盘的初始图标与
-//!   「默认」风格都不再走 `default_window_icon`（它已等于几何鸭）：`standard` 改内嵌
-//!   `icons/128x128@2x.png`（水彩鸭 256px 满画布），快捷方式图标由
-//!   `crate::shortcut_icons::sync` 按所选风格落到 `%LOCALAPPDATA%\SayAll\icons\`
-//!   （2026-10-03：快捷方式 `IconLocation=,0` 取的是 exe 内嵌图标，不额外同步就不会
-//!   跟随切换）。
+//! 个人修改版固定应用图标（2026-10-06）；窗口与托盘按 DPI 使用同源资产。
 
-use sayall_core::AppIconIdentifier;
 use tauri::image::Image;
 use tauri::AppHandle;
 use tauri::Manager;
@@ -43,42 +20,25 @@ pub fn nearest_icon_size(dpi: u32) -> u32 {
         .unwrap_or(32)
 }
 
-fn faceted_duck_tray_bytes(size: u32) -> &'static [u8] {
+fn personal_tray_bytes(size: u32) -> &'static [u8] {
     match size {
-        16 => include_bytes!("../icons/app-icons/faceted-duck-16.png"),
-        20 => include_bytes!("../icons/app-icons/faceted-duck-20.png"),
-        24 => include_bytes!("../icons/app-icons/faceted-duck-24.png"),
-        _ => include_bytes!("../icons/app-icons/faceted-duck-32.png"),
+        16 => include_bytes!("../icons/app-icons/personal-16.png"),
+        20 => include_bytes!("../icons/app-icons/personal-20.png"),
+        24 => include_bytes!("../icons/app-icons/personal-24.png"),
+        _ => include_bytes!("../icons/app-icons/personal-32.png"),
     }
 }
 
-/// 托盘尺寸的几何鸭图标；`standard` 走 `standard_window_image`，不走这里。
-pub fn faceted_duck_tray_image(size: u32) -> Result<Image<'static>, String> {
-    Image::from_bytes(faceted_duck_tray_bytes(size))
-        .map_err(|error| format!("解码内置几何鸭托盘图标失败：{error}"))
+/// 托盘尺寸的固定个人版图标。
+pub fn personal_tray_image(size: u32) -> Result<Image<'static>, String> {
+    Image::from_bytes(personal_tray_bytes(size))
+        .map_err(|error| format!("解码内置个人版托盘图标失败：{error}"))
 }
 
-/// 窗口（任务栏 / Alt-Tab）尺寸的几何鸭图标。
-pub fn faceted_duck_window_image() -> Result<Image<'static>, String> {
-    Image::from_bytes(include_bytes!("../icons/app-icons/faceted-duck-256.png"))
-        .map_err(|error| format!("解码内置几何鸭窗口图标失败：{error}"))
-}
-
-/// 「默认」（水彩鸭）风格的窗口与托盘图标。
-///
-/// 2026-10-04 起 `bundle.icon` 指向几何鸭，`default_window_icon` 不再能代表
-/// `standard`；这里直接内嵌 `scripts/generate-standard-icon.py` 派生的 256px
-/// 满画布资产（窗口与托盘共用一张，与旧 `default_window_icon` 的单图行为一致）。
-pub fn standard_window_image() -> Result<Image<'static>, String> {
-    Image::from_bytes(include_bytes!("../icons/128x128@2x.png"))
-        .map_err(|error| format!("解码内置默认（水彩鸭）图标失败：{error}"))
-}
-
-pub fn style_label(identifier: AppIconIdentifier) -> &'static str {
-    match identifier {
-        AppIconIdentifier::Standard => "standard",
-        AppIconIdentifier::FacetedDuck => "faceted-duck",
-    }
+/// 窗口（任务栏 / Alt-Tab）尺寸的个人版图标。
+pub fn personal_window_image() -> Result<Image<'static>, String> {
+    Image::from_bytes(include_bytes!("../icons/app-icons/personal-256.png"))
+        .map_err(|error| format!("解码内置个人版窗口图标失败：{error}"))
 }
 
 /// 任务栏 / Alt-Tab 用的是 `ICON_BIG`，标题栏用的是 `ICON_SMALL`。
@@ -265,27 +225,117 @@ fn window_dpi(app: &AppHandle) -> u32 {
         .unwrap_or(96)
 }
 
-/// 把选择的应用图标应用到主窗口与托盘；返回真正生效的 ID（回落时 ≠ 请求值）。
+#[cfg(windows)]
+fn refresh_shell_icon(executable: &std::path::Path) -> Result<i32, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        IExtractIconW, ILFree, IShellFolder, SHBindToParent, SHGetFileInfoW, SHParseDisplayName,
+        SHUpdateImageW, SHFILEINFOW, SHGFI_SYSICONINDEX,
+    };
+
+    if !executable.is_file() {
+        return Err("executable_missing".to_owned());
+    }
+    struct Apartment(bool);
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+    struct ItemId(*mut ITEMIDLIST);
+    impl Drop for ItemId {
+        fn drop(&mut self) {
+            unsafe { ILFree(Some(self.0)) };
+        }
+    }
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
+        return Err("com_initialize_failed".to_owned());
+    }
+    let _apartment = Apartment(initialized.is_ok());
+    let path: Vec<u16> = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        let mut parsed = std::ptr::null_mut();
+        SHParseDisplayName(
+            PCWSTR(path.as_ptr()),
+            None::<&IBindCtx>,
+            &mut parsed,
+            0,
+            None,
+        )
+        .map_err(|_| "shell_parse_failed".to_owned())?;
+        let item_id = ItemId(parsed);
+        let mut child = std::ptr::null_mut();
+        let folder: IShellFolder = SHBindToParent(item_id.0, Some(&mut child))
+            .map_err(|_| "shell_parent_failed".to_owned())?;
+        let extractor: IExtractIconW = folder
+            .GetUIObjectOf(HWND::default(), &[child.cast_const()], None)
+            .map_err(|_| "shell_icon_handler_failed".to_owned())?;
+        let mut location = vec![0u16; 32768];
+        let (mut resource_index, mut flags) = (0, 0);
+        extractor
+            .GetIconLocation(0, &mut location, &mut resource_index, &mut flags)
+            .map_err(|_| "shell_icon_location_failed".to_owned())?;
+        let mut info = SHFILEINFOW::default();
+        let list = SHGetFileInfoW(
+            PCWSTR(path.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        );
+        if list == 0 || info.iIcon < 0 || location[0] == 0 {
+            return Err("shell_image_index_failed".to_owned());
+        }
+        // Microsoft requires the existing handler's exact location/index/flags.
+        // Only this executable's image entry is notified; AppID and pins stay intact.
+        SHUpdateImageW(PCWSTR(location.as_ptr()), resource_index, flags, info.iIcon);
+        Ok(info.iIcon)
+    }
+}
+
+/// 将固定个人图标应用到主窗口与托盘，并通知 Shell 当前 EXE 图像项变化。
 ///
 /// 任何一步失败都只记录并继续：图标属于表现层，绝不影响语音与按键主路径。
-pub fn apply(app: &AppHandle, requested: AppIconIdentifier) -> AppIconIdentifier {
-    let applied = resolve(requested);
-    sayall_windows::gatt_note(format!(
-        "app_icon action=apply phase=requested requested={} source=preference",
-        style_label(requested)
-    ));
-
-    let window_icon = match applied {
-        AppIconIdentifier::Standard => standard_window_image().ok(),
-        AppIconIdentifier::FacetedDuck => faceted_duck_window_image().ok(),
-    };
+pub fn apply(app: &AppHandle) {
+    sayall_windows::gatt_note(
+        "app_icon action=apply phase=requested source=personal_bundle".to_owned(),
+    );
+    let window_icon = personal_window_image().ok();
     let dpi = window_dpi(app);
-    let tray_icon = match applied {
-        // 「默认」风格窗口与托盘共用同一张（旧 `default_window_icon` 的单图行为）；
-        // 几何鸭按托盘 DPI 选预生成档。
-        AppIconIdentifier::Standard => window_icon.clone(),
-        AppIconIdentifier::FacetedDuck => faceted_duck_tray_image(nearest_icon_size(dpi)).ok(),
-    };
+    let tray_icon = personal_tray_image(nearest_icon_size(dpi)).ok();
+
+    #[cfg(windows)]
+    tauri::async_runtime::spawn_blocking(|| {
+        sayall_windows::gatt_note(
+            "app_icon action=refresh target=shell_image phase=requested source=current_executable"
+                .to_owned(),
+        );
+        let result = std::env::current_exe()
+            .map_err(|_| "executable_resolve_failed".to_owned())
+            .and_then(|executable| refresh_shell_icon(&executable));
+        match result {
+            Ok(index) => sayall_windows::gatt_note(format!(
+                "app_icon action=refresh target=shell_image phase=submitted image_index={index} display_result=unknown"
+            )),
+            Err(code) => sayall_windows::gatt_note(format!(
+                "app_icon action=refresh target=shell_image phase=completed terminal_result=failed error_domain=shell error_code={code} retryable=false"
+            )),
+        }
+    });
 
     match (&window_icon, app.get_webview_window("main")) {
         (Some(icon), Some(window)) => {
@@ -309,13 +359,13 @@ pub fn apply(app: &AppHandle, requested: AppIconIdentifier) -> AppIconIdentifier
                         if let Err(error) = window_icons::apply(hwnd.0 as isize, &big, &small) {
                             sayall_windows::gatt_note(format!(
                                 "app_icon action=apply target=taskbar phase=completed terminal_result=failed applied={} error_domain=windows error_code=set_icon_failed retryable=true",
-                                style_label(applied)
+                                "personal"
                             ));
                             eprintln!("更新任务栏图标失败：{error}");
                         } else {
                             sayall_windows::gatt_note(format!(
                                 "app_icon action=apply target=taskbar phase=completed terminal_result=passed applied={} big={}x{} small={}x{}",
-                                style_label(applied),
+                                "personal",
                                 big.width,
                                 big.height,
                                 small.width,
@@ -346,70 +396,46 @@ pub fn apply(app: &AppHandle, requested: AppIconIdentifier) -> AppIconIdentifier
             Some(icon) => match tray.set_icon(Some(icon)) {
                 Ok(()) => sayall_windows::gatt_note(format!(
                     "app_icon action=apply target=tray phase=completed terminal_result=passed applied={} dpi={dpi}",
-                    style_label(applied)
+                    "personal"
                 )),
                 Err(error) => {
                     sayall_windows::gatt_note(format!(
                         "app_icon action=apply target=tray phase=completed terminal_result=failed applied={} error_domain=tray error_code=set_icon_failed retryable=true",
-                        style_label(applied)
+                        "personal"
                     ));
                     eprintln!("更新托盘图标失败：{error}");
                 }
             },
             None => sayall_windows::gatt_note(format!(
                 "app_icon action=apply target=tray phase=completed terminal_result=failed applied={} error_domain=icon error_code=resolve_failed retryable=true",
-                style_label(applied)
+                "personal"
             )),
         },
         // 仿真构建不建托盘；真机上托盘创建失败也走这里。只记日志，不报错。
         None => sayall_windows::gatt_note(format!(
             "app_icon action=apply target=tray phase=completed terminal_result=skipped applied={} reason=tray_unavailable",
-            style_label(applied)
+            "personal"
         )),
-    }
-
-    // 快捷方式（开始菜单 / 桌面 / 固定到任务栏）的图标不来自窗口句柄，单独同步
-    // （2026-10-03：切换后开始菜单磁贴与固定项不变，就是缺这一步）。
-    match crate::shortcut_icons::sync(applied) {
-        Ok(report) => sayall_windows::gatt_note(format!(
-            "app_icon action=sync_shortcuts phase=completed terminal_result=passed style={} considered={} updated={} failed={}",
-            style_label(applied),
-            report.considered,
-            report.updated,
-            report.failed
-        )),
-        Err(_) => sayall_windows::gatt_note(format!(
-            "app_icon action=sync_shortcuts phase=completed terminal_result=failed style={} error_domain=shell error_code=sync_failed retryable=true",
-            style_label(applied)
-        )),
-    }
-
-    if applied == requested {
-        sayall_windows::gatt_note(format!(
-            "app_icon action=apply phase=completed terminal_result=passed requested={} applied={} result=applied reason=selection_available",
-            style_label(requested),
-            style_label(applied)
-        ));
-    } else {
-        sayall_windows::gatt_note(format!(
-            "app_icon action=apply phase=completed terminal_result=passed requested={} applied={} result=fallback reason=resource_unavailable",
-            style_label(requested),
-            style_label(applied)
-        ));
-    }
-    applied
-}
-
-/// 目录解析：目前两个 ID 的内置资产都在仓库里，未知 ID 不在枚举内（反序列化时
-/// 已回落 `standard`）；这里保留 Mac 同款入口，供后续新增图标时集中处理。
-fn resolve(requested: AppIconIdentifier) -> AppIconIdentifier {
-    match requested {
-        AppIconIdentifier::Standard | AppIconIdentifier::FacetedDuck => requested,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn shell_refresh_for_current_executable_is_repeatable() {
+        let executable = std::env::current_exe().expect("test executable");
+        assert!(super::refresh_shell_icon(&executable).expect("first refresh") >= 0);
+        assert!(super::refresh_shell_icon(&executable).expect("repeat refresh") >= 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_refresh_rejects_missing_executable() {
+        let missing = std::env::temp_dir().join("sayall-personal-icon-missing.exe");
+        assert!(!missing.exists());
+        assert!(super::refresh_shell_icon(&missing).is_err());
+    }
     use super::*;
 
     #[test]
@@ -424,270 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn style_labels_match_persisted_identifiers() {
-        assert_eq!(style_label(AppIconIdentifier::Standard), "standard");
-        assert_eq!(style_label(AppIconIdentifier::FacetedDuck), "faceted-duck");
-    }
-
-    #[test]
-    fn every_embedded_faceted_duck_size_decodes() {
+    fn every_embedded_personal_size_decodes() {
         for size in TRAY_ICON_SIZES {
-            let image = faceted_duck_tray_image(size)
-                .unwrap_or_else(|error| panic!("{size}px 内置几何鸭图标解码失败：{error}"));
+            let image = personal_tray_image(size)
+                .unwrap_or_else(|error| panic!("{size}px 内置个人版图标解码失败：{error}"));
             assert_eq!((image.width(), image.height()), (size, size));
         }
-        let window_icon = faceted_duck_window_image().expect("窗口尺寸的几何鸭图标必须可解码");
+        let window_icon = personal_window_image().expect("窗口尺寸的个人版图标必须可解码");
         assert_eq!((window_icon.width(), window_icon.height()), (256, 256));
-    }
-
-    /// "内容必须铺满画布"这条约定：阈值取 alpha ≥ 128（抗锯齿边缘也算可见），
-    /// 要求外接框 ≥ 98%。旧导出实测 0.81–0.94，会失败；满画布导出实测 1.000。
-    const ICON_FILL_RATIO_MINIMUM: f64 = 0.98;
-
-    fn visible_fill_ratio(image: &Image<'_>) -> f64 {
-        let (width, height) = (image.width() as i64, image.height() as i64);
-        let rgba = image.rgba();
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (width, height, -1_i64, -1_i64);
-        for (index, pixel) in rgba.chunks_exact(4).enumerate() {
-            if pixel[3] < 128 {
-                continue;
-            }
-            let x = (index as i64) % width;
-            let y = (index as i64) / width;
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-        }
-        if max_x < min_x || max_y < min_y {
-            return 0.0;
-        }
-        let extent = (max_x - min_x + 1).max(max_y - min_y + 1) as f64;
-        extent / width.max(height) as f64
-    }
-
-    /// 回归测试（2026-10-03 现场："图标在任务栏和托盘都比别人的小一圈"）：
-    ///
-    /// 源图若是 macOS 图标网格的导出（图案只占画布 ~87%，四周留白/阴影），缩到
-    /// Windows 尺寸后贴不满画布，任务栏与托盘就会显得比邻居小。
-    #[test]
-    fn faceted_duck_artwork_fills_the_canvas() {
-        let mut checked = Vec::new();
-        for size in TRAY_ICON_SIZES {
-            let image = faceted_duck_tray_image(size).expect("托盘图标必须可解码");
-            checked.push((format!("{size}px"), visible_fill_ratio(&image)));
-        }
-        let window_icon = faceted_duck_window_image().expect("窗口图标必须可解码");
-        checked.push(("256px".to_owned(), visible_fill_ratio(&window_icon)));
-
-        for (label, ratio) in checked {
-            assert!(
-                ratio >= ICON_FILL_RATIO_MINIMUM,
-                "几何鸭 {label} 图标内容只占画布 {ratio:.3}：源图带了 macOS 式留白，\
-                 在任务栏/托盘会比别的应用小一圈（见 scripts/generate-app-icons.py 的 FILL_RATIO_MINIMUM）"
-            );
-        }
-    }
-
-    /// 同一约定的「默认」（standard）风格资产：这些 PNG 由
-    /// `scripts/generate-standard-icon.py` 派生（2026-10-03 满画布处理）。
-    ///
-    /// 2026-10-04 起 `bundle.icon` 改指几何鸭，这套资产只服务「默认」风格本身：
-    /// 窗口/托盘取其中的 `128x128@2x.png`（`standard_window_image`）、快捷方式取
-    /// 同源的 `icon.ico`（`shortcut_icons.rs`）。它们必须继续保持满画布，否则切回
-    /// 「默认」后任务栏/托盘会比邻居小一圈（2026-10-03 现场问题的一半）。
-    #[test]
-    fn standard_icon_artwork_fills_the_canvas() {
-        let assets: [(&str, &[u8]); 4] = [
-            ("32x32.png", include_bytes!("../icons/32x32.png")),
-            ("128x128.png", include_bytes!("../icons/128x128.png")),
-            ("128x128@2x.png", include_bytes!("../icons/128x128@2x.png")),
-            ("icon.png", include_bytes!("../icons/icon.png")),
-        ];
-        for (label, bytes) in assets {
-            let image = Image::from_bytes(bytes)
-                .unwrap_or_else(|error| panic!("{label} 解码失败：{error}"));
-            let ratio = visible_fill_ratio(&image);
-            assert!(
-                ratio >= ICON_FILL_RATIO_MINIMUM,
-                "默认图标 {label} 内容只占画布 {ratio:.3}：源图带了 macOS 式留白，\
-                 在任务栏/托盘会比别的应用小一圈（见 scripts/generate-standard-icon.py 的 FILL_RATIO_MINIMUM）"
-            );
-        }
-    }
-
-    /// 读 `.ico` 目录表里每条的像素面积（顺序 = 文件里的存储顺序）。
-    fn ico_entry_areas(bytes: &[u8]) -> Vec<usize> {
-        assert!(bytes.len() > 6, "ico 太短：{} 字节", bytes.len());
-        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-        assert!(count > 1, "ico 条目数异常：{count}");
-        let mut entries = Vec::new();
-        for index in 0..count {
-            let offset = 6 + index * 16;
-            let width = if bytes[offset] == 0 {
-                256
-            } else {
-                bytes[offset] as usize
-            };
-            let height = if bytes[offset + 1] == 0 {
-                256
-            } else {
-                bytes[offset + 1] as usize
-            };
-            entries.push(width * height);
-        }
-        entries
-    }
-
-    /// 取出 `.ico` 里指定边长档的原始数据块（PIL 写的各档都是 PNG 压缩）。
-    fn ico_frame_bytes(bytes: &[u8], size: usize) -> &[u8] {
-        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-        for index in 0..count {
-            let offset = 6 + index * 16;
-            let width = if bytes[offset] == 0 {
-                256
-            } else {
-                bytes[offset] as usize
-            };
-            if width != size {
-                continue;
-            }
-            let length =
-                u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
-            let start =
-                u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
-            return &bytes[start..start + length];
-        }
-        panic!(".ico 里没有 {size}px 档");
-    }
-
-    /// 几何鸭 `.ico` 的 256px 档必须满画布。
-    ///
-    /// 2026-10-04 实测发现：2026-10-03 换满画布源图时漏了 `faceted-duck.ico`——仓库里
-    /// 那份是旧 macOS 式留白导出（256px 档可见填充 0.938），条目表也还是从小到大
-    /// （首条目 16px）。它此前只服务快捷方式图标，视觉问题没被注意到；变成 exe /
-    /// 安装包图标与 `tauri-codegen` 的窗口默认图标来源后，这两点都会直接暴露（图标
-    /// 比邻居小一圈 + 初始窗口图标发糊）。PIL 写的各档都是 PNG，这里解出 256px 档
-    /// 做与 PNG 资产同口径的填充断言。
-    #[test]
-    fn faceted_duck_ico_256_frame_fills_the_canvas() {
-        let bytes: &[u8] = include_bytes!("../icons/app-icons/faceted-duck.ico");
-        let frame = ico_frame_bytes(bytes, 256);
-        let image =
-            Image::from_bytes(frame).expect("几何鸭 .ico 的 256px 档必须可解码（PNG 压缩）");
-        assert_eq!((image.width(), image.height()), (256, 256));
-        let ratio = visible_fill_ratio(&image);
-        assert!(
-            ratio >= ICON_FILL_RATIO_MINIMUM,
-            "几何鸭 .ico 的 256px 档只占画布 {ratio:.3}：exe / 安装包图标会比邻居小一圈\
-             （见 scripts/generate-app-icons.py 的 FILL_RATIO_MINIMUM）"
-        );
-    }
-
-    /// 几何鸭 `.ico` 的首条目必须是最大一档（256px）。
-    ///
-    /// 2026-10-04 起它就是 `bundle.icon` 里唯一的 `.ico`：
-    /// `tauri-build` 拿它给 exe 写图标资源、`tauri-codegen`
-    /// （`image.rs::CachedIcon::new_ico`）只取 `entries()[0]` 解码成 RGBA 当窗口
-    /// 默认图标；首条目若是 16/32px，窗口初始图标就会被拉大发糊。
-    #[test]
-    fn faceted_duck_ico_puts_the_largest_entry_first() {
-        let bytes: &[u8] = include_bytes!("../icons/app-icons/faceted-duck.ico");
-        let entries = ico_entry_areas(bytes);
-        let first = entries[0];
-        assert_eq!(
-            first,
-            entries.iter().copied().max().unwrap_or_default(),
-            "几何鸭 .ico 首条目不是最大档：首 {first}，全部 {entries:?}\
-             （tauri-codegen 只取 entries()[0] 当窗口/托盘默认图标）"
-        );
-        assert_eq!(
-            first,
-            256 * 256,
-            "几何鸭 .ico 首条目应为 256px：全部 {entries:?}"
-        );
-    }
-
-    /// 2026-10-04 用户定稿：exe 与安装包自身的图标 = 几何鸭。
-    ///
-    /// `tauri-build`（exe 资源）与 `tauri-codegen`（`default_window_icon`）都从
-    /// `bundle.icon` 里挑第一个 `.ico`；NSIS 的安装器/卸载器图标单独取自
-    /// `windows.nsis.installerIcon` / `uninstallerIcon`。这三处一起钉住，
-    /// 防止将来漂回水彩鸭（那一刻 exe 文件图标就不再是几何鸭了）。
-    #[test]
-    fn bundle_icons_keep_local_identity() {
-        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
-            .expect("tauri.conf.json 必须是合法 JSON");
-        let icons: Vec<&str> = config["bundle"]["icon"]
-            .as_array()
-            .expect("bundle.icon 必须是数组")
-            .iter()
-            .map(|value| value.as_str().unwrap_or_default())
-            .collect();
-        let ico_entries: Vec<&str> = icons
-            .iter()
-            .copied()
-            .filter(|path| path.ends_with(".ico"))
-            .collect();
-        assert_eq!(
-            ico_entries,
-            vec!["icons/icon.ico"],
-            "可执行文件与安装器必须使用本地统一图标"
-        );
-        assert!(
-            icons.iter().any(|path| path.ends_with("128x128@2x.png")),
-            "bundle.icon 应包含本地 PNG 条目：{icons:?}"
-        );
-        for key in ["installerIcon", "uninstallerIcon"] {
-            assert_eq!(
-                config["bundle"]["windows"]["nsis"][key].as_str(),
-                Some("icons/icon.ico"),
-                "nsis.{key} 必须与本地可执行文件图标一致"
-            );
-        }
-    }
-
-    /// 「默认」风格窗口/托盘用的 256px 资产必须可解码。
-    #[test]
-    fn standard_runtime_icon_decodes() {
-        let image = standard_window_image().expect("默认（水彩鸭）图标必须可解码");
-        assert_eq!((image.width(), image.height()), (256, 256));
-    }
-
-    /// `icons/icon.ico`（「默认」风格的快捷方式图标）的首条目仍是最大一档。
-    ///
-    /// `tauri-codegen`（`image.rs::CachedIcon::new_ico`）只取 `entries()[0]` 解码当
-    /// 窗口默认图标——2026-10-04 起 `bundle.icon` 已改指几何鸭，这条对它不再生效，
-    /// 但 `scripts/generate-standard-icon.py` 仍按同一契约生成该文件（快捷方式放大
-    /// 档位时优先取大图），且它随时可能被放回 `bundle.icon`；留断言防止再次漂移
-    /// （2026-10-03：重排后的文件漏提交过一次，靠它兜住）。
-    #[test]
-    fn standard_icon_ico_puts_the_largest_entry_first() {
-        let bytes: &[u8] = include_bytes!("../icons/icon.ico");
-        let entries = ico_entry_areas(bytes);
-        let first = entries[0];
-        assert_eq!(
-            first,
-            entries.iter().copied().max().unwrap_or_default(),
-            "icon.ico 首条目不是最大档：首 {first}，全部 {entries:?}"
-        );
-        assert_eq!(
-            first,
-            256 * 256,
-            "icon.ico 首条目应为 256px：全部 {entries:?}"
-        );
-    }
-
-    #[test]
-    fn resolution_keeps_known_identifiers() {
-        assert_eq!(
-            resolve(AppIconIdentifier::FacetedDuck),
-            AppIconIdentifier::FacetedDuck
-        );
-        assert_eq!(
-            resolve(AppIconIdentifier::Standard),
-            AppIconIdentifier::Standard
-        );
     }
 
     /// 回归测试（2026-10-02 用户现场："任务栏没有跟随切换图标"）：

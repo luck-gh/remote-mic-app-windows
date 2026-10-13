@@ -5,19 +5,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
 
 /**
- * 设置页“问题反馈”的外部入口（2026-10-01 用户指定，2026-10-02 官网地址改为
- * 带 `?from=win` 的来源标记，便于官网区分 Windows 版来客）：官网首页与 Windows
- * 版源码仓库。
- *
- * 这两个字符串同时是 `src-tauri/capabilities/default.json` 里 opener 白名单的
- * 键——改这里必须同步改那里，否则真机上点击会被插件判为 ForbiddenUrl
- * （`bridge.test.ts` 逐字锁定了这份契约，runtime simulation 另行断言不在真机
- * 上被拒绝）。
- */
-export const OFFICIAL_WEBSITE_URL = "https://sayall.app/?from=win";
-export const GITHUB_REPOSITORY_URL = "https://github.com/GetSayAll/remote-mic-app-windows";
-
-/**
  * Vokie 官网（2026-10-01 Andy 提供）。
  *
  * 同样是 opener 白名单的键：新增 URL 必须同步
@@ -684,9 +671,7 @@ export function formatDiagnosticReport(
 /**
  * 打开诊断日志目录（关于页入口）。返回实际打开的目录供界面显示。
  *
- * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径——
- * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网、产品官网与
- * 源码仓库三个固定 URL）。
+ * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径。
  */
 export async function openLogDirectory(): Promise<string> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开日志目录");
@@ -803,16 +788,6 @@ async function openExternalUrl(url: string): Promise<void> {
     return;
   }
   await openUrl(url);
-}
-
-/** 设置页顶部“官网”入口。 */
-export async function openOfficialWebsite(): Promise<void> {
-  await openExternalUrl(OFFICIAL_WEBSITE_URL);
-}
-
-/** 设置页“问题反馈”里的“GitHub”入口。 */
-export async function openGitHubRepository(): Promise<void> {
-  await openExternalUrl(GITHUB_REPOSITORY_URL);
 }
 
 /** 连接页“Vokie 未安装”提示里的官网入口（2026-10-01）。 */
@@ -1455,29 +1430,6 @@ export interface ThemeResultReport {
 export async function reportThemeResult(report: ThemeResultReport): Promise<void> {
   if (!isTauriRuntime()) return;
   await invoke("report_theme_result", { report });
-}
-
-/**
- * 应用图标（2026-10-02 用户指定；对齐 Mac main `AppIconController`/`AppIconCatalog`）：
- *
- * - `standard`：「默认」水彩鸭（可切换的另一风格，也是老配置与认不出的 ID 的落点）；
- * - `faceted-duck`：来自 Mac `Resources/AppIcons/faceted-duck.png` 的「几何鸭」，
- *   2026-10-04 起为新装默认，exe / 安装包自身的图标也用它。
- *
- * 切换后由 Rust 同时更换**主窗口图标（任务栏 / Alt-Tab / 标题栏）、托盘图标，
- * 以及开始菜单 / 桌面 / 固定到任务栏的快捷方式图标**；设置页顶部标识与选项预览用
- * 同一 ID 实时渲染。exe 与安装包自身的图标是安装产物，运行期不变。
- */
-export type AppIconIdentifier = "standard" | "faceted-duck";
-
-export async function getAppIcon(): Promise<AppIconIdentifier> {
-  if (!isTauriRuntime()) return "standard";
-  return invoke<AppIconIdentifier>("get_app_icon");
-}
-
-export async function setAppIcon(identifier: AppIconIdentifier): Promise<AppIconIdentifier> {
-  if (!isTauriRuntime()) return identifier;
-  return invoke<AppIconIdentifier>("set_app_icon", { identifier });
 }
 
 /** 下载并安装已检查到的更新（Windows 上安装成功时应用会退出并由安装器重启）。 */

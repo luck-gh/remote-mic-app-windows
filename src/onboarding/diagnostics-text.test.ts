@@ -100,6 +100,8 @@ describe("formatOnboardingDiagnostics", () => {
     );
 
     expect(text).toContain("Generated at: 2026-10-05T06:52:00.000Z");
+    expect(text).toContain("Wireless Mic Personal Edition diagnostics");
+    expect(text).not.toContain("SayAll");
     expect(text).toContain("App version: 0.5.0");
     expect(text).toContain("Build: fe326f8a1b2c3d4e5f60718293a4b5c6d7e8f901");
     expect(text).toContain("Build channel: local-test");

@@ -1,4 +1,4 @@
-﻿param([string]$InstallDirectory, [switch]$FunctionsOnly, [switch]$ProductFiles)
+﻿param([string]$InstallDirectory, [switch]$FunctionsOnly, [switch]$ProductFiles, [switch]$Shortcuts, [string]$ProgramsDirectory, [string]$DesktopDirectory, [string]$SelectedStartMenuFolder, [int]$RestoreCustom = 0, [int]$NoShortcuts = 0)
 $ErrorActionPreference = 'Stop'
 
 function Get-SayAllRetiredFiles([string]$Directory, [switch]$ProductFiles) {
@@ -108,6 +108,127 @@ function Invoke-SayAllRetiredFileRecycle([string]$Directory, [switch]$ProductFil
     Write-Output ('retired-files: recycled_count=' + $files.Count)
 }
 
+function Get-SayAllShortcutAppId([string]$Path) {
+    $shell = New-Object -ComObject Shell.Application
+    $folder = $null
+    $item = $null
+    try {
+        $folder = $shell.Namespace([IO.Path]::GetDirectoryName($Path))
+        if ($null -eq $folder) { throw 'Shortcut property folder unavailable' }
+        $item = $folder.ParseName([IO.Path]::GetFileName($Path))
+        if ($null -eq $item) { throw 'Shortcut property item unavailable' }
+        return [string]$item.ExtendedProperty('System.AppUserModel.ID')
+    } finally {
+        if ($null -ne $item) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($item) }
+        if ($null -ne $folder) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($folder) }
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
+}
+
+function Invoke-SayAllRetiredShortcutRecycle([string]$Directory, [string]$Programs, [string]$Desktop, [string]$Selection = '', [int]$Update = 0, [int]$SkipShortcuts = 0) {
+    $script:ShortcutFailurePhase = 'scope_validation'
+    $script:RecycledShortcutCount = 0
+    $target = [IO.Path]::GetFullPath((Join-Path $Directory 'sayall-windows-app.exe'))
+    $programRoot = [IO.Path]::GetFullPath($Programs)
+    $desktopRoot = [IO.Path]::GetFullPath($Desktop)
+    $oldFolder = Join-Path $programRoot '无线麦 SayAll'
+    $known = [Collections.Generic.List[string]]::new()
+    $pending = [Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($programRoot)
+    while ($pending.Count -gt 0) {
+        $folder = $pending.Dequeue()
+        if ((Get-Item -LiteralPath $folder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Output 'shortcut-cleanup: scope=programs result=preserved reason=reparse_directory'
+            continue
+        }
+        foreach ($file in Get-ChildItem -LiteralPath $folder -File -Filter '无线麦 SayAll.lnk' -Force) { $known.Add($file.FullName) }
+        foreach ($child in Get-ChildItem -LiteralPath $folder -Directory -Force) { $pending.Enqueue($child.FullName) }
+    }
+    $known.Add((Join-Path $desktopRoot '无线麦 SayAll.lnk'))
+    $shell = New-Object -ComObject WScript.Shell
+    $count = 0
+    $script:ReplacedShortcutKinds = 0
+    try {
+        foreach ($file in $known) {
+            if (-not (Test-Path -LiteralPath $file)) { continue }
+            $ancestor = Get-Item -LiteralPath $file -Force
+            while ($null -ne $ancestor) {
+                if ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse shortcut rejected' }
+                $ancestor = if ($ancestor -is [IO.FileInfo]) { $ancestor.Directory } else { $ancestor.Parent }
+            }
+            $shortcut = $shell.CreateShortcut($file)
+            try {
+                if (-not [string]::Equals([IO.Path]::GetFullPath($shortcut.TargetPath), $target, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-Output 'shortcut-cleanup: result=preserved reason=target_mismatch'
+                    continue
+                }
+                $parent = [IO.Path]::GetDirectoryName($file)
+                $desktopLink = [string]::Equals($parent, $desktopRoot, [StringComparison]::OrdinalIgnoreCase)
+                $defaultLink = [string]::Equals($parent, $oldFolder, [StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($parent, $programRoot, [StringComparison]::OrdinalIgnoreCase)
+                Write-Output ('shortcut-cleanup: candidate=' + $count + ' target=current kind=' + $(if ($desktopLink) {'desktop'} else {'start_menu'}))
+                # Unattended updates retain existing custom folders. Interactive MUI
+                # selections (including its > no-create sentinel) are left to NSIS.
+                if (-not $desktopLink -and -not $defaultLink -and $Update -eq 1 -and $SkipShortcuts -eq 0 -and -not $Selection.StartsWith('>')) {
+                    $replacementPath = Join-Path $parent '无线麦.lnk'
+                    $script:ShortcutFailurePhase = 'read_properties'
+                    $replacement = $null
+                    if (Test-Path -LiteralPath $replacementPath) {
+                        $replacement = $shell.CreateShortcut($replacementPath)
+                        if (-not [string]::Equals($replacement.TargetPath, $target, [StringComparison]::OrdinalIgnoreCase)) {
+                            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($replacement)
+                            $script:ShortcutFailurePhase = 'destination_conflict'
+                            throw 'New shortcut name belongs to another target'
+                        }
+                        $previousAppId = Get-SayAllShortcutAppId $replacementPath
+                    } else {
+                        $previousAppId = Get-SayAllShortcutAppId $file
+                        $script:ShortcutFailurePhase = 'copy_link'
+                        Copy-Item -LiteralPath $file -Destination $replacementPath -ErrorAction Stop
+                        $replacement = $shell.CreateShortcut($replacementPath)
+                    }
+                    try {
+                        $replacement.TargetPath = $target
+                        $replacement.IconLocation = $target + ',0'
+                        $replacement.Description = '无线麦 · 个人版'
+                        $script:ShortcutFailurePhase = 'save_link'
+                        $replacement.Save()
+                        $script:ShortcutFailurePhase = 'verify_properties'
+                        if (-not (Test-Path -LiteralPath $replacementPath)) { throw 'Replacement shortcut was not created' }
+                        if ((Get-SayAllShortcutAppId $replacementPath) -ne $previousAppId) {
+                            Write-Output 'shortcut-cleanup: result=failed reason=app_id_readback_mismatch old_link=preserved'
+                            throw 'Shortcut extension property changed'
+                        }
+                        $readback = $shell.CreateShortcut($replacementPath)
+                        try {
+                            if (-not [string]::Equals($readback.TargetPath, $target, [StringComparison]::OrdinalIgnoreCase) -or $readback.IconLocation -ne ($target + ',0')) { throw 'Shortcut target/icon readback mismatch' }
+                        } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($readback) }
+                        Write-Output 'shortcut-cleanup: target=current property_readback=matched icon_readback=matched'
+                    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($replacement) }
+                }
+                Initialize-SayAllRecycleApi
+                $script:ShortcutFailurePhase = 'recycle_link'
+                [SayAllRecycle]::File($file)
+                if (Test-Path -LiteralPath $file) { throw 'Shortcut remained after recycle' }
+                if ($desktopLink) { $script:ReplacedShortcutKinds = $script:ReplacedShortcutKinds -bor 2 }
+                elseif ($defaultLink) { $script:ReplacedShortcutKinds = $script:ReplacedShortcutKinds -bor 1 }
+                $count++
+                $script:RecycledShortcutCount = $count
+            } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        }
+        if ($count -gt 0 -and (Test-Path -LiteralPath $oldFolder) -and @(Get-ChildItem -LiteralPath $oldFolder -Force).Count -eq 0) {
+            [SayAllRecycle]::File($oldFolder)
+        }
+    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    Write-Output ('shortcut-cleanup: result=completed recycled_count=' + $count + ' restore_kinds=' + $script:ReplacedShortcutKinds)
+}
+
 if ($FunctionsOnly) { return }
-try { Invoke-SayAllRetiredFileRecycle $InstallDirectory -ProductFiles:$ProductFiles; exit 0 }
-catch { Write-Output 'retired-files: unconfirmed; no permanent-delete fallback'; exit 15 }
+try {
+    if ($Shortcuts) { Invoke-SayAllRetiredShortcutRecycle $InstallDirectory $ProgramsDirectory $DesktopDirectory $SelectedStartMenuFolder $RestoreCustom $NoShortcuts; exit $script:ReplacedShortcutKinds }
+    else { Invoke-SayAllRetiredFileRecycle $InstallDirectory -ProductFiles:$ProductFiles }
+    exit 0
+} catch {
+    if ($Shortcuts) { Write-Output ('shortcut-cleanup: result=failed phase=' + $script:ShortcutFailurePhase + ' recycled_count=' + $script:RecycledShortcutCount) }
+    Write-Output 'retired-files: unconfirmed; no permanent-delete fallback'
+    exit 15
+}

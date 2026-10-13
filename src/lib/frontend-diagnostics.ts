@@ -6,7 +6,7 @@ const bootStarted = performance.now();
 export interface FrontendDiagnosticEvent {
   event: string;
   phase: string;
-  result: "passed" | "failed" | "unknown";
+  result: "passed" | "failed" | "unknown" | "skipped" | "cancelled";
   reason: string;
   /** 向导等功能的稳定 token 字段（Rust 侧逐字校验，含空格/中文会记为 invalid）。 */
   step?: string;

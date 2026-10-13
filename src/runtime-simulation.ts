@@ -3,18 +3,14 @@ import {
   connectRemote,
   disconnectRemote,
   getAudioSnapshot,
-  getButtonMappings,
   getDiagnosticReport,
   getGainDb,
   getRawInputSnapshot,
   getRuntimeSnapshot,
   listAudioEndpoints,
-  learnFocusTarget,
   saveButtonMappings,
   scanPairedRemotes,
-  setAppIcon,
   stopRawInput,
-  testAppFocus,
   testButtonMapping,
   type PlatformSnapshot,
 } from "./lib/bridge";
@@ -86,66 +82,8 @@ async function openPage(label: string, heading = label): Promise<void> {
   );
 }
 
-/** 仿真选项：本机运行时跳过「外部入口」两步，避免反复弹出系统浏览器。 */
-interface RuntimeSimulationOptions {
-  skipExternalEntries: boolean;
-}
-
-async function loadSimulationOptions(): Promise<RuntimeSimulationOptions> {
-  try {
-    return await invoke<RuntimeSimulationOptions>("get_runtime_simulation_options");
-  } catch {
-    // 拿不到选项时按 CI 口径（执行外部入口），不静默降级覆盖面。
-    return { skipExternalEntries: false };
-  }
-}
-
-/**
- * 设置页外部入口（官网 / GitHub）的 CI 判据。
- *
- * 2026-10-02 用户指定：成功不再显示任何提示，只有失败就地给原因。因此判据是
- * "在窗口期内要么出现失败原因、要么保持静默"；capability 白名单是产品配置，
- * 被 opener 拒绝（"Not allowed to open url"）必须报红，runner 上没有可用的
- * 默认浏览器只是环境差异（失败文案会如实带出来），不制造与本产品无关的红灯。
- *
- * 本机运行（脚本未带 -IncludeExternalEntries 且非 CI）时这两步会弹出系统浏览器，
- * 打断操作人：此时**如实记为 deferred 步骤**并跳过点击（不是静默丢覆盖面）。
- */
-async function recordExternalEntry(
-  label: string,
-  steps: string[],
-  skip: boolean,
-): Promise<void> {
-  if (skip) {
-    // 本机运行：跳过点击（避免弹出系统浏览器），如实记为 deferred。
-    steps.push(`设置页“${label}”入口本机跳过（避免弹出浏览器）：capability 往返未验证`);
-    return;
-  }
-  await clickButton(label);
-  const deadline = Date.now() + 3_000;
-  let message: string | null = null;
-  while (Date.now() < deadline) {
-    const text = document.querySelector(".link-message")?.textContent?.trim();
-    if (text) {
-      message = text;
-      break;
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
-  }
-  assert(
-    message === null || !message.includes("Not allowed to open url"),
-    `设置页“${label}”入口被 opener capability 拒绝：${message}`,
-  );
-  steps.push(
-    message === null
-      ? `设置页“${label}”入口点击后未显示错误；浏览器可见打开结果 deferred`
-      : `设置页“${label}”入口返回不可用（deferred）：${message}`,
-  );
-}
-
 async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   mark("journey_start");
-  const simulationOptions = await loadSimulationOptions();
   // 驱动页允许已连接时重新扫描；连接页在自动连接后会禁用扫描入口。
   await openPage("驱动", "驱动与配对");
   const runtime = await getRuntimeSnapshot();
@@ -329,23 +267,17 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     document.querySelectorAll<HTMLElement>(".settings-section .section-title"),
   ).map((element) => element.textContent?.trim());
   assert(
-    sectionTitles.join(" / ") === "通用 / 首次设置 / 问题反馈",
+    sectionTitles.join(" / ") === "通用 / 首次设置",
     `设置页分组标题异常：${sectionTitles.join(" / ")}`,
   );
   const wizardEntry = Array.from(
     document.querySelectorAll<HTMLButtonElement>(".settings-section .settings-row button"),
   ).find((button) => button.textContent?.trim() === "重新运行向导");
   assert(wizardEntry !== null, "设置页缺少「重新运行向导」入口");
-  const entryLabels = Array.from(
-    document.querySelectorAll<HTMLButtonElement>(".settings-section .button-row button"),
-  ).map((button) => button.textContent?.trim());
-  assert(
-    entryLabels.length === 2 && entryLabels[0] === "官网" && entryLabels[1] === "GitHub",
-    `设置页问题反馈入口异常：${entryLabels.join(" / ")}`,
-  );
-  steps.push("设置页顶部为应用标识/版本/检查更新，含「重新运行向导」入口与问题反馈（官网/GitHub）");
-  await recordExternalEntry("官网", steps, simulationOptions.skipExternalEntries);
-  await recordExternalEntry("GitHub", steps, simulationOptions.skipExternalEntries);
+  assert(!sectionTitles.includes("问题反馈"), "设置页仍显示官方问题反馈分组");
+  assert(!document.querySelector('input[name="app-icon"]'), "设置页仍显示废弃图标选择");
+  assert(document.querySelector('img.app-logo')?.getAttribute('src') === '/app-logo.png', "设置页未显示固定个人图标");
+  steps.push("设置页固定个人图标，无官方反馈入口及旧图标选择");
 
   const darkTheme = await waitFor(
     () =>
@@ -369,38 +301,6 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   await waitFor(() => (systemTheme.checked && !systemTheme.disabled ? true : null), "系统外观恢复");
   assert(!document.querySelector('[role="alert"]'), "恢复系统外观后显示错误");
   steps.push("设置页深色/系统外观经 Windows WebView、Tauri capability 与设置持久化闭环");
-
-  // 应用图标（2026-10-02；2026-10-04 起新装默认几何鸭）：仿真每次运行都用全新的
-  // 状态目录（= 新装），这里同时证明"默认值经真实 IPC 读回"与选项、切换、持久化
-  // 往返可用；窗口图标接口不报错（真实托盘/任务栏换图属真机验收，见
-  // Testing/WindowsRC003Preview.md 用例十四）。
-  const facetedDuckOption = await waitFor(
-    () =>
-      document.querySelector<HTMLInputElement>(
-        'input[name="app-icon"][value="faceted-duck"]:not(:disabled)',
-      ),
-    "设置页应用图标选项可用",
-  );
-  assert(facetedDuckOption.checked, "新装默认没有选中几何鸭");
-  assert(
-    document.querySelector<HTMLImageElement>("img.app-logo")?.getAttribute("src") ===
-      "/app-icon-faceted-duck.png",
-    "顶部标识没有按新装默认（几何鸭）渲染",
-  );
-  const standardOption = document.querySelector<HTMLInputElement>(
-    'input[name="app-icon"][value="standard"]:not(:disabled)',
-  );
-  assert(standardOption !== null, "设置页缺少「默认」应用图标选项");
-  standardOption.click();
-  await waitFor(() => (standardOption.checked ? true : null), "应用图标切换到默认（水彩鸭）");
-  assert(!document.querySelector('[role="alert"]'), "切换应用图标后显示错误");
-  // 直达断言：命令参数契约（前端 `{ identifier }` ↔ Rust 命令参数名）。名字不匹配
-  // 时 Tauri 判成缺参，前端只会看到 "IPC 不可用"（2026-10-02 本机仿真现场教训）。
-  const switchedIcon = await setAppIcon("standard");
-  assert(switchedIcon === "standard", `仿真切换应用图标没有生效：${switchedIcon}`);
-  const restoredIcon = await setAppIcon("faceted-duck");
-  assert(restoredIcon === "faceted-duck", `仿真还原应用图标没有生效：${restoredIcon}`);
-  steps.push("设置页应用图标新装默认几何鸭，切换经真实 IPC 与设置持久化往返");
 
   await openPage("连接");
   // 重新挂载连接页：增益必须从持久化设置恢复（证明读取路径真的从 IPC 取值，

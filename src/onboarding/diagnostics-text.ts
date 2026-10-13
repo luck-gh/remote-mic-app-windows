@@ -67,7 +67,7 @@ export function formatOnboardingDiagnostics(
 ): string {
   const stepIndex = ONBOARDING_STEP_ORDER.indexOf(snapshot.step) + 1;
   const lines: string[] = [
-    "SayAll diagnostics",
+    "Wireless Mic Personal Edition diagnostics",
     `Generated at: ${now.toISOString()}`,
     `App version: ${report.appVersion}`,
     `Build: ${report.sourceRevision}`,

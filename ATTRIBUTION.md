@@ -72,7 +72,8 @@
 
 ## App Logo 版权
 
-- App Logo 与 App Icon 沿用 `HD838A/remote-mic-app` 的版权边界：属于 HD838A 保留版权的专有品牌资产，不纳入 GPL-3.0-only；Windows 版适用范围和授权条件见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。
+- 历史应用使用的上游 App Logo 与 App Icon 沿用 `HD838A/remote-mic-app` 的版权边界：属于 HD838A 保留版权的专有品牌资产，不纳入 GPL-3.0-only；Windows 版适用范围和授权条件见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。
+- 2026-10-06 个人修改版使用 [SVG 母版](public/app-logo-personal.svg) 与 [PNG 预览](public/app-logo-personal.png)：用户确认的“轻放”独立几何设计，未复制或改编上游小鸭品牌资产。`scripts/generate-app-icons.py` 从固定母版派生 UI/favicon、Windows ICO、窗口和 16/20/24/32 px 托盘资产；小尺寸仅做光学调整，未新增运行依赖。贡献范围为**仅本地定制**，这是上游贡献范围，不限制 GPL 赋予的再分发权利。正式运行路径不使用历史专有品牌资产；`icon-source.png` 仅保留历史取证身份，不进入运行或打包资产。修改者展示身份为 `luck-gh`，本版当前展示“个人版”，修改日期 2026-10-06；商标授权未核实，GPL 不作为商标授权依据。原软件版权、GPL-3.0-only 与第三方许可保持。
 
 ## 产品与 UI 基准
 
@@ -409,3 +410,15 @@
 本轮固定输入为 `GetSayAll/remote-mic-app-windows@e225bb4c9791dbfefa37c8fb197bc06e95fca428`，共同基线 `c81308e011a757dc22d22f2861b687ef787d295e`。吸收设置向导、显式连发与确认键鼠标行为、按键宿主和扫描码注入、日志轮转、双架构载荷及 WebView 恢复后按主窗口信号撤销提示。PR #200（延迟单位）及 #209（保留 #202 原作者的 WebView 修复）已在输入历史中；Git merge 保留双方提交归属。
 
 本地冲突决议保留模板实际应用/编辑分离、严格同一虚拟音频线配对、语音准备与成对释放、捕获所有权/代次、正常退出和回收规则。没有引入宿主强杀重注、设备禁启恢复、安装器永久删除、按名字猜选另一写入端，亦不将上游旧配置隐式连发迁移应用到本地模板。上游历史验收仅证明其被测提交，本轮结果与未验证边界记录在既有 TODO 和测试文档。
+### 2026-10-06 个人修改版许可与分发边界
+
+按 [GNU GPL v3 第 1、5、6 节](https://www.gnu.org/licenses/gpl-3.0.html)，修改版保留版权、许可与无担保声明，显著注明修改事实与日期。向他人分发本修改版二进制时，应提供该精确版本的完整对应源码，包括控制构建和安装的脚本；网络分发提供等价获取方式，不只给未修改上游链接。此要求不等同每次构建须得到相同二进制哈希，见 [GNU FAQ](https://www.gnu.org/licenses/gpl-faq.en.html#MustSourceBuildToMatchExactHashOfBinary)。GPL 第 7(e) 节允许不授予商标权；本次未查询商标注册或取得名称授权，不宣称官方背书。这里记录义务，不授权本轮上传或发布。
+
+
+### 2026-10-06 安装器个人品牌与开始菜单选择
+
+沿用 [NSIS Modern UI 2 官方 Start Menu 选择契约](https://nsis.sourceforge.io/Docs/Modern%20UI%202/Readme.html)：保留页面变量中的自定义文件夹与“不创建”选择，不无条件覆盖。旧版本没有保存文件夹记录时，仅在公开 Programs 根下遍历非 reparse 目录寻找精确旧品牌文件名，逐个通过公开 Shell COM 确认目标为当前安装 EXE 后回收；不扫描其他 .lnk。无人值守更新只重建确实回收的默认/桌面入口，已存在的自定义旧入口在原文件夹改为新显示名，空/不匹配保持无新入口。不新增迁移框架或更新机制；未知、冲突或回收失败保留并报告，不永久删除。
+
+自定义快捷方式只在新名不存在时复制单个已核对 .lnk，再用公开 COM 更新图标/修改版说明，保存后重读目标、图标和扩展属性。按 [Microsoft System.AppUserModel.ID](https://learn.microsoft.com/en-us/windows/win32/properties/props-system-appusermodel-id) 与 [IPropertyStore::SetValue/Commit](https://learn.microsoft.com/en-us/windows/win32/api/propsys/nf-propsys-ipropertystore-setvalue) 的公开属性契约，实际 fixture 设置并重读 AppUserModelID，证明新链接仍保留该值；新名冲突不覆盖，失败不回收原链接。此测试仅自建文件，不读取第三方私有配置。
+
+同日真实桌面发现任务栏仍有旧图，但公开 `WM_GETICON` 大/小图、EXE 资源和 Shell EXE 图像均已新；普通应用正常重开与 `SHCNE_UPDATEITEM` 通知不能修复。按微软 [SHUpdateImageW](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shupdateimagew) 的现有图像键契约，从当前 EXE 的 `IExtractIconW::GetIconLocation` 读取真实 location/index/flags，并用 [SHGetFileInfoW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shgetfileinfow) 获取该项系统图像 index，仅通知这个 EXE 项后实际任务栏出现新个人图。启动正式接入复用已有 `windows` crate 与 Tauri blocking runtime，后台查询避免阻塞 UI；COM/PIDL 成功、失败均按所有权配对释放，不改变 AppID/pin/顺序，不清全局缓存、不重启 Explorer。日志区分请求、submitted 与失败，submitted 不能表述为显示通过。具体候选与真实像素范围归既有安装验收专项。

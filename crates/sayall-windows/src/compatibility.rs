@@ -42,7 +42,7 @@ impl fmt::Display for UnsupportedWindowsVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "当前 Windows 版本 {} 不受支持；无线麦 SayAll 需要 Windows 10 1809（{}）或更高版本",
+            "当前 Windows 版本 {} 不受支持；无线麦 需要 Windows 10 1809（{}）或更高版本",
             self.current, self.minimum
         )
     }
@@ -86,13 +86,14 @@ pub fn show_unsupported_windows_message(error: UnsupportedWindowsVersion) {
     use windows::core::{w, PCWSTR};
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
-    let message = format!("{error}\r\n\r\nSayAll requires Windows 10 1809 (build 17763) or later.");
+    let message =
+        format!("{error}\r\n\r\nWireless Mic requires Windows 10 1809 (build 17763) or later.");
     let message: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = MessageBoxW(
             None,
             PCWSTR(message.as_ptr()),
-            w!("无线麦 SayAll"),
+            w!("无线麦"),
             MB_OK | MB_ICONERROR,
         );
     }

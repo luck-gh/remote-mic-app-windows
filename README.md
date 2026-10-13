@@ -1,4 +1,6 @@
-# 无线麦 SayAll for Windows
+# 无线麦 Windows 个人版
+
+本个人版由 luck-gh 修改；修改日期 2026-10-06。基于 GetSayAll 的 GPL-3.0-only Windows 项目，版权和来源保留。
 
 <p align="center">
   <img src="Screenshots/sayall-key-mapping.png" alt="无线麦 SayAll Windows 版按键映射界面" width="960">
@@ -35,7 +37,7 @@
 
 视频作者：[可乐不甜的跑焦日记](https://space.bilibili.com/327214328)
 
-无线麦 SayAll Windows 版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
+无线麦 Windows 个人版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
 
 支持目标包括两种型号；各型号的当前验收结果以本 fork 的测试记录为准：
 
@@ -110,4 +112,4 @@ Windows 主机上的完整检查和双型号真机步骤见 [Testing/WindowsRC00
 
 ## 开源协议
 
-程序代码使用 GPL-3.0-only。App Logo 和 App Icon 是保留版权的专有品牌资产，不属于 GPL-3.0-only 授权范围；详见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。第三方来源与素材边界见 [ATTRIBUTION.md](ATTRIBUTION.md) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+程序代码使用 GPL-3.0-only。上游原 App Logo 和 App Icon 是保留版权的专有品牌资产，不属于 GPL-3.0-only 授权范围；本个人版运行资产已替换为独立“轻放”设计，历史 icon-source.png 仅供取证，不用于运行；详见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。第三方来源与素材边界见 [ATTRIBUTION.md](ATTRIBUTION.md) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

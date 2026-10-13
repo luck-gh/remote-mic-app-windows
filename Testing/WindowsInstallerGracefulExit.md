@@ -2,6 +2,40 @@
 
 初版：2026-09-16；当前安装前卸载/覆盖流程：2026-10-04。
 
+## 2026-10-06 个人修改版本地覆盖证据
+
+以下先记录图标任务阶段 c4099ba2 的独立历史验收；后续用户短身份修正及最新交付归同页下一节。本轮仅本地定制，不发布或向上游贡献。基线 `50f21e005b4f1bf3455268eb013d58259196d6a2` 上保留 dirty 工作区，无提交或源码快照。最终 NSIS 包 `target/release/bundle/nsis/无线麦_0.5.0_x64-setup.exe` SHA256 为 `c4099ba26c55bd834976a9bbe5559b75d21280417b6934617c2e40c2b93b0e82`；单包校验整体成功后，metadata 与 SHA256SUMS 均读回为该候选。包内正式启动接入 Windows 单项 Shell 图像通知；源码身份见本次 metadata，不把旧候选测试外推到新增代码。
+
+- **passed**：公开命名事件请求应用正常退出并观察进程结束，随后管理员 `/P /UPDATE` 覆盖安装。注册显示“无线麦”，publisher `luck-gh` 来自本人 fork 身份；历史安装目录、注册键、AppID、配置路径和 updater 保持。初始候选 `e9ed6a48…` 的首次升级实际回收两个精确自有旧名链接并创建无线麦入口；最终候选再次覆盖后，新开始菜单/桌面入口实际目标和图标读回正确。自定义目录、不创建、目标不匹配、新名冲突及 AUMID 保留另有真实 fixture 验证。
+- **passed**：最终已装 EXE SHA256 `E6F57EED847761527DEB9D5F4C0FBE5ED49AEDF6C7F4CED4D6FD7C7535545D67`，大小 19,731,968 字节。构建与已装文件只有 Tauri bundle 标记 `UNK`→`NSS` 的三字节变化；仅在内存应用该标记后完整 hash 一致。没有另存整 EXE。
+- **passed**：最终 PID 20912，启动时实际读回父进程 `explorer.exe` PID 58888，唯一实例；收口时 ParentPid 仍为 58888，而该 Explorer 启动进程已结束，不把历史启动证据伪称当前父进程仍在。token elevation=0、Integrity RID=8192。实际会话 WTSInfoEx SessionFlags=1（Windows 10.0.26200，非 Windows 7 反转语义），桌面解锁。不能仅凭 OpenInputDesktop 返回 Default 判断解锁，也不能用锁屏时 PrintWindow 的离屏渲染作可见证据。
+- **passed**：最终候选实际主窗、完整设置范围的个人修改版/非官方声明、新图标及无反馈/图标选择残留、tray 图标与显示/退出菜单、精确 UIA 关联任务栏按钮、两个 Explorer 快捷方式和安装器欢迎页名称/标题图标均观察新品牌。只展示同一现包再 CloseMainWindow 正常取消并观察退出，随后 Explorer 普通启动。最终启动日志 PID 20912 的 `shell_icon_refresh requested`→`submitted`（image index 166）与新任务栏像素成对观察，未手工通知、强杀应用或重启 Explorer。
+- **passed**：三个原配置文件、23 个既有字段结构保持；最终字节 hash 亦与本轮基线一致，证据不包含值。正常启动时第三个 capture-input-session 运行日志文件曾短暂变化，应用日志显示真实初始化 journal 写入，随后恢复；不把该瞬态说成偏好丢失，也不宣称全程逐字节不变。
+- **passed**：前端 251 项与生产构建、Rust 工作区验证及 fmt/check、Windows 兼容性 2 项、实际快捷方式边界、WebView/IPC 仿真 16 步与正常退出、生产仿真隔离和单包检查。新增 Shell 接入定向先 1 failed/1 passed，再 2 passed；受影响 Tauri 最终 101 passed/1 ignored、fmt 和 runtime-simulation check passed。其余未变部分复用已有证据。最终 Tauri 的 1 项 ignored 为 `updater::tests::live_preview_channel_resolves_a_signed_manifest_endpoint`，联网发布端点检查仅发布前执行，本轮无发布。
+统计口径：`rust-test.log` 为多段命令累计 498 passed，包含平台 362 passed/20 ignored、原 Host 98 passed/1 ignored 与独立测试，不表述为单次 workspace 的纯统计。后续受影响 Host 为 101 passed/1 ignored。平台 20 项 ignored 涉及真实交互桌面/前台、音频端点、蓝牙切换/UAC、供应商下载、指定第三方应用及 WeType 历史，另含两个已知缺陷 keyboard_coexistence 显式回归；未执行，不纳入本次 passed。品牌、旧配置、快捷方式和 Shell 通知相关必需测试均已通过。
+
+- **deferred / 未覆盖**：RC001/RC003 硬件语音、睡眠/蓝牙升级中链路、真实卸载矩阵、标准账户/UAC 取消、签名/SmartScreen。本次展示与配置验证不外推这些范围。
+
+任务栏分层诊断：初始候选的实际任务栏仍旧图，窗口 WM_GETICON 和 EXE/Shell 图已新、class icon 为 null。UPDATEITEM 与普通重开无效；真实 IExtractIconW 键及系统 image index 的单项 SHUpdateImage 后像素变新。正式接入采用同一公开 API，独立审查无必需问题后才构建上述新候选。系统缓存此前已被实验证明更新，不伪称最终启动前缓存仍旧，也不为复现清全局缓存或更改 pin/AppID。
+
+本机最小过程证据复用 `target/dev/personal-branding/`：`bundle-validation/` 双摘要、`payload-marker-proof.json`、`installed-readback.json`、`startup-readback.json`、`config-result.json`、`simulation-report.json`、`shell-startup.log`。同最终候选图像为 `main-visible.png`、`settings-visible.png`、`tray-visible.png`、`tray-menu-visible.png`、`taskbar-final.png`、`taskbar-full-rendered.png`、`startmenu-shortcut-visible.png`、`desktop-shortcut-visible.png`、`installer-visible.png`；主窗与任务栏最终 PID 20912，设置/tray 为同候选先前 PID 34372。`taskbar-reopened.png` 为初始候选旧图，`taskbar-single-image-notified.png` 为手工单项通知后的新图；full-rendered 当前为新图，不能充当 before。长期结论归本页，不依赖临时目录作为唯一依据。独立完成审计已通过；保留上述最小图像/摘要、分层图标读回、红绿/ignored 统计和必要公开观察脚本，用于本地交付复核及独有缓存对照。完整重复成功构建/check 输出和空日志已回收，生产日志只留 NSIS patch/产物摘要。保留材料在候选被替换或不再需要本地复核/独有对照时按回收站规则清理；不复制源码或其他任务材料。
+
+实际验证入口：`pnpm test`、`pnpm build`、`cargo test --workspace`、`cargo fmt --all -- --check`、`cargo check --workspace`、`cargo test -p sayall-windows-app`、`cargo check -p sayall-windows-app --features runtime-simulation`；`pwsh -File scripts/test-windows-retired-shortcuts.ps1`；`python scripts/generate-app-icons.py --check`；`pnpm tauri build --bundles nsis`；`pwsh -File scripts/verify-windows-bundle.ps1 -InstallerPath target/release/bundle/nsis/无线麦_0.5.0_x64-setup.exe -ArtifactDirectory target/dev/personal-branding/bundle-validation`；`pwsh -File scripts/verify-runtime-simulation-isolation.ps1`。本轮仿真由 `target/dev/personal-branding/run-simulation.ps1` 执行，16 步报告与实际退出为判据；安装与可见观察为上述公开 Windows API/Explorer 实际操作，不以命令退出码替代副作用。
+
+### 同日用户修正：当前身份统一“个人版”
+
+用户最新指令覆盖前一阶段的长身份展示，窗口为“无线麦 · 个人版”，设置小标为“个人版”，tray tooltip 和自定义新链接描述使用短身份；当前 README/AGENTS/PLAN/FEATURES/RELEASING 与 ATTRIBUTION 展示说明同步。前一阶段截图/标语记录保留历史身份，GPL、作者/版权、来源、完整对应源码及构建脚本义务、publisher luck-gh、图标、技术标识与 updater 未改变。
+
+**passed**：定向 TDD 旧实现 1 failed/10 passed，修正后前端 251 passed/22 files 与 build；增量 Host 101 passed/1 ignored（发布前联网 updater 项）、fmt、runtime-simulation check；自定义链接实际 Description=无线麦·个人版及其原属性/冲突保护 fixture passed。本轮不重跑无关 workspace/硬件仿真。
+
+最终包仍在原 `target/release/bundle/nsis/无线麦_0.5.0_x64-setup.exe`，SHA256 `a8113ea1c705ca27f7d814026d026ccf8d44881e76246fca5a6513683f693714`；singlebundle verifier 整体成功、双摘要读回一致、生产仿真隔离 passed。生产应用已编译，默认 NSIS cache rename 报 os error17，TEMP 同盘尝试不能解决，不能说 TEMP 是根因；依官方 CLI schema 的 `bundle.useLocalToolsDir` 与仓库 `build-local-input-candidate.ps1` 现成契约，临时 overlay `{useLocalToolsDir:true,createUpdaterArtifacts:false}` 用 `pnpm tauri bundle --bundles nsis --config target/dev/personal-branding/identity-bundle-config.json` 打包已编译 EXE/dist，整体 exit0。发布签名附件不属于本地包；没有私钥/签名生成、永久配置修改或 updater 重做。cache 为 `target/.tauri/` 的既有构建工具职责，非源码快照。官方实现参考 [NSIS bundler](https://github.com/tauri-apps/tauri/blob/dev/crates/tauri-bundler/src/bundle/windows/nsis/mod.rs)，实际配置支持以当前 CLI schema 和本地脚本为准。
+
+**passed**：旧 App20912 精确身份正常事件退出、WaitForExit 后提权 `/P /UPDATE`。最终已装/构建 EXE 完整 hash 均 `1EABAEA3863079E5F6AD48B4BCBF60DFC9620F19D35BD79E90BD28D0A044C8C5`，19,731,968 bytes，均已是 NSS 标记；重复 bundle 的 UNK 不存在 warning 已以真实标记/完整载荷一致读回闭环。两个现行自有新名链接 target=current 且 COM Description 为空，没有旧长标语，不新增链接迁移。
+
+**passed**：最终 App54444 实际父进程 explorer.exe46020，唯一实例、token elevation0；当前 WTS session1 flags1 解锁，收口精确目标 HWND727906 的 Offscreen=false、IsWindowVisible=true、GetForegroundWindow 实际匹配。精确主窗/完整设置截图像素为“个人版”；同最终现包欢迎页实际展示后 CloseMainWindow/WaitForExit 正常取消；tray 新图/menu 像素及 Shell 托盘按钮实际 Name=无线麦·个人版已观察。一次 hover 探针未取到 tooltip popup，不能称该独立 popup 截图 passed；短 tooltip 的真实Shell UIA读回与现行运行代码吻合，不用资源替代设置/主窗像素。COM 首次启动的 parent=pwsh 不作为 Explorer 通过；sandbox“无进程”查询不足主机结论，实际主机仍有52792，精确身份正常退出确认后才 Explorer 启动54444，无强杀/重复实例。
+
+**passed**：本轮覆盖/启动后3文件23既有字段与字节hash保持。本轮图证据 `identity-settings-visible.png`（同时覆盖主窗标题）、`identity-installer-visible.png`、`identity-tray-visible.png`、`identity-tray-menu-visible.png`，及 `identity-settings-visible.json`、`identity-startup.json`、`identity-final-state.json`、`identity-shortcut-readback.json`、`identity-payload-proof.json`、`identity-config-result.json`、`identity-install-result.json` 和 `identity-installer-cancel-result.json`，均在原 `target/dev/personal-branding/`。旧图文件没有改作新候选。保留短标语红绿/失败最小上下文、必要图像/读回及本地打包overlay至本候选被替换或不再需要复核；重复成功输出、失败hover探针和临时同盘temp回收，本地tools缓存按既有构建缓存职责保留。未提交、推送、上传或发布。
+
 ## 验证目标
 
 确认"应用正在运行"时执行安装或卸载**不会强杀应用**，而是：

@@ -20,13 +20,12 @@ mod onboarding;
 mod platform;
 mod rc003_task;
 mod settings;
-mod shortcut_icons;
 mod startup;
 mod updater;
 
 use diagnostics::DiagnosticReport;
 use platform::PlatformRuntime;
-use sayall_core::{AppIconIdentifier, ThemePreference, VoiceInputTool};
+use sayall_core::{ThemePreference, VoiceInputTool};
 use updater::{
     check_app_update, get_app_update_preferences, install_app_update, set_app_update_preferences,
 };
@@ -227,7 +226,7 @@ fn application_startup_settings(
 /// 界面未能正常显示时写进窗口标题的文案（2026-10-07 定稿，见 docs/product-copy.md）。
 /// 放在 Rust 是因为界面已经不工作时它也必须能显示，与托盘菜单文案同理。
 #[cfg(windows)]
-const WEBVIEW_UNAVAILABLE_TITLE: &str = "无线麦 SayAll 界面未能正常显示，请从托盘退出后重开";
+const WEBVIEW_UNAVAILABLE_TITLE: &str = "无线麦 · 个人版界面未能正常显示，请从托盘退出后重开";
 
 /// 判定宽限期：前端每秒报到一次，连续 5 秒没有信号才认定界面没有回来。
 /// 窗口收进托盘时 WebView 会把定时器节流，可能误判为"没回来"；页面一旦恢复
@@ -994,7 +993,7 @@ fn get_diagnostic_report(
 ///
 /// 路径来自日志初始化的**实际**落盘路径，不接受前端传入：否则等于把"用
 /// ShellExecuteW 打开任意路径"的能力交给 WebView，与本仓库 capabilities 的
-/// 最小权限设计（opener 只放行 VB-CABLE 官网、产品官网与源码仓库三个固定
+/// 最小权限设计（opener 只放行仍需使用的第三方工具公开入口，固定
 /// URL，见 capabilities/default.json）直接冲突。
 ///
 /// 目录不存在时先创建：日志初始化理论上已建好父目录（`create_dir_all`），
@@ -1131,25 +1130,6 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
         started.elapsed().as_millis()
     ));
     result
-}
-
-/// 设置页「应用图标」的当前选择（默认内置应用图标）。
-#[tauri::command]
-fn get_app_icon(state: tauri::State<'_, AppState>) -> Result<AppIconIdentifier, String> {
-    state.settings.load().map(|settings| settings.app_icon)
-}
-
-/// 切换应用图标：先落盘，再应用到主窗口（任务栏 / Alt-Tab）与托盘图标；
-/// 认不出的 ID 与资产缺失都在应用层回落 `standard` 并落日志。
-#[tauri::command]
-fn set_app_icon(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    identifier: AppIconIdentifier,
-) -> Result<AppIconIdentifier, String> {
-    state.settings.save_app_icon(identifier)?;
-    let applied = app_icon::apply(&app, identifier);
-    Ok(applied)
 }
 
 #[tauri::command]
@@ -4618,7 +4598,7 @@ pub fn run() {
                     .icon(icon)
                     .menu(&menu)
                     .show_menu_on_left_click(false)
-                    .tooltip("无线麦 SayAll")
+                    .tooltip("无线麦 · 个人版")
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "tray-show" => show_main_window(app, "tray_menu"),
                         "tray-quit" => request_clean_exit(app.clone(), 0),
@@ -4667,7 +4647,7 @@ pub fn run() {
             // 应用图标（2026-10-02）：托盘刚用内置图标建成，这里按持久化选择把
             // 主窗口（任务栏 / Alt-Tab）与托盘图标一起换成用户选的那一个。
             #[cfg(windows)]
-            app_icon::apply(app.handle(), saved_settings.app_icon);
+            app_icon::apply(app.handle());
             // 启动时把持久化偏好同步到 Windows 当前用户登录启动项；失败只记录，
             // 不阻断主程序启动，用户可在“关于”页重试。
             #[cfg(all(windows, not(feature = "runtime-simulation")))]
@@ -5041,8 +5021,6 @@ pub fn run() {
         get_launch_at_login,
         set_launch_at_login,
         report_theme_result,
-        get_app_icon,
-        set_app_icon,
         get_app_update_preferences,
         set_app_update_preferences,
         check_app_update,
@@ -5150,8 +5128,6 @@ pub fn run() {
         get_launch_at_login,
         set_launch_at_login,
         report_theme_result,
-        get_app_icon,
-        set_app_icon,
         get_app_update_preferences,
         set_app_update_preferences,
         check_app_update,
@@ -5888,6 +5864,37 @@ mod lifecycle_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn personal_branding_keeps_install_identity() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["productName"], "无线麦");
+        assert_eq!(config["bundle"]["publisher"], "luck-gh");
+        assert_eq!(config["identifier"], "app.getsayall.remote-mic.windows");
+        assert_eq!(
+            config["bundle"]["windows"]["nsis"]["startMenuFolder"],
+            "无线麦"
+        );
+        let installer = include_str!("../windows/installer.nsi");
+        assert!(installer.contains("!define INSTALLIDENTITY \"无线麦 SayAll\""));
+        assert!(installer.contains("!define MANUKEY \"Software\\GetSayAll\""));
+        assert!(installer.contains("Uninstall\\${INSTALLIDENTITY}"));
+        assert!(installer.contains("$LOCALAPPDATA\\${INSTALLIDENTITY}"));
+    }
+    #[test]
+    fn personal_installer_preserves_shortcut_choices_and_updates_existing_links() {
+        let installer = include_str!("../windows/installer.nsi");
+        let hooks = include_str!("../windows/installer-hooks.nsh");
+        assert!(!installer.contains("StrCpy $AppStartMenuFolder \"${STARTMENUFOLDER}\""));
+        assert!(installer.contains("${AndIf} $SayAllRestoreStartMenuShortcut = 0"));
+        assert!(installer.contains("${AndIf} $SayAllRestoreDesktopShortcut = 0"));
+        for line in hooks
+            .lines()
+            .filter(|line| line.contains("MessageBox") || line.trim_start().starts_with("Abort"))
+        {
+            assert!(!line.contains("SayAll"), "old display branding: {line}");
+        }
+    }
+    #[test]
     fn startup_settings_never_restore_enhancement_after_load_failure() {
         let failure = super::application_startup_settings(Err("invalid settings".to_owned()));
         assert!(!failure.rc003_capture_enabled);
@@ -6213,7 +6220,7 @@ mod ui_hint_tests {
     fn ui_hint_copy_follows_the_product_naming_rules() {
         assert_eq!(
             WEBVIEW_UNAVAILABLE_TITLE,
-            "无线麦 SayAll 界面未能正常显示，请从托盘退出后重开"
+            "无线麦 · 个人版界面未能正常显示，请从托盘退出后重开"
         );
         for banned in ["注入", "进程", "重载", "钩子", "提权", "端口"] {
             assert!(
@@ -6222,8 +6229,8 @@ mod ui_hint_tests {
             );
         }
         assert!(
-            WEBVIEW_UNAVAILABLE_TITLE.contains("无线麦 SayAll"),
-            "产品名必须用名称表写法（含空格）"
+            WEBVIEW_UNAVAILABLE_TITLE.contains("无线麦 · 个人版"),
+            "产品名必须明确个人版身份"
         );
     }
     #[test]

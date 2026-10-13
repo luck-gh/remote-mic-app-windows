@@ -7,10 +7,7 @@ import {
   chordLabel,
   connectionPhaseLabel,
   formatDiagnosticReport,
-  GITHUB_REPOSITORY_URL,
   isRecommendedVoiceEndpoint,
-  OFFICIAL_WEBSITE_URL,
-  openGitHubRepository,
   openLogDirectory,
   openOfficialWebsite,
   openVbCableDownloadPage,
@@ -204,44 +201,26 @@ describe("VB-CABLE download guidance", () => {
   });
 });
 
-describe("设置页外部入口（官网 / GitHub）", () => {
+describe("设置页移除普通官方入口，同时保留必要第三方链接", () => {
   afterEach(() => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.mocked(openUrl).mockReset();
   });
 
-  it("指向已确认的官网与 Windows 仓库地址", () => {
-    // 2026-10-02 用户指定：官网入口带 `?from=win` 来源标记，便于官网区分来客。
-    expect(OFFICIAL_WEBSITE_URL).toBe("https://sayall.app/?from=win");
-    expect(GITHUB_REPOSITORY_URL).toBe("https://github.com/GetSayAll/remote-mic-app-windows");
-  });
-
-  it("浏览器预览下用新标签打开，不调用 Tauri opener", async () => {
+  it("保留 VB-CABLE 与 Vokie 的公开入口", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
 
-    await openOfficialWebsite();
-    await openGitHubRepository();
+    await openVbCableDownloadPage();
+    await openVokieHomepage();
 
-    expect(open).toHaveBeenNthCalledWith(1, OFFICIAL_WEBSITE_URL, "_blank", "noopener,noreferrer");
-    expect(open).toHaveBeenNthCalledWith(2, GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer");
+    expect(VB_CABLE_DOWNLOAD_URL).toBe("https://vb-audio.com/Cable/");
+    expect(VOKIE_HOMEPAGE_URL).toBe("https://vokie.com/");
+    expect(open).toHaveBeenNthCalledWith(1, VB_CABLE_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
+    expect(open).toHaveBeenNthCalledWith(2, VOKIE_HOMEPAGE_URL, "_blank", "noopener,noreferrer");
     expect(openUrl).not.toHaveBeenCalled();
     open.mockRestore();
   });
 
-  it("Tauri 运行时交给 opener 插件，地址必须与 capability 白名单逐字一致", async () => {
-    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-    vi.mocked(openUrl).mockResolvedValue(undefined);
-
-    await openOfficialWebsite();
-    await openGitHubRepository();
-
-    // 传出的字符串与 src-tauri/capabilities/default.json 的 allow 列表是同一份
-    // 契约：多一个字符、少一个尾斜杠都会被插件判为 ForbiddenUrl。
-    expect(vi.mocked(openUrl).mock.calls.map(([url]) => url)).toEqual([
-      OFFICIAL_WEBSITE_URL,
-      GITHUB_REPOSITORY_URL,
-    ]);
-  });
 });
 
 describe("诊断日志目录入口", () => {

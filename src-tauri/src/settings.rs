@@ -1,6 +1,5 @@
 use sayall_core::{
-    normalize_gain_db, AppIconIdentifier, AppSettings, ThemePreference, UsageStatistics,
-    VoiceInputTool,
+    normalize_gain_db, AppSettings, ThemePreference, UsageStatistics, VoiceInputTool,
 };
 use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord, KeyCode};
 use sayall_windows::templates::{
@@ -177,11 +176,6 @@ impl SettingsStore {
     }
 
     /// 应用图标（设置页「应用图标」，2026-10-02）。
-    pub fn save_app_icon(&self, identifier: AppIconIdentifier) -> Result<(), String> {
-        self.update("保存应用图标设置", move |settings| {
-            settings.app_icon = identifier;
-        })
-    }
 
     /// 连接页显式选择的输入工具；None 保持未选择，不因初始化或读取失败写盘。
     pub fn save_voice_input_tool(&self, tool: Option<VoiceInputTool>) -> Result<(), String> {
@@ -1983,33 +1977,24 @@ mod tests {
         assert_eq!(decoded.theme_preference, ThemePreference::System);
     }
 
-    // 上游图标选择迁移不覆盖本地已确认的图标契约。
     #[test]
-    fn app_icon_keeps_existing_choice_without_upstream_migration() {
+    fn retired_icon_choice_does_not_reset_saved_settings() {
         let path = std::env::temp_dir().join(format!(
-            "sayall-test-app-icon-migration-{}.json",
+            "sayall-test-retired-icon-{}.json",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&path);
-        std::fs::write(
-            &path,
-            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold","app_icon":"standard"}"#,
-        )
-        .unwrap();
+        std::fs::write(&path,
+            r#"{"schema_version":3,"gain_db":12.0,"voice_trigger_mode":"hold","app_icon":"standard","theme_preference":"dark"}"#,
+        ).unwrap();
         let store = SettingsStore::new(path.clone());
-
-        // 已保存的选择保持。
-        assert_eq!(store.load().unwrap().app_icon, AppIconIdentifier::Standard);
-
-        // 新版本里选择「默认」并落盘：带新代次，之后读回保持。
-        store.save_app_icon(AppIconIdentifier::Standard).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        // 配置文件是 pretty JSON（键冒号后有空格），用解析而不是子串比对。
-        let persisted: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(persisted["schema_version"], serde_json::json!(3));
-        assert_eq!(persisted["app_icon"], serde_json::json!("standard"));
-        assert_eq!(store.load().unwrap().app_icon, AppIconIdentifier::Standard);
-
+        let settings = store.load().unwrap();
+        assert_eq!(settings.gain_db, 12.0);
+        assert_eq!(settings.theme_preference, ThemePreference::Dark);
+        store.save_gain_db(settings.gain_db).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.get("app_icon").is_none());
+        assert_eq!(store.load().unwrap().gain_db, 12.0);
         let _ = std::fs::remove_file(path);
     }
 

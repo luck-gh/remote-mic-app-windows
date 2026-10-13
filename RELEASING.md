@@ -66,7 +66,17 @@
   `package_info().version` 与 config 一致（删掉 config 的 `version` 会同时丢掉 exe 的
   版本资源并让测试失败）；`generate-updater-manifest.ps1` 继续强制 Tag 与 config 版本一致。
 
+## 个人版交付（2026-10-06）
+
+本地修改版显示“无线麦 · 个人版”，发布者为 `luck-gh`；保留原 GPL-3.0-only、版权、来源及第三方许可。安装注册键、默认目录、包/IPC identifier 和配置位置保留历史技术身份，显示文案与这些键分离；旧品牌快捷方式仅在公开 Shell 校验指向当前精确安装程序后送入回收站，不处理其他目标。
+
+未来向朋友或其他接收者分发二进制时，必须随该精确修改版提供完整对应源码、构建及安装脚本和许可声明，不能仅指向未修改的上游仓库。网络分发方式须满足 [GNU GPL v3 第 6 节](https://www.gnu.org/licenses/gpl-3.0.html) 的对应源码获取要求；来源版本一致不要求二进制哈希可重复。本轮仅本地验证，不创建源码快照、Tag、Release 或上传；没有分发授权。商标权未核实，个人标记不代表已获得名称授权。
+
 ## 本地安装与升级
+
+- 本地包构建明确设置 `SAYALL_BUILD_CHANNEL=local` 与 `SAYALL_BUNDLE_BUILD=1`；后一变量开启 staging 回执门禁，不能用 `GITHUB_SHA` 或仅设置通道替代。日常 Cargo check/test 不要求包载荷回执。
+- 当前本地 Tauri 前端输入目录为仓库根目录 `dist`。`scripts/build-local-input-candidate.ps1` 与 `scripts/build-local-test-package.ps1` 必须先构建当前 Vite 输出，再共用 `verify-frontend-embedded` 内容门禁：将 fresh HTML/资源回执与实际 EXE 的唯一压缩载荷、解压内容及 HTML 脚本引用逐字节核对。不要用旧 `dist-build`、检查配置路径字符串或旧回执代替内容核验；门禁失败时禁止继续把包当作当前前端候选。2026-10-13 B8 旧包因 `dist`/`dist-build` 输入不一致被新门禁以 `compiler_input_mismatch` 拒绝；门禁12项通过后新本地 NSIS 仍需单独完成安装和实际 Explorer 运行读回。
+- 身份记录区分 `sourceBaseCommit`、`sourceState`、`sourceFingerprint` 与 `sourceCommit`；dirty/unknown 的 `sourceCommit=null`。打包指纹纳入约定源码输入与本轮回执中实际载荷字节，不提交未提交修改，也不创建源码副本。安装后从实际进程日志读回五个身份字段，并对照 manifest、包 metadata、普通权限实例与安装载荷；具体字段契约见 [LOGGING](LOGGING.md#行格式与诊断头)。
 
 - 双击安装包发现已有安装时，提供“安装前卸载”和“请勿卸载”：前者正常退出应用、用当前包生成的卸载器移除产品文件后自动继续安装，后者直接覆盖。两者均保留原安装目录、设置、按键映射和启动偏好。静默 `/S` 与被动更新 `/P /UPDATE` 默认覆盖；系统“已安装的应用”及独立 `uninstall.exe` 仍提供卸载。
 - 当前用户安装采用 `RequestExecutionLevel highest`：管理员的同账户提升令牌可写受保护安装目录，真正的标准账户仍使用普通权限，不通过其他管理员身份改写 HKCU。安装前检查目标目录或最近已存在父目录的写入权限；权限不足时在请求退出和卸载之前停止。完成页及 `/R` 仍通过 `RunAsUser` 启动普通权限主程序。

@@ -2,6 +2,10 @@
 
 Copyright (C) 2026 HD838A. All rights reserved.
 
+## 个人修改版范围说明（2026-10-06）
+
+以下 HD838A 版权和许可条款保持，适用于上游原品牌图像及其衍生物。2026-10-06 起本个人修改版的同名 UI/favicon/bundle 图标已由独立“轻放”母版替换，不能仅凭文件路径把新图归为上游专有作品。新设计来源与贡献范围见 [ATTRIBUTION.md](ATTRIBUTION.md#app-logo-版权)；原 `src-tauri/icons/icon-source.png` 只保留历史取证，不用于本版展示。本说明不声称获得商标权，不修改原资产许可。
+
 ## 适用范围
 
 本许可适用于无线麦 SayAll Windows 版的 App Logo、App Icon 及由其生成或演绎的图像资产，包括：

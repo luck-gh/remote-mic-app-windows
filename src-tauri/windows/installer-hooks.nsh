@@ -10,6 +10,8 @@ Var SayAllReinstall
 Var SayAllPreviousInstallDirectory
 Var SayAllReinstallRadio
 Var SayAllOverlayRadio
+Var SayAllRestoreStartMenuShortcut
+Var SayAllRestoreDesktopShortcut
 
 ; One current-run result, using fixed event/component identifiers only. Logging
 ; is best-effort and preserves the caller's error flag and process error level.
@@ -167,7 +169,7 @@ Var SayAllOverlayRadio
       sayall_timeout_${_uid}:
         SetErrorLevel ${SAYALL_LEGACY_RUNNING_ERROR_LEVEL}
         ${IfNot} ${Silent}
-          MessageBox MB_ICONINFORMATION|MB_OK "无线麦仍在完成退出清理，本次安装已停止。请待应用正常退出后重试。$\r$\nSayAll is still cleaning up. Installation has stopped without terminating it."
+          MessageBox MB_ICONINFORMATION|MB_OK "无线麦仍在完成退出清理，本次安装已停止。请待应用正常退出后重试。$\r$\nWireless Mic is still cleaning up. Installation has stopped without terminating it."
         ${EndIf}
         Abort
       sayall_done_${_uid}:
@@ -183,7 +185,7 @@ Var SayAllOverlayRadio
       ${If} ${Silent}
         SetErrorLevel ${SAYALL_LEGACY_RUNNING_ERROR_LEVEL}
       ${Else}
-        MessageBox MB_ICONINFORMATION|MB_OK "正在运行的无线麦是较早的版本，直接覆盖安装会中断蓝牙链路。$\r$\n请打开无线麦，在「设置」里点「检查更新」完成升级（应用会自己断开蓝牙并重启）。$\r$\n$\r$\nSayAll is running an older build. Please upgrade from Settings → Check for updates inside the app."
+        MessageBox MB_ICONINFORMATION|MB_OK "正在运行的无线麦是较早的版本，直接覆盖安装会中断蓝牙链路。$\r$\n请打开无线麦，在「设置」里点「检查更新」完成升级（应用会自己断开蓝牙并重启）。$\r$\n$\r$\nWireless Mic is running an older build. Please upgrade from Settings → Check for updates inside the app."
       ${EndIf}
       Abort
     ${EndIf}
@@ -232,7 +234,7 @@ Var SayAllOverlayRadio
   Pop $R9
   ${If} $R9 = 0
     SetErrorLevel 1639
-    Abort "SayAll restarted during cleanup. Installation stopped."
+    Abort "Wireless Mic restarted during cleanup. Installation stopped."
   ${EndIf}
 !macroend
 
@@ -360,7 +362,7 @@ Var SayAllOverlayRadio
 !macro SayAllValidateUpgrade
   StrCpy $SayAllInstallStage platform_check
   ${IfNot} ${AtLeastBuild} ${SAYALL_MINIMUM_WINDOWS_BUILD}
-    MessageBox MB_ICONSTOP|MB_OK "无线麦 SayAll 需要 Windows 10 1809（内部版本 17763）或更高版本。$\r$\nSayAll requires Windows 10 1809 (build 17763) or later."
+    MessageBox MB_ICONSTOP|MB_OK "无线麦 需要 Windows 10 1809（内部版本 17763）或更高版本。$\r$\nWireless Mic requires Windows 10 1809 (build 17763) or later."
     !insertmacro SayAllLogInstallResult a failed platform_check
     SetErrorLevel 1633
     Quit
@@ -375,7 +377,7 @@ Var SayAllOverlayRadio
     Pop $R9
     ${If} $R9 = -1
       ${IfNot} ${Silent}
-        MessageBox MB_ICONSTOP|MB_OK "已安装较新版本的无线麦 SayAll，不能用此旧版本覆盖。$\r$\nA newer version of SayAll is already installed. This older installer cannot replace it."
+        MessageBox MB_ICONSTOP|MB_OK "已安装较新版本的无线麦，不能用此旧版本覆盖。$\r$\nA newer version of Wireless Mic is already installed. This older installer cannot replace it."
       ${EndIf}
       SetErrorLevel ${SAYALL_DOWNGRADE_ERROR_LEVEL}
       !insertmacro SayAllLogInstallResult a failed version_check
@@ -406,11 +408,39 @@ Var SayAllOverlayRadio
   ReadRegStr $R8 HKLM "${SAYALL_VB_CABLE_SERVICE_KEY}" "DisplayName"
   ${If} $R8 == ""
     ${IfNot} ${Silent}
-      MessageBox MB_ICONINFORMATION|MB_YESNO "无线麦需要 VB-CABLE 把遥控器语音传给输入法和语音软件。VB-CABLE 由 VB-Audio 提供，属于 Donationware，安装需要管理员权限，完成后必须重启 Windows。$\r$\n$\r$\n是否现在打开 VB-CABLE 官方下载页面？$\r$\n$\r$\nSayAll requires VB-CABLE for speech input. Installation requires administrator permission and a Windows restart. Open the official download page now?" IDYES sayall_vb_cable_open IDNO sayall_vb_cable_done
+      MessageBox MB_ICONINFORMATION|MB_YESNO "无线麦需要 VB-CABLE 把遥控器语音传给输入法和语音软件。VB-CABLE 由 VB-Audio 提供，属于 Donationware，安装需要管理员权限，完成后必须重启 Windows。$\r$\n$\r$\n是否现在打开 VB-CABLE 官方下载页面？$\r$\n$\r$\nWireless Mic requires VB-CABLE for speech input. Installation requires administrator permission and a Windows restart. Open the official download page now?" IDYES sayall_vb_cable_open IDNO sayall_vb_cable_done
 sayall_vb_cable_open:
       ExecShell "open" "${SAYALL_VB_CABLE_DOWNLOAD_URL}"
 sayall_vb_cable_done:
     ${EndIf}
   ${EndIf}
   Pop $R8
+!macroend
+
+!macro SayAllRecycleRetiredShortcuts
+  InitPluginsDir
+  StrCpy $SayAllInstallStage shortcut_recycler
+  ClearErrors
+  File /oname=$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1 "${SAYALL_RETIRED_RECYCLER}"
+  !insertmacro SayAllRequireWriteSuccess shortcut_recycler
+  StrCpy $SayAllInstallStage shortcut_cleanup
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1" -InstallDirectory "$INSTDIR" -Shortcuts -ProgramsDirectory "$SMPROGRAMS" -DesktopDirectory "$DESKTOP" -SelectedStartMenuFolder "$AppStartMenuFolder" -RestoreCustom "$UpdateMode" -NoShortcuts "$NoShortcutMode"'
+  Pop $R8
+  Pop $R9
+  DetailPrint "$R9"
+  ${If} $R8 != 0
+  ${AndIf} $R8 != 1
+  ${AndIf} $R8 != 2
+  ${AndIf} $R8 != 3
+    !insertmacro SayAllLogInstallResult a failed shortcut_cleanup
+    SetErrorLevel 1603
+    Abort "Previous shortcuts could not be recycled. No permanent deletion was attempted."
+  ${EndIf}
+  IntOp $SayAllRestoreStartMenuShortcut $R8 & 1
+  IntOp $SayAllRestoreDesktopShortcut $R8 & 2
+  ${If} $AppStartMenuFolder == ""
+  ${AndIf} $SayAllRestoreStartMenuShortcut = 1
+    StrCpy $AppStartMenuFolder "无线麦"
+  ${EndIf}
+  !insertmacro SayAllLogInstallResult a completed shortcut_cleanup
 !macroend

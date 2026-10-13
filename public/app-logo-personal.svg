@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">无线麦 · 轻放</title>
+  <desc id="description">个人 fork 的独立 logo 设计：小遥控器从舒展的薄荷绿轨迹中轻扬，指向暖橙色 AI 星芒，表达放下键盘、用声音与遥控器发出指令。本设计尚未替换应用现有图标。</desc>
+  <!-- Independently drawn vector artwork for the personal fork; no embedded images or fonts. -->
+  <rect x="8" y="8" width="496" height="496" rx="112" fill="#123B3E"/>
+  <!-- An open, rising gesture: freedom from the desk, rather than a closed badge. -->
+  <path d="M108 271C91 319 104 363 141 392C190 430 257 420 310 368C263 398 214 399 180 372C151 349 134 313 129 276C128 264 112 260 108 271Z" fill="#71DFC0"/>
+  <!-- The navigation ring and microphone key make the silhouette read as a remote. -->
+  <g transform="translate(251 274) rotate(28)">
+    <rect x="-62" y="-143" width="124" height="290" rx="56" fill="#F5F8E9"/>
+    <circle cy="-59" r="38" fill="#123B3E"/>
+    <circle cy="-59" r="16" fill="#71DFC0"/>
+    <rect x="-22" y="7" width="44" height="65" rx="22" fill="#123B3E"/>
+    <rect x="-5" y="20" width="10" height="21" rx="5" fill="#F5F8E9"/>
+    <path d="M-11 35V38A11 11 0 0 0 11 38V35M0 49V56M-6 56H6" fill="none" stroke="#F5F8E9" stroke-width="4" stroke-linecap="round"/>
+    <rect x="-15" y="107" width="30" height="7" rx="3.5" fill="#123B3E"/>
+  </g>
+  <!-- A responsive AI spark, aligned with the direction of the remote. -->
+  <path d="M363 66C370 98 379 108 411 115C379 122 370 132 363 164C356 132 347 122 315 115C347 108 356 98 363 66Z" fill="#FFBA7A"/>
+</svg>

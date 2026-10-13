@@ -42,6 +42,8 @@ ${StrLoc}
 
 !define MANUFACTURER "{{manufacturer}}"
 !define PRODUCTNAME "{{product_name}}"
+; Stable installation identity; display branding is independent.
+!define INSTALLIDENTITY "无线麦 SayAll"
 !define VERSION "{{version}}"
 !define VERSIONWITHBUILD "{{version_with_build}}"
 !define HOMEPAGE "{{homepage}}"
@@ -66,9 +68,9 @@ ${StrLoc}
 !define WEBVIEW2BOOTSTRAPPERPATH "{{webview2_bootstrapper_path}}"
 !define WEBVIEW2INSTALLERPATH "{{webview2_installer_path}}"
 !define MINIMUMWEBVIEW2VERSION "{{minimum_webview2_version}}"
-!define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
-!define MANUKEY "Software\${MANUFACTURER}"
-!define MANUPRODUCTKEY "${MANUKEY}\${PRODUCTNAME}"
+!define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${INSTALLIDENTITY}"
+!define MANUKEY "Software\GetSayAll"
+!define MANUPRODUCTKEY "${MANUKEY}\${INSTALLIDENTITY}"
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 !define STARTMENUFOLDER "{{start_menu_folder}}"
@@ -85,7 +87,7 @@ OutFile "${OUTFILE}"
 ; We don't actually use this value as default install path,
 ; it's just for nsis to append the product name folder in the directory selector
 ; https://nsis.sourceforge.io/Reference/InstallDir
-!define PLACEHOLDER_INSTALL_DIR "placeholder\${PRODUCTNAME}"
+!define PLACEHOLDER_INSTALL_DIR "placeholder\${INSTALLIDENTITY}"
 InstallDir "${PLACEHOLDER_INSTALL_DIR}"
 
 VIProductVersion "${VERSIONWITHBUILD}"
@@ -116,7 +118,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 
 !if "${INSTALLMODE}" == "both"
   !define MULTIUSER_MUI
-  !define MULTIUSER_INSTALLMODE_INSTDIR "${PRODUCTNAME}"
+  !define MULTIUSER_INSTALLMODE_INSTDIR "${INSTALLIDENTITY}"
   !define MULTIUSER_INSTALLMODE_COMMANDLINE
   !if "${ARCH}" == "x64"
     !define MULTIUSER_USE_PROGRAMFILES64
@@ -196,13 +198,13 @@ Function SayAllReinstallPage
     StrCpy $SayAllReinstall 0
     Abort
   ${EndIf}
-  !insertmacro MUI_HEADER_TEXT "已安装无线麦 SayAll" "请选择本次安装方式。两种方式都会保留用户设置。"
+  !insertmacro MUI_HEADER_TEXT "已安装无线麦" "请选择本次安装方式。两种方式都会保留用户设置。"
   nsDialogs::Create 1018
   Pop $0
   ${If} $0 == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 0 0 100% 28u "已检测到无线麦 SayAll。开始安装后会先请求正在运行的应用正常退出。"
+  ${NSD_CreateLabel} 0 0 100% 28u "已检测到无线麦。开始安装后会先请求正在运行的应用正常退出。"
   Pop $0
   ${NSD_CreateRadioButton} 0 38u 100% 14u "安装前卸载"
   Pop $SayAllReinstallRadio
@@ -351,17 +353,17 @@ Function .onInit
     !if "${INSTALLMODE}" == "perMachine"
       ${If} ${RunningX64}
         !if "${ARCH}" == "x64"
-          StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"
+          StrCpy $INSTDIR "$PROGRAMFILES64\${INSTALLIDENTITY}"
         !else if "${ARCH}" == "arm64"
-          StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"
+          StrCpy $INSTDIR "$PROGRAMFILES64\${INSTALLIDENTITY}"
         !else
-          StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
+          StrCpy $INSTDIR "$PROGRAMFILES\${INSTALLIDENTITY}"
         !endif
       ${Else}
-        StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
+        StrCpy $INSTDIR "$PROGRAMFILES\${INSTALLIDENTITY}"
       ${EndIf}
     !else if "${INSTALLMODE}" == "currentUser"
-      StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
+      StrCpy $INSTDIR "$LOCALAPPDATA\${INSTALLIDENTITY}"
     !endif
 
     Call RestorePreviousInstallLocation
@@ -573,6 +575,9 @@ Section Install
     WriteRegStr SHCTX "${UNINSTKEY}" "HelpLink" "${HOMEPAGE}"
   !endif
 
+  ; Retire only old branded links targeting this exact installation.
+  !insertmacro SayAllRecycleRetiredShortcuts
+
   ; Create start menu shortcut
   !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
     Call CreateOrUpdateStartMenuShortcut
@@ -731,7 +736,7 @@ Section Uninstall
   ; If it doesn't exist, it does nothing.
   ; We do this when not updating (to preserve the registry value on updates)
   ${If} $UpdateMode <> 1
-    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${INSTALLIDENTITY}"
   ${EndIf}
 
   ; Delete app data if the checkbox is selected
@@ -804,8 +809,11 @@ Function CreateOrUpdateStartMenuShortcut
   ${EndIf}
 
   ; Skip creating shortcut if in update mode or no shortcut mode.
+  ${If} $NoShortcutMode = 1
+    Return
+  ${EndIf}
   ${If} $UpdateMode = 1
-  ${OrIf} $NoShortcutMode = 1
+  ${AndIf} $SayAllRestoreStartMenuShortcut = 0
     Return
   ${EndIf}
 
@@ -830,8 +838,11 @@ Function CreateOrUpdateDesktopShortcut
   ${EndIf}
 
   ; Skip creating shortcut if in update mode or no shortcut mode.
+  ${If} $NoShortcutMode = 1
+    Return
+  ${EndIf}
   ${If} $UpdateMode = 1
-  ${OrIf} $NoShortcutMode = 1
+  ${AndIf} $SayAllRestoreDesktopShortcut = 0
     Return
   ${EndIf}
 

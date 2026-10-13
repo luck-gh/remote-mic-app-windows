@@ -66,6 +66,7 @@ test('every payload write fails closed before registry commit and retired-file c
   assert.match(hooks, /SayAllRecycleRetiredFiles/);
   assert.match(hooks, /SayAllCleanupHelper\.exe|sayall-helper\.exe/);
   assert.match(hooks, /-CleanupHelperPath/);
+  assert.match(hooks, /!macro SayAllRecycleRetiredShortcuts[^]*?File \/oname=[^\n]+\n\s*!insertmacro SayAllRequireWriteSuccess shortcut_recycler/);
   assert.doesNotMatch(hooks, /KillProcess|TerminateProcess|taskkill|Stop-Process/i);
 });
 
