@@ -1726,6 +1726,10 @@ fn show_main_window(app: &tauri::AppHandle, trigger: &str) {
     let minimized_before = window.is_minimized().unwrap_or(false);
     let iconic_before = hwnd.map(|hwnd| unsafe { IsIconic(hwnd).as_bool() });
     let visible_before = hwnd.map(|hwnd| unsafe { IsWindowVisible(hwnd).as_bool() });
+    sayall_windows::gatt_note(format!(
+        "app_lifecycle event=show_main_window trigger={trigger} phase=requested actual_foreground={}",
+        overlay_is_foreground(&window)
+    ));
 
     if minimized_before || iconic_before == Some(true) {
         let _ = window.unminimize();
@@ -3672,6 +3676,7 @@ const SCENE_OVERLAY_LABEL: &str = "scene-overlay";
 struct SceneOverlayState {
     panel_open: bool,
     interactive: bool,
+    foreground_verified: bool,
     menu_generation: Option<u64>,
     exit_after_release: Option<i32>,
     notices_enabled: bool,
@@ -3685,9 +3690,32 @@ impl SceneOverlayState {
             || self.interactive != interactive;
         self.panel_open = true;
         self.interactive = interactive;
+        if layout_required {
+            self.foreground_verified = false;
+        }
         self.menu_generation = Some(generation);
         self.visible_notice_revision = None;
         layout_required
+    }
+
+    fn record_native_menu_focus(
+        &mut self,
+        focused: bool,
+        actual_foreground: bool,
+    ) -> Option<(bool, u64)> {
+        let generation = self.menu_generation?;
+        if !self.panel_open || !self.interactive {
+            return None;
+        }
+        if focused && actual_foreground {
+            self.foreground_verified = true;
+            Some((true, generation))
+        } else if !focused && !actual_foreground && self.foreground_verified {
+            self.foreground_verified = false;
+            Some((false, generation))
+        } else {
+            None
+        }
     }
 }
 
@@ -3739,17 +3767,30 @@ fn create_scene_overlay(app: &tauri::App) -> tauri::Result<()> {
                 }
             });
         }
-        if matches!(event, tauri::WindowEvent::Focused(false)) {
-            let interactive = {
+        if let tauri::WindowEvent::Focused(focused) = event {
+            let Some(window) = handle.get_webview_window(SCENE_OVERLAY_LABEL) else {
+                return;
+            };
+            let actual_foreground = overlay_is_foreground(&window);
+            let (transition, observed_menu_generation) = {
                 let overlay = handle.state::<Mutex<SceneOverlayState>>();
                 let mut overlay = overlay.lock().unwrap_or_else(|p| p.into_inner());
-                std::mem::take(&mut overlay.interactive)
+                let generation = overlay.menu_generation;
+                let transition = overlay.record_native_menu_focus(*focused, actual_foreground);
+                (transition, generation)
             };
-            if interactive {
-                handle
-                    .state::<AppState>()
-                    .platform
-                    .set_template_menu_focus(false);
+            log_template_menu_window_state(&window, "native_focus", observed_menu_generation);
+            sayall_windows::gatt_note(format!(
+                "template_menu phase=native_focus focused={focused} observed_menu_generation={} actual_foreground={actual_foreground} cleanup_requested={}",
+                menu_generation_field(observed_menu_generation), matches!(transition, Some((false, _)))
+            ));
+            if let Some((verified, generation)) = transition {
+                handle.state::<AppState>().platform.set_template_menu_focus(
+                    verified,
+                    if verified { "native_focus_verified" } else { "native_focus_lost" },
+                    Some(generation),
+                    verified.then(|| overlay_window_id(&window)).flatten(),
+                );
             }
         }
     });
@@ -3805,6 +3846,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
         SceneEvent::Snapshot { .. } if state.panel_open => {
             state.panel_open = false;
             state.interactive = false;
+            state.foreground_verified = false;
             state.menu_generation = None;
             "hide"
         }
@@ -3834,6 +3876,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
         return;
     };
     let interactive = state.interactive;
+    let observed_menu_generation = state.menu_generation;
     let restore_target = mode == "hide" && was_interactive && overlay_is_foreground(&window);
     let deferred_exit = if mode == "hide" {
         state.exit_after_release.take()
@@ -3907,19 +3950,51 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
     if mode == "hide" && result.is_ok() {
         // A nonforeground hide need not raise a native focus event. Complete
         // the return-target lifecycle explicitly once the window is hidden.
-        app.state::<AppState>()
-            .platform
-            .set_template_menu_focus(false);
+        app.state::<AppState>().platform.set_template_menu_focus(
+            false,
+            "hide_completed",
+            previous_menu_generation,
+            None,
+        );
     }
     if interactive && !was_interactive {
-        let requested = result.is_ok() && activate_template_menu(&window);
-        let verified = requested && overlay_is_foreground(&window);
-        app.state::<AppState>()
-            .platform
-            .set_template_menu_focus(verified);
+        let window_operation_passed = result.is_ok();
+        let (activation_api_result, verified, actual_foreground) =
+            template_menu_foreground_readback(
+                window_operation_passed,
+                || activate_template_menu(&window),
+                || overlay_is_foreground(&window),
+            );
+        {
+            let overlay = app.state::<Mutex<SceneOverlayState>>();
+            let mut overlay = overlay.lock().unwrap_or_else(|p| p.into_inner());
+            if overlay.menu_generation == observed_menu_generation && overlay.interactive {
+                overlay.foreground_verified = verified;
+            }
+        }
+        let requested = activation_api_result == Some(true);
+        let activation_attempted = activation_api_result.is_some();
+        let activation_api_result = match activation_api_result {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "not_attempted",
+        };
+        log_template_menu_window_state(&window, "activation_result", observed_menu_generation);
+        // Record the request and observation before focus cleanup emits another snapshot.
         sayall_windows::gatt_note(format!(
-            "template_menu phase=foreground_verified requested={requested} result={verified} before={role_before} after={} request_count={}", scene_foreground_role(app), usize::from(result.is_ok())
+            "template_menu phase=foreground_verified observed_menu_generation={} window_operation_passed={window_operation_passed} activation_attempted={activation_attempted} activation_api_result={activation_api_result} requested={requested} actual_foreground={actual_foreground} result={verified} before={role_before} after={} request_count={}",
+            menu_generation_field(observed_menu_generation), scene_foreground_role(app), usize::from(activation_attempted)
         ));
+        app.state::<AppState>().platform.set_template_menu_focus(
+            verified,
+            if window_operation_passed {
+                "activation_result"
+            } else {
+                "window_operation_failed"
+            },
+            observed_menu_generation,
+            verified.then(|| overlay_window_id(&window)).flatten(),
+        );
     }
     sayall_windows::gatt_note(format!(
         "scene_overlay action={} terminal_result={} reason={}",
@@ -3947,10 +4022,70 @@ fn restore_before_hide(
     }
 }
 
-fn activate_template_menu(window: &tauri::WebviewWindow) -> bool {
+fn template_menu_foreground_readback(
+    window_operation_passed: bool,
+    activate: impl FnOnce() -> Option<bool>,
+    readback: impl FnOnce() -> bool,
+) -> (Option<bool>, bool, bool) {
+    let activation_api_result = if window_operation_passed {
+        activate()
+    } else {
+        None
+    };
+    let observed = readback();
+    (
+        activation_api_result,
+        window_operation_passed && observed,
+        observed,
+    )
+}
+
+fn menu_generation_field(generation: Option<u64>) -> String {
+    generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn log_template_menu_window_state(
+    window: &tauri::WebviewWindow,
+    reason: &'static str,
+    observed_menu_generation: Option<u64>,
+) {
     #[cfg(windows)]
     {
-        window.hwnd().is_ok_and(|hwnd| unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE,
+            WS_EX_NOACTIVATE,
+        };
+        if let Ok(hwnd) = window.hwnd() {
+            let hwnd = HWND(hwnd.0);
+            let (visible, minimized, no_activate, caller_is_window_thread) = unsafe {
+                (
+                    IsWindowVisible(hwnd).as_bool(),
+                    IsIconic(hwnd).as_bool(),
+                    GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0 != 0,
+                    GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, None),
+                )
+            };
+            sayall_windows::gatt_note(format!(
+                "template_menu phase=window_readback reason={reason} observed_menu_generation={} window_available=true visible={visible} minimized={minimized} no_activate={no_activate} caller_is_window_thread={caller_is_window_thread}",
+                menu_generation_field(observed_menu_generation)
+            ));
+        } else {
+            sayall_windows::gatt_note(format!(
+                "template_menu phase=window_readback reason={reason} observed_menu_generation={} window_available=false",
+                menu_generation_field(observed_menu_generation)
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (window, reason, observed_menu_generation);
+}
+
+fn activate_template_menu(window: &tauri::WebviewWindow) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        window.hwnd().ok().map(|hwnd| unsafe {
             windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(
                 windows::Win32::Foundation::HWND(hwnd.0),
             )
@@ -3960,7 +4095,7 @@ fn activate_template_menu(window: &tauri::WebviewWindow) -> bool {
     #[cfg(not(windows))]
     {
         let _ = window;
-        false
+        None
     }
 }
 
@@ -3996,6 +4131,18 @@ fn overlay_is_foreground(window: &tauri::WebviewWindow) -> bool {
     {
         let _ = window;
         false
+    }
+}
+
+fn overlay_window_id(window: &tauri::WebviewWindow) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        window.hwnd().ok().map(|hwnd| hwnd.0 as usize as u64)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
     }
 }
 
@@ -4926,7 +5073,19 @@ pub fn run() {
                 let handle = app.handle().clone();
                 sayall_windows::app_launcher::set_self_show_sync(move || {
                     if let Some(window) = handle.get_webview_window("main") {
-                        let _ = window.show();
+                        let visible_before = window.is_visible().ok();
+                        let result = window.show();
+                        sayall_windows::gatt_note(format!(
+                            "app_lifecycle event=self_show_sync trigger=app_launcher_self window_available=true result={} tauri_visible_before={} tauri_visible_after={} actual_foreground={}",
+                            if result.is_ok() { "submitted" } else { "failed" },
+                            visible_before.map_or("unknown", |visible| if visible { "true" } else { "false" }),
+                            window.is_visible().ok().map_or("unknown", |visible| if visible { "true" } else { "false" }),
+                            overlay_is_foreground(&window)
+                        ));
+                    } else {
+                        sayall_windows::gatt_note(
+                            "app_lifecycle event=self_show_sync trigger=app_launcher_self window_available=false result=failed reason=main_window_missing".to_owned()
+                        );
                     }
                 });
             }
@@ -5290,6 +5449,84 @@ mod lifecycle_tests {
             WebviewFailureState::default().failed(3, false),
             WebviewFailureAction::Ignore
         );
+    }
+
+    #[test]
+    fn menu_activation_uses_actual_foreground_when_the_window_is_prepared() {
+        for (requested, actual_foreground) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let reads = std::cell::Cell::new(0);
+            let (api_result, verified, observed) = template_menu_foreground_readback(
+                true,
+                || Some(requested),
+                || {
+                    reads.set(reads.get() + 1);
+                    actual_foreground
+                },
+            );
+            assert_eq!(api_result, Some(requested));
+            assert_eq!(
+                reads.get(),
+                1,
+                "API denial must not skip actual foreground observation"
+            );
+            assert_eq!(observed, actual_foreground);
+            assert_eq!(
+                verified, actual_foreground,
+                "the observed foreground window determines keyboard ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_only_menu_ignores_native_focus_noise_and_new_menu_ignores_old_loss() {
+        let mut state = SceneOverlayState::default();
+        assert!(state.update_menu(8, true));
+        assert_eq!(state.record_native_menu_focus(false, false), None);
+        assert_eq!(state.record_native_menu_focus(true, false), None);
+        assert_eq!(state.record_native_menu_focus(true, true), Some((true, 8)));
+        assert_eq!(state.record_native_menu_focus(false, true), None);
+        assert!(state.update_menu(9, true));
+        assert_eq!(state.record_native_menu_focus(false, false), None);
+        assert_eq!(state.record_native_menu_focus(true, true), Some((true, 9)));
+        assert_eq!(
+            state.record_native_menu_focus(false, false),
+            Some((false, 9))
+        );
+    }
+
+    #[test]
+    fn unprepared_menu_skips_activation_but_still_reads_actual_foreground() {
+        for actual_foreground in [false, true] {
+            let activations = std::cell::Cell::new(0);
+            let reads = std::cell::Cell::new(0);
+            let (api_result, verified, observed) = template_menu_foreground_readback(
+                false,
+                || {
+                    activations.set(activations.get() + 1);
+                    Some(true)
+                },
+                || {
+                    reads.set(reads.get() + 1);
+                    actual_foreground
+                },
+            );
+            assert_eq!(activations.get(), 0);
+            assert_eq!(reads.get(), 1);
+            assert_eq!(observed, actual_foreground);
+            assert!(!verified);
+            assert_eq!(
+                api_result, None,
+                "unattempted API must be distinct from denial"
+            );
+        }
+        // API delivery is recorded separately from the actual HWND observation.
+        let (api_result, verified, observed) =
+            template_menu_foreground_readback(true, || None, || true);
+        assert_eq!(api_result, None);
+        assert!(verified);
+        assert!(observed);
     }
 
     #[test]

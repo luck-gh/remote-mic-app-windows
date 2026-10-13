@@ -962,8 +962,19 @@ impl WindowsPlatform {
         self.scene_control.select_template(template_id)
     }
 
-    pub fn set_template_menu_focus(&self, focused: bool) {
-        self.scene_control.set_template_menu_focus(focused);
+    pub fn set_template_menu_focus(
+        &self,
+        focused: bool,
+        reason: &'static str,
+        observed_menu_generation: Option<u64>,
+        menu_window_id: Option<u64>,
+    ) {
+        self.scene_control.set_template_menu_focus(
+            focused,
+            reason,
+            observed_menu_generation,
+            menu_window_id,
+        );
     }
 
     pub fn template_menu_key(

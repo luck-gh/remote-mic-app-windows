@@ -290,6 +290,27 @@
 
 ### 2026-10-10 晚共享宿主来源修复、本地安装与旧代次拒绝
 
+**2026-10-11 当日现场追验 failed**：同一 App 50156 / host 11972 仍受旧脚本版本阻断，四次 Menu 成对观察均未启动模板菜单；选项重新勾选保存成功，但捕获所有权为零。实际安装主程序、Helper 和包哈希再次对齐下列身份，未重新构建/安装。根因与恢复限制归 [既有 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-11-菜单已勾选但触发原生上下文菜单当日现场未恢复)。当日新版实际接管、菜单和键盘共存为 deferred，未代用户重启 Windows；12 日续验见下文，不把安装成功或此前失败混作当前功能结论。
+
+根因及实际键码归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-10-晚方向键长按与实体键盘共存来源调查中)：20:17 仅实体键盘的测试实际进入 TV/方向映射，注入 Tab/单次方向；组合时公开观察收到实际 C0/scan29 和原生重复。当前源码新增逐 WDF 请求功能 PDO 核验，其他设备/未知来源不改写、不上报，保留配置、按键配对、代次与正常退出契约。未重复迁移、恢复 stash 或改用户模板/连发；固定来源参考与模块/架构范围归 ATTRIBUTION。
+
+- **passed（自动化）**：Agent 95/95、独立 Helper 58 passed / 3 ignored，新增来源与 PDO/私有续约测试先红后绿；Helper fmt/check；工作区 fmt、669 passed / 22 ignored、check；Windows runtime-simulation 编译；前端 348 passed、类型检查和生产构建；覆盖安装契约 5 passed。Frida Python 传输台尚未执行（当前解释器没有 frida），语法检查仅为语法证据。未把单元测试或仿真编译扩大为实体捕获通过。
+- **passed（最终包与源码对应）**：沿用 `scripts/build-local-input-candidate.ps1`，最终 x64 NSIS `target/release/bundle/nsis/无线麦_0.8.6_x64-setup.exe` SHA256 `04ba26c64bfcccaff065c00aedf3746672c29e188fbe827c73c87dd7de2bbaf2`；四项载荷、生产隔离、GUI 与实际前端资源通过包检查。Helper SHA256 `f9ede074f96b56c99e2468ca7137af6c45168c557934d6f4186fe7971ef9cce2`；二进制包含最终 Agent 源文件的完整字节（SHA256 `a78d135ad500689ef8960ddca009655839777ae510ade016dae9ff337bc73bfd`），代次 `2026-10-10.request-source`。仍为合并 `af710b757897cb0567b63c63a7ceb40f62426652` 加原有未提交工作及本轮修复；sourceCommit=null，最终运行 build_channel=unknown，不用版本号/HEAD 代替完整内容身份。本次修复未额外提交。
+- **passed（旧应用正常退出）**：20:20:46 请求自身退出；旧主程序 38828 与按键宿主 50032 自行结束，Helper 2600 的停止回执 `hook_detached=true / result=passed / module_unloaded=false`，主程序 overall passed、failed_stages=0、554ms。安装前只读确认所有正式应用/Helper 实例均已结束；未强杀宿主或操作无线电。
+- **passed（覆盖原目录）**：管理员覆盖原安装目录一次，版本读回 0.8.6。settings、button-mappings、capture-input-session、onboarding 四份 JSON 安装前后逐件哈希一致。四项实际载荷与暂存集合完全对齐，主 EXE 与生产构建仅有既有三个 NSIS 标记字节差异；安装 EXE SHA256 `730c804d38859f321238deed95b69c52e2c3dde8f802f435559a67182bc566ae`。
+- **passed（实际启动与拒绝旧脚本）**：20:28 从真实 Explorer 窗口普通用户启动主程序 50156（父 Explorer 12712）和子按键宿主 36976；双方 TokenElevation=0，个人版主窗可见且 Responding=true。新 Helper 46912 记录共享宿主 7/1、固定来源模块核验通过，但实际宿主 11972 仍为 `2026-10-03.cleanup-instance`。新 Helper 明确拒绝，renews_sent=0、capture_acquired=false、terminal=agent_version_blocked 并退出；旧组件已正常撤钩而未卸载，禁止把继续驻留当作新源码生效。没有并起第二套捕获或强杀/重启宿主。
+- **deferred（10 月 10 日安装时的新链路真机）**：当时 Windows 宿主生命周期未结束，尚未装载新 Agent；新来源接管与键盘共存没有实际证据，不能把旧捕获撤除/版本拒绝外推为全功能修复。12 日的新代次结果见下文。三轮启动及 17:56 单击退格失效仍按原记录保留未知；此固定来源适配的其他 Windows 模块组合及 ARM64 也未验证，源码为明确拒绝。
+
+**2026-10-12 重启后续验**：用户已自行重启，Windows 启动时间 10:06:55.5（UTC+08:00）。沿用上述安装内容，本次主程序 10780 / 按键宿主 26108 / Helper 29896 / 设备宿主 12192；10:12:01.692 实际鉴权脚本为 `2026-10-10.request-source`，Menu 所有权及后续模板 generation 2→3→4 依次生效，迟到 generation 3 被拒绝。10:12:07–09 完成 Menu DOWN/UP、菜单聚焦读回、真实确认 UP 后选择模板、原窗口恢复/菜单隐藏，最后 `actions_available=true`；用户明确确认“菜单和实体键盘都已正常”，本次 RC003 菜单与当前 PC 键盘观察 **passed**。来源分类、报告清除/恢复及配对边沿均已有实际计数；完整时间线与边界归 [续验 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-12-用户重启后的来源菜单与连发配置续验)。
+
+当前 Agent 模板返回及四方向没有 `holdRepeat`，实际两个 repeat mask 为 0；847ms/1016ms/1415ms 的方向/返回持有各只触发一次并正常释放，符合关闭配置。用户讨论应保留选择权，本轮未改模板；开启后的连续输出、UP 停止、冷/闲置首用及完整双型号矩阵仍 **deferred**。该阶段另见保存音频端点不可用及设备 Code 10，当时语音原因调查中；随后通道与反馈修复、安装及实测见下节。冻结材料复用 `target/dev/foreground-input/post-reboot-current.log`，按本次 PID 取证；该只读续验阶段未重复构建、迁移或安装，未提交、推送或发布。
+
+10 月 10 日 20:30:03–20:32:03 的安装后公开键盘观察已正常完成撤钩，期间没有目标键事件，当时尚未取得用户单键/长按恢复反馈；因此该窗口不记为键盘实际恢复 passed。安装前观察有事件的材料单独保留为 `keyboard-source-before-fix.log`，安装后空观察为复用的 `keyboard-readonly-probe.log`，不混用两个窗口；10 月 12 日用户确认另见上述续验。
+
+最小过程输出复用 `target/dev/foreground-input/`：前后键盘只读观察、必要用户动作时段、退出/启动日志、安装前配置哈希与包检查；原件及轮转日志未动。旧 `e4d20971` 包仅保留一个准确对照，错误临时副本与空格式输出已回收，不保存源码副本或另一套台账；新来源验收闭合后回收不再需要的原始现场和对照包。长期身份、脱敏计数与边界以上述记录为准。
+
+最小现场复用 `target/dev/foreground-input/`，本次开机过滤日志、第三轮部署前日志和只读配置仅用于未闭合异常；不含本次开机内容的两份大历史副本已移入回收站，原始应用日志未清理。合并保护清单、最终 combined 测试/构建日志、bundle 校验、`boot-merge-install.json` 与安装载荷校验复用 `target/dev/upstream-sync/`，留到相应候选被替代且未知点闭合后回收；不用源码副本、worktree 或重复长期台账代替 Git 与本节结论。
+
 ### 2026-10-12 音频通道识别与语音键反馈修复
 
 本候选仍基于合并 SHA `af710b757897cb0567b63c63a7ceb40f62426652` 加保留的未提交工作；新增识别修复、独立语音按键观察与页面反馈也未提交。版本 0.8.6，`build_channel=local`，包元数据 `sourceCommit=null`，不能仅以 HEAD 或版本号表示完整源码身份。
@@ -330,6 +351,29 @@
 - **failed（本包菜单）**：用户报告 Codex 前台菜单按下出现、释放瞬间消失；误触主页打开无线麦后切回 Codex，菜单随后正常。15:56:21–23首批日志 return_target generation15–18为external_window，focus verified=false、`foreground_verified requested=false/result=false`（旧合并字段，不是单独记录的激活 API 原生结果）；不将 snapshot_applied 或随后恢复当作首次菜单通过。最小现场保留 `audio-recovery-menu-regression-evidence.log`（548行，199,632字节），补齐隐藏、文档加载与主页关键事件，关闭早于UP等时序归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md)。原始当前及轮转日志未改、未重启重装。旧 Code 10、标准 pin 原因、历史三轮/17:56 未知、RC001/ARM64/完整睡眠断连及暂停的捕获换代/租约边界仍未关闭；后续诊断结果见同页菜单诊断候选节。
 
 包仍位于 `target/release/bundle/nsis/无线麦_0.8.6_x64-setup.exe`；本轮必要红测、manifest、metadata、实际生命周期及回退包复用 `target/dev/foreground-input/`，回退目的和清理条件归输入切换专项。不创建源码副本，不提交、推送或发布。
+
+### 2026-10-12 菜单诊断候选
+
+- **候选身份与部署**：包 SHA-256 `e39e642c42299f440492838a9fb268c9e17a8a0c5f7a0fbdb1e519636f7a374d`（12,858,164 字节），基线 `af710b757897cb0567b63c63a7ceb40f62426652`，source fingerprint `fb31da04e942670b294ec83aa4a0015db84f787d149fc95168f260900b27d77d`，dirty/local/included，`sourceCommit=null`。raw EXE `84cc2f515d014003f47fa010af6ad52cf21e27b721940cf4849f78fa0b5d2219` 与 installed EXE `94a6ab4999e058e537de51ec4de354b2f5558b70625fc970d976cc0c22705f66` 均为 20,696,576 字节。NSIS 标记差异限于安装器 offset 15467490–15467492 的 `UNK`→`NSS`，NSIS build patch 记录确认是构建标记，不是错包。正常退出约 544ms、held=0、各项 cleanup passed；正常覆盖安装四 payload 和四份配置字节均保持。NSIS 生成/核验 passed；Tauri 总命令仍因无 updater 私钥退出 1、无 `.sig`，本地未签名候选。实际启动走 Explorer ShellExecute open，App 36272 / 子进程 21196 均 TokenElevation=0，Helper 20812；五字段运行身份与构建记录一致。
+- **passed（自动化）**：Host 全工作区 695 passed / 0 failed / 23 ignored，日志 `target/dev/foreground-input/menu-diagnostics-final-workspace-test-host.log`。一次 sandbox 测试超时后只结束了测试进程；它不是代码回归，也不覆盖上述最终成功运行。
+- **failed（当前 PC / RC003 菜单）**：用户在 Codex 前台、未先打开主页或无线麦主窗时，短按 Menu 仍观察到菜单出现后消失。本包仅增加诊断，不改关闭策略。generation 8–18 共 11 次激活尝试中，明确记录窗口 `visible=true`、`minimized=false`、`no_activate=false`、调用方为窗口线程；激活 API 实际返回 false 且真实 foreground 未变，程序随后清面板并隐藏。确认“API 激活拒绝被当作立即取消”是本次菜单直接消失的原因；Windows 拒绝激活的底层原因仍未知。`native focused=true` 不等价于真实前台窗口。菜单事实与脱敏证据 `target/dev/foreground-input/menu-diagnostics-current-repro.log`（80,981 字节，SHA-256 `f322012c6888137f35b964a83e932b19f719e5ca34e4264d82a4fcafd48997b9`）归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md)。
+- **证据修正与范围**：此前 548 行旧现场中的 generation 15–27 `requested=false` 是合并前置窗口操作与 API BOOL 的字段，不能倒推 13 次均调用了激活 API并返回 false；旧字段具体覆盖的阶段以当时日志实现为限。新的 11 次实际 API 结果只适用于本诊断包。本包用户菜单验收仍 failed；上一组合包 `228f6221` 上用户确认的连发、实体键盘和语音结果不外推为本包验收。捕获生命周期 lease/hotreload 仍按要求暂缓，更新源未改。菜单修复及后续新包待独立验收。
+
+### 菜单恢复实现与自动化（局部用户交互已实测）
+
+- 修复源码已最终冻结并经独立审查，无 P0/P1/P2 必修项。五文件变更以 scene control 和只读窗口身份透传为主：SetForegroundWindow 首次被拒时，仅当同次开窗捕获目标仍是实际前台才保留 remote-only 面板；键盘操作/确认匹配精确菜单 HWND；每次遥控/原生手势及 UP 重新读回实际窗口，前台切出即取消。开窗 pending、前台观察、语音/配置取消后的迟到 UP、Menu Long 保存和旧代次清理覆盖于回归。
+- **passed（自动化）**：`cargo test --workspace` core 32 passed、Windows 522 passed / 22 ignored、Host 153 passed / 1 ignored；其余 workspace 库与文档测试通过。窄测 71 passed / 1 ignored，Host 菜单专项 7 passed；fmt、workspace check、runtime-simulation check 与五文件 diff check passed。日志位于 `target/dev/foreground-input/menu-fix-workspace-test.log`、`menu-fix-workspace-check.log`、`menu-fix-runtime-simulation-check.log`。`scene_control.rs` 最终 SHA-256 `022F1FE0…375`，源码仍为 dirty 工作区，不能用 HEAD 代替完整身份。
+- **deferred（完整内部链路关联）**：e39 诊断包上的用户复现仍为 failed。新候选日志确认实际出现一次 activation API 拒绝后面板保持、snapshot 应用通过；但没有用户动作关联标识，不能断言这就是用户第一项操作，也不能证明“拒绝→继续遥控→确认模板”在同一次真实交互完整串联。未见 remote-only 专属字段。用户三项菜单观察仍按本机本次记录为 `passed`。Windows 拒绝激活的具体原因未知。未修改模板、前端、更新源或捕获 lease/hotreload；后者继续暂缓。
+
+### 菜单恢复修复候选安装（用户观察）
+
+- 本地 NSIS 安装包 `无线麦_0.8.6_x64-setup.exe`：12,870,141 字节，SHA-256 `370b51b214cefac324d6966ee0631188d5155db7faa9b9978e9a7834c264c32b`。基线 `af710b757897cb0567b63c63a7ceb40f62426652`，`sourceCommit=null`，dirty/local/included，source fingerprint `ad1c0484b521c21bd5ebd5a220b66c13c168ee51d857a89021cdda1af56cdaaf`。
+- raw EXE 20,737,536 字节、SHA-256 `4279051b62848a9ade0e5c03c9b4820a81ab847d63686714da6c6635bfd15979`；installed EXE 同尺寸、SHA-256 `021706b0d9b48a6048a2d7b2f2bc2e6bfd72530f0559f4bca40697649d30d892`。二者仅安装器标记 offset 15497730–15497732 的 `UNK`→`NSS` 三字节不同；Tauri bundle patch 有记录，其余字节完全一致。
+- **passed（安装与运行身份）**：旧版正常退出、failed_stages=0、held_keys=0，三个相关进程正常退出、无强杀；覆盖安装 exit 0 / 约 8.3 秒。四项安装 payload、10 项前端嵌入及 production simulation 隔离检查通过；四份配置安装前、安装后及启动后 SHA 一致。Explorer 普通 ShellExecute(show=1) 启动 App 45320 / 子 10424（安装路径 TokenElevation=0）、Helper 39324；运行五字段与新 manifest 匹配。启动记录有 main_window loaded/focused，但没有人为打开主窗口、主页或菜单，不能视为实际 API 拒绝分支已验证。
+- NSIS 生成与独立核验 passed。Tauri 总命令在 updater 签名处因本机缺少私钥失败，监控 shell 回收未取到整体数值退出码；未生成私钥或 `.sig`，安装包未签名。首次 payload 校验调用参数错误，未进入验证；显式提供 StagedDirectory 后通过。首次 EXE 比较复用了旧候选固定偏移并误报，改用动态标记及全文件字节核对后通过。具体过程日志均在 `target/dev/foreground-input/menu-focus-fix-*`。
+- **passed（用户实际菜单观察，本机/当前遥控器）**：用户回复“一二三都成功了”：Codex 前台短按 Menu 后松开，菜单保持；遥控方向选择模板并确认，模板正常应用；重新开菜单后切换到其他软件，菜单关闭。此三项是本机本次用户观察，不外推到 RC001、另一台 RC003、长期稳定或全按键新一轮验收。
+- **运行日志中的分支证据与关联限制**：同一安装进程 `10:37:17.776Z`（北京时间 `18:37:17.776`）generation 13 激活 API 返回 false、actual_foreground=false；窗口可见、未最小化、no-activate=false、调用方为窗口线程。随后 `activation_denied_policy` 记录 panel_before=true / panel_after=true，`snapshot_applied` passed，确认本轮出现“激活拒绝后面板保留”状态。`10:38:15.075Z` generation 22 API 与实际前台均成功、面板保持；`10:38:16.756Z` generation 23 模板选择 `actions_available=true`，随后有 `focus_ignored hide_completed`。脱敏证据 `target/dev/foreground-input/menu-focus-fix-user-validation-evidence.json`（1,823 字节）。没有用户动作关联 ID，不能唯一断定 generation 13 对应用户第一项操作，也不能证明“拒绝→继续遥控→确认模板”完整同次链；未见 remote-only 专属字段。三项外部行为仍按用户确认记当前本机观察 `passed`。Windows 拒绝激活的底层原因仍未知。
+- **材料留存**：保留当前 `370b51b2` 安装候选供当前部署恢复；保留 e39 单安装器失败对照以比较诊断失败现场；保留 `5fd60bef` 基线以对照此前 dirty 音频/构建身份。完成本轮完整链路验收、相关引用与对照唯一性核对后，再按 LOGGING 规则确认是否回收；本轮不删除。
 
 ### 上游历史记录（不代表本 fork 当前合并候选通过）
 

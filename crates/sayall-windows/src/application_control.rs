@@ -93,6 +93,9 @@ impl WindowToken {
     pub fn process_id(&self) -> u32 {
         self.process_id
     }
+    pub(crate) fn window_id(&self) -> u64 {
+        self.window_id
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

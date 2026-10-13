@@ -143,7 +143,14 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     ) -> Result<sayall_windows::scene_control::SceneSnapshot, String> {
         Err("当前运行环境不支持模板切换".into())
     }
-    fn set_template_menu_focus(&self, _focused: bool) {}
+    fn set_template_menu_focus(
+        &self,
+        _focused: bool,
+        _reason: &'static str,
+        _observed_menu_generation: Option<u64>,
+        _menu_window_id: Option<u64>,
+    ) {
+    }
     fn template_menu_key(
         &self,
         _generation: u64,
@@ -415,8 +422,20 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::select_current_template(self, template_id)
     }
 
-    fn set_template_menu_focus(&self, focused: bool) {
-        WindowsPlatform::set_template_menu_focus(self, focused);
+    fn set_template_menu_focus(
+        &self,
+        focused: bool,
+        reason: &'static str,
+        observed_menu_generation: Option<u64>,
+        menu_window_id: Option<u64>,
+    ) {
+        WindowsPlatform::set_template_menu_focus(
+            self,
+            focused,
+            reason,
+            observed_menu_generation,
+            menu_window_id,
+        );
     }
     fn template_menu_key(
         &self,
