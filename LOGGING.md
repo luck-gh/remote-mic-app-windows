@@ -25,6 +25,9 @@ diagnostic_schema=1
 app_version=0.2.1
 app_build=42
 source_revision=<完整 SHA 或 unknown>
+source_fingerprint=<构建输入 SHA-256 或 unknown>
+source_state=clean|dirty|unknown
+payload_inputs=included|not-bundling|unknown
 build_channel=stable|pr_preview|local|unknown
 release_tag=v0.2.1|none|unknown
 process_id=1234
@@ -34,6 +37,10 @@ windows_build=<build 或 unknown>
 ```
 
 构建时写入 `source_revision`，运行时不得读取 Git 工作区。无法可靠取得的值写 `unknown`，不能省略字段。
+
+`source_revision` 是构建基线，不代表 dirty 源码已完整提交。`source_fingerprint` 由构建时约定的源码输入集合计算；打包时还纳入本轮 staging 回执的 Helper、Gadget 和许可文件实际字节，`payload_inputs=included`。日常 check/test 为 `not-bundling`，不拿它证明包内载荷。`source_state=dirty|unknown` 时 `sourceCommit` 必须为 null；以基线、指纹与包摘要共同识别内容，不声称可由单一提交重建。
+
+最终交付须从已安装 EXE 的真实运行日志或诊断读回上述字段及 `build_channel`，与当轮 build manifest、包 metadata 和安装载荷哈希对齐；仅构建脚本成功或 manifest 存在不算运行身份通过。输入范围以 `scripts/build-identity.ps1` 的 root/扩展名 allowlist 为准，排除构建缓存、过程证据和文档正文，不将指纹解释为全磁盘快照或逐字可重建源码档案。
 
 正式应用默认写入 `%LOCALAPPDATA%\SayAll\Logs\sayall-diagnostic.log`，不再要求用户
 预先设置环境变量。受控测试仍可用 `SAYALL_GATT_LOG` 覆盖写入位置；日志正文不得
@@ -86,6 +93,16 @@ Vue 渲染或 IPC 阶段故障。
 8. 唯一 `terminal_result` 及总耗时。
 
 失败应带 `error_domain`、`error_code`、`reason` 和 `retryable=true|false`。状态未变化时不得重复刷相同日志；高频 HID、音频包和轮询只记录首尾、聚合计数、字节/帧数、丢弃数量和耗时。
+
+返回键取证沿用同一日志：`rc003_bridge event=edge_received` 与所有权确认的
+`rx_seq` 为单次桥接连接内接收顺序，`target_generation` 区分配置代次；目标/所有权
+mask 使用 `RemoteButton` 序号位。`state_snapshot=true` 仅表示接收时快照，不能当作
+跨线程原子状态或注入成功。首次报告及返回按下/释放的状态变化留痕，重复报告不刷屏，
+未知 usage 仅计数。`map_capabilities` 只在能力摘要变化时写入；`map_gesture` 说明语义
+边沿是否进入识别、是否配置和未输出原因，后接既有 `map_route`、`map_skip_inject`、
+`map_fire` 与带 `button/trigger` 的 `map_inject`。快捷键只记录键数，不输出自定义和弦；
+`map_inject result=ok` 仅表示注入提交，目标软件是否响应仍需用户观察。现场步骤及
+未确认原因见[前台按键回归记录](Bugs/2026-10-03-foreground-input-regression.md#2026-10-06-朋友的-rc003-返回键报障待现场日志)。
 
 ## 隐私红线
 

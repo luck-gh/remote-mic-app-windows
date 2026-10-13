@@ -92,8 +92,10 @@ grep -a "windows_resource_exhausted" "$LOG" | grep -ao "pid=[0-9]*" | sort | uni
 
 ## 7. 工具反模式清单（都在本仓库真实出现过）
 
-- **测试/运维脚本用强杀收尾。** `Stop-Process -Force` 本身就是楔死诱因。正确收尾：先请求
-  优雅退出（`Local\SayAll-GracefulExit`）→ 有界等待 → 仍不退才强杀并打印告警。
+- **测试/运维脚本用强杀收尾。** `Stop-Process -Force` 本身就是楔死诱因。正式应用正确收尾：先请求
+  优雅退出（`Local\SayAll-GracefulExit`）→ 有界等待 → 仍不退则记录 `blocked` 并保留现场，
+  不强杀正式应用、Helper 或宿主。自有测试进程的终止只按用户明确授权的精确对象执行；
+  发布构建旧开发进程例外按 AGENTS，不扩展到正式安装版。
   2026-09-16 已修正两个安装脚本，并以
   `scripts/test-windows-installer-graceful-exit.ps1` 把"应用运行中执行安装/卸载"纳入 CI。
 - **测试依赖"我是第一个初始化全局状态的人"。** `gatt_sink()` 是 `OnceLock`，首次调用即

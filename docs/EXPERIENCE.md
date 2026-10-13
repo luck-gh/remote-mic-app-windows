@@ -2,6 +2,10 @@
 
 本页导航到具有实际实验记录、且仍与当前实现相关的项目经验。完整结论、条件与过程保留在各原真源；历史实验证明当时观察到的因果，不证明当前版本已重新完成端到端验收。当前能力证据归 [FEATURES.md](FEATURES.md)，稳定工作规则归 [AGENTS.md](../AGENTS.md)。
 
+Windows 图标资源已新但任务栏仍旧时的分层实证与单项公开 Shell 通知，见 [安装专项的个人修改版证据](../Testing/WindowsInstallerGracefulExit.md#2026-10-06-个人修改版本地覆盖证据)；窗口/EXE 读回不能代替任务栏像素观察。
+
+0.8.5 本地安装核验中，Tauri 的 `UNK` → `NSS` 三字节包类型标记与同 EXE 的 `--sayall-key-host` 子进程已逐项确认，见 [实际安装与启动记录](../Testing/WindowsRC003Preview.md#同日按用户要求覆盖安装并打开1128)。EXE 哈希不一致须解释精确字节差异；同名进程须按命令行和职责区分，不能直接判为文件损坏或重复主实例。
+
 ## 音频写入成功与下游可听性
 
 - 直接证据：[CABLE Input 静音自愈实证](investigations/evidence/2026-09-07-cable-input-unmute.md) 中的“Windows 真实端点实验”和“SayAll + RC001 现场复验”；包含受控静音、调用产品路径、状态读回及现场观察。
