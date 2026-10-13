@@ -4475,6 +4475,15 @@ pub fn run() {
                 .unwrap_or("unknown")
                 .to_owned(),
             source_revision: env!("SAYALL_SOURCE_REVISION").to_owned(),
+            source_fingerprint: option_env!("SAYALL_SOURCE_FINGERPRINT")
+                .unwrap_or("unknown")
+                .to_owned(),
+            source_state: option_env!("SAYALL_SOURCE_STATE")
+                .unwrap_or("unknown")
+                .to_owned(),
+            payload_inputs: option_env!("SAYALL_PAYLOAD_INPUTS")
+                .unwrap_or("unknown")
+                .to_owned(),
             build_channel: option_env!("SAYALL_BUILD_CHANNEL")
                 .unwrap_or("unknown")
                 .to_owned(),

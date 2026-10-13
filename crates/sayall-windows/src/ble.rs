@@ -3091,6 +3091,9 @@ pub struct DiagnosticLogMetadata {
     pub app_version: String,
     pub app_build: String,
     pub source_revision: String,
+    pub source_fingerprint: String,
+    pub source_state: String,
+    pub payload_inputs: String,
     pub build_channel: String,
     pub release_tag: String,
 }
@@ -3196,11 +3199,14 @@ pub fn gatt_note(note: String) {
     let timestamp = utc_timestamp();
     let metadata = DIAGNOSTIC_LOG_METADATA.get();
     let _ = diagnostic_log_append(&format!(
-        "{timestamp} pid={} ver={} build={} source_revision={} build_channel={} release_tag={} {note}",
+        "{timestamp} pid={} ver={} build={} source_revision={} source_fingerprint={} source_state={} payload_inputs={} build_channel={} release_tag={} {note}",
         std::process::id(),
         metadata.map(|value| value.app_version.as_str()).unwrap_or("unknown"),
         metadata.map(|value| value.app_build.as_str()).unwrap_or("unknown"),
         metadata.map(|value| value.source_revision.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.source_fingerprint.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.source_state.as_str()).unwrap_or("unknown"),
+        metadata.map(|value| value.payload_inputs.as_str()).unwrap_or("unknown"),
         metadata.map(|value| value.build_channel.as_str()).unwrap_or("unknown"),
         metadata.map(|value| value.release_tag.as_str()).unwrap_or("unknown"),
     ));

@@ -225,6 +225,8 @@ jobs:
       # staging 已保证四件载荷都在 src-tauri/，这里把 bundle.resources 覆盖成四件。
       - name: Build unsigned NSIS preview installer
         run: pnpm tauri build --bundles nsis --config src-tauri/tauri.arm64-payload.conf.json
+        env:
+          SAYALL_BUNDLE_BUILD: "1"
 
       # 防回归（2026-10-03 本机实证）：见 verify job 中同名步骤的注释。
       - name: Verify frontend assets are embedded in the executable

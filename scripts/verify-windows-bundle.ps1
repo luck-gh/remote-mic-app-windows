@@ -1,20 +1,21 @@
-﻿$ErrorActionPreference = "Stop"
+﻿param([string]$InstallerPath, [string]$ArtifactDirectory)
+$ErrorActionPreference = "Stop"
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repositoryRoot "src-tauri/tauri.conf.json"
 $compatibilitySourcePath = Join-Path $repositoryRoot "crates/sayall-windows/src/compatibility.rs"
 $bundleDirectory = Join-Path $repositoryRoot "target/release/bundle/nsis"
-$artifactDirectory = Join-Path $repositoryRoot "artifacts/windows-preview"
+if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { $ArtifactDirectory = Join-Path $repositoryRoot "artifacts/windows-preview" }
 $applicationPath = Join-Path $repositoryRoot "target/release/sayall-windows-app.exe"
 
 $config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
-if ($config.productName -ne "无线麦 SayAll") {
+if ($config.productName -ne "无线麦") {
     throw "Unexpected productName: $($config.productName)"
 }
 if ($config.identifier -ne "app.getsayall.remote-mic.windows") {
     throw "Unexpected application identifier: $($config.identifier)"
 }
-if ($config.bundle.publisher -ne "GetSayAll") {
+if ($config.bundle.publisher -ne "luck-gh") {
     throw "Unexpected publisher: $($config.bundle.publisher)"
 }
 if ($config.bundle.windows.nsis.installMode -ne "currentUser") {
@@ -131,7 +132,11 @@ if ($subsystem -ne 2) {
 }
 Write-Host "Verified Windows GUI subsystem for $([System.IO.Path]::GetFileName($applicationPath))"
 
-$installers = @(Get-ChildItem -Path $bundleDirectory -Filter "*-setup.exe" -File)
+$explicitInstaller = -not [string]::IsNullOrWhiteSpace($InstallerPath)
+$installers = if ($explicitInstaller) {
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw 'Selected installer does not exist' }
+    @(Get-Item -LiteralPath $InstallerPath)
+} else { @(Get-ChildItem -Path $bundleDirectory -Filter "*-setup.exe" -File) }
 if ($installers.Count -ne 1) {
     throw "Expected exactly one NSIS installer, found $($installers.Count)"
 }
@@ -145,9 +150,24 @@ if ($signature.Status -ne "NotSigned") {
     throw "CI preview must be explicitly unsigned; observed signature status $($signature.Status)"
 }
 
+$identityScript = Join-Path $PSScriptRoot 'build-identity.ps1'
+$identityJson = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $identityScript -RepositoryRoot $repositoryRoot -IncludePayloads
+if ($LASTEXITCODE -ne 0 -or @($identityJson).Count -ne 1) { throw 'Could not recompute build input identity' }
+$identity = $identityJson | ConvertFrom-Json
+$identityManifestPath = Join-Path $repositoryRoot 'target/dev/foreground-input/build-identity-current.json'
+if (-not (Test-Path -LiteralPath $identityManifestPath -PathType Leaf)) { throw 'Build input identity manifest is missing' }
+$builtIdentity = Get-Content -LiteralPath $identityManifestPath -Raw | ConvertFrom-Json
+foreach ($field in @('sourceCommit', 'sourceBaseCommit', 'sourceState', 'sourceFingerprint', 'payloadInputs')) {
+    if ($identity.$field -ne $builtIdentity.$field) { throw "Build input identity changed after compilation ($field)" }
+}
+if ($builtIdentity.payloadInputs -ne 'included') { throw 'Runtime identity was built without current staged payload inputs' }
+
 New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
-$copiedInstaller = Join-Path $artifactDirectory $installer.Name
-Copy-Item -LiteralPath $installer.FullName -Destination $copiedInstaller -Force
+$copiedInstaller = $installer.FullName
+if (-not $explicitInstaller) {
+    $copiedInstaller = Join-Path $artifactDirectory $installer.Name
+    Copy-Item -LiteralPath $installer.FullName -Destination $copiedInstaller -Force
+}
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $copiedInstaller).Hash.ToLowerInvariant()
 $checksumPath = Join-Path $artifactDirectory "SHA256SUMS.txt"
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
@@ -161,7 +181,12 @@ $metadata = [ordered]@{
     installer = $installer.Name
     sha256 = $hash
     signatureStatus = $signature.Status.ToString()
-    sourceCommit = $env:GITHUB_SHA
+    sourceCommit = $identity.sourceCommit
+    sourceBaseCommit = $identity.sourceBaseCommit
+    sourceState = $identity.sourceState
+    sourceFingerprint = $identity.sourceFingerprint
+    buildChannel = $builtIdentity.buildChannel
+    payloadInputs = $identity.payloadInputs
     distributionStatus = "unsigned-ci-preview-not-for-public-release"
 }
 $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $artifactDirectory "build-metadata.json")

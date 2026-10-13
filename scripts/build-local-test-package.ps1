@@ -87,9 +87,11 @@ Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 & node (Join-Path $repo "scripts\stage-bundle-inputs.cjs")
 if ($LASTEXITCODE -ne 0) { throw "staging 失败" }
 
-# ---- 4/6 前端到独立目录（避免 staging 内 vite 清 dist/ 撞 safe-delete 守卫） ----
-Write-Host "[4/6] vite build -> dist-build"
-& node (Join-Path $repo "node_modules\vite\bin\vite.js") build --outDir dist-build
+# ---- 4/6 标准前端构建：类型检查和 Vite 共同产出唯一 dist ----
+Write-Host "[4/6] pnpm build -> dist"
+Remove-Item Env:VITE_SAYALL_RUNTIME_SIMULATION -ErrorAction SilentlyContinue
+Remove-Item Env:SAYALL_WINDOWS_RUNTIME_SIMULATION -ErrorAction SilentlyContinue
+Invoke-Pnpm @("build")
 if ($LASTEXITCODE -ne 0) { throw "前端构建失败" }
 
 # ---- 5/6 tauri build（NSIS；配置覆盖走文件，见头部坑 1/2/4） ----
@@ -131,7 +133,7 @@ Write-Host "[6/6] 嵌入校验 + 产物报告"
 $targetRoot = if ($CargoTargetDir) { $CargoTargetDir } else { Join-Path $repo "target" }
 $rawExe = Join-Path $targetRoot "release\sayall-windows-app.exe"
 if (-not (Test-Path $rawExe)) { throw "找不到裸构建产物：$rawExe" }
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo "scripts\verify-frontend-embedded.ps1") -Executable $rawExe -FrontendDirectory (Join-Path $repo "dist-build")
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo "scripts\verify-frontend-embedded.ps1") -Executable $rawExe -FrontendDirectory (Join-Path $repo "dist")
 if ($LASTEXITCODE -ne 0) { throw "前端嵌入校验失败" }
 $setup = Get-ChildItem (Join-Path $targetRoot "release\bundle\nsis") -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $setup) { throw "找不到 NSIS 产物" }

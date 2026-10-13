@@ -12,6 +12,12 @@ pub struct DiagnosticReport {
     pub app_build: String,
     /// 源码修订（40 位 git SHA，取不到时为 `unknown`）。
     pub source_revision: String,
+    /// 当前构建输入集合的 SHA-256 摘要；不包含文件名或路径。
+    pub source_fingerprint: String,
+    /// Git 工作区范围状态（`clean|dirty|unknown`）。
+    pub source_state: String,
+    /// Whether the exact helper/Gadget bundle payload receipt was included in the identity.
+    pub payload_inputs: String,
     /// 发布通道（`SAYALL_BUILD_CHANNEL`，无则 `unknown`）。
     pub build_channel: String,
     /// 运行机器的 Windows 版本（major.minor.build，如 `10.0.26100`）。
@@ -115,6 +121,15 @@ impl DiagnosticReport {
                 .unwrap_or("unknown")
                 .to_owned(),
             source_revision: env!("SAYALL_SOURCE_REVISION").to_owned(),
+            source_fingerprint: option_env!("SAYALL_SOURCE_FINGERPRINT")
+                .unwrap_or("unknown")
+                .to_owned(),
+            source_state: option_env!("SAYALL_SOURCE_STATE")
+                .unwrap_or("unknown")
+                .to_owned(),
+            payload_inputs: option_env!("SAYALL_PAYLOAD_INPUTS")
+                .unwrap_or("unknown")
+                .to_owned(),
             build_channel: option_env!("SAYALL_BUILD_CHANNEL")
                 .unwrap_or("unknown")
                 .to_owned(),

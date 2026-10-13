@@ -15,6 +15,9 @@ fn production_default_log_path_writes_structured_metadata_without_environment_ov
             app_version: "0.2.2-test".to_owned(),
             app_build: "42".to_owned(),
             source_revision: "0123456789012345678901234567890123456789".to_owned(),
+            source_fingerprint: "abcdef0123456789".to_owned(),
+            source_state: "dirty".to_owned(),
+            payload_inputs: "included".to_owned(),
             build_channel: "local".to_owned(),
             release_tag: "none".to_owned(),
         },
@@ -28,6 +31,7 @@ fn production_default_log_path_writes_structured_metadata_without_environment_ov
         "missing UTC timestamp: {contents}"
     );
     assert!(contents.contains("ver=0.2.2-test build=42"));
+    assert!(contents.contains("source_revision=0123456789012345678901234567890123456789 source_fingerprint=abcdef0123456789 source_state=dirty payload_inputs=included"));
     assert!(contents.contains("build_channel=local release_tag=none"));
     assert!(contents.contains("diagnostic_test phase=completed terminal_result=passed"));
 }
