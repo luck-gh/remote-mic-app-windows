@@ -167,6 +167,14 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     }
     fn complete_template_default_save(&self, _request_id: u64, _saved: bool) {}
     fn complete_menu_preference_save(&self, _request_id: u64, _saved: bool) {}
+    fn manual_template_save_is_current(
+        &self,
+        _request_id: u64,
+        _template_id: Option<&str>,
+    ) -> bool {
+        false
+    }
+    fn complete_manual_template_save(&self, _request_id: u64, _saved: bool) {}
     fn prepare_template_menu_exit(&self) -> bool {
         true
     }
@@ -460,6 +468,12 @@ impl PlatformRuntime for WindowsPlatform {
     }
     fn complete_menu_preference_save(&self, request_id: u64, saved: bool) {
         self.complete_menu_preference_save(request_id, saved);
+    }
+    fn manual_template_save_is_current(&self, request_id: u64, template_id: Option<&str>) -> bool {
+        WindowsPlatform::manual_template_save_is_current(self, request_id, template_id)
+    }
+    fn complete_manual_template_save(&self, request_id: u64, saved: bool) {
+        WindowsPlatform::complete_manual_template_save(self, request_id, saved);
     }
     fn prepare_template_menu_exit(&self) -> bool {
         WindowsPlatform::prepare_template_menu_exit(self)

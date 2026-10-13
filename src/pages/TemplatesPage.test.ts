@@ -5,7 +5,7 @@ import TemplatesPage from "./TemplatesPage.vue";
 import ApplicationTemplateBindings from "../components/ApplicationTemplateBindings.vue";
 import {
   getMappingConfiguration, listPresetApps, saveMappingConfiguration,
-  getSceneSnapshot, subscribeSceneEvents,
+  getSceneSnapshot, selectCurrentTemplate, subscribeSceneEvents,
   getTemplateCatalog, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
   listRunningApps, removeApplicationBinding, upsertApplicationBinding,
   type MappingConfiguration,
@@ -15,7 +15,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/bridge")>();
   return {
     ...actual,
-    getSceneSnapshot: vi.fn(), subscribeSceneEvents: vi.fn(),
+    getSceneSnapshot: vi.fn(), selectCurrentTemplate: vi.fn(), subscribeSceneEvents: vi.fn(),
     getMappingConfiguration: vi.fn(), listPresetApps: vi.fn(),
     updateButtonMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
     getTemplateCatalog: vi.fn(), setButtonMappingFollowEnabled: vi.fn(), setMappingNoticeEnabled: vi.fn(), setMenuTemplateSwitchEnabled: vi.fn(),
@@ -47,7 +47,13 @@ const stubs = {
 describe("templates page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(getSceneSnapshot).mockResolvedValue({ templateId: "preset-agent", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 } as import("../lib/bridge").SceneSnapshot);
+    vi.mocked(getSceneSnapshot).mockResolvedValue({ templateId: "preset-agent", mappingNotice: { kind: "direct", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 } as import("../lib/bridge").SceneSnapshot);
+    vi.mocked(selectCurrentTemplate).mockImplementation(async templateId => ({
+      templateId,
+      mappingNotice: { kind: templateId ? "direct" : "common", templateId, name: templateId ? "模板 A" : null, actionsAvailable: true },
+      mappingNoticeRevision: 2,
+      generation: 2,
+    } as import("../lib/bridge").SceneSnapshot));
     vi.mocked(subscribeSceneEvents).mockResolvedValue(() => {});
     vi.mocked(getMappingConfiguration).mockResolvedValue(structuredClone(configuration));
     vi.mocked(getTemplateCatalog).mockResolvedValue(structuredClone(catalog));
@@ -66,7 +72,7 @@ describe("templates page", () => {
     expect(wrapper.get('.template-row.current-template').text()).toContain("Agent");
     await wrapper.findAll('.template-row')[3]!.findAll('button').find(button => button.text() === "编辑")!.trigger('click');
     expect(wrapper.get('.template-row.current-template').text()).toContain("Agent");
-    handler({ type: "mapping_applied", revision: 2, notice: { kind: "template", templateId: "buttons", name: "工作", actionsAvailable: true } });
+    handler({ type: "mapping_applied", revision: 2, notice: { kind: "direct", templateId: "buttons", name: "工作", actionsAvailable: true } });
     await flushPromises();
     expect(wrapper.get('.template-row.current-template').text()).toContain("工作");
     expect(wrapper.findAll('.template-row.current-template')).toHaveLength(1);
@@ -74,9 +80,54 @@ describe("templates page", () => {
   });
 
   it("does not highlight a pending scene candidate before mappings are applied", async () => {
-    vi.mocked(getSceneSnapshot).mockResolvedValueOnce({ templateId: "buttons", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 2 } as import("../lib/bridge").SceneSnapshot);
+    vi.mocked(getSceneSnapshot).mockResolvedValueOnce({ templateId: "buttons", mappingNotice: { kind: "direct", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 2 } as import("../lib/bridge").SceneSnapshot);
     const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
     expect(wrapper.get('.template-row.current-template').text()).toContain("Agent");
+    wrapper.unmount();
+  });
+
+  it("uses the active template again without changing an open editor draft", async () => {
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    const rows = wrapper.findAll(".complete-template-panel .template-row");
+    const activeUse = rows[0]!.findAll("button").find(button => button.text() === "使用");
+    expect(activeUse).toBeDefined();
+    if (!activeUse) throw new Error("当前模板缺少使用按钮");
+    expect(activeUse.element.nextElementSibling?.textContent).toBe("编辑");
+    expect((activeUse.element as HTMLButtonElement).disabled).toBe(false);
+    await rows[3]!.findAll("button").find(button => button.text() === "编辑")!.trigger("click");
+    expect(wrapper.find("[role='dialog']").attributes("aria-label")).toContain("工作");
+    await activeUse.trigger("click"); await flushPromises();
+    expect(selectCurrentTemplate).toHaveBeenCalledExactlyOnceWith("preset-agent");
+    expect(wrapper.get('.template-row.current-template strong').text()).toBe("Agent");
+    expect(wrapper.find("[role='dialog']").attributes("aria-label")).toContain("工作");
+    expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+    expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("leaves the active highlight unchanged when using a template fails", async () => {
+    vi.mocked(selectCurrentTemplate).mockRejectedValueOnce(new Error("映射应用失败"));
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    const row = wrapper.findAll(".complete-template-panel .template-row")[3]!;
+    await row.findAll("button").find(button => button.text() === "使用")!.trigger("click"); await flushPromises();
+    expect(wrapper.get('.template-row.current-template strong').text()).toBe("Agent");
+    expect(wrapper.text()).toContain("映射应用失败");
+    expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("ignores repeated use requests while waiting for the engine acknowledgement", async () => {
+    let resolve!: (snapshot: import("../lib/bridge").SceneSnapshot) => void;
+    vi.mocked(selectCurrentTemplate).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    const use = wrapper.findAll(".complete-template-panel .template-row")[3]!.findAll("button").find(button => button.text() === "使用")!;
+    await use.trigger("click");
+    expect((use.element as HTMLButtonElement).disabled).toBe(true);
+    await use.trigger("click");
+    expect(selectCurrentTemplate).toHaveBeenCalledExactlyOnceWith("buttons");
+    resolve({ templateId: "buttons", mappingNotice: { kind: "direct", templateId: "buttons", name: "工作", actionsAvailable: true }, mappingNoticeRevision: 2, generation: 2 } as import("../lib/bridge").SceneSnapshot);
+    await flushPromises();
+    expect(wrapper.get('.template-row.current-template strong').text()).toBe("工作");
     wrapper.unmount();
   });
 

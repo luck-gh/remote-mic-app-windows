@@ -4358,6 +4358,24 @@ fn register_scene_events(
         .name("sayall-scene-settings".to_owned())
         .spawn(move || {
             while let Ok(event) = receiver.recv() {
+                if let SceneEvent::ManualTemplatePersistenceRequested {
+                    request_id,
+                    template_id,
+                } = &event
+                {
+                    let result = settings.save_remembered_template(
+                        *request_id,
+                        template_id.as_deref(),
+                        || {
+                            runtime.manual_template_save_is_current(
+                                *request_id,
+                                template_id.as_deref(),
+                            )
+                        },
+                    );
+                    runtime.complete_manual_template_save(*request_id, matches!(result, Ok(true)));
+                    continue;
+                }
                 if let SceneEvent::MenuPreferencePersistenceRequested {
                     request_id,
                     enabled,
@@ -4423,6 +4441,11 @@ fn register_scene_events(
         }
         if let SceneEvent::MenuPreferencePersistenceRequested { request_id, .. } = &event {
             if sender.send(event.clone()).is_err() { platform_for_failure.complete_menu_preference_save(*request_id, false); }
+        }
+        if let SceneEvent::ManualTemplatePersistenceRequested { request_id, .. } = &event {
+            if sender.send(event.clone()).is_err() {
+                platform_for_failure.complete_manual_template_save(*request_id, false);
+            }
         }
         if let SceneEvent::DefaultTemplatePersistenceRequested { request_id, .. } = &event {
             if sender.send(event.clone()).is_err() {

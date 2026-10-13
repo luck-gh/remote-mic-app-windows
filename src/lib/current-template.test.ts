@@ -6,8 +6,12 @@ import { useCurrentTemplate } from "./current-template";
 
 vi.mock("./bridge", () => ({ getSceneSnapshot: vi.fn(), selectCurrentTemplate: vi.fn(), subscribeSceneEvents: vi.fn(), isTauriRuntime: () => false }));
 const consumers = new Set<(event: SceneEvent) => void>();
-const snapshot = (id: string | null, revision = 1): SceneSnapshot => ({ mappingNoticeEnabled: true, mappingNotice: { kind: id ? "template" : "common", templateId: id, name: id, actionsAvailable: true }, mappingNoticeRevision: revision, enabled: true, generation: revision, foregroundGeneration: 1, applicationId: "app", templateId: id, panel: null, updateDefault: false, selectedIndex: null, menuItems: [], waitingForRelease: false, voiceActive: false, voiceButtonPressed: false, status: null });
-const Harness = defineComponent({ setup: () => ({ state: useCurrentTemplate() }), template: '<span>{{ state.applied.value ? state.templateId.value ?? "common" : "unknown" }}</span>' });
+// Mirrors crates/sayall-windows/src/scene_control.rs::mapping_notice_from:
+// kind reports mapping availability (direct/common/disabled/unconfigured), templateId is the active identity.
+const snapshot = (id: string | null, revision = 1): SceneSnapshot => ({ mappingNoticeEnabled: true, mappingNotice: { kind: id ? "direct" : "common", templateId: id, name: id, actionsAvailable: true }, mappingNoticeRevision: revision, enabled: true, generation: revision, foregroundGeneration: 1, applicationId: "app", templateId: id, panel: null, updateDefault: false, selectedIndex: null, menuItems: [], waitingForRelease: false, voiceActive: false, voiceButtonPressed: false, status: null });
+const Harness = defineComponent({ setup: () => ({ state: useCurrentTemplate() }), template: '<span><b>{{ state.applied.value ? state.templateId.value ?? "common" : "unknown" }}</b><i>{{ state.persistenceMessage.value }}</i></span>' });
+let actionableState: ReturnType<typeof useCurrentTemplate> | null = null;
+const ActionHarness = defineComponent({ setup: () => { actionableState = useCurrentTemplate(); return {}; }, template: "<span />" });
 
 describe("applied template state", () => {
   beforeEach(() => {
@@ -61,6 +65,65 @@ describe("applied template state", () => {
     await flushPromises();
     expect(selectCurrentTemplate).not.toHaveBeenCalled();
     expect(wrapper.text()).toBe("common"); wrapper.unmount();
+  });
+
+  it("shows no transient success message and reports only authoritative persistence failure", async () => {
+    const wrapper = mount(Harness); await flushPromises();
+    expect(wrapper.find("i").text()).toBe("");
+    const saving = { ...snapshot("first", 2).mappingNotice!, manualSaveStatus: "saving" as const };
+    for (const callback of consumers) callback({ type: "mapping_applied", notice: saving, revision: 2 });
+    await flushPromises();
+    expect(wrapper.find("i").text()).toBe("");
+    const saved = { ...snapshot("first", 2).mappingNotice!, manualSaveStatus: "saved" as const };
+    for (const callback of consumers) callback({ type: "mapping_applied", notice: saved, revision: 2 });
+    await flushPromises();
+    expect(wrapper.find("i").text()).toBe("");
+    const failed = { ...saved, manualSaveStatus: "failed" as const };
+    for (const callback of consumers) callback({ type: "mapping_applied", notice: failed, revision: 3 });
+    await flushPromises();
+    expect(wrapper.find("b").text()).toBe("first");
+    expect(wrapper.find("i").text()).toContain("未能记住本次选择");
+    expect(wrapper.find("i").text()).toContain("重启后将使用之前记住的选择");
+    expect(wrapper.find("i").text()).toContain("如无记录则为通用配置");
+    wrapper.unmount();
+  });
+
+  it("does not let an older activation reply overwrite a newer MappingApplied event", async () => {
+    let resolve!: (value: SceneSnapshot) => void;
+    vi.mocked(selectCurrentTemplate).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const wrapper = mount(ActionHarness); await flushPromises();
+    const pending = actionableState!.activate("first");
+    for (const callback of consumers) callback({ type: "mapping_applied", notice: snapshot("second", 2).mappingNotice!, revision: 2 });
+    resolve(snapshot("first", 1)); await pending; await flushPromises();
+    expect(actionableState!.templateId.value).toBe("second");
+    expect(actionableState!.applying.value).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("accepts the Rust mapping notice kinds for selected and common templates", async () => {
+    vi.mocked(selectCurrentTemplate)
+      .mockResolvedValueOnce({ ...snapshot("empty-template", 2), mappingNotice: { kind: "disabled", templateId: "empty-template", name: "空模板", actionsAvailable: false } })
+      .mockResolvedValueOnce({ ...snapshot(null, 3), mappingNotice: { kind: "unconfigured", templateId: null, name: null, actionsAvailable: false } });
+    const wrapper = mount(ActionHarness); await flushPromises();
+    await actionableState!.activate("empty-template");
+    expect(actionableState!.templateId.value).toBe("empty-template");
+    expect(actionableState!.error.value).toBe("");
+    await actionableState!.activate(null);
+    expect(actionableState!.templateId.value).toBe(null);
+    expect(actionableState!.error.value).toBe("");
+    wrapper.unmount();
+  });
+
+  it("does not let an activation reply erase a same-revision physical snapshot", async () => {
+    let resolve!: (value: SceneSnapshot) => void;
+    vi.mocked(selectCurrentTemplate).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const wrapper = mount(ActionHarness); await flushPromises();
+    const pending = actionableState!.activate("first");
+    const pressed = { ...snapshot("first", 1), voiceButtonPressed: true };
+    for (const callback of consumers) callback({ type: "snapshot", snapshot: pressed });
+    resolve(snapshot("first", 1)); await pending; await flushPromises();
+    expect(actionableState!.sceneSnapshot.value?.voiceButtonPressed).toBe(true);
+    wrapper.unmount();
   });
 
   it("keeps the previous applied template when a snapshot only changes the candidate", async () => {

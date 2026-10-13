@@ -93,6 +93,10 @@ pub struct MappingConfiguration {
     /// user's explicit associations without rewriting them.
     #[serde(default)]
     pub button_mapping_follow_enabled: bool,
+    /// Confirmed global manual choice while program following is disabled.
+    /// None means common mappings; enabling following clears this choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remembered_template_id: Option<String>,
 }
 
 /// A share-safe import preview. The token retains local launch resolutions;
@@ -150,6 +154,7 @@ impl Default for MappingConfiguration {
             templates: Vec::new(),
             application_bindings: Vec::new(),
             button_mapping_follow_enabled: false,
+            remembered_template_id: None,
         }
     }
 }
@@ -213,6 +218,23 @@ impl MappingConfiguration {
                 .take()
                 .map(|v| normalized_required(&v, "程序目标"))
                 .transpose()?;
+        }
+        if self.remembered_template_id.is_some()
+            && (self.button_mapping_follow_enabled
+                || self
+                    .remembered_template_id
+                    .as_deref()
+                    .is_some_and(|id| self.template_mappings(id).is_none()))
+        {
+            crate::gatt_note(format!(
+                "manual_template_memory phase=normalized result=cleared reason={}",
+                if self.button_mapping_follow_enabled {
+                    "following_enabled"
+                } else {
+                    "template_missing"
+                }
+            ));
+            self.remembered_template_id = None;
         }
         Ok(self)
     }

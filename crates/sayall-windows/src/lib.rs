@@ -953,8 +953,8 @@ impl WindowsPlatform {
     pub fn set_mapping_configuration(&self, configuration: templates::MappingConfiguration) {
         ble::gatt_note(format!("template_configuration result=applied program_defaults_enabled={} third_party_ui_query=false", configuration.button_mapping_follow_enabled));
         let common = configuration.common_mappings.clone();
-        self.button_mapping.set_mappings(common);
         let _ = self.scene_control.set_configuration(configuration);
+        self.button_mapping.set_mappings(common);
     }
 
     pub fn scene_snapshot(&self) -> scene_control::SceneSnapshot {
@@ -1022,6 +1022,20 @@ impl WindowsPlatform {
 
     pub fn subscribe_scene_events(&self, callback: scene_control::SceneEventCallback) {
         self.scene_control.subscribe(callback);
+    }
+
+    pub fn manual_template_save_is_current(
+        &self,
+        request_id: u64,
+        template_id: Option<&str>,
+    ) -> bool {
+        self.scene_control
+            .manual_template_save_is_current(request_id, template_id)
+    }
+
+    pub fn complete_manual_template_save(&self, request_id: u64, saved: bool) {
+        self.scene_control
+            .complete_manual_template_save(request_id, saved);
     }
 
     pub fn notify_scene_voice_active(&self, active: bool) {

@@ -23,7 +23,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   });
   return {
     ...actual,
-    getSceneSnapshot: vi.fn(async () => ({ templateId: "preset-agent", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 })),
+    getSceneSnapshot: vi.fn(async () => ({ templateId: "preset-agent", mappingNotice: { kind: "direct", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 })),
     selectCurrentTemplate: vi.fn(),
     subscribeSceneEvents: vi.fn(async (handler: SceneHandler) => { sceneHandler = handler; return () => { sceneHandler = null; }; }),
     getMappingConfiguration: vi.fn(async () => ({
@@ -224,6 +224,7 @@ beforeEach(() => {
   gestureHandler = null;
   vi.mocked(getMappingConfiguration).mockClear();
   vi.mocked(getTemplateCatalog).mockClear();
+  vi.mocked(selectCurrentTemplate).mockReset();
   vi.mocked(saveMappingConfiguration).mockClear();
   vi.mocked(setMenuTemplateSwitchEnabled).mockReset();
   vi.mocked(subscribeButtonEdges).mockClear();
@@ -314,16 +315,16 @@ describe("buttons mapping page", () => {
 
   it("shows the applied template separately from the editing draft and follows runtime changes", async () => {
     const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
-    const current = wrapper.get('output[aria-label="当前使用的按键模板"]');
-    expect(current.text()).toBe("Agent");
-    expect(wrapper.find('.current-template-display select, .current-template-display button, .current-template-display input').exists()).toBe(false);
+    const current = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    expect((current.element as HTMLSelectElement).value).toBe("preset-agent");
+    expect(current.text()).toContain("Agent");
     const editor = wrapper.get('.editing-source-picker select');
     await editor.setValue("template:profile-a"); await flushPromises();
-    expect(current.text()).toBe("Agent");
+    expect((current.element as HTMLSelectElement).value).toBe("preset-agent");
     expect(selectCurrentTemplate).not.toHaveBeenCalled();
-    sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "template", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
+    sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "direct", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
     await flushPromises();
-    expect(current.text()).toBe("模板 A");
+    expect((current.element as HTMLSelectElement).value).toBe("profile-a");
     expect((editor.element as HTMLSelectElement).value).toBe("template:profile-a");
     wrapper.unmount();
   });
@@ -331,15 +332,60 @@ describe("buttons mapping page", () => {
   it("shows an unconfirmed state on read failure and updates to common only after application", async () => {
     vi.mocked(getSceneSnapshot).mockRejectedValueOnce(new Error("读取失败"));
     const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
-    const current = wrapper.get('output[aria-label="当前使用的按键模板"]');
-    expect(current.text()).toBe("正在确认当前模板…");
+    const current = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    expect((current.element as HTMLSelectElement).value).toBe("");
+    expect(current.text()).toContain("正在确认当前模板…");
     expect(wrapper.text()).toContain("读取失败");
     sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "common", templateId: null, name: null, actionsAvailable: true } });
     await flushPromises();
-    expect(current.text()).toBe("通用配置");
+    expect((current.element as HTMLSelectElement).value).toBe("common");
     expect(selectCurrentTemplate).not.toHaveBeenCalled();
     wrapper.unmount();
   });
+
+  it("applies the selected runtime template without changing the separate editor target", async () => {
+    vi.mocked(selectCurrentTemplate).mockImplementationOnce(async templateId => ({
+      ...voiceSnapshot(false),
+      templateId,
+      mappingNotice: { kind: templateId ? "direct" : "common", templateId, name: templateId ? "模板 A" : null, actionsAvailable: true },
+      mappingNoticeRevision: 2,
+    }));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const active = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    await active.setValue("profile-a"); await flushPromises();
+    expect(selectCurrentTemplate).toHaveBeenCalledExactlyOnceWith("profile-a");
+    expect((active.element as HTMLSelectElement).value).toBe("profile-a");
+    expect((wrapper.get(".editing-source-picker select").element as HTMLSelectElement).value).toBe("common");
+    expect(wrapper.text()).toContain("模板 A");
+    wrapper.unmount();
+  });
+
+  it("keeps the confirmed active template on application failure", async () => {
+    vi.mocked(selectCurrentTemplate).mockRejectedValueOnce(new Error("映射应用失败"));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const active = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    await active.setValue("profile-a"); await flushPromises();
+    expect((active.element as HTMLSelectElement).value).toBe("preset-agent");
+    expect(wrapper.text()).toContain("映射应用失败");
+    wrapper.unmount();
+  });
+
+  it("blocks repeated active-template changes while the engine confirmation is pending", async () => {
+    let resolve!: (snapshot: SceneSnapshot) => void;
+    vi.mocked(selectCurrentTemplate).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const active = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    await active.setValue("profile-a");
+    expect((active.element as HTMLSelectElement).disabled).toBe(true);
+    (active.element as HTMLSelectElement).value = "scene-copy";
+    await active.trigger("change");
+    expect(selectCurrentTemplate).toHaveBeenCalledExactlyOnceWith("profile-a");
+    resolve({ ...voiceSnapshot(false), templateId: "profile-a", mappingNotice: { kind: "direct", templateId: "profile-a", name: "模板 A", actionsAvailable: true }, mappingNoticeRevision: 2 });
+    await flushPromises();
+    expect((active.element as HTMLSelectElement).value).toBe("profile-a");
+    wrapper.unmount();
+  });
+
   it("saves Menu mode through the shared narrow command without changing drafts or confirming pending state", async () => {
     const base = await getMappingConfiguration();
     const wrapper = await mountPage();

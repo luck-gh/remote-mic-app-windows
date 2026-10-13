@@ -1,14 +1,16 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { getSceneSnapshot, subscribeSceneEvents, type MappingNotice, type SceneSnapshot } from "./bridge";
+import { getSceneSnapshot, selectCurrentTemplate, subscribeSceneEvents, type MappingNotice, type SceneSnapshot } from "./bridge";
 
 /** Applied mapping notices are authoritative; menu candidates and editor drafts are not. */
 export function useCurrentTemplate() {
   const applied = ref<MappingNotice | null>(null);
   const sceneSnapshot = ref<SceneSnapshot | null>(null);
   const error = ref("");
+  const applying = ref(false);
   let revision = -1;
   let snapshotEvents = 0;
   let readRequest = 0;
+  let applyRequest = 0;
   let disposed = false;
   let unlisten: (() => void) | undefined;
 
@@ -38,6 +40,31 @@ export function useCurrentTemplate() {
     }
   }
 
+  async function activate(templateId: string | null): Promise<void> {
+    if (disposed || applying.value) return;
+    applying.value = true;
+    error.value = "";
+    const request = ++applyRequest;
+    const revisionAtStart = revision;
+    const eventsAtRequest = snapshotEvents;
+    try {
+      const snapshot = await selectCurrentTemplate(templateId);
+      if (disposed || request !== applyRequest) return;
+      const notice = snapshot.mappingNotice;
+      // MappingNotice.kind describes action availability (direct/common/disabled/unconfigured),
+      // not the selected-template category. The notice's templateId is the applied identity.
+      const matchesRequest = notice && notice.templateId === templateId;
+      if (!matchesRequest) throw new Error("模板应用未得到对应的引擎确认。");
+      if (snapshotEvents === eventsAtRequest && snapshot.mappingNoticeRevision >= revision) acceptSnapshot(snapshot);
+      else if (snapshot.mappingNoticeRevision > revision) acceptNotice(notice, snapshot.mappingNoticeRevision);
+    } catch (reason) {
+      if (!disposed && request === applyRequest && revision === revisionAtStart)
+        error.value = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      if (!disposed && request === applyRequest) applying.value = false;
+    }
+  }
+
   onMounted(async () => {
     try {
       const stop = await subscribeSceneEvents(event => {
@@ -57,5 +84,10 @@ export function useCurrentTemplate() {
   });
   onUnmounted(() => { disposed = true; unlisten?.(); });
 
-  return { applied, sceneSnapshot, templateId: computed(() => applied.value?.templateId ?? null), error, refresh };
+  const persistenceMessage = computed(() => {
+    return applied.value?.manualSaveStatus === "failed"
+      ? "当前模板已应用，但未能记住本次选择；重启后将使用之前记住的选择（如无记录则为通用配置）。"
+      : "";
+  });
+  return { applied, sceneSnapshot, templateId: computed(() => applied.value?.templateId ?? null), error, applying, persistenceMessage, refresh, activate };
 }

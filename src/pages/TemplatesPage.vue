@@ -241,6 +241,11 @@ function directTemplate(entry: TemplateCatalogEntry): ButtonMappingTemplate | nu
     : null;
 }
 
+function useTemplate(entry: TemplateCatalogEntry): void {
+  if (busy.value || currentTemplate.applying.value) return;
+  void currentTemplate.activate(entry.id);
+}
+
 function bindingCount(entry: TemplateCatalogEntry): number {
   return entry.kind === "direct"
     ? configuration.value?.applicationBindings.filter((binding) => binding.templateId === entry.id).length ?? 0
@@ -290,7 +295,7 @@ onMounted(() => {
           <input type="checkbox" aria-label="模板切换提示" aria-describedby="mapping-notice-help" :checked="configuration.mappingNoticeEnabled" :disabled="busy" :aria-busy="rulePending.mappingNoticeEnabled" :aria-disabled="busy || rulePending.mappingNoticeEnabled" @change="toggleMappingNotice">
           <span><strong>模板切换提示</strong><small id="mapping-notice-help">仅生效模板变化时短暂提示。</small></span>
         </label>
-        <details class="template-help"><summary>使用说明</summary><p class="muted">关闭自动加载后，手动选中的模板在本次运行中持续使用，切换程序不会清除；重启后恢复通用配置。开启自动加载后，菜单未勾选更新默认时仅覆盖当前程序，切到其他程序后清除；勾选并确认才保存该程序默认。按键页切换仅改变当前使用模板。关闭菜单选择后，菜单键按当前映射执行。提示开关不影响按键动作。</p></details>
+        <details class="template-help"><summary>使用说明</summary><p class="muted">关闭自动加载后，手动选中的模板会记住并在重启后继续使用，切换程序不会清除；选择通用配置会清除这项记忆。开启自动加载后，按现有程序规则加载；再次关闭后从通用配置开始。菜单选择可选本次使用或保存为程序默认。模板列表和按键页的“当前使用”都会立即应用模板，与编辑草稿分开；不会开启自动加载或更改程序默认。关闭菜单选择后，菜单键按当前映射执行。提示开关不影响按键动作。</p></details>
         <p class="rule-feedback error-text" role="status" aria-live="polite">{{ ruleError ? `保存失败：${ruleError}` : "" }}</p>
       </section>
 
@@ -299,12 +304,14 @@ onMounted(() => {
         <div class="collapsible-body">
         <p class="muted">所有模板统一发送固定按键或组合键，不读取第三方界面。前三项可直接编辑或单独复位；未配置的动作不执行映射。</p>
         <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
+        <p v-if="currentTemplate.persistenceMessage.value" class="muted" role="status" aria-live="polite">{{ currentTemplate.persistenceMessage.value }}</p>
         <div v-for="template in catalog" :key="template.id" class="status-panel template-row" :class="{ 'current-template': currentTemplate.applied.value && currentTemplate.templateId.value === template.id }" :aria-current="currentTemplate.applied.value && currentTemplate.templateId.value === template.id ? 'true' : undefined">
           <span>
             <strong>{{ template.name }}</strong>
             <small>固定按键与组合键 · 已关联 {{ bindingCount(template) }} 个程序<span v-if="template.builtIn"> · 默认模板</span></small>
           </span>
           <span class="button-row">
+            <button type="button" class="secondary-button" :disabled="busy || currentTemplate.applying.value" :aria-busy="currentTemplate.applying.value" @click="useTemplate(template)">使用</button>
             <button type="button" class="secondary-button" :disabled="busy" @click="directTemplate(template) && edit(directTemplate(template)!)">编辑</button>
             <button v-if="template.builtIn" type="button" class="secondary-button" :disabled="busy" @click="resetDefault(template)">复位模板</button>
             <button type="button" class="secondary-button" :disabled="busy" @click="copyCatalogEntry(template)">复制</button>

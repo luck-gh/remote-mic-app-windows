@@ -545,9 +545,15 @@ impl SettingsStore {
         let _guard = lock(&self.access);
         // A mapping editor may have opened before the menu preference changed.
         // Only the dedicated preference transaction owns this setting.
-        configuration.menu_update_default = self
-            .load_mapping_configuration_unlocked()?
-            .menu_update_default;
+        let latest = self.load_mapping_configuration_unlocked()?;
+        configuration.menu_update_default = latest.menu_update_default;
+        configuration.remembered_template_id = if configuration.button_mapping_follow_enabled
+            != latest.button_mapping_follow_enabled
+        {
+            None
+        } else {
+            latest.remembered_template_id
+        };
         let saved = self.save_mapping_configuration_unlocked(configuration)?;
         apply(&saved);
         Ok(saved)
@@ -588,10 +594,36 @@ impl SettingsStore {
     ) -> Result<(MappingConfiguration, R), String> {
         let _guard = lock(&self.access);
         let mut configuration = self.load_mapping_configuration_unlocked()?;
+        let following_before = configuration.button_mapping_follow_enabled;
         let result = update(&mut configuration)?;
+        if configuration.button_mapping_follow_enabled != following_before {
+            configuration.remembered_template_id = None;
+        }
         let saved = self.save_mapping_configuration_unlocked(configuration)?;
         apply(&saved);
         Ok((saved, result))
+    }
+
+    /// The engine has already applied this choice. Do not reapply mappings while
+    /// remembering it: a disk callback must not cancel a newer engine request.
+    pub fn save_remembered_template(
+        &self,
+        request_id: u64,
+        template_id: Option<&str>,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<bool, String> {
+        let _guard = lock(&self.access);
+        let mut configuration = self.load_mapping_configuration_unlocked()?;
+        if configuration.button_mapping_follow_enabled || !is_current() {
+            sayall_windows::gatt_note(format!("manual_template_memory phase=save_skipped request_id={request_id} reason=selection_changed"));
+            return Ok(false);
+        }
+        if template_id.is_some_and(|id| configuration.template_mappings(id).is_none()) {
+            return Err("已应用的模板已不存在，未能记住本次选择".into());
+        }
+        configuration.remembered_template_id = template_id.map(str::to_owned);
+        self.save_mapping_configuration_unlocked(configuration)?;
+        Ok(true)
     }
 
     fn save_mapping_configuration_unlocked(
@@ -1171,6 +1203,7 @@ fn resolve_mapping_import(
                     menu_template_switch_enabled: current.menu_template_switch_enabled,
                     menu_update_default: current.menu_update_default,
                     button_mapping_follow_enabled: v.button_mapping_follow_enabled,
+                    remembered_template_id: current.remembered_template_id.clone(),
                     templates: v.templates,
                     application_bindings: v
                         .application_bindings
@@ -1332,6 +1365,160 @@ mod tests {
             std::env::temp_dir().join(format!("sayall-template-test-{}", new_template_id()));
         fs::create_dir_all(&directory).unwrap();
         SettingsStore::new(directory.join("settings.json"))
+    }
+
+    #[test]
+    fn remembered_template_transaction_preserves_latest_choice_through_editor_save_and_reopen() {
+        let store = template_test_store();
+        let mut stale_editor = store.load_mapping_configuration().unwrap();
+        assert!(store
+            .save_remembered_template(
+                4,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true
+            )
+            .unwrap());
+        stale_editor.mapping_notice_enabled = false;
+        let saved = store.save_mapping_configuration(stale_editor).unwrap();
+        assert_eq!(
+            saved.remembered_template_id.as_deref(),
+            Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID)
+        );
+        let reopened = SettingsStore::new(store.path.clone())
+            .load_mapping_configuration()
+            .unwrap();
+        assert_eq!(reopened, saved);
+        assert!(store.save_remembered_template(5, None, || true).unwrap());
+        assert!(SettingsStore::new(store.path.clone())
+            .load_mapping_configuration()
+            .unwrap()
+            .remembered_template_id
+            .is_none());
+    }
+
+    #[test]
+    fn remembered_template_transaction_rejects_stale_missing_and_auto_choices() {
+        let store = template_test_store();
+        let original = store.load_mapping_configuration().unwrap();
+        assert!(!store
+            .save_remembered_template(
+                1,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || false
+            )
+            .unwrap());
+        assert!(store
+            .save_remembered_template(2, Some("missing-template"), || true)
+            .is_err());
+        assert_eq!(store.load_mapping_configuration().unwrap(), original);
+        store
+            .update_mapping_configuration(
+                |c| {
+                    c.button_mapping_follow_enabled = true;
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert!(!store
+            .save_remembered_template(
+                3,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true
+            )
+            .unwrap());
+        assert!(store
+            .load_mapping_configuration()
+            .unwrap()
+            .remembered_template_id
+            .is_none());
+    }
+
+    #[test]
+    fn remembered_template_mode_switch_delete_and_rename_have_distinct_memory_semantics() {
+        let store = template_test_store();
+        let (_, template) = store
+            .update_mapping_configuration(|c| c.create_template("local test".into()), |_| {})
+            .unwrap();
+        store
+            .save_remembered_template(1, Some(&template.id), || true)
+            .unwrap();
+        let renamed = store
+            .update_mapping_configuration(
+                |c| {
+                    c.templates[0].name = "renamed test".into();
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            renamed.remembered_template_id.as_deref(),
+            Some(template.id.as_str())
+        );
+        let deleted = store
+            .update_mapping_configuration(
+                |c| {
+                    c.templates.clear();
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap()
+            .0;
+        assert!(deleted.remembered_template_id.is_none());
+        store
+            .save_remembered_template(
+                2,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true,
+            )
+            .unwrap();
+        for following in [true, false] {
+            let changed = store
+                .update_mapping_configuration(
+                    |c| {
+                        c.button_mapping_follow_enabled = following;
+                        Ok(())
+                    },
+                    |_| {},
+                )
+                .unwrap()
+                .0;
+            assert!(changed.remembered_template_id.is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remembered_template_write_failure_leaves_previous_file_and_returns_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let store = template_test_store();
+        let path = store.button_mappings_path();
+        store
+            .save_mapping_configuration(MappingConfiguration::default())
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(store
+            .save_remembered_template(
+                1,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true
+            )
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(store
+            .load_mapping_configuration()
+            .unwrap()
+            .remembered_template_id
+            .is_none());
+        drop(guard);
     }
 
     #[test]

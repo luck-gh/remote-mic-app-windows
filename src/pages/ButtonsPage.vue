@@ -390,6 +390,24 @@ const editingSourceOptions = computed(() => [
   })),
 ]);
 
+const activeTemplateOptions = computed(() => {
+  const activeId = currentTemplate.templateId.value;
+  const active = activeId ? templateCatalog.value.find(entry => entry.id === activeId) : null;
+  return [
+    { value: "common", label: "通用配置" },
+    ...(activeId && !active ? [{ value: activeId, label: currentTemplate.applied.value?.name ?? "当前模板" }] : []),
+    ...templateCatalog.value.map(entry => ({ value: entry.id, label: entry.name })),
+  ];
+});
+
+function selectActiveTemplate(event: Event): void {
+  const select = event.currentTarget as HTMLSelectElement;
+  const requested = select.value === "common" ? null : select.value;
+  // The control always reflects the confirmed mapping; the API result/event moves it.
+  select.value = currentTemplate.applied.value?.templateId ?? "common";
+  void currentTemplate.activate(requested);
+}
+
 function cloneMappings(value: ButtonMappings): ButtonMappings {
   return JSON.parse(JSON.stringify(value)) as ButtonMappings;
 }
@@ -1036,7 +1054,10 @@ onUnmounted(() => {
       <div class="mapping-header-controls">
         <div class="current-template-display">
           <span>当前使用</span>
-          <output aria-label="当前使用的按键模板">{{ !currentTemplate.applied.value ? '正在确认当前模板…' : currentTemplate.templateId.value ? currentTemplate.applied.value.name ?? '当前模板' : '通用配置' }}</output>
+          <select aria-label="当前使用的按键模板" :value="!currentTemplate.applied.value ? '' : currentTemplate.templateId.value ?? 'common'" :disabled="busy || currentTemplate.applying.value || !currentTemplate.applied.value" :aria-busy="currentTemplate.applying.value" @change="selectActiveTemplate">
+            <option value="" disabled>正在确认当前模板…</option>
+            <option v-for="option in activeTemplateOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
         </div>
         <label class="editing-source-picker">
           <span>编辑配置</span>
@@ -1048,8 +1069,9 @@ onUnmounted(() => {
 
       </div>
       <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
+      <p v-if="currentTemplate.persistenceMessage.value" class="mapping-header-status muted" role="status" aria-live="polite">{{ currentTemplate.persistenceMessage.value }}</p>
       <p v-if="voiceFeedback" class="voice-feedback" role="status">{{ voiceFeedback }}</p>
-      <p class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
+      <p v-else class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
     </header>
 
     <div id="global-mapping-panel">
@@ -1428,20 +1450,7 @@ onUnmounted(() => {
   font-size: 0.78rem;
 }
 .editing-source-picker select { min-height: 36px; min-width: 0; width: 100%; }
-.current-template-display output {
-  display: block;
-  box-sizing: border-box;
-  min-height: 36px;
-  padding: 0 8px;
-  line-height: 34px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text-secondary);
-  background: var(--surface-control);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.current-template-display select { min-height: 36px; min-width: 0; width: 100%; }
 .save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
 .mapping-header {
   display: grid;

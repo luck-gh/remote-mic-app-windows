@@ -201,6 +201,22 @@ UI 的确定缺陷是仅以持久化 `enabled=false` 显示“未开启”，忽
 
 必要现场仅本机留于既有 `target/dev/foreground-input/template-switch-current.log` 与 `template-switch-configuration.json`，前者保留 13:42:25 至本轮冻结终点的完整相关会话，后者用于核对用户映射并比较早先快照；含本机敏感配置与旧日志字段，不提交原件。本页仅记录脱敏时间、PID、位图、标准退格键码、包指纹及用户观察。保留至该次正常/异常路径对照闭合，随后按 LOGGING 回收，不新增重复台账。
 
+### 2026-10-13 当前启动与菜单手选（旧启动契约与新记忆要求）
+
+用户补充确认：当前重选使用模板后正常响应；按键被收到与实际存在映射须分开判断。本轮只读核对安装身份 `f7c679a6ed822b9a2cbcf1a335fdc3ab06140bef6034825410b81657e95e2b99` 的 App 53020 当前生命周期，不重启、不改配置、不模拟按键。北京时间17:07:07启动，17:07:08实际应用 `source=common / generation=2 / actions_available=false`；自动跟随关闭、common actions为0，捕获随后仅有Menu（mask=256），17:07:25的Left已收到但 `configured=false`。17:17:43首次且唯一手选请求为 `source=menu / common=false / scope=session / persisted=false`，generation19→20；17:17:44捕获确认后 `actions_available=true`。随后Back有142条手势/执行/提交事件，17:20:03–06多次Single为fired/queued；最后17:20:45仍是 `source=menu / generation=33 / actions_available=true`，未见重新应用common。用户确认手选Agent后的可用性是实际观察；queued本身只证明提交。
+
+当前事实符合连续覆盖安装后的新启动不恢复上次进程内手选这一旧明确契约，不是0.8.6随机覆盖；它不证明以前17:56同运行先成功、后失败的原因。菜单请求日志不含template ID，不能只凭 `source=menu` 断言确切模板；当前保存的Agent覆盖确为单键Backspace，与用户说明一致。未直接调用活体SceneSnapshot IPC或采集UI像素，不将日志检查当作灰标签显示核验。编辑源选择只更新前端草稿；向导语音绑定只推送语音设置，映射暂挂只设置suspended；本轮未发现它们清除当前手选的新代码/日志竞争证据。17:17–18分钟另有菜单返回目标恢复失败/保留面板日志，是独立焦点边界，不据此解释当前映射丢失。
+
+用户随后明确要求替换旧契约：关闭自动跟随时，手动使用经映射引擎确认后记住，重启恢复；明确选通用清除记忆。开启跟随清除全局记忆，按已有程序规则选择；再次关闭从通用开始，程序默认关联不改。候选只新增 `rememberedTemplateId` 设置，缺字段为None；删除/无效ID安全回通用，重命名/编辑保留同ID。菜单与UI共用引擎确认后的保存事件，保存只更新记忆字段，不重新套用整套映射；整包编辑保存合并最新记忆。`manualSaveStatus=saving/saved/failed` 区分实际应用与持久化结果；保存失败保留当前已应用模板，重启仍使用上次保存的选择，不谎报回滚或已记住。迟到旧保存核对本次手选代次，未确认新选择的previous可结清旧保存；引擎超时/拒绝不请求保存。捕获租约/驻留换代开发继续暂停。
+
+定向验证：初始四项重启/首次配置/开关/ACK回归先红后绿，旧保存与未确认新请求交错另先红后绿；场景套件79 passed、0 failed、1个既有真前台探针ignored。真实Host的四项记忆事务测试passed，覆盖旧编辑合并/重开/通用、迟到与无效选择、重命名/删除/开关以及自有文件共享锁造成的真实写入失败后旧字节保持。独立有界review发现启动记忆来源被旧分支误标program_default，补断言先红后修正为remembered，最终记忆定向9/9 passed。冻结源码完整矩阵passed：前端407项/28文件、类型检查/构建；Rust workspace728 passed/23 ignored（Windows531/22、Host158/1、core32、scene4、集成3），另有独立诊断子进程1项；fmt、普通/仿真check；Helper58/3 ignored及父测试实际执行的子入口、Agent95、身份夹具及前端嵌入内容门禁12项。真实隔离WebView/Tauri模拟18步passed且正常清理，但模拟接口不支持select_current_template，不把它当作本次模板记忆验收。沙箱内tauri-build/rustfmt的os error5不计产品失败，实际检查由真实宿主执行。
+
+本地候选运行身份 `d884cf3d7399e892c0bbc2ab9cb87879886ca744888d9baa6187e1017e7242fc` 安装后，用户明确确认模板列表鼠标“使用”和按键页当前使用下拉均正常、编辑目标不变，当前PC此次两入口交互passed。用户另反馈成功提示闪动；仅删除成功提示，不更改应用/保存链，重跑前端检查后正常覆盖安装后续静默候选：setup SHA-256 `1a2a01a08ce5effda6260b4d52cff5a625b2ead404bef9c7d166a5162161505c`，运行 source fingerprint `8a38c43cce592fff5636e0aa9aafa06abd38f0b6092b21e73e34cff1cc774007`，base `af710b757897cb0567b63c63a7ceb40f62426652`、dirty/local/included。六个相关Rust文件hash保持，因此复用上述同内容Rust/Helper/模拟证据；不凭新前端包自动扩大硬件结论。
+
+真实退出/安装/重启分层证据：旧App23840正常退出overall passed、failed_stages=0、808ms；安装前记忆为browser，安装前后五份配置哈希保持。Explorer12848启动安装版59956，Session1、TokenElevation0、主窗可见，实际身份与静默候选匹配、Helper connected。北京时间18:25:49–52新进程首先读回 `source=remembered / generation=2 / actions_available=true`；18:25:55.096随后有 `source=buttons_page / generation=3` 请求、应用确认及记忆保存passed，稍后读回Agent。用户最终明确说明Agent是自己启动后手动选择，并确认再次切换不闪动。启动初始browser恢复依据是安装前后配置与新进程日志，不声称用户亲眼确认了该初始画面；之后Agent是已确认的人为使用，不是自动覆盖记忆。本次两入口、正常重启记忆恢复和去成功提示的限定验收passed；它不关闭旧17:56同进程失映射、其他设备/完整硬件矩阵或暂停capture边界。
+
+最小现场为既有主题下 `target/dev/foreground-input/template-current-session-evidence.json`（6,933字节），保留35条脱敏生命周期/应用/捕获事件及Back首尾样本；当前与最近轮转原件原位保留，无整树复制。归因已在本节独立保存；本次入口验收闭合后按LOGGING回收，不提交原始配置或语音内容。红绿与场景日志复用同目录 `remembered-template-*`，不新增重复台账。
+
 ## 2026-10-10 晚方向键长按与实体键盘共存（来源调查中）
 
 用户再次报告遥控器方向与返回按住不能连续执行，并补充实体键盘也异常：ESC 下方、数字 1 左侧的键变成 Tab（用户称 Table），方向键按住只移动一次，实体 Backspace 仍能连续退格。此补充扩大到键盘共存，不能只以遥控器模板连发关闭解释整组现象；尚未取得本轮只按实体键盘的准确时段及连接方式。

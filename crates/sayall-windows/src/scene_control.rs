@@ -109,6 +109,10 @@ pub enum SceneEvent {
         request_id: u64,
         enabled: bool,
     },
+    ManualTemplatePersistenceRequested {
+        request_id: u64,
+        template_id: Option<String>,
+    },
 }
 
 pub type SceneEventCallback = Arc<dyn Fn(SceneEvent) + Send + Sync>;
@@ -122,6 +126,7 @@ pub struct MappingNotice {
     pub name: Option<String>,
     pub actions_available: bool,
     pub default_save_status: Option<String>,
+    pub manual_save_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +150,8 @@ struct ManualTemplateSelection {
     template_id: Option<String>,
     application_id: Option<String>,
     source: &'static str,
+    generation: u64,
+    save_status: Option<String>,
 }
 
 struct PendingTemplateSelection {
@@ -315,15 +322,18 @@ impl SceneController {
         {
             let mut state = lock(&self.state);
             cancel_state(&mut state, "configuration_changed");
-            let follow_reenabled = !state.configuration.button_mapping_follow_enabled
-                && configuration.button_mapping_follow_enabled;
+            let follow_changed = state.configuration.button_mapping_follow_enabled
+                != configuration.button_mapping_follow_enabled;
             state.configuration = configuration;
+            if follow_changed {
+                state.configuration.remembered_template_id = None;
+            }
             if state
                 .manual_selection
                 .as_ref()
                 .and_then(|selection| selection.template_id.as_deref())
                 .is_some_and(|id| !template_exists(&state.configuration, id))
-                || (follow_reenabled && !manual_selection_matches_application(&state))
+                || follow_changed
             {
                 state.manual_selection = None;
             }
@@ -446,7 +456,7 @@ impl SceneController {
         mut notice: MappingNotice,
         available: bool,
     ) {
-        let (event, source, selection_confirmed) = {
+        let (event, source, selection_confirmed, persistence) = {
             let mut state = lock(&self.state);
             if state.generation != generation || state.foreground_generation != foreground {
                 return;
@@ -461,6 +471,24 @@ impl SceneController {
             }
             notice.actions_available =
                 available && !matches!(notice.kind.as_str(), "disabled" | "unconfigured");
+            let persistence = if !state.configuration.button_mapping_follow_enabled {
+                state.manual_selection.as_mut().and_then(|selection| {
+                    if selection.save_status.is_some() {
+                        return None;
+                    }
+                    selection.save_status = Some("saving".into());
+                    Some(SceneEvent::ManualTemplatePersistenceRequested {
+                        request_id: selection.generation,
+                        template_id: selection.template_id.clone(),
+                    })
+                })
+            } else {
+                None
+            };
+            notice.manual_save_status = state
+                .manual_selection
+                .as_ref()
+                .and_then(|selection| selection.save_status.clone());
             let event = if state.mapping_notice.as_ref() != Some(&notice) {
                 state.mapping_notice_revision = state.mapping_notice_revision.saturating_add(1);
                 state.mapping_notice = Some(notice.clone());
@@ -479,7 +507,12 @@ impl SceneController {
                     let _ = pending.reply.try_send(Ok(snapshot_from(&state)));
                 }
             }
-            (event, selection_source(&state), selection_confirmed)
+            (
+                event,
+                selection_source(&state),
+                selection_confirmed,
+                persistence,
+            )
         };
         if event.is_none() && !selection_confirmed {
             return;
@@ -489,6 +522,78 @@ impl SceneController {
         if let Some(event) = event {
             emit(&self.callbacks, event);
         }
+        if let Some(event) = persistence {
+            emit(&self.callbacks, event);
+        }
+    }
+
+    /// Called under the settings transaction lock before saving only the memory field.
+    pub fn manual_template_save_is_current(
+        &self,
+        request_id: u64,
+        template_id: Option<&str>,
+    ) -> bool {
+        let state = lock(&self.state);
+        !state.configuration.button_mapping_follow_enabled
+            && state
+                .manual_selection
+                .as_ref()
+                .into_iter()
+                .chain(
+                    state
+                        .pending_selection
+                        .as_ref()
+                        .and_then(|pending| pending.previous.as_ref()),
+                )
+                .any(|selection| {
+                    selection.generation == request_id
+                        && selection.template_id.as_deref() == template_id
+                        && selection.save_status.as_deref() == Some("saving")
+                })
+    }
+
+    pub fn complete_manual_template_save(&self, request_id: u64, saved: bool) {
+        let event = {
+            let mut state = lock(&self.state);
+            if state.configuration.button_mapping_follow_enabled {
+                return;
+            }
+            let selection = if state
+                .manual_selection
+                .as_ref()
+                .is_some_and(|selection| selection.generation == request_id)
+            {
+                state.manual_selection.as_mut()
+            } else {
+                state
+                    .pending_selection
+                    .as_mut()
+                    .and_then(|pending| pending.previous.as_mut())
+            };
+            let Some(selection) = selection.filter(|selection| {
+                selection.generation == request_id
+                    && selection.save_status.as_deref() == Some("saving")
+            }) else {
+                return;
+            };
+            selection.save_status = Some(if saved { "saved" } else { "failed" }.into());
+            let remembered = selection.template_id.clone();
+            if saved {
+                state.configuration.remembered_template_id = remembered;
+            }
+            let Some(mut notice) = state.mapping_notice.clone() else {
+                return;
+            };
+            notice.manual_save_status = Some(if saved { "saved" } else { "failed" }.into());
+            state.mapping_notice_revision = state.mapping_notice_revision.saturating_add(1);
+            state.mapping_notice = Some(notice.clone());
+            SceneEvent::MappingApplied {
+                notice,
+                revision: state.mapping_notice_revision,
+            }
+        };
+        crate::gatt_note(format!("manual_template_memory phase=persisted request_id={request_id} terminal_result={} current_mapping_retained=true", if saved { "passed" } else { "failed" }));
+        emit(&self.callbacks, event);
     }
 
     /// Returns the ordinary-key profile selected by the current foreground
@@ -1972,6 +2077,8 @@ fn apply_manual_selection(
         template_id,
         application_id,
         source,
+        generation: state.generation,
+        save_status: None,
     });
     state.default_save_status = None;
     state.default_request = None;
@@ -2001,7 +2108,11 @@ fn selection_source(state: &State) -> &'static str {
     if let Some(selection) = effective_manual_selection(state) {
         selection.source
     } else if selected_template(state).is_some() {
-        "program_default"
+        if state.configuration.button_mapping_follow_enabled {
+            "program_default"
+        } else {
+            "remembered"
+        }
     } else {
         "common"
     }
@@ -2015,7 +2126,11 @@ fn selected_template(state: &State) -> Option<&str> {
             .filter(|id| template_exists(&state.configuration, id));
     }
     if !state.configuration.button_mapping_follow_enabled {
-        return None;
+        return state
+            .configuration
+            .remembered_template_id
+            .as_deref()
+            .filter(|id| template_exists(&state.configuration, id));
     }
     let application = state.token.as_ref()?.application_id();
     state
@@ -2133,6 +2248,10 @@ fn mapping_notice_from(state: &State) -> MappingNotice {
         name: template.map(|t| t.name),
         actions_available: false,
         default_save_status: state.default_save_status.clone(),
+        manual_save_status: state
+            .manual_selection
+            .as_ref()
+            .and_then(|selection| selection.save_status.clone()),
     }
 }
 fn snapshot_from(state: &State) -> SceneSnapshot {
@@ -4439,10 +4558,21 @@ mod tests {
     #[test]
     fn button_selection_requires_mapping_ack_and_rejects_late_ack_after_timeout() {
         let controller = controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
         let before = controller.active_button_mapping();
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&callbacks);
+        let save_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requested = Arc::clone(&save_requests);
         controller.subscribe(Arc::new(move |event| {
+            if matches!(
+                &event,
+                SceneEvent::ManualTemplatePersistenceRequested { .. }
+            ) {
+                requested.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             if let SceneEvent::Snapshot { snapshot } = event {
                 lock(&observed).push((snapshot.generation, snapshot.foreground_generation));
             }
@@ -4451,6 +4581,7 @@ mod tests {
             .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
             .is_err());
         assert_eq!(controller.active_button_mapping(), before);
+        assert_eq!(save_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         let (generation, foreground) = lock(&callbacks)[0];
         let mut notice = controller.mapping_notice_candidate().2;
         notice.template_id = Some(BUILTIN_CHAT_TEMPLATE_ID.into());
@@ -4560,7 +4691,7 @@ mod tests {
         );
     }
     #[test]
-    fn reenabling_follow_keeps_only_the_current_program_manual_override() {
+    fn reenabling_follow_clears_global_choice_and_uses_program_default() {
         for switch_program in [false, true] {
             let controller = acknowledged_controller();
             lock(&controller.state)
@@ -4585,7 +4716,7 @@ mod tests {
             } else {
                 assert_eq!(
                     active_template_id(&lock(&controller.state)).as_deref(),
-                    Some(BUILTIN_CHAT_TEMPLATE_ID)
+                    Some(BUILTIN_AGENT_TEMPLATE_ID)
                 );
             }
         }
@@ -4610,7 +4741,7 @@ mod tests {
         assert!(lock(&controller.state).manual_selection.is_none());
     }
     #[test]
-    fn restarting_runtime_keeps_preferences_and_defaults_but_not_manual_selection() {
+    fn remembered_template_restarts_without_changing_program_defaults() {
         let controller = acknowledged_controller();
         lock(&controller.state)
             .configuration
@@ -4620,9 +4751,10 @@ mod tests {
             .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
             .unwrap();
         let configuration = lock(&controller.state).configuration.clone();
-        let json = serde_json::to_string(&configuration).unwrap();
+        let mut json = serde_json::to_value(&configuration).unwrap();
+        json["rememberedTemplateId"] = BUILTIN_CHAT_TEMPLATE_ID.into();
         let restarted = State {
-            configuration: serde_json::from_str(&json).unwrap(),
+            configuration: serde_json::from_value(json).unwrap(),
             token: Some(token("a", 2)),
             ..Default::default()
         };
@@ -4631,7 +4763,244 @@ mod tests {
             restarted.configuration.application_bindings,
             configuration.application_bindings
         );
-        assert!(active_button_mapping_from(&restarted).is_none());
+        assert_eq!(
+            selected_template(&restarted),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+        assert!(active_button_mapping_from(&restarted).is_some());
+    }
+    #[test]
+    fn remembered_template_starts_in_the_first_configured_mapping_generation() {
+        let controller = acknowledged_controller();
+        // This helper normally starts in program-following mode; a fresh runtime does not.
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let configuration: MappingConfiguration = serde_json::from_value(serde_json::json!({
+            "rememberedTemplateId": BUILTIN_AGENT_TEMPLATE_ID,
+            "buttonMappingFollowEnabled": false
+        }))
+        .unwrap();
+        controller.set_configuration(configuration);
+        let snapshot = controller.snapshot();
+        assert_eq!(selection_source(&lock(&controller.state)), "remembered");
+        assert_eq!(
+            snapshot.mapping_notice.unwrap().template_id.as_deref(),
+            Some(BUILTIN_AGENT_TEMPLATE_ID)
+        );
+    }
+    #[test]
+    fn remembered_template_mode_switch_clears_global_manual_choice() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        let mut configuration = lock(&controller.state).configuration.clone();
+        configuration.button_mapping_follow_enabled = true;
+        controller.set_configuration(configuration.clone());
+        assert!(lock(&controller.state).manual_selection.is_none());
+        configuration.button_mapping_follow_enabled = false;
+        controller.set_configuration(configuration);
+        assert!(controller.snapshot().template_id.is_none());
+    }
+    #[test]
+    fn remembered_template_is_requested_only_once_after_engine_ack() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        controller.subscribe(Arc::new(move |event| {
+            lock(&captured).push(serde_json::to_value(event).unwrap())
+        }));
+        let snapshot = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(snapshot.mapping_notice).unwrap()["manualSaveStatus"],
+            "saving"
+        );
+        let (generation, foreground, notice) = controller.mapping_notice_candidate();
+        controller.confirm_mapping_notice(generation, foreground, notice, true);
+        assert_eq!(
+            lock(&events)
+                .iter()
+                .filter(|event| event["type"] == "manual_template_persistence_requested")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn remembered_template_save_failure_keeps_the_actual_profile_and_can_retry() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let first = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        controller.complete_manual_template_save(first.generation, false);
+        assert_eq!(
+            controller
+                .snapshot()
+                .mapping_notice
+                .unwrap()
+                .manual_save_status
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            controller.snapshot().template_id.as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+        assert!(lock(&controller.state)
+            .configuration
+            .remembered_template_id
+            .is_none());
+        let second = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        controller.complete_manual_template_save(first.generation, true);
+        assert_eq!(
+            controller
+                .snapshot()
+                .mapping_notice
+                .unwrap()
+                .manual_save_status
+                .as_deref(),
+            Some("saving")
+        );
+        controller.complete_manual_template_save(second.generation, true);
+        assert_eq!(
+            lock(&controller.state)
+                .configuration
+                .remembered_template_id
+                .as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+    }
+    #[test]
+    fn remembered_template_explicit_common_clears_restart_memory() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let selected = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        controller.complete_manual_template_save(selected.generation, true);
+        let common = controller.select_template(None).unwrap();
+        assert!(common.mapping_notice.unwrap().template_id.is_none());
+        controller.complete_manual_template_save(common.generation, true);
+        assert!(lock(&controller.state)
+            .configuration
+            .remembered_template_id
+            .is_none());
+    }
+    #[test]
+    fn remembered_template_save_settles_the_previous_choice_during_an_unconfirmed_request() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let selected = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        {
+            let mut state = lock(&controller.state);
+            let (reply, _) = mpsc::sync_channel(1);
+            state.generation += 1;
+            state.pending_selection = Some(PendingTemplateSelection {
+                generation: state.generation,
+                foreground_generation: state.foreground_generation,
+                previous: state.manual_selection.clone(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                reply,
+            });
+            apply_manual_selection(&mut state, None, None, "buttons_page");
+        }
+        assert!(controller
+            .manual_template_save_is_current(selected.generation, Some(BUILTIN_CHAT_TEMPLATE_ID)));
+        controller.complete_manual_template_save(selected.generation, true);
+        cancel_state(&mut lock(&controller.state), "selection_ack_timeout");
+        assert_eq!(
+            lock(&controller.state)
+                .manual_selection
+                .as_ref()
+                .unwrap()
+                .save_status
+                .as_deref(),
+            Some("saved")
+        );
+        assert_eq!(
+            lock(&controller.state)
+                .configuration
+                .remembered_template_id
+                .as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+    }
+    #[test]
+    fn remembered_template_missing_id_and_following_never_override_program_rules() {
+        let mut configuration: MappingConfiguration = serde_json::from_value(
+            serde_json::json!({ "rememberedTemplateId": "missing-template" }),
+        )
+        .unwrap();
+        configuration = configuration.normalized().unwrap();
+        assert!(configuration.remembered_template_id.is_none());
+        configuration.remembered_template_id = Some(BUILTIN_CHAT_TEMPLATE_ID.into());
+        configuration.button_mapping_follow_enabled = true;
+        configuration = configuration.normalized().unwrap();
+        assert!(configuration.remembered_template_id.is_none());
+        let controller = acknowledged_controller();
+        let selected = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        assert!(selected
+            .mapping_notice
+            .unwrap()
+            .manual_save_status
+            .is_none());
+    }
+    #[test]
+    fn remembered_template_menu_confirmation_uses_the_same_save_request_as_ui() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        controller.subscribe(Arc::new(move |event| {
+            if let SceneEvent::ManualTemplatePersistenceRequested {
+                request_id,
+                template_id,
+            } = event
+            {
+                lock(&captured).push((request_id, template_id));
+            }
+        }));
+        choose(&mut lock(&controller.state), false);
+        controller.emit_snapshot();
+        let (request_id, selected) = lock(&events)[0].clone();
+        assert_eq!(selected.as_deref(), Some(BUILTIN_CHAT_TEMPLATE_ID));
+        controller.complete_manual_template_save(request_id, true);
+        assert_eq!(
+            lock(&controller.state).configuration.remembered_template_id,
+            selected
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .mapping_notice
+                .unwrap()
+                .manual_save_status
+                .as_deref(),
+            Some("saved")
+        );
     }
     #[cfg(windows)]
     mod mapping_worker_tests {
