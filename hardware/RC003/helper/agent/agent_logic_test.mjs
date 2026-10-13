@@ -95,6 +95,27 @@ const sleeps = [];                                           // Thread.sleep 桩
 const messages = [];
 let detachCount = 0;
 let attachCount = 0;
+const sourceHandlers = [];
+const sourceState = { pdo: '\\Device\\TestRemote', status: 0, queueMissing: false };
+const globals = { isNull: () => false, equals: (p) => p === globals };
+const nullPointer = { isNull: () => true };
+const table = { isNull: () => false, add: (offset) => ({ readPointer: () => ({
+  slot: offset / 8, isNull: () => false, compare: (p) => p.end ? -1 : 1,
+}) }) };
+function allocation(size) {
+  const bytes = new Uint8Array(size);
+  function at(offset) { return {
+    isNull: () => false, add: (n) => at(offset + n),
+    writeByteArray: (value) => bytes.set(new Uint8Array(value), offset),
+    writeU16: (value) => new DataView(bytes.buffer).setUint16(offset, value, true),
+    writeU32: (value) => new DataView(bytes.buffer).setUint32(offset, value, true),
+    readU16: () => new DataView(bytes.buffer).getUint16(offset, true),
+    readU32: () => new DataView(bytes.buffer).getUint32(offset, true),
+    readUtf16String: (count) => String.fromCharCode(...Array.from({ length: count }, (_, i) =>
+      new DataView(bytes.buffer).getUint16(offset + 2 * i, true))),
+  }; }
+  return at(0);
+}
 
 const sandbox = {
   console,
@@ -103,17 +124,42 @@ const sandbox = {
     id: 4242,
     arch: 'x64',
     pointerSize: 8,
-    getModuleByName: () => ({ getExportByName: () => ({ isNull: () => false }) }),
+    getModuleByName: (name) => name === 'ntdll.dll'
+      ? { getExportByName: () => ({ isNull: () => false }) }
+      : name === 'WUDFx02000.dll'
+        ? { base: { add: () => ({ end: true }) }, size: 0x100000 }
+        : { base: { add: (offset) => ({ readPointer: () => offset === 0x32dc0 ? table : globals }) } },
+    findRangeByAddress: () => ({ protection: 'r-x' }),
+  },
+  NativeFunction: function (address) {
+    return (...args) => {
+      if (address.slot === 175) return sourceState.queueMissing ? nullPointer : globals;
+      if (address.slot === 90) return globals;
+      if (address.slot === 165) {
+        args[2].add(4).writeU32(14); args[2].add(24).writeU32(0xb000b); return;
+      }
+      if (address.slot === 31) {
+        const text = sourceState.pdo;
+        for (let i = 0; i < text.length; i++) args[4].add(2 * i).writeU16(text.charCodeAt(i));
+        args[4].add(2 * text.length).writeU16(0);
+        args[5].writeU32(2 * (text.length + 1)); return sourceState.status;
+      }
+      throw new Error('unexpected WDF slot');
+    };
   },
   Interceptor: {
     attach(_fn, cb) {
+      if (_fn.slot !== undefined) {
+        sourceHandlers.push(cb);
+        return { detach() { sourceHandlers.splice(sourceHandlers.indexOf(cb), 1); } };
+      }
       handlers.onEnter = cb.onEnter; handlers.onLeave = cb.onLeave;
       attachCount++;
       return { detach() { detachCount++; } };
     },
     flush() {},
   },
-  Memory: { protect() { return true; } },
+  Memory: { protect() { return true; }, alloc: allocation },
   Socket: {
     connect() {
       return Promise.resolve({
@@ -143,19 +189,25 @@ ctx.params.port = 47831;
 ctx.connectOnce().catch(() => {});
 await new Promise((r) => setImmediate(r));                   // 让 connectOnce 的 then 落地
 check('桩助手已连接（租约前置条件）', ctx.connected === true, `connected=${ctx.connected}`);
-ctx.handleCommand('{"type":"renew"}');                       // 首次续约 = 武装时刻
+ctx.handleCommand('{"type":"renew","source_pdo":"\\\\Device\\\\TestRemote"}');
 
 /* ---------------------------------------------------------------- 挂 hook */
 
 ctx.installHook();
 check('installHook 注册了 onEnter', typeof handlers.onEnter === 'function');
 
-function beginPress(...usages) {
+function beginSourcePress(pdo, ...usages) {
   const ptr = fakePtr(report(...usages));
-  const self = {};
+  const self = { threadId: 17 };
+  const completion = { threadId: 17 };
+  sourceState.pdo = pdo;
+  const callback = sourceHandlers[0];
+  if (pdo !== null && callback) callback.onEnter.call(completion, [globals, globals, { toInt32: () => 0 }]);
   handlers.onEnter.call(self, fakeArgs(ptr));
+  if (pdo !== null && callback) callback.onLeave.call(completion);
   return { ptr, self };
 }
+function beginPress(...usages) { return beginSourcePress('\\Device\\TestRemote', ...usages); }
 
 function press(...usages) {
   const result = beginPress(...usages);
@@ -320,7 +372,7 @@ check('targets 热更新被接受（targets_applied=2）',
 {
   /* 租约过期（disarm/bye 同路径）：替换停止 → 报告回归语音键原样 → 0xE6 从
      报告中消失。HID 报告是状态语义，usage 消失本身就是 UP——无需补帧。 */
-  ctx.handleCommand(JSON.stringify({ type: 'renew' }));
+  ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
   press(0x003E);                                            // 替换激活（OS 收到 0xE6 DOWN）
   ctx.lastRenewAt = 0;                                      // 模拟租约过期
   const a = press(0x003E);
@@ -330,7 +382,7 @@ check('targets 热更新被接受（targets_applied=2）',
 }
 
 {
-  ctx.handleCommand(JSON.stringify({ type: 'renew' }));
+  ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
   ctx.handleCommand(JSON.stringify({ type: 'synth', off: true }));
   const { ptr } = press(0x003E);
   check('synth：off 后语音键恢复原样', ptr.buf[3] === 0x3e,
@@ -428,7 +480,7 @@ const attachesBefore = attachCount;
 ctx.handleCommand(JSON.stringify({ type: 'arm' }));
 ctx.handleCommand(JSON.stringify({ type: 'arm' }));
 check('重新 arm 恰好挂钩一次', attachCount === attachesBefore + 1);
-ctx.handleCommand(JSON.stringify({ type: 'renew' }));
+ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
 ctx.handleCommand(JSON.stringify({ type: 'synth', from: 0x003e, to: 0x00e6 }));
 press(0x003e);
 const beforeHeldStop = messages.length;
@@ -436,7 +488,7 @@ const beforeHeldDetach = detachCount;
 ctx.handleCommand(JSON.stringify({ type: 'disarm', instance: ctx.agentInstance, stop_id: 'held-stop' }));
 ctx.handleCommand(JSON.stringify({ type: 'disarm', instance: ctx.agentInstance, stop_id: 'held-retry' }));
 ctx.handleCommand(JSON.stringify({ type: 'arm' }));
-ctx.handleCommand(JSON.stringify({ type: 'renew' }));
+ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
 check('合成键持有中不伪报释放，也不能重新 arm',
   detachCount === beforeHeldDetach && ctx.disarmed &&
   !messages.slice(beforeHeldStop).some((m) => m.type === 'stopped'));
@@ -470,7 +522,7 @@ check('真实释放后撤钩并确认', detachCount === beforeHeldDetach + 1 &&
 check('持键停止重试仍等真实释放并回显最新请求', messages.at(-1).stop_id === 'held-retry');
 
 ctx.handleCommand(JSON.stringify({ type: 'arm' }));
-ctx.handleCommand(JSON.stringify({ type: 'renew' }));
+ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
 ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 101, report: [], clear: [] }));
 press(0x0028);
 ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 102, report: [0x0028], clear: [0x0028] }));
@@ -483,7 +535,7 @@ check('新增映射等真实 UP 后下一按才接管', press(0x0028).ptr.buf[3]
 press();
 for (const change of [{ off: true }, { from: 0x003e, to: 0x00e2 }]) {
   ctx.handleCommand(JSON.stringify({ type: 'arm' }));
-  ctx.handleCommand(JSON.stringify({ type: 'renew' }));
+  ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
   ctx.handleCommand(JSON.stringify({ type: 'synth', from: 0x003e, to: 0x00e6 }));
   press(0x003e);
   ctx.handleCommand(JSON.stringify({ type: 'synth', ...change }));
@@ -495,7 +547,59 @@ for (const change of [{ off: true }, { from: 0x003e, to: 0x00e2 }]) {
   check(`synth ${change.off ? 'off' : 'change'} 后真实释放可完成停止`, detachCount === before + 1 && !ctx.stopPending);
 }
 
+// 同样的 usage 不能证明来自遥控器。包括零帧：别的设备释放不得释放遥控器。
+ctx.handleCommand(JSON.stringify({ type: 'arm' }));
+ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
+ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 500, report: [0x35, 0x4f], clear: [0x35, 0x4f] }));
+for (const pdo of ['\\Device\\TestKeyboard', null]) {
+  for (const usage of [0x35, 0x4f, 0x2a]) {
+    const before = messages.length;
+    const result = beginSourcePress(pdo, usage);
+    check(`非遥控器/未知来源保持 usage ${usage} 原样 (${pdo === null ? 'unknown' : 'keyboard'})`,
+      result.ptr.buf[3] === usage && !messages.slice(before).some((m) =>
+        (m.type === 'edge' || m.type === 'observed') && m.usages.length));
+  }
+}
+press(0x4f);
+check('已证明来源的遥控器仍被接管', ctx.currentUsages().includes(0x4f));
+const beforeForeignUp = messages.length;
+beginSourcePress('\\Device\\TestKeyboard');
+check('键盘零帧不能释放遥控器按住状态', ctx.currentUsages().includes(0x4f) &&
+  !messages.slice(beforeForeignUp).some((m) => m.type === 'edge'));
+press();
+check('遥控器自己的零帧成对释放', ctx.currentUsages().length === 0);
+sourceState.status = -1;
+check('来源属性查询失败保持原报告', beginPress(0x35).ptr.buf[3] === 0x35);
+sourceState.status = 0;
+sourceState.queueMissing = true;
+check('来源队列缺失保持原报告', beginPress(0x4f).ptr.buf[3] === 0x4f);
+sourceState.queueMissing = false;
+const outer = { threadId: 17 };
+sourceState.pdo = '\\Device\\TestRemote';
+sourceHandlers[0].onEnter.call(outer, [globals, globals, { toInt32: () => 0 }]);
+const inner = { threadId: 17 };
+sourceState.pdo = '\\Device\\TestKeyboard';
+sourceHandlers[1].onEnter.call(inner, [globals, globals, { toInt32: () => 0 }]);
+check('嵌套的键盘请求遮住外层遥控器来源', beginSourcePress(null, 0x35).ptr.buf[3] === 0x35);
+sourceHandlers[1].onLeave.call(inner);
+check('嵌套返回后恢复当前遥控器作用域', beginSourcePress(null, 0x35).ptr.buf[3] === 0);
+const unrelated = fakePtr(report(0x35));
+handlers.onEnter.call({ threadId: 18 }, fakeArgs(unrelated));
+check('另一线程不能借用遥控器来源', unrelated.buf[3] === 0x35);
+ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: null }));
+check('当前节点失效后旧完成作用域不得继续改写', beginSourcePress(null, 0x35).ptr.buf[3] === 0x35 && !ctx.leaseOk());
+sourceHandlers[0].onLeave.call(outer);
+ctx.handleCommand(JSON.stringify({ type: 'renew', source_pdo: '\\Device\\TestRemote' }));
+check('完成回调结束不留下可借用来源', beginSourcePress(null, 0x35).ptr.buf[3] === 0x35);
+press();
+ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 501, report: [], clear: [] }));
+
 const firstInstance = messages.find((m) => m.type === 'hello')?.instance;
+const privacyStart = messages.length;
+ctx.handleCommand('{"source_pdo":"PRIVATE-IDENTITY","type":');
+ctx.handleCommand(JSON.stringify({ type: 'PRIVATE-IDENTITY' }));
+check('异常控制帧不得把身份或原文带入日志',
+  !JSON.stringify(messages.slice(privacyStart)).includes('PRIVATE-IDENTITY'));
 ctx.connected = false;
 ctx.connectOnce().catch(() => {});
 await new Promise((r) => setImmediate(r));

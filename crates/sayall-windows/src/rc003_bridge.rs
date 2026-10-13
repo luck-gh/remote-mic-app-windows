@@ -1101,6 +1101,10 @@ fn handle_connection(
     let mut last_rx = Instant::now();
     // 本轮连接内实际投递给映射引擎的边沿数（用于"边沿到底有没有到"这个问题）。
     let mut session_edges = 0u64;
+    // Local receive order for E/O diagnostics; never changes protocol or ownership.
+    let mut capture_rx_seq = 0u64;
+    let mut last_logged_ownership: Option<(u64, BTreeSet<u16>)> = None;
+    let mut last_received_usages: Option<BTreeSet<u16>> = None;
     // 不用初值：所有出口都在 break 前赋值，给它一个"默认值"只会掩盖漏赋值的分支。
     let drop_reason: &str;
 
@@ -1217,8 +1221,26 @@ fn handle_connection(
             }
             match message {
                 BridgeLine::Edges { usages } => {
+                    capture_rx_seq = capture_rx_seq.wrapping_add(1);
                     let wanted: BTreeSet<u16> = usages.into_iter().collect();
+                    let diagnostic_snapshot =
+                        edge_diagnostic_needed(last_received_usages.as_ref(), &wanted).then(|| {
+                            let target = lock(targets).clone();
+                            let owned = lock(shared).owned.clone();
+                            (target, owned)
+                        });
                     let edges = apply_usages(shared, targets, &wanted);
+                    // Track the raw report so even a filtered Back DOWN has a logged UP.
+                    if let Some((target, owned)) = diagnostic_snapshot {
+                        note(edge_diagnostic_note(
+                            capture_rx_seq,
+                            &target,
+                            &wanted,
+                            &owned,
+                            edges.len(),
+                        ));
+                    }
+                    last_received_usages = Some(wanted);
                     for edge in edges {
                         if sender.send(EngineMessage::DriverEdge(edge)).is_err() {
                             drop_reason = "engine_gone";
@@ -1254,6 +1276,7 @@ fn handle_connection(
                 }
                 BridgeLine::Ping => {}
                 BridgeLine::Ownership { generation, usages } => {
+                    capture_rx_seq = capture_rx_seq.wrapping_add(1);
                     let reported: BTreeSet<u16> = usages.into_iter().collect();
                     let target = lock(targets).clone();
                     if generation == target.generation && reported == target.usages {
@@ -1271,13 +1294,21 @@ fn handle_connection(
                         }
                         if resumed {
                             note(format!(
-                                "enhanced_capture event=ownership_resumed usages={}",
+                                "enhanced_capture event=ownership_resumed usages={} rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask}",
+                                format_usage_payload(&reported),
+                            ));
+                        } else if last_logged_ownership.as_ref()
+                            != Some(&(generation, reported.clone()))
+                        {
+                            note(format!(
+                                "enhanced_capture event=ownership_confirmed rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask} usages={}",
                                 format_usage_payload(&reported)
                             ));
                         }
+                        last_logged_ownership = Some((generation, reported));
                     } else {
                         note(format!(
-                            "enhanced_capture event=ownership_rejected reported_generation={generation} expected_generation={} reported={} expected={}",
+                            "enhanced_capture event=ownership_rejected reported_generation={generation} expected_generation={} reported={} expected={} rx_seq={capture_rx_seq}",
                             target.generation,
                             format_usage_payload(&reported),
                             format_usage_payload(&target.usages)
@@ -1531,6 +1562,50 @@ fn apply_usages(
     edges
 }
 
+fn edge_diagnostic_note(
+    sequence: u64,
+    target: &CaptureTargets,
+    wanted: &BTreeSet<u16>,
+    owned: &BTreeSet<u16>,
+    decoded_edges: usize,
+) -> String {
+    let whitelisted: BTreeSet<_> = wanted
+        .iter()
+        .copied()
+        .filter(|usage| BRIDGE_ALLOWED_USAGES.contains(usage))
+        .collect();
+    let accepted: BTreeSet<_> = whitelisted.intersection(&target.usages).copied().collect();
+    let reason = if wanted.is_empty() {
+        "released_all"
+    } else if whitelisted.len() != wanted.len() {
+        "outside_whitelist"
+    } else if accepted.len() != wanted.len() {
+        "not_targeted"
+    } else if !accepted.is_subset(owned) {
+        "ownership_missing"
+    } else {
+        "ownership_confirmed"
+    };
+    // Target/ownership are the snapshot at E reception; decoded_edges describes
+    // apply_usages, not successful delivery or an action in a third-party app.
+    format!(
+        "rc003_bridge event=edge_received rx_seq={sequence} target_generation={} phase=received state_snapshot=true usages={} unknown_usages={} target_mask={} owned_mask={} accepted_mask={} dropped_usages={} decoded_edges={decoded_edges} reason={reason}",
+        target.generation,
+        format_usage_payload(&whitelisted),
+        wanted.len() - whitelisted.len(),
+        usage_mask(&target.usages),
+        usage_mask(owned),
+        usage_mask(&accepted),
+        wanted.len() - accepted.len(),
+    )
+}
+
+fn edge_diagnostic_needed(previous: Option<&BTreeSet<u16>>, wanted: &BTreeSet<u16>) -> bool {
+    previous.is_none_or(|previous| {
+        previous != wanted && (previous.contains(&0x00F1) || wanted.contains(&0x00F1))
+    })
+}
+
 /// 从描述文件里读出 `key=value`。助手侧有等价实现（零依赖手写解析）。
 ///
 /// 放在这里是为了**同一份解析规则只写一次**：助手与主程序对描述文件的
@@ -1582,6 +1657,70 @@ mod tests {
         buttons
             .iter()
             .fold(0, |mask, button| mask | (1u64 << button.ordinal()))
+    }
+
+    #[test]
+    fn back_edge_diagnostic_distinguishes_target_filtering_from_pending_ownership() {
+        let target = CaptureTargets {
+            generation: 7,
+            usages: [0x00f1].into_iter().collect(),
+        };
+        let wanted = [0x00f1].into_iter().collect();
+        let unowned = edge_diagnostic_note(4, &target, &wanted, &BTreeSet::new(), 1);
+        assert!(unowned.contains("event=edge_received rx_seq=4 target_generation=7"));
+        assert!(unowned.contains("usages=f1"));
+        assert!(unowned.contains("reason=ownership_missing"));
+        assert!(unowned.contains("decoded_edges=1"));
+        assert!(unowned.contains("dropped_usages=0"));
+
+        let owned = edge_diagnostic_note(6, &target, &wanted, &wanted, 1);
+        assert!(owned.contains("reason=ownership_confirmed"));
+        assert_ne!(owned, unowned);
+
+        let disabled = CaptureTargets {
+            generation: 8,
+            usages: BTreeSet::new(),
+        };
+        let dropped = edge_diagnostic_note(8, &disabled, &wanted, &wanted, 0);
+        assert!(dropped.contains("reason=not_targeted"));
+        assert!(dropped.contains("dropped_usages=1"));
+        assert!(dropped.contains("decoded_edges=0"));
+    }
+
+    #[test]
+    fn edge_diagnostic_reports_release_and_whitelist_filter_without_inventing_delivery() {
+        let target = CaptureTargets {
+            generation: 9,
+            usages: [0x00f1].into_iter().collect(),
+        };
+        let rejected = edge_diagnostic_note(
+            1,
+            &target,
+            &[0xffff].into_iter().collect(),
+            &target.usages,
+            0,
+        );
+        assert!(rejected.contains("reason=outside_whitelist"));
+        assert!(rejected.contains("dropped_usages=1"));
+        assert!(!rejected.contains("ffff"));
+        let released = edge_diagnostic_note(2, &target, &BTreeSet::new(), &BTreeSet::new(), 1);
+        assert!(released.contains("reason=released_all"));
+        assert!(released.contains("phase=received"));
+        assert!(!released.contains("enqueued"));
+        assert!(!released.contains("passed"));
+    }
+
+    #[test]
+    fn edge_diagnostic_logs_back_release_and_filters_repeated_snapshots() {
+        let back = [0x00f1].into_iter().collect();
+        let all_up = BTreeSet::new();
+        let other = [0x0028].into_iter().collect();
+        assert!(edge_diagnostic_needed(None, &all_up));
+        assert!(edge_diagnostic_needed(Some(&all_up), &back));
+        assert!(!edge_diagnostic_needed(Some(&back), &back));
+        assert!(edge_diagnostic_needed(Some(&back), &all_up));
+        assert!(!edge_diagnostic_needed(Some(&all_up), &all_up));
+        assert!(!edge_diagnostic_needed(Some(&all_up), &other));
     }
 
     #[test]

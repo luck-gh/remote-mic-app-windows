@@ -767,10 +767,40 @@ fn stop_capture(expected_epoch: Option<u64>) -> Result<u64, String> {
     let (epoch, submitted) = request_stop(expected_epoch)?;
     let mut attempt = StopAttempt::new(submitted);
     let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut last_observation = None;
     loop {
-        let processes = helper_processes()?;
-        let receipt = read_cleanup_receipt()?;
-        match attempt.observe(&processes, receipt.as_ref())? {
+        let processes = helper_processes().inspect_err(|_| {
+            sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=reset epoch={epoch} phase=observed outcome=process_observation_failed"));
+        })?;
+        let receipt = read_cleanup_receipt().inspect_err(|_| {
+            sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=reset epoch={epoch} phase=observed outcome=receipt_observation_failed"));
+        })?;
+        let progress = attempt.observe(&processes, receipt.as_ref());
+        // Record changed observations only; never serialize the receipt or paths.
+        let observation = format!(
+            "rc003 feature=enhanced-capture action=reset epoch={epoch} phase=observed helper_count={} expected_helper_pid={} receipt_present={} receipt_valid={} receipt_settled={} receipt_recoverable={} receipt_matches_process={} receipt_matches_start={} recovery_attempted={} queued_start={} outcome={}",
+            processes.len(),
+            attempt.expected_process.map_or(0, |(pid, _)| pid),
+            receipt.is_some(),
+            receipt.as_ref().is_some_and(CleanupReceipt::valid),
+            receipt.as_ref().is_some_and(CleanupReceipt::settled),
+            receipt.as_ref().is_some_and(CleanupReceipt::recoverable),
+            receipt.as_ref().is_some_and(|r| attempt.expected_process.is_none_or(|(pid, started)| r.matches_process(pid, started))),
+            receipt.as_ref().is_some_and(|r| r.matches_submitted_start(attempt.submitted)),
+            attempt.recovered,
+            attempt.queued_start,
+            match &progress {
+                Ok(StopProgress::Complete) => "complete",
+                Ok(StopProgress::Recover) => "recover",
+                Ok(StopProgress::Waiting) => "waiting",
+                Err(_) => "rejected",
+            },
+        );
+        if last_observation.as_ref() != Some(&observation) {
+            sayall_windows::gatt_note(observation.clone());
+            last_observation = Some(observation);
+        }
+        match progress? {
             StopProgress::Complete => {
                 let _ = SUBMITTED_START_MS.compare_exchange(
                     submitted,

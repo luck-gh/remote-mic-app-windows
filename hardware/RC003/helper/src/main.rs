@@ -6,7 +6,7 @@
 //! 它做什么
 //! --------
 //! 1. 从注册表定位承载 RC003 的 `WUDFHost.exe`（`Device Parameters\WUDFDiagnosticInfo\HostPid`），
-//!    并核对它是「独占 RC003」宿主；
+//!    并核对所选功能节点；共享宿主逐请求核验来源，不能用键码代替设备身份；
 //! 2. 把**固定版本 + 已校验 SHA-256** 的 Frida Gadget 与我们自持的 agent 脚本准备到运行时目录；
 //! 3. 用 `VirtualAllocEx` / `WriteProcessMemory` / `CreateRemoteThread(LoadLibraryW)` 把 Gadget
 //!    加载进该宿主；
@@ -448,6 +448,20 @@ mod imp {
             len: *mut u32,
         ) -> i32;
         fn RegCloseKey(key: Handle) -> i32;
+    }
+
+    #[link(name = "cfgmgr32")]
+    extern "system" {
+        fn CM_Locate_DevNodeW(node: *mut u32, id: *const u16, flags: u32) -> u32;
+        fn CM_Get_DevNode_Status(state: *mut u32, problem: *mut u32, node: u32, flags: u32) -> u32;
+        fn CM_Get_DevNode_Registry_PropertyW(
+            node: u32,
+            property: u32,
+            kind: *mut u32,
+            buffer: *mut c_void,
+            bytes: *mut u32,
+            flags: u32,
+        ) -> u32;
     }
 
     #[link(name = "shell32")]
@@ -995,6 +1009,8 @@ mod imp {
         /// 属 `LOGGING.md` 隐私红线的"HID 路径"。
         /// 不保留设备名：它同样含设备接口路径，排错不需要它。
         is_rc003: bool,
+        // 私有来源核验：完整功能实例，不写入日志或 Debug 输出。
+        instance_id: String,
     }
 
     /// RC003 识别判据（纯函数）：BTHLEDevice 枚举器 + HID 服务前缀 + 本型号硬件串。
@@ -1219,6 +1235,7 @@ mod imp {
                         pid,
                         enumerator: enumerator.clone(),
                         is_rc003,
+                        instance_id: format!("{enumerator}\\{device}\\{instance}"),
                     });
                 }
                 unsafe { RegCloseKey(device_key) };
@@ -5033,14 +5050,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             for (index, m) in members.iter().enumerate() {
                 logger.line(&member_line(index + 1, &m.enumerator, m.is_rc003));
             }
-            // 共享宿主**不再直接拒绝**（2026-09-25 产品决策：用户需要长期同时
-            // 连接另一个 BLE 键鼠设备）。原来的独占前提只是为了兜住"改写别的
-            // 设备报告"的风险；而 agent 的 `targetSetIn` 已经是**内容门禁**：
-            // 报告里不含目标 usage（0x00F1/0x0080/0x0081）就一个字节都不动，
-            // 普通键盘的按键报告天然不匹配——来源核验由报文内容成立。
-            // 残留前提（写进日志供验收核对）：同一宿主里没有**别的**设备会发出
-            // 这三个 usage（0xF1 为保留/厂商定义，0x80/0x81 是键盘页音量键，
-            // 通用键盘的音量走消费页 0xE9/0xEA）。
+            // 内容只决定映射范围，不能证明来源；共享宿主必须逐请求核验功能 PDO。
             if !(members.len() == 1 && rc003_members == 1) {
                 if args.require_exclusive_host || args.force {
                     // 旧行为（--require-exclusive-host；--force 保持同义）：
@@ -5051,17 +5061,45 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 logger.kv(
                     "[SHARED-HOST]",
                     &[
-                        ("decision", "continue_with_usage_gate".to_string()),
+                        ("decision", "require_request_source".to_string()),
                         ("members", members.len().to_string()),
                         ("rc003_members", rc003_members.to_string()),
                     ],
                 );
                 logger.line(
-                    "[INFO] 宿主同时承载其它 HID 设备：仅改写含目标 usage（F1/80/81）\
-                     的键盘报告，其它设备的报告不动；如需恢复旧行为加 --require-exclusive-host。",
+                    "[INFO] 宿主同时承载其它 HID 设备：先证明每个请求来自所选功能节点，再应用按键目标。",
                 );
             }
         }
+
+        // 固定来源适配仅在此前验证过的系统模块组合上运行；未知组合零注入。
+        let _source_module_locks = match verify_source_modules(target_pid) {
+            Ok(locks) => locks,
+            Err(reason) => {
+                logger.kv(
+                    "[SOURCE]",
+                    &[("result", "blocked".into()), ("reason", reason.into())],
+                );
+                std::process::exit(16);
+            }
+        };
+        logger.kv(
+            "[SOURCE]",
+            &[
+                ("result", "modules_verified".into()),
+                ("contract", "umdf_2_15".into()),
+            ],
+        );
+        let source_instance = entries
+            .iter()
+            .filter(|entry| entry.pid == target_pid && entry.is_rc003)
+            .map(|entry| entry.instance_id.clone())
+            .collect::<Vec<_>>();
+        if source_instance.len() != 1 || current_source_pdo(&source_instance[0]).is_none() {
+            logger.line("[SOURCE] result=blocked reason=selected_function_unproven");
+            std::process::exit(16);
+        }
+        let source_instance = source_instance[0].clone();
 
         // ---- Gadget 与 agent ----
         let gadget_src = match args.gadget.clone().or_else(default_gadget_path) {
@@ -5393,6 +5431,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let renew_counter = Arc::clone(&renew_count);
         let renew_stale = Arc::clone(&conn_stale);
         let renew_token = args.token.clone();
+        let renew_source_instance = source_instance;
         // 注意：这里是 `new` **不是** `open_round` —— 续约线程不是新一轮运行，
         // 它若写分隔线会让"每轮起点"的 grep 多算一次（2026-09-23 实测）。
         let renew_logger = Logger::with_shared(args.log.clone(), shared_log.clone());
@@ -5409,7 +5448,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     Err(_) => break,
                 };
                 if let Some(stream) = guard.as_mut() {
-                    let line = format!("{{\"type\":\"renew\",\"token\":\"{renew_token}\"}}\n");
+                    let pdo = current_source_pdo(&renew_source_instance);
+                    let line = source_renewal(&renew_token, pdo.as_deref());
                     if stream.write_all(line.as_bytes()).is_err() {
                         renew_logger.kv("[RENEW]", &[("state", "write_failed".into())]);
                         *guard = None;
@@ -6315,6 +6355,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 return;
                             }
                             AGENT_AUTHORIZED.store(true, Ordering::Relaxed);
+                            let pdo = source_pdo_for_host(cleanup.target_pid);
+                            if stream
+                                .write_all(source_renewal(token, pdo.as_deref()).as_bytes())
+                                .is_err()
+                            {
+                                return;
+                            }
                             session.config_sent = true;
                             let targets = bridge
                                 .map(|bridge| bridge.capture_targets())
@@ -7818,7 +7865,154 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 有了代次，接管旧实例时日志会打 `[AGENT-STALE]`，让这件事一眼可见。
     ///
     /// 旧/未知代次不允许接管；本助手不结束共享宿主来替换 DLL。
-    const AGENT_BUILD: &str = "2026-10-03.cleanup-instance";
+    const AGENT_BUILD: &str = "2026-10-10.request-source";
+
+    fn decode_pdo_property(kind: u32, bytes: u32, buffer: &[u16]) -> Option<String> {
+        let count = (bytes / 2) as usize;
+        if kind != 1
+            || bytes < 4
+            || bytes & 1 != 0
+            || count > buffer.len()
+            || buffer[count - 1] != 0
+            || buffer[..count - 1].contains(&0)
+        {
+            return None;
+        }
+        String::from_utf16(&buffer[..count - 1]).ok()
+    }
+
+    // 每次租约都重新读取当前已启动的功能节点；不把旧 PDO 当作恢复依据。
+    fn current_source_pdo(instance: &str) -> Option<String> {
+        let id = to_wide(instance);
+        let (mut node, mut state, mut problem) = (0, 0, 0);
+        let (mut kind, mut bytes) = (0, 2048);
+        let mut buffer = [0u16; 1024];
+        unsafe {
+            if CM_Locate_DevNodeW(&mut node, id.as_ptr(), 0) != 0
+                || CM_Get_DevNode_Status(&mut state, &mut problem, node, 0) != 0
+                || state & 8 == 0
+                || CM_Get_DevNode_Registry_PropertyW(
+                    node,
+                    0x0f,
+                    &mut kind,
+                    buffer.as_mut_ptr().cast(),
+                    &mut bytes,
+                    0,
+                ) != 0
+            {
+                return None;
+            }
+        }
+        decode_pdo_property(kind, bytes, &buffer)
+    }
+
+    fn source_pdo_for_host(pid: u32) -> Option<String> {
+        let entries = enum_hosts().ok()?.entries;
+        let mut selected = entries
+            .iter()
+            .filter(|entry| entry.pid == pid && entry.is_rc003);
+        let instance = &selected.next()?.instance_id;
+        if selected.next().is_some() {
+            return None;
+        }
+        current_source_pdo(instance)
+    }
+
+    fn source_renewal(token: &str, pdo: Option<&str>) -> String {
+        // 仅写已鉴权的 loopback；包含身份的文本不得送入 Logger。
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "renew", "token": token, "source_pdo": pdo})
+        )
+    }
+
+    fn verify_source_modules(pid: u32) -> Result<Vec<fs::File>, &'static str> {
+        use std::os::windows::fs::OpenOptionsExt;
+        if !cfg!(target_arch = "x86_64") {
+            return Err("source_architecture_unverified");
+        }
+        let system = std::env::var_os("SystemRoot").ok_or("system_directory_unknown")?;
+        let system = PathBuf::from(system).join("System32");
+        let expected = [
+            (
+                "Microsoft.Bluetooth.Profiles.HidOverGatt.dll",
+                system
+                    .join("drivers")
+                    .join("UMDF")
+                    .join("Microsoft.Bluetooth.Profiles.HidOverGatt.dll"),
+                "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6",
+            ),
+            (
+                "WUDFx02000.dll",
+                system.join("WUDFx02000.dll"),
+                "e97a8bbbda4dd4989d9b3063cbfea05df9f60cdc7758fd21b163ebe3ce6786e0",
+            ),
+        ];
+        let modules = enum_modules(pid).map_err(|_| "source_modules_unknown")?;
+        let mut locks = Vec::new();
+        for (name, path, digest) in expected {
+            if !modules.iter().any(|module| {
+                module.name.eq_ignore_ascii_case(name)
+                    && Path::new(&module.path)
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&path.to_string_lossy())
+            }) {
+                return Err("source_module_path_unverified");
+            }
+            // 持有只共享读的句柄，防止核验后系统文件被替换；随 Helper 正常退出释放。
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&path)
+                .map_err(|_| "source_module_lock_failed")?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|_| "source_module_read_failed")?;
+            if sha256_hex(&bytes) != digest {
+                return Err("source_module_version_unverified");
+            }
+            locks.push(file);
+        }
+        Ok(locks)
+    }
+
+    #[cfg(test)]
+    mod request_source_binding_tests {
+        use super::*;
+
+        #[test]
+        fn pdo_property_requires_one_complete_string() {
+            let valid: Vec<u16> = "\\Device\\TestRemote\0".encode_utf16().collect();
+            assert_eq!(
+                decode_pdo_property(1, (valid.len() * 2) as u32, &valid),
+                Some("\\Device\\TestRemote".into())
+            );
+            assert_eq!(
+                decode_pdo_property(1, (valid.len() * 2 - 1) as u32, &valid),
+                None
+            );
+            assert_eq!(
+                decode_pdo_property(7, (valid.len() * 2) as u32, &valid),
+                None
+            );
+            assert_eq!(decode_pdo_property(1, 0, &valid), None);
+            assert_eq!(decode_pdo_property(1, 4, &[65, 66]), None);
+            assert_eq!(decode_pdo_property(1, 6, &[65, 0, 0]), None);
+        }
+
+        #[test]
+        fn source_renewal_uses_private_json_and_unknown_is_null() {
+            let line = source_renewal("token", Some("\\Device\\TestRemote"));
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["source_pdo"], "\\Device\\TestRemote");
+            assert_eq!(value["type"], "renew");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&source_renewal("token", None)).unwrap()
+                    ["source_pdo"]
+                    .is_null()
+            );
+        }
+    }
     /// 锁定文件在编译期内联。三重作用：
     /// 1) **缺失即编译失败**：锁定文件被删/路径写错，构建直接报错，不会产出"看起来正常、
     ///    实际没登记完整性"的二进制（本常量写错路径时已实测触发编译错误）；

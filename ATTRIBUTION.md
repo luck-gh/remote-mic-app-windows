@@ -324,6 +324,15 @@
 - **NSIS 与既有安装器门禁的相互作用**：updater 以 `/P`（passive）+ `/UPDATE` 运行，既有 installer-hooks.nsh 的 PREINSTALL SemVer 降级门禁照常生效（升级路径不受影响）；POSTINSTALL 的 VB-CABLE 提示在 passive（非 Silent）模式下仍会弹出——仅影响未装 VB-CABLE 的用户，与首装行为一致，保留。
 - **预览版通道（2026-09-08 增补）**：Tauri 官方 Runtime Configuration 文档明确支持通过 `UpdaterBuilder::endpoints` 在运行时选择 stable/beta 等独立通道；本仓库据此保持默认稳定端点不变，仅在用户显式开启“检查预览版更新”后覆盖端点。GitHub Releases 页面公开提供标准 Atom feed（`releases.atom`），包含已发布的正式版与 Pre-release、排除 Draft；实现从本仓库 feed 的 `alternate` 链接读取 SemVer tag，选择最高版本并自行构造本仓库 `https://github.com/GetSayAll/remote-mic-app-windows/releases/download/<tag>/latest.json`，避开匿名 REST API 每 IP 60 次/小时限流。最终安装包仍由 Tauri minisign 强制验签。
 
+### 2026-10-10 个人版更新源核查与 Gitee 选择
+
+- **默认与运行时边界（2026-10-12）**：稳定源配置及预览源代码路径的默认值仍为 `GetSayAll/remote-mic-app-windows`；`SAYALL_UPDATER_ENDPOINT` 可覆盖运行时端点。本轮没有检查当前进程环境，也没有观察网络请求，因此只确认默认配置，不能断言当前运行实例实际请求了哪个源。用户要求本轮暂停修改更新源；个人 GitHub/Gitee 来源接入仍以既有 TODO 条目为准。
+
+- **现行来源事实**：个人 origin 为 `luck-gh/remote-mic-app-windows`，但 `src-tauri/tauri.conf.json` 的稳定端点、`src-tauri/src/updater.rs` 的预览 Atom/feed/tag/manifest 地址与下载路径校验仍锁定 `GetSayAll/remote-mic-app-windows`。已安装 0.8.6 EXE 只读字节核查也找到上游稳定/预览内置地址，未找到个人稳定内置地址；这不替代实际网络检查或更新验收。`scripts/generate-updater-manifest.ps1` 的 Repository 默认值为 GetSayAll，`.github/workflows/windows-release.yml` 调用时未覆盖，个人仓库发布亦可能生成指向上游的安装包链接。配置公钥沿用既有值，个人签名发布配置未验证，不能只改端点就宣称个人更新可信路径成立。
+- **平台选择与参考**：用户同日明确将第二来源改为 Gitee，GitLab/极狐候选不再属于当前接入计划。Gitee 官方 [API 文档](https://gitee.com/api/v5/swagger) 及 [SDK 仓库 API 清单](https://gitee.com/sdk/gitee5j/blob/main/docs/RepositoriesApi.md) 提供 Release 查询与附件相关接口，可作为接入参考；Gitee 仓库尚未创建，实际项目的免登录检查、清单及安装包下载、限额和国内速度均未验证。不能仅将 GitHub 下载链接的域名替换为 Gitee，也不能把 Release 的 latest 接口直接当作最高稳定 SemVer。未复制第三方代码或引入 SDK 依赖。
+- **同步与适配边界**：代码、分支和标签同步不能替代 Releases、安装器、签名及 latest.json 的同步；Gitee 的具体发布和同步方式须在实际仓库创建后核对。后续应复用 [Tauri updater 运行时端点配置](https://v2.tauri.app/plugin/updater/)，用户选择平台与是否包含预览版保持独立；端点列表的顺序尝试不等于同时查询两源并比较最高版本。两源须发布同一签名包，清单下载地址分别落在各自可匿名访问的资产；单纯复制含 GitHub 下载地址的 JSON 不能提供 Gitee 下载路径。个人签名、公钥、稳定/预览过滤和来源切换的待安装缓存/迟到结果须一并验证，实施与验收状态仍归原 TODO 更新条目。
+- **先前 GitLab 调研边界**：此前参考的 [JiHu 技术授权说明](https://handbook.gitlab.com/handbook/company/faq-gitlab-licensing-technology-to-independent-chinese-company/)、[GitLab 镜像](https://docs.gitlab.com/user/project/repository/mirror/)、[Release 资产](https://docs.gitlab.com/user/project/releases/release_fields/) 与 [Release API](https://docs.gitlab.com/api/releases/#sorting-preferences) 仅说明 GitLab/极狐的产品关系、同步对象、资产托管及 latest 语义；这些结论不适用于 Gitee，不作为本轮实现依据。
+
 ## 2026-10-04 覆盖升级与受限回收
 
 - 同日晚按用户进一步明确的安装交互，已有版本提供“安装前卸载”与“请勿卸载”；前者安全退出后卸载并自动续装，后者覆盖。安装权限依据 [NSIS RequestExecutionLevel](https://nsis.sourceforge.io/Reference/RequestExecutionLevel) 与微软 [Running with Administrator Privileges](https://learn.microsoft.com/en-us/windows/win32/secbp/running-with-administrator-privileges)：在既有 currentUser 安装范围采用 `highest`，对同一管理员账户请求可用权限，避免 `admin` 接受另一账户凭据后误用其 HKCU/配置。真正标准账户仍没有管理员写权限，不能把它表述为跨账户安装支持；受保护目录须在卸载旧版之前明确拒绝。主程序继续使用原普通权限 manifest，安装后启动复用现有 `nsis_tauri_utils::RunAsUser`。未引入 NSIS 已弃用的 UAC 插件、未改用户目录 ACL 或扩大产品运行权限。两条交互路径的实测与限制归同主题 Bug。
@@ -386,7 +395,7 @@
 ## Windows 官方上游整合（2026-09-27）
 
 - 来源：<https://github.com/GetSayAll/remote-mic-app-windows>，GPL-3.0-only；固定提交 `74230bf5f841cac2f099d1c6fd25683dac50131d`，比较基线 `6504010828b12713ce033cb3e231087af6a6482f`。这次是同一 Windows 仓库历史整合，不能与 macOS 参考或 remote-bridge-hub 混称。
-- 融合模块：`battery.rs`/电量指示，`registered_apps.rs`/应用库，`send_input.rs`/鼠标动作，`key_gate.rs`/系统级录入配对，BLE 部分连接 RAII/资源记录，`graceful_exit.rs`/安装正常退出请求。模板仍只发固定键；应用库只作用户显式通用动作，保持本地草稿保存和可分享导出隐私。
+- 融合模块：`battery.rs`/电量指示，`registered_apps.rs`/应用库，`send_input.rs`/鼠标动作，`key_gate.rs`/系统级录入配对，BLE 部分连接 RAII/资源记录，`graceful_exit.rs`/安装正常退出请求。现行固定模板契约仍限固定键/组合键与已授权任务动作；通用映射另有 mouse_move、mouse_click、scroll 模型、编辑与执行链，因此“固定模板限制”不表示上游鼠标动作未被整合。按键页/模板页对这些动作的可见性和模板保存校验目前不一致，具体未闭合边界归 TODO，不在此改变动作许可范围。应用库只作用户显式通用动作，保持本地草稿保存和可分享导出隐私。
 - 保留本地：逐报告 WDF/PDO 当前来源、mask0物理观察不映射、输入设备锁定与唯一 ExitCleanup、程序默认/临时或保存默认、菜单焦点和偏好、底栏。排除上游仅以 BLE 建链状态吞 F5、遥控在线常驻通用门控、安装超时强杀、全局 artifacts 忽略。历史取证当前树已匿名化，不复跑探针、不重新认可被本地事实取代的失败路线。
 - 合并候选实机仍 pending；历史 RC001、睡眠、语音结果不外推。本轮没有电源、无线电或驱动安装授权。
 
@@ -410,6 +419,43 @@
 本轮固定输入为 `GetSayAll/remote-mic-app-windows@e225bb4c9791dbfefa37c8fb197bc06e95fca428`，共同基线 `c81308e011a757dc22d22f2861b687ef787d295e`。吸收设置向导、显式连发与确认键鼠标行为、按键宿主和扫描码注入、日志轮转、双架构载荷及 WebView 恢复后按主窗口信号撤销提示。PR #200（延迟单位）及 #209（保留 #202 原作者的 WebView 修复）已在输入历史中；Git merge 保留双方提交归属。
 
 本地冲突决议保留模板实际应用/编辑分离、严格同一虚拟音频线配对、语音准备与成对释放、捕获所有权/代次、正常退出和回收规则。没有引入宿主强杀重注、设备禁启恢复、安装器永久删除、按名字猜选另一写入端，亦不将上游旧配置隐式连发迁移应用到本地模板。上游历史验收仅证明其被测提交，本轮结果与未验证边界记录在既有 TODO 和测试文档。
+
+2026-10-12 归因补充：对比 `9f4ead5^1` 与合并结果 `9f4ead5` 的 `button_gestures.rs`，本地原规则是单击已配置、无双击/长按时按住默认连发；合并后改为仅 `hold_repeat=Single/Long` 才重复。上述不迁移决定保留了模板内容，却没有保持旧模板的运行行为：原有缺字段模板变成不重复。这是 0.8.5 整合的行为变化，不能表述为用户主动关闭，也不能归因于后来的 0.8.6 合并。该代码对比不能追溯证明每次历史正常输入经过哪条路径；用户随后明确的自动/关闭/单击/长按规则及本地修复验收见现有连发手册与 Bug。
+
+格式兼容边界：官方 `formatVersion: 1` 导入只承载 common mappings（`settings.rs` 导入路径保留本地模板与程序绑定）；本地当前导出为 `formatVersion: 3`，包含模板等字段，官方格式不接受，不能宣称无损双向兼容。当前本地 `buttonMappings.schemaVersion: 2` 缺省 `holdRepeat` 表示自动连发，新 `off` 表示明确关闭；官方 schema v1 缺省仍表示关闭。用户已确认本地缺省自动连发契约，导入官方 v1 时缺字段的语义差异须保持明确，不能以通用“兼容”覆盖。
+
+2026-10-13 有界历史复核补充：`9f4ead50bcd429ef9bfe448cec54aeede936bf7f^1` 的 `GestureConfig::for_button` 按单击/无双击长按直接生成 `repeat`；合并后改为显式 `repeat_single/repeat_long`，因此缺字段旧模板的连发变化属于0.8.5适配遗漏。上游全键增强 `6a4aaf88ef740534a29152ea0ef021cffee82256` 的Agent已按IOCTL/报告usage接管而无逐报告设备来源，本地 `50f21e005b4f1bf3455268eb013d58259196d6a2` 仍有该缺口；`9f4ead5→af710b7` 的Agent/Helper无差异，实体键盘误路由不是0.8.6新引入。修复与当前PC实测范围归既有Bug，不外推历史三轮或17:56短按未知路径。
+
+向导与出包的来源须分别判断：上游 `6c0c6f6c`（2026-10-04）明确无Skip/完成前无旁路，是本轮被用户替换的交互契约；`e748b309` 的idle单侧结束判定带来混合快照源码缺陷，但原现场缺attempt/session关联，不能声明唯一现场根因已追溯。上游AudioStep没有本地临时切麦开关，导入时未接该设置属于产品适配遗漏。local配置的 `../dist-build`/空beforeBuildCommand来自 `8b5d5332`，资源路径串门禁来自 `1f3a03c7`（均2026-10-03）；本轮构建dist与嵌入dist-build错配、B8内容审计和修复门禁归向导手册，不把构建流程误用说成0.8.6删除修复。PR #209仅涉及WebView有界恢复，未取得它导致上述按键/端点/向导问题的证据。
+
+### 2026-10-10 上游 0.8.6 评估与合并
+
+固定参考为 `GetSayAll/remote-mic-app-windows@3ec66566ceabf82915dd1b9ff9a3b10ec163ca26`（0.8.6）；相对已合入的 `e225bb4` 新增 12 个提交。主要修复来自 [PR #239](https://github.com/GetSayAll/remote-mic-app-windows/pull/239)，最终发布由 [PR #240](https://github.com/GetSayAll/remote-mic-app-windows/pull/240) 合入。
+
+核对最终 `ime.rs`、`wetype_revive.rs`、`ble.rs` 与平台配置入口：失焦后有界等待前台让出，工具选择导致真实输入法切换后尝试焦点往返，新增开麦观测与失败后恢复。中途尝试的五秒切换间隔和 Win+Space 步进已被后续提交替代，不作为最终方案描述。上游 Bug 记录报告 RC003 首按实测，未在本 fork 复现，不能外推本地返回键、菜单或语音问题已修复。
+
+先前只读评估指出焦点恢复没有绑定原目标与本地会话代次、窗口类稳定哈希不符合本地隐私规则；这属于静态合并风险，未声称已在本机复现。2026-10-10 用户授权调查三轮启动后同步上游，再次 fetch 确认最新 upstream/main 仍为上述提交，在原目录完成合并 `af710b757897cb0567b63c63a7ceb40f62426652`（父提交 `9f4ead50bcd429ef9bfe448cec54aeede936bf7f` 与 `3ec66566ceabf82915dd1b9ff9a3b10ec163ca26`）。原有未提交个人版/返回键诊断内容恢复并逐文件核对，版本改为 0.8.6；未重复 apply 旧恢复 stash，未推送或发布。
+
+采用最终输入法切换、有界开麦观测和焦点恢复诊断，按本地契约适配：恢复票据绑定原前台/原焦点子窗口与选择代次；工具或快捷键变更、语音开始、断连、退出和超时取消使旧票据失效；等待语音结束必须确认 Idle。焦点往返只恢复捕获的焦点子窗口，不遍历任意兄弟窗口；失焦后恢复作为配对清理，重新核对前台及焦点，不覆盖用户已经改变的焦点。SetFocus 后读取 GetFocus，AttachThreadInput 成对 detach 并记录未确认结果。沿用上游现有时序常量，未凭推理调延迟。窗口诊断仅保留存在/自身进程等分类，不记录类名稳定哈希、PID 组合、路径或实际快捷键。
+
+官方契约参考：[SetFocus](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setfocus)、[GetGUIThreadInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getguithreadinfo)、[AttachThreadInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-attachthreadinput)。前两者用于目标捕获与焦点读回，后者说明键态重置及线程连接边界；API 成功或焦点恢复不是实际开麦成功判据。保留本地模板实际应用/编辑分离、严格同线音频配对、音频准备→切换麦克风→快捷键、成对释放、正常退出；不恢复报告层语音合成、强杀宿主或不符合当前发布契约的工作流覆盖。上游 Bug 文档与探针仅作为来源，未执行探针。
+
+代次/语音/退出护栏的三项回归先编译失败后通过，完整合并与恢复后检查见 [Preview](Testing/WindowsRC003Preview.md)。当前三轮按键异常另归 [既有 Bug](Bugs/2026-10-03-foreground-input-regression.md#2026-10-10-用户报告同次开机的三轮启动部分定位未闭合)，只补诊断，不声称同根因或已修复；实际焦点恢复、冷态首按和 RC001/RC003 验收未由上游结果替代。
+
+2026-10-12 只读同步核对：最新 `upstream/main` 为 `25826ada8a48b103bc6ae772cb9b465eddb09ddf`，相对已吸收共同基线 `3ec66566ceabf82915dd1b9ff9a3b10ec163ca26` 仅多 `a8164fb` 与 PR #243 两个提交，改动为 README/联系二维码；本轮未合并。源码差异比较基于现有工作区，没有发现索引冲突；未安装或运行官方包，不把源码比较表述为官方包实测。
+
+上游贡献状态纠正：PR #200 已以 `dc061cf593bdcab16a7efae1bf8bb1aed827617a` 合并；PR #202 仍 open/draft，其核心 WebView 修复经 PR #209（`15a065298a6ab9c84a675bb24c0e419418704d71`）cherry-pick 保留并采纳。原 #202 提示层因 Reload 不能证明恢复、tooltip 与无 owner 时 MessageBox 可靠性不足，被 heartbeat 与重做提示层替换（维护者说明：[首次说明](https://github.com/GetSayAll/remote-mic-app-windows/pull/202#issuecomment-6021273357)、[后续说明](https://github.com/GetSayAll/remote-mic-app-windows/pull/202#issuecomment-6028248764)）。PR #203 仍 open/draft；未发现维护者拒绝说明，作者正文自述真机验收 deferred。GitHub 对 #202/#203 返回 `mergeable_state=dirty` 只说明对应旧 PR 分支状态，不能推断当前本地工作区存在冲突。
+
+### 2026-10-10 共享宿主与逐报告来源核查
+
+微软 [UMDF 设备池](https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/using-device-pooling-in-umdf-drivers) 说明多个设备可以共用宿主；[NtDeviceIoControlFile](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntdeviceiocontrolfile) 的 FileHandle 指向被调用的设备，宿主 PID 和相同报告内容不等于同一设备。核查当前 `hardware/RC003/helper/src/main.rs` 与 `agent/rc003_agent.js`：Helper 知道所选宿主有 7 项/仅 1 项 RC003，仍按 usage 内容继续，agent 上报/清空前没有逐报告设备来源证明。复用既有 JS 桩运行当前源码，不同模拟句柄的 0x0035/0x004F 均被清除，普通 Backspace 0x002A 保持；这是来源隔离缺口的代码实验，不是实体键盘验收或完整根因闭合。
+
+20:17 的用户键盘对照已确认 TV/方向被误路由，公开观察捕获实际 VK_C0/scan29 与成对的注入 Tab。修复实质复用本仓库 `Testing/rc003_wdf_pdo_source.js` 的固定 UMDF 2.15 请求完成→queue→device→PDO 方法，沿用 2026-09-20 的精确功能 PDO 实证，不恢复已移除的原生生产链或采用父节点猜测。参考微软 [WdfRequestGetIoQueue](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfrequest/nf-wdfrequest-wdfrequestgetioqueue)、[WdfIoQueueGetDevice](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfio/nf-wdfio-wdfioqueuegetdevice)、[WdfDeviceQueryProperty](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfdevice/nf-wdfdevice-wdfdevicequeryproperty) 和 [CM_Get_DevNode_Registry_PropertyW](https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_registry_propertyw)。固定 x64 模块散列沿用此前已验证的 `372c3628…8d6` / `e97a8bbb…6e0`；锁住系统文件并验证目标加载路径，再使用固定表偏移/槽位。其他系统模块组合和 ARM64 尚未建立此来源绑定，明确拒绝，不把 KMDF-only 接口或未知偏移当作适配。逐请求身份只在完成回调和已鉴权私有续约中使用，日志只记分类、代次与计数。
+
+此前“保留逐报告 WDF/PDO 来源”是本地契约，不能作为当前 Agent 已实现的证明，本次核查纠正该外推。已补先红后绿的来源、嵌套/线程、代次、释放和隐私回归；源码修复不修改用户模板、连发或系统键盘设置。0.8.6 输入法/焦点恢复、旧驻留版本与这次误路由分别归因；10 月 10 日旧脚本拒绝/撤除不等于新链路通过。2026-10-12 用户重启后已取得新 Agent 的实际来源分类、报告处理与菜单完整链证据，且用户确认菜单和实体键盘正常；仅覆盖当前 PC/RC003，显式连发开启、冷/闲置首用、其他系统模块及 ARM64 不外推。实机证据、最小材料和验收归 [既有 Bug](Bugs/2026-10-03-foreground-input-regression.md#2026-10-12-用户重启后的来源菜单与连发配置续验)、Testing 与 TODO。未新增外部依赖、恢复迁移或提交本次修复。
+
+2026-10-11 菜单失效追加核查：[Frida Gadget Script 官方文档](https://frida.re/docs/gadget/#script) 明确 `on_change` 默认 `ignore`，脚本只加载一次；Listen 与 Script 为不同交互模式。当前 Helper 的 `serde_like_config` 仅写 script/parameters，旧 Agent 只有应用自建 JSON 命令，没有 reload 或 Frida 控制服务。对照 [Frida 17.18.0 Gadget 实现](https://github.com/frida/frida-core/blob/17.18.0/lib/gadget/gadget.vala#L360-L403)，重复 load 不重新初始化已加载实例。本结论用于解释当日已安装新文件但旧脚本仍驻留的阻碍，不授权强制卸载、第二实例或重新启用已证实误捕获的旧脚本，也不将官方生命周期说明当作本地新脚本功能验收。当前无在线换代实现，12 日通过用户重启结束旧宿主后取得新代次实证，不凭猜测添加热更新补丁。
+
 ### 2026-10-12 无长按动作时默认连续单击
 
 用户本次明确要求替代此前缺省关闭语义。参考微软 [Keyboard Input Overview / Keystroke Messages](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#keystroke-messages) 的持键自动重复与释放终止行为；该参考仅解释键盘交互，不把 Windows 原生重复误当遥控器已支持。实现复用本仓库 `GestureRecognizer`、动作白名单和原 Mac 来源时序，不改延迟或系统键盘设置、不复制新外部代码或增加依赖。缺省自动与显式关闭分别保存；旧缺字段同时代表未设置和历史关闭，无法恢复历史意图，按用户新规则解释。当前合同与场景占位边界归原长按方案，实机与回归结果归原连发手册，不用上游 10 月 6 日结果外推本地新候选。

@@ -44,6 +44,21 @@ use crate::send_input::{
 };
 use crate::UsageCounters;
 
+fn mapping_note(note: String) {
+    #[cfg(test)]
+    if let Some(notes) = MAPPING_TEST_NOTES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        notes.push(note.clone());
+    }
+    crate::ble::gatt_note(note);
+}
+
+#[cfg(test)]
+static MAPPING_TEST_NOTES: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
 /// 引擎消息（监听器/门控/宿主 → 引擎线程）。
 #[derive(Debug)]
 pub enum EngineMessage {
@@ -499,6 +514,7 @@ struct InputConfiguration {
     connected: bool,
     enhanced: bool,
     captured_mask: u64,
+    capability_diagnostic: Mutex<Option<String>>,
 }
 
 impl InputConfiguration {
@@ -525,6 +541,24 @@ impl InputConfiguration {
         );
         let scene = self.apply_input_capabilities(self.scene_mappings.clone());
         let recognition = merge_recognition_mappings(&execution, &scene);
+        let note = format!(
+            "map_capabilities model={:?} connected={} captured_mask={} requested_mask={} execution_mask={} recognition_mask={}",
+            self.model,
+            self.connected,
+            self.captured_mask,
+            self.profile_mappings.as_ref().unwrap_or(&self.mappings).mapped_mask()
+                | self.scene_mappings.mapped_mask(),
+            execution.mapped_mask(),
+            recognition.mapped_mask(),
+        );
+        let mut last = self
+            .capability_diagnostic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if last.as_ref() != Some(&note) {
+            mapping_note(note.clone());
+            *last = Some(note);
+        }
         (execution, recognition)
     }
 }
@@ -1176,6 +1210,7 @@ fn engine_worker(
     let mut native_pending: BTreeSet<RemoteButton> = BTreeSet::new();
     let mut gesture_input = GestureInputState::default();
     let mut enhancement_active = false;
+    let mut mapping_revision = 0u64;
     let mut mapping_notice: Option<MappingNoticeCallback> = None;
     // 「按住连续触发」统计：起拍建条目，释放/复位时聚合落一行。
     let mut repeat_runs: RepeatRuns = BTreeMap::new();
@@ -1387,6 +1422,40 @@ fn engine_worker(
                 recognition,
                 enhanced,
             } => {
+                mapping_revision = mapping_revision.wrapping_add(1);
+                let (repeat_single, repeat_long, repeat_auto, repeat_off) =
+                    crate::raw_input::ALL_BUTTONS.iter().fold(
+                        (0u32, 0u32, 0u32, 0u32),
+                        |(single, long, automatic, off), button| {
+                            let mask = 1 << button.ordinal();
+                            let config = crate::button_gestures::GestureConfig::for_button(
+                                &recognition,
+                                *button,
+                            );
+                            let single_enabled = config.is_some_and(|c| c.repeat_single.is_some());
+                            let long_enabled = config.is_some_and(|c| c.repeat_long.is_some());
+                            let choice = execution.actions(*button).hold_repeat;
+                            (
+                                single | if single_enabled { mask } else { 0 },
+                                long | if long_enabled { mask } else { 0 },
+                                automatic
+                                    | if single_enabled && choice.is_none() {
+                                        mask
+                                    } else {
+                                        0
+                                    },
+                                off | if choice == Some(HoldRepeat::Off) {
+                                    mask
+                                } else {
+                                    0
+                                },
+                            )
+                        },
+                    );
+                crate::ble::gatt_note(format!(
+                    "map_reconfig revision={mapping_revision} execution_enabled={} execution_mask={} recognition_mask={} enhanced={enhanced} repeat_single_mask={repeat_single} repeat_long_mask={repeat_long} repeat_auto_mask={repeat_auto} repeat_explicit_off_mask={repeat_off}",
+                    execution.enabled, execution.mapped_mask(), recognition.mapped_mask(),
+                ));
                 if !recognition.enabled {
                     injector.cancel_focus();
                 }
@@ -1535,6 +1604,10 @@ fn handle_edges(
 
     for edge in edges {
         if !gesture_input.accept(edge) {
+            mapping_note(format!(
+                "map_gesture button={:?} pressed={} accepted=false fired_count=0 reason=waiting_release",
+                edge.button, edge.is_pressed,
+            ));
             native_pending.remove(&edge.button);
             continue;
         }
@@ -1570,6 +1643,25 @@ fn handle_edges(
             // 含「按住连续触发」的一趟结束：落聚合日志（拍数/时长）。
             finish_repeat_run(repeat_runs, edge.button, "release");
         }
+        let recognition = read_lock(recognition_mappings);
+        let configured =
+            crate::button_gestures::GestureConfig::for_button(&recognition, edge.button).is_some();
+        let reason = if !recognition.enabled {
+            "recognition_disabled"
+        } else if !configured {
+            "unconfigured"
+        } else if !fired.is_empty() {
+            "fired"
+        } else if edge.is_pressed {
+            "waiting_gesture"
+        } else {
+            "released_without_gesture"
+        };
+        mapping_note(format!(
+            "map_gesture button={:?} pressed={} accepted=true recognition_enabled={} configured={} fired_count={} reason={reason}",
+            edge.button, edge.is_pressed, recognition.enabled, configured, fired.len(),
+        ));
+        drop(recognition);
         for trigger in fired {
             if fire_gesture(
                 edge.button,
@@ -1671,7 +1763,7 @@ fn fire_gesture(
     // 门控未运行时不注入：原始键未被吞（或无法归因），注入会造成双输入。
     if !recognition.enabled || !key_gate::is_gate_thread_alive() {
         if recognition.enabled {
-            crate::ble::gatt_note(format!(
+            mapping_note(format!(
                 "map_skip_inject reason=gate_not_alive enabled={} gate_alive=false button={:?} trigger={:?}",
                 recognition.enabled, button, trigger
             ));
@@ -1688,7 +1780,7 @@ fn fire_gesture(
             gesture: fired,
             native_delivered,
         });
-        crate::ble::gatt_note(format!(
+        mapping_note(format!(
             "map_route button={button:?} trigger={trigger:?} disposition={disposition:?} native_delivered={native_delivered}"
         ));
         if disposition != GestureDisposition::PassThrough {
@@ -1697,11 +1789,14 @@ fn fire_gesture(
     }
     let mappings = read_lock(mappings).clone();
     if !mappings.enabled {
+        mapping_note(format!(
+            "map_skip_inject reason=mapping_disabled button={button:?} trigger={trigger:?}"
+        ));
         return false;
     }
     let action = mappings.action_for(button, trigger);
     if action == ButtonAction::Disabled {
-        crate::ble::gatt_note(format!(
+        mapping_note(format!(
             "map_skip_inject reason=action_disabled button={:?} trigger={:?}",
             button, trigger
         ));
@@ -1764,16 +1859,11 @@ fn fire_gesture(
         }
         ButtonAction::Shortcut { chord } => {
             let terminal_action = chord.is_lock_workstation();
-            crate::ble::gatt_note(format!(
-                "map_fire button={:?} trigger={:?} action=shortcut chord={}",
+            mapping_note(format!(
+                "map_fire button={:?} trigger={:?} action=shortcut key_count={}",
                 button,
                 trigger,
-                chord
-                    .keys
-                    .iter()
-                    .map(|key| format!("{key:?}"))
-                    .collect::<Vec<_>>()
-                    .join("+")
+                chord.keys.len(),
             ));
             // 成功判据分两层（Issue #195，2026-10-08）：`tap` 的 Ok 只表示事件
             // 已入队（SendInput 提交数 = 计划数），不能当成"前台收到了键"——
@@ -1786,15 +1876,20 @@ fn fire_gesture(
                     // 锁屏动作走 Win32 API（LockWorkStation），不进输入流：
                     // 没有可观测的注入回声，不得套用 SendInput 分支的判据。
                     if terminal_action {
-                        crate::ble::gatt_note(LOCK_WORKSTATION_INJECT_NOTE.to_owned());
+                        mapping_note(format!(
+                            "{LOCK_WORKSTATION_INJECT_NOTE} button={button:?} trigger={trigger:?}"
+                        ));
                     } else {
                         let echo = observe_injection_echo(echo_before);
-                        crate::ble::gatt_note(shortcut_injection_note(echo));
+                        mapping_note(format!(
+                            "{} button={button:?} trigger={trigger:?}",
+                            shortcut_injection_note(echo)
+                        ));
                     }
                     return terminal_action;
                 }
                 Err(error) => {
-                    crate::ble::gatt_note("map_inject result=err error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true".to_owned());
+                    mapping_note(format!("map_inject result=err button={button:?} trigger={trigger:?} error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true"));
                     lock_state(state).last_error = Some(format!("注入快捷键失败：{error}"));
                 }
             }
@@ -1935,6 +2030,229 @@ mod tests {
 
     // Production has one process-wide gate; test runtimes must own it exclusively.
     use crate::key_gate::GATE_TEST_LOCK;
+
+    #[test]
+    fn mapping_diagnostics_explain_each_received_edge_without_changing_execution() {
+        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = crate::key_gate::KeyGate::start();
+        for scenario in [
+            "unowned", "waiting", "handled", "blocked", "disabled", "ok", "err",
+        ] {
+            *MAPPING_TEST_NOTES.lock().unwrap() = Some(Vec::new());
+            let injector = Arc::new(RecordingInjector {
+                fail: scenario == "err",
+                ..Default::default()
+            });
+            let runtime = ButtonMappingRuntime::new(
+                injector.clone(),
+                Arc::new(UsageCounters::default()),
+                Arc::new(StdMutex::new(RawInputSnapshot::default())),
+            );
+            runtime.set_input_context(crate::RemoteModel::Rc003, true);
+            let mut mapping = mappings_with_single(RemoteButton::Back, KeyCode::Backspace);
+            if scenario == "waiting" {
+                let actions = mapping.actions.get_mut(&RemoteButton::Back).unwrap();
+                actions.double = actions.single.clone();
+            }
+            if scenario == "disabled" {
+                runtime.set_application_mappings(None, mapping);
+            } else {
+                runtime.set_mappings(mapping);
+            }
+            if scenario != "unowned" {
+                runtime.set_input_enhancement(true);
+            }
+            if matches!(scenario, "handled" | "blocked") {
+                let disposition = if scenario == "handled" {
+                    GestureDisposition::Handled
+                } else {
+                    GestureDisposition::Blocked
+                };
+                runtime.set_gesture_handler(Some(Arc::new(move |_| disposition)));
+            }
+            flush(&runtime);
+            runtime
+                .sender()
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            flush(&runtime);
+            let notes = MAPPING_TEST_NOTES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .join("\n");
+            assert!(
+                notes.contains("map_gesture button=Back pressed=true"),
+                "{scenario}: missing recognizer evidence: {notes}"
+            );
+            match scenario {
+                "unowned" => {
+                    assert!(
+                        notes.contains(
+                            "captured_mask=0 requested_mask=1 execution_mask=0 recognition_mask=0"
+                        ),
+                        "{notes}"
+                    );
+                    assert!(
+                        notes.contains("configured=false fired_count=0 reason=unconfigured"),
+                        "{notes}"
+                    );
+                }
+                "waiting" => assert!(
+                    notes.contains("configured=true fired_count=0 reason=waiting_gesture"),
+                    "{notes}"
+                ),
+                "handled" => assert!(notes.contains("disposition=Handled"), "{notes}"),
+                "blocked" => assert!(notes.contains("disposition=Blocked"), "{notes}"),
+                "disabled" => assert!(
+                    notes.contains("reason=action_disabled button=Back trigger=Single"),
+                    "{notes}"
+                ),
+                "ok" => assert!(
+                    notes
+                        .lines()
+                        .any(|line| line.starts_with("map_inject result=queued ")
+                            && line.contains("button=Back trigger=Single")),
+                    "{notes}"
+                ),
+                "err" => assert!(
+                    notes.contains("map_inject result=err button=Back trigger=Single"),
+                    "{notes}"
+                ),
+                _ => unreachable!(),
+            }
+            assert!(
+                !notes.contains("chord="),
+                "diagnostics must not disclose configured keys: {notes}"
+            );
+            assert_eq!(
+                injector.taps.lock().unwrap().len(),
+                usize::from(scenario == "ok")
+            );
+            runtime
+                .sender()
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false,
+                }))
+                .unwrap();
+            flush(&runtime);
+            drop(runtime);
+        }
+        drop(gate);
+        *MAPPING_TEST_NOTES.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn mapping_diagnostics_deduplicate_unchanged_state_and_explain_cancelled_release() {
+        let _gate_test = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = crate::key_gate::KeyGate::start();
+        *MAPPING_TEST_NOTES.lock().unwrap() = Some(Vec::new());
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            injector.clone(),
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        let mut mapping = ButtonMappings::default();
+        let buttons = [
+            RemoteButton::Back,
+            RemoteButton::Menu,
+            RemoteButton::VolumeUp,
+            RemoteButton::VolumeDown,
+        ];
+        for button in buttons {
+            mapping
+                .actions
+                .extend(mappings_with_single(button, KeyCode::Backspace).actions);
+        }
+        runtime.set_mappings(mapping.clone());
+        runtime.set_input_enhancement(true);
+        flush(&runtime);
+        let before = MAPPING_TEST_NOTES.lock().unwrap().as_ref().unwrap().len();
+        for _ in 0..10 {
+            runtime.set_mappings(mapping.clone());
+        }
+        flush(&runtime);
+        assert_eq!(
+            MAPPING_TEST_NOTES.lock().unwrap().as_ref().unwrap().len(),
+            before,
+            "unchanged capability state must remain quiet"
+        );
+        for button in buttons {
+            for is_pressed in [true, true, false, false] {
+                runtime
+                    .sender()
+                    .send(EngineMessage::DriverEdge(ButtonEdge { button, is_pressed }))
+                    .unwrap();
+            }
+        }
+        flush(&runtime);
+        assert_eq!(injector.taps.lock().unwrap().len(), buttons.len());
+        let notes = MAPPING_TEST_NOTES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .join("\n");
+        assert_eq!(
+            notes
+                .lines()
+                .filter(|line| line.starts_with("map_gesture "))
+                .count(),
+            8,
+            "only real logical edges should produce recognizer diagnostics"
+        );
+        for button in buttons {
+            assert!(
+                notes.contains(&format!("map_gesture button={button:?} pressed=true")),
+                "{notes}"
+            );
+        }
+        runtime
+            .sender()
+            .send(EngineMessage::DriverEdge(ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: true,
+            }))
+            .unwrap();
+        flush(&runtime);
+        mapping.actions.get_mut(&RemoteButton::Back).unwrap().single = ButtonAction::Shortcut {
+            chord: KeyChord {
+                keys: vec![KeyCode::Escape],
+            },
+        };
+        runtime.set_mappings(mapping);
+        flush(&runtime);
+        runtime
+            .sender()
+            .send(EngineMessage::DriverEdge(ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: false,
+            }))
+            .unwrap();
+        flush(&runtime);
+        let notes = MAPPING_TEST_NOTES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .join("\n");
+        assert!(notes.contains("map_gesture button=Back pressed=false accepted=false fired_count=0 reason=waiting_release"), "{notes}");
+        assert_eq!(
+            injector.taps.lock().unwrap().len(),
+            buttons.len() + 1,
+            "cancelled UP must not execute the replacement mapping"
+        );
+        drop(runtime);
+        drop(gate);
+        *MAPPING_TEST_NOTES.lock().unwrap() = None;
+    }
 
     #[test]
     fn unified_capture_targets_include_profile_and_menu_without_common_actions() {

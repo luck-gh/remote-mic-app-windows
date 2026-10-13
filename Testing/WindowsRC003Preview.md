@@ -254,6 +254,42 @@
 - 正常执行前曾出现 sandbox 工具权限/loopback 限制；改在当前 Windows 主机执行后通过。旧测试 PID 占用导致 Helper debug 链接失败，最终 release 测试通过；用户仅授权结束该测试进程后已核其退出，正式应用未被强杀。
 - 临时日志复用 `target/dev/upstream-sync/` 和 Helper 核对所用 `target/dev/upstream-merge/`；留到候选验证完成或被替代后回收，不复制源码、缓存或安装包留档。
 
+### 同日恢复原有未提交改动后的验证
+
+本地合并提交为 `9f4ead50bcd429ef9bfe448cec54aeede936bf7f`，父提交分别为原工作基线 `50f21e0` 和上游 `e225bb4`。恢复合并前的个人版品牌与 RC003 返回键诊断补丁后，继续保持未提交；新增向导也沿用个人版显示，固定图标不恢复旧图标选择。原文件存在/删除状态全部保持，个人 SVG 母版 SHA256 仍为 `40cc8382d2e16ef060abac300d5f3fb9bfaf48ece841939d2eeac3151d9d238e`。
+
+最终 **passed**：前端 348 项、类型检查与 Vite 构建；Rust 工作区 660 项（core 32、场景 4、Windows 478、集成 3、宿主 143），21 ignored；fmt、普通与 runtime-simulation 编译检查。测试数变化来自个人版移除已退役图标/反馈流程及恢复诊断回归，不是跳过失败测试。映射诊断与桥接定向 40/25 项通过；真实合成快捷方式的受限回收及 5 项安装脚本契约通过。日志为 `target/dev/upstream-sync/*restored*.log` 与 `target/dev/upstream-merge/*restored*.log`，按本节留存条件收尾。未运行真实安装器、未改变现有安装实例，前述实体按键、真实收音、冷态/睡眠、ARM64 等边界仍 **deferred**。
+
+安装器当前钩子的安装/卸载段汇编为 **deferred**：复用已有 `target/.tauri/NSIS/makensis.exe`，第一次受 PowerShell 原生命令启动器输出编码错误阻止；第二次显式 stdout/stderr 重定向仍报系统 DLL relocation，编译器未启动，未生成或执行安装包。钩子 SHA256 `2e2c4d2c11cc083d4e88975aeb9c15b245d4d45c7f1db724d44e3bd0712af22c`；摘要 `target/dev/upstream-sync/installer-hooks-makensis-summary.log`，本次 4 份探针文件已回收。此环境失败不算 NSIS 语法或生命周期通过，也不影响已通过的 Rust/前端验证；真实出包前须补此项。
+
+### 同日按用户要求覆盖安装并打开（11:28）
+
+用户明确要求“安装并打开”后，以 `9f4ead5` 加已恢复的未提交个人版/诊断工作构建本地 x64 生产包；正常 Windows 构建环境中 `build-local-input-candidate.ps1` 完成 NSIS 出包，替代前述未启动编译器的 deferred 汇编结果，不据此推断那次隔离工具失败的具体责任。
+
+- **passed**：`target/release/bundle/nsis/无线麦_0.8.5_x64-setup.exe`，SHA256 `55d3cf83c192cbaad9cdf106923bbe936e0068da7cf6436adba37c7adb177352`；GUI/版本/许可证与四项载荷校验通过，10 个前端资源均实际嵌入。
+- **passed（实际安装）**：原 PID 3976 通过正常退出事件结束；管理员覆盖既有安装目录，注册版本读回 0.8.5，原 JSON 配置在安装前后哈希保持，四项资源逐件 SHA 对齐。主程序与构建产物的差异严格仅为 `__TAURI_BUNDLE_TYPE_VAR_UNK` → `NSS` 的三个字节，其余字节完全一致；已安装 EXE SHA256 `707880d02f6dc40edfe7f4030e3fe73af5c93de7f72b1514d28fe50fc1312f7c`。
+- **passed（实际启动）**：由 Explorer 普通令牌启动 PID 10168，TokenElevation=false；一个主窗口及一个明确 `--sayall-key-host` 子进程，主窗口“无线麦 · 个人版”可见、Responding=true、三项导航标签实际存在。初始 IPC 和按键页监听/轮询均有完成日志，短时观察无该进程的 WebView process_failed。
+- 初次临时验收脚本错误要求 EXE 字节完全一致，并把同名按键宿主算作第二主实例；逐项只读核对后按已有 Tauri 标记和新进程职责完成验证，没有重复安装或强杀。既有未提交源码继续保持未提交；未推送、发布或新增 worktree。
+- 2026-10-10 交接核对：本机 `build-metadata.json` 的 `sourceCommit` 为 `null`，没有形成单一精确提交的源码身份。上述候选为 `9f4ead5` 加当时未提交工作，不能用版本号、HEAD 或空元数据声称可完整重建。下一轮先核对实际载荷及工作区；沿用本页包/EXE 指纹区分现场，构建时按 LOGGING 核对来源字段，不新增整仓库快照。
+- 原始摘要为 `target/dev/upstream-sync/` 中的 `local-install-build.log`、`local-install-bundle-check.log`、`local-install-embedded-check.log`、`local-install-result.json` 与 `local-startup-result.json`，留到候选被替代或验收闭合后回收。ARM64 不在本次包中；实体遥控按键、实际收音及完整卸载矩阵仍 deferred，不把可见启动外推这些功能。
+
+### 2026-10-10 三轮启动调查后合并 0.8.6、本地安装与启动
+
+先保护当前及轮转日志，再按本次开机时间核对三轮主程序、Helper、按键宿主、配置与捕获代次。事实与未知点原位归 [前台输入 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-10-用户报告同次开机的三轮启动部分定位未闭合)；第三轮正常观察不算故障修复。设备宿主始终为同一个 11972，没有因本轮操作被强杀、重启或更换；未操作无线电。
+
+最新上游仍为 `3ec66566ceabf82915dd1b9ff9a3b10ec163ca26`（0.8.6）。本地必要合并提交 `af710b757897cb0567b63c63a7ceb40f62426652` 保留双方父历史，按 [ATTRIBUTION](../ATTRIBUTION.md#2026-10-10-上游-086-评估与合并) 适配焦点恢复、迟到回调与隐私日志。原有 80 项文件存在状态及 52 个已修改文件内容与本轮保护 stash 核对一致（文本只允许换行差异，个人品牌配置仅另改版本号）；全部保持未提交/未暂存，旧恢复 stash 未再次 apply。本轮新增 reset/实际映射与连发诊断也保持未提交，不包含根因未确认的按键修复。
+
+- **passed（自动化）**：`cargo test --workspace` 669 passed（core 32、场景 4、Windows 487、集成 3、宿主 143），22 ignored；不重复计入宿主测试产生的隔离子进程一次执行。`cargo fmt --all -- --check`、`cargo check --workspace`、`cargo check -p sayall-windows-app --features runtime-simulation`；`pnpm test` 348 passed，`pnpm build` 类型检查和生产构建；安装覆盖契约 5 项通过。正常 Windows 环境执行，sandbox 下 IPC 失败/挂起的中间测试未作为产品失败或通过证据。
+- **passed（本地生产包）**：既定 `scripts/build-local-input-candidate.ps1` 构建 x64 NSIS，包 `target/release/bundle/nsis/无线麦_0.8.6_x64-setup.exe`，SHA256 `e4d20971632f5bbdaa3b4a1ee43da8bdc81498f477466d182802abcad8753873`；版本/许可证/GUI、四项载荷与十项实际嵌入的前端资源通过。`build_channel=local`，内嵌 revision 为合并提交，但包包含原有未提交内容和本轮诊断；`build-metadata.json` 仍因本地没有 GITHUB_SHA 而 sourceCommit=null，不能把内嵌 HEAD 当作完整源码身份。
+- **passed（正常退出及实际覆盖安装）**：原主程序 23708 在 12:10:16 请求正常退出，日志 overall passed、failed_stages=0、728ms；进程观察 913ms 后确认主程序/按键宿主已结束，原 Helper 46672 随后单独只读确认已退出。管理员仅覆盖原安装目录一次，版本读回 0.8.6；settings、button-mappings、capture-input-session、onboarding 四份 JSON 安装前后哈希保持。实际四项载荷逐件 SHA 对齐；主 EXE 与构建产物逐字节核对，仅允许既有 NSIS bundle 标记差异。安装 EXE SHA256 `307a5ebe5720a2b6154e254df91133d3830daf968420331a36ee50b8778147f3`。
+- **passed（普通权限启动与诊断副作用）**：首次普通候选 18960 的父进程不能确认，先通过正常退出结束，日志 799ms、failed_stages=0，Helper 39648 的 reset 从 helper_count=1/receipt_settled=false 到 0/true/complete 有实际记录。没有重复安装；改用已有真实 Explorer 窗口的自动化入口于 12:13:44 启动主程序 32448、按键宿主 49576，父进程为 Explorer，双方 TokenElevation=false，个人版窗口实际可见且响应，配置仍保持。启动 reset 记录完整匹配判据并 complete；映射 revision=3 的 execution_mask=0、recognition_mask=256、repeat_single/long_mask=0 与当前配置一致，捕获所有权也确认 256。12:14:17 日志记录正常 hide_to_tray，后续只读 UIA 仅见事件窗口，不能把这个查询扩大解释为导航页面检查通过。
+- **passed（同日 13:45 按用户要求核对最新版并退出）**：再次核对当前主程序 32448/按键宿主 49576 来自既有安装目录，版本 0.8.6；安装 EXE、包指纹及四项实际载荷与上述交付一致，没有比 EXE 构建更新的功能源码，复用已完成的打包/安装，不重复构建、恢复或安装。13:45:37 请求应用正常退出，主程序日志 overall passed、failed_stages=0、799ms，增强释放 passed、592ms；984ms 后主程序、按键宿主与 Helper 20032 均已退出，无强杀，未重新打开。安装版保留为当前候选，下次启动仍使用该 0.8.6。最小当前会话日志复用 `target/dev/foreground-input/current-086-session.log`，留到对应未闭合异常完成或候选被替代后回收；不扩大按键/收音验收结论。
+- **deferred**：实体键盘实际键位/扫描码及异常复现、第二轮确切模板/前台程序、在同一实际模板下显式关闭/开启连发的实体对照、输入法真实首按/收音和焦点恢复、冷态/闲置后首用、断连/睡眠/持键退出、分别 RC001 与 RC003 的硬件回归、ARM64、完整升级/卸载矩阵。未运行新候选的完整 GUI runtime simulation；其编译及现有隔离 IPC/生命周期测试不替代硬件验收。
+
+安装验证脚本最初因现有载荷校验脚本的默认 StagedDirectory 求值为空而中止；显式传入路径只补校验，未再次安装。临时启动脚本用本地 Shell.Application 的首次普通启动未确认 Explorer 父进程，按上述正常退出后改真实 Explorer 自动化；不把中间校验失败改写成产品故障。当前只创建必要合并提交，未自动提交新增诊断、未推送、PR、合入 main 或发布。
+
+### 2026-10-10 晚共享宿主来源修复、本地安装与旧代次拒绝
+
 ### 2026-10-12 默认长按连续单击修订
 
 用户明确要求未配置长按时默认连续单击，替代此前缺省关闭规则；不是重复迁移或把旧关闭配置误诊为引擎丢拍。模型新增独立关闭值，缺省自动仅作用于原有可重复按键和动作，长按动作优先；编辑器显示自动/关闭/重复单击/重复长按。菜单与任务识别占位明确关闭，原捕获来源、语音、时序和成对释放路径保持。完整规则与分项结果归 [连发手册](WindowsButtonGestureRepeat.md#2026-10-12-用户调整无长按动作时默认连续单击)。
