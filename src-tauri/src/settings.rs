@@ -2677,15 +2677,21 @@ mod tests {
     }
 
     #[test]
-    fn existing_mapping_load_save_and_export_do_not_enable_repeat() {
+    fn existing_mapping_load_save_and_export_preserve_automatic_repeat_configuration() {
         use sayall_windows::raw_input::RemoteButton;
         let store = template_test_store();
         let path = store.button_mappings_path();
         let legacy = r#"{"enabled":true,"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["backspace"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#;
         std::fs::write(&path, legacy).unwrap();
         let loaded = store.load_button_mappings().unwrap();
-        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.schema_version, 2);
         assert_eq!(loaded.actions(RemoteButton::Back).hold_repeat, None);
+        assert_eq!(
+            loaded
+                .actions(RemoteButton::Back)
+                .effective_hold_repeat(RemoteButton::Back),
+            Some(sayall_windows::send_input::ButtonTrigger::Single)
+        );
         store.save_button_mappings(loaded).unwrap();
         let configuration = store.load_mapping_configuration().unwrap();
         assert_eq!(
@@ -2715,5 +2721,129 @@ mod tests {
             .save_button_mappings(ButtonMappings::default())
             .is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[test]
+    fn hold_repeat_off_and_auto_round_trip_common_and_custom_template() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::{ButtonActions, HoldRepeat, KeyCode};
+        let store = template_test_store();
+        let mut configuration = MappingConfiguration::default();
+        for (button, key, hold_repeat) in [
+            (
+                RemoteButton::Back,
+                KeyCode::Backspace,
+                Some(HoldRepeat::Off),
+            ),
+            (RemoteButton::Right, KeyCode::Right, None),
+        ] {
+            configuration.common_mappings.actions.insert(
+                button,
+                ButtonActions {
+                    single: ButtonAction::Shortcut {
+                        chord: KeyChord { keys: vec![key] },
+                    },
+                    hold_repeat,
+                    ..Default::default()
+                },
+            );
+        }
+        let custom = configuration.create_template("自动与关闭".into()).unwrap();
+        let mut custom_mappings = configuration.common_mappings.clone();
+        custom_mappings
+            .actions
+            .get_mut(&RemoteButton::Back)
+            .unwrap()
+            .hold_repeat = None;
+        custom_mappings
+            .actions
+            .get_mut(&RemoteButton::Right)
+            .unwrap()
+            .hold_repeat = Some(HoldRepeat::Off);
+        configuration
+            .templates
+            .iter_mut()
+            .find(|template| template.id == custom.id)
+            .unwrap()
+            .mappings = custom_mappings.clone();
+        let saved = store.save_mapping_configuration(configuration).unwrap();
+        assert_eq!(store.load_mapping_configuration().unwrap(), saved);
+        let exported_path = store.path.with_file_name("repeat-round-trip.json");
+        store
+            .export_mapping_configuration(&exported_path, saved.clone(), None)
+            .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&fs::read(&exported_path).unwrap()).unwrap();
+        assert_eq!(exported["formatVersion"], 3);
+        assert_eq!(exported["commonMappings"]["schemaVersion"], 2);
+        assert_eq!(exported["templates"][0]["mappings"]["schemaVersion"], 2);
+        assert_eq!(
+            exported["commonMappings"]["actions"]["back"]["holdRepeat"],
+            "off"
+        );
+        assert!(exported["commonMappings"]["actions"]["right"]
+            .get("holdRepeat")
+            .is_none());
+
+        let destination = template_test_store();
+        let preview = destination
+            .preview_mapping_configuration_import(&exported_path)
+            .unwrap();
+        assert_eq!(
+            preview.configuration.common_mappings.actions,
+            saved.common_mappings.actions
+        );
+        assert_eq!(preview.configuration.templates[0].mappings, custom_mappings);
+        let imported = destination
+            .apply_mapping_configuration_import(&preview.token)
+            .unwrap();
+        assert_eq!(
+            imported.common_mappings.actions,
+            saved.common_mappings.actions
+        );
+        assert_eq!(imported.templates[0].mappings, custom_mappings);
+        assert_eq!(destination.load_mapping_configuration().unwrap(), imported);
+    }
+
+    #[test]
+    fn nested_future_mapping_schema_rejects_save_export_and_import_without_writing() {
+        let store = template_test_store();
+        let mut configuration = MappingConfiguration::default();
+        configuration.create_template("测试模板".into()).unwrap();
+        let saved = store.save_mapping_configuration(configuration).unwrap();
+        let original = fs::read(store.button_mappings_path()).unwrap();
+        let export = store.path.with_file_name("future-export.json");
+        store
+            .export_mapping_configuration(&export, saved.clone(), None)
+            .unwrap();
+        let original_export = fs::read(&export).unwrap();
+        let incoming = store.path.with_file_name("future-import.json");
+        for common in [true, false] {
+            let mut invalid = saved.clone();
+            if common {
+                invalid.common_mappings.schema_version = 3;
+            } else {
+                invalid.templates[0].mappings.schema_version = 3;
+            }
+            assert!(store.save_mapping_configuration(invalid.clone()).is_err());
+            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), original);
+            assert!(store
+                .export_mapping_configuration(&export, invalid, None)
+                .is_err());
+            assert_eq!(fs::read(&export).unwrap(), original_export);
+
+            let mut document: serde_json::Value = serde_json::from_slice(&original_export).unwrap();
+            if common {
+                document["commonMappings"]["schemaVersion"] = 3.into();
+            } else {
+                document["templates"][0]["mappings"]["schemaVersion"] = 3.into();
+            }
+            fs::write(&incoming, serde_json::to_vec(&document).unwrap()).unwrap();
+            assert!(store
+                .preview_mapping_configuration_import(&incoming)
+                .is_err());
+            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), original);
+            assert_eq!(store.load_mapping_configuration().unwrap(), saved);
+        }
     }
 }

@@ -39,8 +39,8 @@ use crate::raw_input::{
     ButtonEdge, ButtonStateMerger, RawInputSnapshot, RawKeyboardEvent, RemoteButton,
 };
 use crate::send_input::{
-    native_key, ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, KeyCode, MouseClickKind,
-    MoveDirection, ScrollDirection,
+    native_key, ButtonAction, ButtonMappings, ButtonTrigger, HoldRepeat, KeyChord, KeyCode,
+    MouseClickKind, MoveDirection, ScrollDirection,
 };
 use crate::UsageCounters;
 
@@ -537,6 +537,11 @@ fn merge_recognition_mappings(
     merged.enabled = execution.enabled || scene.enabled;
     for (button, scene_actions) in &scene.actions {
         let actions = merged.actions.entry(*button).or_default();
+        // Recognition markers are not user actions. Filling an empty Single
+        // must not turn automatic repeat on for a scene-only control.
+        if actions.single == ButtonAction::Disabled && actions.hold_repeat.is_none() {
+            actions.hold_repeat = Some(HoldRepeat::Off);
+        }
         // Scene controls own this button before common contextual clicks.
         actions.ok_context_click = false;
         merge_recognition_action(&mut actions.single, &scene_actions.single);
@@ -3157,8 +3162,8 @@ mod tests {
             RemoteButton::Up,
             ButtonActions {
                 single: single(KeyCode::Up),
-                // 场景 5 断言按住连续触发 4 拍：按新模型显式开启开关。
-                hold_repeat: Some(ButtonTrigger::Single),
+                // 场景 5 同时验证新缺省：原生首拍只对冲一次，后续自动连发仍注入。
+                hold_repeat: None,
                 ..ButtonActions::default()
             },
         );
@@ -3938,6 +3943,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scene_recognition_placeholders_do_not_enable_default_repeat() {
+        let scene = mappings_with_single(RemoteButton::Back, KeyCode::Escape);
+        let recognition = merge_recognition_mappings(&ButtonMappings::default(), &scene);
+        let config =
+            crate::button_gestures::GestureConfig::for_button(&recognition, RemoteButton::Back)
+                .unwrap();
+        assert!(config.single_configured, "场景仍能识别单击");
+        assert!(
+            config.repeat_single.is_none(),
+            "识别占位动作不得获得默认连发"
+        );
+
+        let execution = mappings_with_single(RemoteButton::Back, KeyCode::Backspace);
+        let recognition = merge_recognition_mappings(&execution, &scene);
+        let config =
+            crate::button_gestures::GestureConfig::for_button(&recognition, RemoteButton::Back)
+                .unwrap();
+        assert_eq!(
+            config.repeat_single,
+            RemoteButton::Back.repeat_interval(),
+            "真实映射的默认连发必须保留"
+        );
+    }
+
     /// 「按住连续触发」引擎路径（2026-10-05）：门控边沿驱动的连续拍注入、
     /// 释放即停；配置变化取消进行中的一趟、不得迟到拍。
     #[test]
@@ -3970,7 +4000,7 @@ mod tests {
                         keys: vec![KeyCode::Backspace],
                     },
                 },
-                hold_repeat: Some(ButtonTrigger::Long),
+                hold_repeat: Some(HoldRepeat::Long),
                 ..ButtonActions::default()
             },
         );
@@ -4048,7 +4078,7 @@ mod tests {
                     },
                 },
                 long: ButtonAction::Disabled,
-                hold_repeat: Some(ButtonTrigger::Single),
+                hold_repeat: Some(HoldRepeat::Single),
                 ok_context_click: false,
             },
         );

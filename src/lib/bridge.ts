@@ -188,10 +188,11 @@ export interface ButtonActions {
   double: ButtonAction;
   long: ButtonAction;
   /**
-   * 「按住连续触发」指定的槽位（单击或长按；缺省 = 关闭）。
+   * 「按住连续触发」策略；缺省 = 自动（无长按时连续执行可重复的单击）。
+   * off 显式关闭，single / long 显式指定连续执行的槽位。
    * 每键至多一个槽位，互斥由界面与 Rust `normalized()` 强制。
    */
-  holdRepeat?: "single" | "long";
+  holdRepeat?: "off" | "single" | "long";
   /**
    * OK 键：用遥控器移动过光标后的 5 秒内，按 OK 直接点击光标位置
    * （缺省 = 关闭；只对 OK 键生效）。
@@ -200,7 +201,7 @@ export interface ButtonActions {
 }
 
 export interface ButtonMappings {
-  /** 配置结构版本（Rust 侧写入并校验；界面原样回传）。 */
+  /** 配置结构版本（当前为 2：缺省自动，off 显式关闭；保存时由 Rust 校验）。 */
   schemaVersion?: number;
   enabled: boolean;
   actions: Partial<Record<RemoteButton, ButtonActions>>;

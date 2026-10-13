@@ -488,7 +488,7 @@ const repeatGroupVisible = computed(() => {
   );
 });
 
-type HoldRepeatChoice = "off" | "single" | "long";
+type HoldRepeatChoice = "auto" | "off" | "single" | "long";
 
 /** 选项不可选的原因（null = 可选）；radio 展示与一致性收口共用同一判据。 */
 function holdRepeatBlockedReason(
@@ -520,7 +520,18 @@ function holdRepeatBlockedReason(
 const repeatChoice = computed<HoldRepeatChoice>(() => {
   const target = editingTarget.value;
   const hold = target ? actionsOf(target.button).holdRepeat : undefined;
-  return hold === "long" ? "long" : hold === "single" ? "single" : "off";
+  return hold ?? "auto";
+});
+
+const repeatAutoHint = computed(() => {
+  const target = editingTarget.value;
+  if (!target) return "";
+  const actions = actionsOf(target.button);
+  if (actions.long.type !== "disabled") return "当前：按住后执行长按动作一次。";
+  if (actions.single.type === "disabled") return "当前：未设置单击动作，按住不执行动作。";
+  return actionAllowsRepeat(actions.single)
+    ? "当前：按住会连续执行单击动作。"
+    : "当前：单击动作只执行一次。";
 });
 
 const repeatSingleReason = computed<string | null>(() => {
@@ -536,7 +547,7 @@ const repeatLongReason = computed<string | null>(() => {
 /** 常驻原因行：只解释当前页面对应的选项。 */
 const repeatPageReason = computed<string | null>(() => {
   const target = editingTarget.value;
-  if (!target) return null;
+  if (!target || repeatChoice.value === "auto") return null;
   if (target.trigger === "single") return repeatSingleReason.value;
   if (target.trigger === "long") return repeatLongReason.value;
   return null;
@@ -605,13 +616,13 @@ function reconcileHoldRepeat(
   actions: ButtonActions,
 ): { actions: ButtonActions; notice: string | null } {
   const hold = actions.holdRepeat;
-  if (!hold) return { actions, notice: null };
+  if (!hold || hold === "off") return { actions, notice: null };
   const slot = hold === "long" ? "long" : "single";
   const valid =
     REPEAT_CAPABLE_BUTTONS.includes(button) && holdRepeatBlockedReason(actions, slot) === null;
   if (valid) return { actions, notice: null };
   const next = { ...actions };
-  delete next.holdRepeat;
+  next.holdRepeat = "off";
   // 自动关闭的提示同样不得指向灰掉的选项（长按动作只执行一次时它不可选）。
   const notice =
     slot === "single" && actions.long.type !== "disabled"
@@ -638,7 +649,7 @@ function selectHoldRepeat(choice: HoldRepeatChoice): void {
   }
   if (repeatChoice.value === choice) return;
   const actions = { ...actionsOf(target.button) };
-  if (choice === "off") {
+  if (choice === "auto") {
     delete actions.holdRepeat;
   } else {
     actions.holdRepeat = choice;
@@ -649,11 +660,13 @@ function selectHoldRepeat(choice: HoldRepeatChoice): void {
   };
   reportFrontendEvent({ event: "button_mapping_repeat", phase: "draft_changed", result: "passed", reason: choice });
   statusMessage.value = (
-    choice === "off"
-      ? "已关闭“按住时连续执行”"
-      : choice === "long"
-        ? "已开启：长按后不松手会继续连续执行"
-        : "已开启：按住不放会连续执行"
+    choice === "auto"
+      ? "已选择自动：未设置长按时连续执行可重复的单击动作；设置长按后只执行一次"
+      : choice === "off"
+        ? "已关闭“按住时连续执行”"
+        : choice === "long"
+          ? "已开启：长按后不松手会继续连续执行"
+          : "已开启：按住不放会连续执行"
   );
 }
 
@@ -686,6 +699,7 @@ async function persist(message?: string): Promise<boolean> {
   const request = ++saveSequence;
   const source = editingSource.value;
   const payload = cloneMappings(mappings.value);
+  payload.schemaVersion = 2;
   busy.value = true;
   statusMessage.value = null;
   reportFrontendEvent({ event: "button_mapping_editor_save", phase: "started", result: "passed", reason: source === "common" ? "common" : "template" });
@@ -772,7 +786,7 @@ async function saveAsTemplate(): Promise<void> {
   const started = performance.now();
   reportFrontendEvent({ event: "button_template_create", phase: "started", result: "passed", reason: editingSource.value === "common" ? "common_draft" : "template_draft" });
   try {
-    const template = await saveButtonMappingTemplate(name, cloneMappings(mappings.value));
+    const template = await saveButtonMappingTemplate(name, { ...cloneMappings(mappings.value), schemaVersion: 2 });
     if (configuration.value) {
       configuration.value = {
         ...configuration.value,
@@ -1197,6 +1211,16 @@ onUnmounted(() => {
         <div class="repeat-options">
           <button
             class="chip"
+            :class="{ selected: repeatChoice === 'auto' }"
+            type="button"
+            title="未设置长按动作时，连续执行可重复的单击动作；设置长按后只执行一次"
+            :disabled="busy"
+            @click="selectHoldRepeat('auto')"
+          >
+            自动（默认）
+          </button>
+          <button
+            class="chip"
             :class="{ selected: repeatChoice === 'off' }"
             type="button"
             title="按住不放只执行一次"
@@ -1226,6 +1250,7 @@ onUnmounted(() => {
             重复长按动作
           </button>
         </div>
+        <p v-if="repeatChoice === 'auto'" class="muted repeat-hint repeat-auto-hint">{{ repeatAutoHint }}</p>
         <p v-if="repeatPageReason" class="muted repeat-hint">{{ repeatPageReason }}</p>
       </div>
       <label v-if="okClickVisible" class="toggle-row ok-click-toggle" title="刚用遥控器移动过光标时，按 OK 会点击光标位置">

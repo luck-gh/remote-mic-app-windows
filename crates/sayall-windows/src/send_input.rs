@@ -539,17 +539,26 @@ pub enum ButtonTrigger {
     Long,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldRepeat {
+    Off,
+    Single,
+    Long,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ButtonActions {
     pub single: ButtonAction,
     pub double: ButtonAction,
     pub long: ButtonAction,
-    /// 「按住连续触发」指定的槽位（单击或长按；`None` = 关闭）。
+    /// 按住连续触发：`None` 自动（无长按动作时重复可连续的单击），
+    /// `Off` 明确关闭，`Single` / `Long` 显式指定槽位。
     ///
     /// 每键至多一个槽位：互斥由界面与 [`ButtonMappings::normalized`] 强制。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hold_repeat: Option<ButtonTrigger>,
+    pub hold_repeat: Option<HoldRepeat>,
     /// OK 键：用遥控器移动过光标后的 5 秒内，按 OK 直接点击光标位置
     /// （本次按压不触发单击/双击/长按）。只对 OK 键生效，默认关。
     ///
@@ -576,6 +585,20 @@ impl Default for ButtonActions {
 }
 
 impl ButtonActions {
+    /// 执行与诊断共用的有效连发决策；不修改保存的自动/显式配置。
+    pub fn effective_hold_repeat(&self, button: RemoteButton) -> Option<ButtonTrigger> {
+        button.repeat_interval()?;
+        match self.hold_repeat {
+            None | Some(HoldRepeat::Single)
+                if self.long == ButtonAction::Disabled && self.single.allows_repeat() =>
+            {
+                Some(ButtonTrigger::Single)
+            }
+            Some(HoldRepeat::Long) if self.long.allows_repeat() => Some(ButtonTrigger::Long),
+            _ => None,
+        }
+    }
+
     pub fn trigger(&self, trigger: ButtonTrigger) -> &ButtonAction {
         match trigger {
             ButtonTrigger::Single => &self.single,
@@ -609,7 +632,7 @@ struct ButtonActionsCells {
     double: ButtonAction,
     long: ButtonAction,
     #[serde(default)]
-    hold_repeat: Option<ButtonTrigger>,
+    hold_repeat: Option<HoldRepeat>,
     #[serde(default)]
     ok_context_click: bool,
 }
@@ -632,9 +655,9 @@ impl From<ButtonActionsWire> for ButtonActions {
     }
 }
 
-/// 按键映射配置结构版本：0 = 未记录版本的旧文件（缺省连续触发关闭），
-/// 1 = 含显式「按住连续触发」（`holdRepeat`）。保存/导出统一写当前版本。
-pub const BUTTON_MAPPINGS_SCHEMA_VERSION: u32 = 1;
+/// 按键映射配置结构版本：0 = 未记录版本，1 = 显式单击/长按连发，
+/// 2 = 增加显式关闭；缺省按当前自动规则执行，不物化为模板修改。
+pub const BUTTON_MAPPINGS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -746,14 +769,11 @@ impl ButtonMappings {
             }
         }
         for (button, actions) in this.actions.iter() {
-            let Some(trigger) = actions.hold_repeat else {
-                continue;
+            let trigger = match actions.hold_repeat {
+                None | Some(HoldRepeat::Off) => continue,
+                Some(HoldRepeat::Single) => ButtonTrigger::Single,
+                Some(HoldRepeat::Long) => ButtonTrigger::Long,
             };
-            if trigger == ButtonTrigger::Double {
-                return Err(SendInputError::Backend(
-                    "按住连续触发不支持双击槽位".to_owned(),
-                ));
-            }
             if button.repeat_interval().is_none() {
                 return Err(SendInputError::Backend(format!(
                     "按键 {button:?} 不支持按住连续触发"
@@ -1761,7 +1781,7 @@ mod tests {
         ButtonAction::Shortcut { chord: chord(keys) }
     }
 
-    fn actions_with(single: ButtonAction, hold_repeat: Option<ButtonTrigger>) -> ButtonActions {
+    fn actions_with(single: ButtonAction, hold_repeat: Option<HoldRepeat>) -> ButtonActions {
         ButtonActions {
             single,
             hold_repeat,
@@ -1842,10 +1862,10 @@ mod tests {
         let mut mappings = ButtonMappings::default();
         mappings.actions.insert(
             RemoteButton::Back,
-            actions_with(shortcut(&[KeyCode::Delete]), Some(ButtonTrigger::Single)),
+            actions_with(shortcut(&[KeyCode::Delete]), Some(HoldRepeat::Single)),
         );
         let json = serde_json::to_string(&mappings).unwrap();
-        assert!(json.contains("\"schemaVersion\":1"), "版本必须落盘：{json}");
+        assert!(json.contains("\"schemaVersion\":2"), "版本必须落盘：{json}");
         assert!(
             json.contains("\"holdRepeat\":\"single\""),
             "开关必须落盘：{json}"
@@ -1853,25 +1873,92 @@ mod tests {
         let decoded: ButtonMappings = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, mappings);
 
-        // 关闭状态不写字段（与既有配置保持最小 diff），读回仍是 None。
+        // 自动状态不物化字段，读回仍是 None；明确关闭必须单独落盘。
         let mut off = ButtonMappings::default();
         off.actions.insert(
             RemoteButton::Back,
             actions_with(shortcut(&[KeyCode::Delete]), None),
         );
         let off_json = serde_json::to_string(&off).unwrap();
-        assert!(!off_json.contains("holdRepeat"), "关闭不落字段：{off_json}");
+        assert!(!off_json.contains("holdRepeat"), "自动不落字段：{off_json}");
         let decoded: ButtonMappings = serde_json::from_str(&off_json).unwrap();
         assert_eq!(decoded.actions(RemoteButton::Back).hold_repeat, None);
+
+        off.actions
+            .get_mut(&RemoteButton::Back)
+            .unwrap()
+            .hold_repeat = Some(HoldRepeat::Off);
+        let explicit_off = serde_json::to_string(&off).unwrap();
+        assert!(explicit_off.contains("\"holdRepeat\":\"off\""));
+        assert_eq!(
+            serde_json::from_str::<ButtonMappings>(&explicit_off).unwrap(),
+            off
+        );
+    }
+
+    #[test]
+    fn automatic_hold_repeat_respects_actions_buttons_and_long_priority() {
+        let automatic = actions_with(shortcut(&[KeyCode::Backspace]), None);
+        assert_eq!(
+            automatic.effective_hold_repeat(RemoteButton::Back),
+            Some(ButtonTrigger::Single)
+        );
+        assert_eq!(automatic.effective_hold_repeat(RemoteButton::Ok), None);
+        assert_eq!(automatic.effective_hold_repeat(RemoteButton::Menu), None);
+        for single in [
+            shortcut(&[KeyCode::Control, KeyCode::C]),
+            shortcut(&[KeyCode::RightAlt]),
+            ButtonAction::FocusInput,
+            ButtonAction::OpenApp {
+                target: "notepad".into(),
+            },
+            ButtonAction::MouseClick {
+                kind: MouseClickKind::Left,
+            },
+            ButtonAction::Disabled,
+        ] {
+            assert_eq!(
+                actions_with(single, None).effective_hold_repeat(RemoteButton::Back),
+                None
+            );
+        }
+        let mut with_long = automatic.clone();
+        with_long.long = shortcut(&[KeyCode::Delete]);
+        assert_eq!(with_long.effective_hold_repeat(RemoteButton::Back), None);
+        with_long.hold_repeat = Some(HoldRepeat::Single);
+        assert_eq!(with_long.effective_hold_repeat(RemoteButton::Back), None);
+        with_long.hold_repeat = Some(HoldRepeat::Long);
+        assert_eq!(
+            with_long.effective_hold_repeat(RemoteButton::Back),
+            Some(ButtonTrigger::Long)
+        );
+        with_long.hold_repeat = Some(HoldRepeat::Off);
+        assert_eq!(with_long.effective_hold_repeat(RemoteButton::Back), None);
+    }
+
+    #[test]
+    fn hold_repeat_rejects_unknown_and_double_values_during_deserialization() {
+        for value in ["double", "automatic", "invalid"] {
+            let json = serde_json::json!({
+                "schemaVersion": 2,
+                "actions": { "back": {
+                    "single": { "type": "disabled" },
+                    "double": { "type": "disabled" },
+                    "long": { "type": "disabled" },
+                    "holdRepeat": value
+                } }
+            });
+            assert!(serde_json::from_value::<ButtonMappings>(json).is_err());
+        }
     }
 
     #[test]
     fn explicit_hold_repeat_is_preserved_by_normalization() {
-        // 版本 1、显式关闭：再次加载不得被重新打开。
+        // 新版本显式关闭：再次加载不得被重新打开。
         let json = serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "actions": {
-                "back": { "single": { "type": "shortcut", "chord": { "keys": ["delete"] } }, "double": { "type": "disabled" }, "long": { "type": "disabled" } }
+                "back": { "single": { "type": "shortcut", "chord": { "keys": ["delete"] } }, "double": { "type": "disabled" }, "long": { "type": "disabled" }, "holdRepeat": "off" }
             }
         });
         let mappings = serde_json::from_value::<ButtonMappings>(json)
@@ -1880,8 +1967,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             mappings.actions(RemoteButton::Back).hold_repeat,
-            None,
-            "版本 1 的显式关闭不得被重新打开"
+            Some(HoldRepeat::Off),
+            "显式关闭不得被重新打开"
         );
 
         // 版本 1 且显式开启：原样保留。
@@ -1897,7 +1984,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             mappings.actions(RemoteButton::Back).hold_repeat,
-            Some(ButtonTrigger::Single)
+            Some(HoldRepeat::Single)
         );
     }
 
@@ -1910,22 +1997,11 @@ mod tests {
         };
         let cases: Vec<(&str, ButtonMappings)> = vec![
             (
-                "双击槽位",
-                with_actions(
-                    RemoteButton::Back,
-                    ButtonActions {
-                        double: shortcut(&[KeyCode::Space]),
-                        hold_repeat: Some(ButtonTrigger::Double),
-                        ..ButtonActions::default()
-                    },
-                ),
-            ),
-            (
                 "单击未配置",
                 with_actions(
                     RemoteButton::Back,
                     ButtonActions {
-                        hold_repeat: Some(ButtonTrigger::Single),
+                        hold_repeat: Some(HoldRepeat::Single),
                         ..ButtonActions::default()
                     },
                 ),
@@ -1937,7 +2013,7 @@ mod tests {
                     ButtonActions {
                         single: shortcut(&[KeyCode::Delete]),
                         long: shortcut(&[KeyCode::Backspace]),
-                        hold_repeat: Some(ButtonTrigger::Single),
+                        hold_repeat: Some(HoldRepeat::Single),
                         ..ButtonActions::default()
                     },
                 ),
@@ -1948,7 +2024,7 @@ mod tests {
                     RemoteButton::Back,
                     ButtonActions {
                         single: shortcut(&[KeyCode::Control, KeyCode::C]),
-                        hold_repeat: Some(ButtonTrigger::Single),
+                        hold_repeat: Some(HoldRepeat::Single),
                         ..ButtonActions::default()
                     },
                 ),
@@ -1959,7 +2035,7 @@ mod tests {
                     RemoteButton::Ok,
                     ButtonActions {
                         single: shortcut(&[KeyCode::Delete]),
-                        hold_repeat: Some(ButtonTrigger::Single),
+                        hold_repeat: Some(HoldRepeat::Single),
                         ..ButtonActions::default()
                     },
                 ),
@@ -1969,7 +2045,7 @@ mod tests {
                 with_actions(
                     RemoteButton::Back,
                     ButtonActions {
-                        hold_repeat: Some(ButtonTrigger::Long),
+                        hold_repeat: Some(HoldRepeat::Long),
                         ..ButtonActions::default()
                     },
                 ),
@@ -1982,7 +2058,7 @@ mod tests {
                         long: ButtonAction::OpenApp {
                             target: "wechat".to_owned(),
                         },
-                        hold_repeat: Some(ButtonTrigger::Long),
+                        hold_repeat: Some(HoldRepeat::Long),
                         ..ButtonActions::default()
                     },
                 ),
@@ -1997,7 +2073,7 @@ mod tests {
             RemoteButton::Back,
             ButtonActions {
                 single: shortcut(&[KeyCode::Delete]),
-                hold_repeat: Some(ButtonTrigger::Single),
+                hold_repeat: Some(HoldRepeat::Single),
                 ..ButtonActions::default()
             },
         );
@@ -2006,7 +2082,7 @@ mod tests {
             RemoteButton::Back,
             ButtonActions {
                 long: shortcut(&[KeyCode::Backspace]),
-                hold_repeat: Some(ButtonTrigger::Long),
+                hold_repeat: Some(HoldRepeat::Long),
                 ..ButtonActions::default()
             },
         );

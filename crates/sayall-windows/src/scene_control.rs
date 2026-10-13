@@ -7,7 +7,8 @@ use crate::application_control::{
 use crate::button_mapping::{FiredGesture, GestureDisposition, RoutedGesture};
 use crate::raw_input::{ButtonEdge, RemoteButton};
 use crate::send_input::{
-    ButtonAction, ButtonActions, ButtonMappings, ButtonTrigger, KeyChord, KeyCode, TaskSwitchView,
+    ButtonAction, ButtonActions, ButtonMappings, ButtonTrigger, HoldRepeat, KeyChord, KeyCode,
+    TaskSwitchView,
 };
 use crate::templates::MappingConfiguration;
 use serde::{Deserialize, Serialize};
@@ -1725,7 +1726,9 @@ fn active_button_mapping_from(state: &State) -> Option<ButtonMappings> {
             RemoteButton::Back,
             RemoteButton::Power,
         ] {
-            mappings.actions.entry(button).or_default().single = recognition_marker();
+            let actions = mappings.actions.entry(button).or_default();
+            actions.single = recognition_marker();
+            actions.hold_repeat = Some(HoldRepeat::Off);
         }
         mappings
             .actions
@@ -1752,11 +1755,9 @@ fn active_scene_mappings_from(state: &State) -> ButtonMappings {
     };
     if state.configuration.menu_template_switch_enabled {
         mappings.enabled = true;
-        mappings
-            .actions
-            .entry(RemoteButton::Menu)
-            .or_default()
-            .single = recognition_marker();
+        let actions = mappings.actions.entry(RemoteButton::Menu).or_default();
+        actions.single = recognition_marker();
+        actions.hold_repeat = Some(HoldRepeat::Off);
         if state.panel.is_some() {
             mappings.actions.entry(RemoteButton::Menu).or_default().long = recognition_marker();
             for button in [
@@ -1768,7 +1769,9 @@ fn active_scene_mappings_from(state: &State) -> ButtonMappings {
                 RemoteButton::Back,
                 RemoteButton::Power,
             ] {
-                mappings.actions.entry(button).or_default().single = recognition_marker();
+                let actions = mappings.actions.entry(button).or_default();
+                actions.single = recognition_marker();
+                actions.hold_repeat = Some(HoldRepeat::Off);
             }
         }
     }
@@ -3712,7 +3715,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let _key_gate = crate::key_gate::KeyGate::start();
-            let controller = Arc::new(controller());
+            let mut scene = controller();
+            let backend = Arc::new(TaskBackend {
+                current: Mutex::new(Some(token("a", 1))),
+                ..Default::default()
+            });
+            scene.application = backend.clone();
+            let controller = Arc::new(scene);
             let recorded = Arc::new(RecordedActions::default());
             let runtime = Arc::new(ButtonMappingRuntime::new(
                 recorded.clone(),
@@ -3745,6 +3754,7 @@ mod tests {
                 .unwrap();
             press(&runtime, RemoteButton::Back);
             let observe_actual = |application, window| {
+                *lock(&backend.current) = Some(token(application, window));
                 let generation = controller.snapshot().generation;
                 apply_foreground_observation(
                     &controller.state,
@@ -3756,7 +3766,7 @@ mod tests {
             };
             observe_actual("b", 2);
             press(&runtime, RemoteButton::Menu);
-            controller.set_template_menu_focus(true);
+            controller.set_template_menu_focus(true, "test", None, Some(2));
             let generation = controller.snapshot().generation;
             assert!(controller.template_menu_key(generation, RemoteButton::Down, true));
             assert!(controller.template_menu_key(generation, RemoteButton::Down, false));
@@ -3791,7 +3801,17 @@ mod tests {
     }
     #[test]
     fn cold_start_manual_menu_does_not_require_an_external_application() {
-        let controller = controller();
+        let mut controller = controller();
+        controller.application = Arc::new(TaskBackend {
+            current: Mutex::new(Some(WindowToken::from_identity(
+                "sayall".into(),
+                ApplicationAdapterKind::Generic,
+                std::process::id(),
+                90,
+                90,
+            ))),
+            ..Default::default()
+        });
         {
             let mut state = lock(&controller.state);
             state.token = None;
@@ -3805,7 +3825,7 @@ mod tests {
             menu_gesture(&controller, ButtonTrigger::Single),
             GestureDisposition::Handled
         );
-        controller.set_template_menu_focus(true);
+        controller.set_template_menu_focus(true, "test", None, Some(90));
         let generation = controller.snapshot().generation;
         assert!(!controller.set_update_default(generation, true));
         assert!(controller.template_menu_key(generation, RemoteButton::Ok, true));
@@ -3887,6 +3907,90 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn menu_recognition_markers_do_not_enable_default_repeat() {
+        let state = state();
+        let mut state = lock(&state);
+        let saved_configuration = state.configuration.clone();
+        open_panel(&mut state, ScenePanel::Template);
+        let mappings = active_scene_mappings_from(&state);
+        assert!(mappings
+            .actions
+            .values()
+            .all(|actions| actions.hold_repeat == Some(HoldRepeat::Off)));
+        let mut recognizer = GestureRecognizer::new();
+        recognizer.configure(&mappings);
+        let now = Instant::now();
+        for button in [
+            RemoteButton::Up,
+            RemoteButton::Down,
+            RemoteButton::Left,
+            RemoteButton::Right,
+            RemoteButton::Ok,
+            RemoteButton::Back,
+            RemoteButton::Power,
+        ] {
+            let config =
+                crate::button_gestures::GestureConfig::for_button(&mappings, button).unwrap();
+            assert_eq!(config.repeat_single, None, "scene marker {button:?}");
+            assert_eq!(config.repeat_long, None, "scene marker {button:?}");
+            assert_eq!(recognizer.press(button, now), vec![ButtonTrigger::Single]);
+            assert!(recognizer.advance(now + Duration::from_secs(2)).is_empty());
+            assert!(recognizer
+                .release(button, now + Duration::from_secs(2))
+                .is_empty());
+        }
+        assert_eq!(state.configuration, saved_configuration);
+    }
+
+    #[test]
+    fn task_recognition_markers_do_not_enable_default_repeat_or_rewrite_tv() {
+        for view in [TaskSwitchView::Applications, TaskSwitchView::Desktops] {
+            let state = state();
+            let mut state = lock(&state);
+            let tv_actions = state
+                .configuration
+                .template_mappings(BUILTIN_AGENT_TEMPLATE_ID)
+                .unwrap()
+                .actions(RemoteButton::Tv);
+            let saved_configuration = state.configuration.clone();
+            state.task_switch = Some(TaskSwitchSession {
+                origin: token("a", 1),
+                target: None,
+                view,
+                started_at: Instant::now(),
+                tv_actions: tv_actions.clone(),
+            });
+            let mappings = active_button_mapping_from(&state).unwrap();
+            assert_eq!(mappings.actions(RemoteButton::Tv), tv_actions);
+            let mut recognizer = GestureRecognizer::new();
+            recognizer.configure(&mappings);
+            let now = Instant::now();
+            for button in [
+                RemoteButton::Up,
+                RemoteButton::Down,
+                RemoteButton::Left,
+                RemoteButton::Right,
+                RemoteButton::Ok,
+                RemoteButton::Back,
+                RemoteButton::Power,
+            ] {
+                let config =
+                    crate::button_gestures::GestureConfig::for_button(&mappings, button).unwrap();
+                assert_eq!(mappings.actions(button).hold_repeat, Some(HoldRepeat::Off));
+                assert_eq!(config.repeat_single, None, "task marker {button:?}");
+                assert_eq!(config.repeat_long, None, "task marker {button:?}");
+                assert_eq!(recognizer.press(button, now), vec![ButtonTrigger::Single]);
+                assert!(recognizer.advance(now + Duration::from_secs(2)).is_empty());
+                assert!(recognizer
+                    .release(button, now + Duration::from_secs(2))
+                    .is_empty());
+            }
+            assert_eq!(state.configuration, saved_configuration);
+        }
+    }
+
     #[test]
     fn menu_wraps_and_cancel_retains_native_release_barrier() {
         let state = state();

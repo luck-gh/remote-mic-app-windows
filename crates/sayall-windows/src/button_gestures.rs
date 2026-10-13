@@ -1,10 +1,11 @@
 //! 普通按键手势识别（单击/双击/长按/按住连续触发），语义对齐 Mac 原版
 //! `RemoteButtonGestureRecognizer` + `HIDRemoteScheduler`，并按 Windows 产品
-//! 口径扩展（2026-10-05）：「按住连续触发」是显式开关（每键至多一个槽位）。
+//! 口径扩展：「按住连续触发」支持自动、明确关闭和显式槽位（每键至多一个）。
 //!
 //! - 双击窗口 300ms、长按阈值 550ms、连续触发起始 350ms（逐键间隔：
 //!   返回 50ms、方向/音量 100ms，见 `RemoteButton::repeat_interval`）。
 //! - 开关取值与行为（`ButtonActions::hold_repeat`）：
+//!   - 自动（缺省）→ 没有长按动作且单击可重复时，按单击连发规则执行；
 //!   - 关闭 → 单击在按下沿立即触发（无双击/长按时）或经双击窗确认；按住不连续；
 //!   - 单击 → 按住连续触发单击动作：无双击时 350ms 起连拍；有双击时按住超过
 //!     双击窗（300ms）即确认为单击并起拍，快速点按仍走双击判定；
@@ -40,7 +41,7 @@ pub struct GestureConfig {
     pub double_enabled: bool,
     /// 长按列已配置 → 按住 550ms 触发长按。
     pub long_enabled: bool,
-    /// 单击保持连续触发（开关=单击、动作可连续、非锁屏延迟；长按为空）。
+    /// 单击保持连续触发（自动或显式单击、动作可连续；长按为空）。
     pub repeat_single: Option<Duration>,
     /// 长按触发后继续连续触发（开关=长按、长按动作可连续）。
     pub repeat_long: Option<Duration>,
@@ -66,18 +67,13 @@ impl GestureConfig {
         let interval = button.repeat_interval();
         // 防御降级：手改文件出现「开关=单击 + 长按已配置」时，长按优先、忽略
         // 单击连续（与界面阻止规则一致，不得双触发）。
-        let repeat_single = match actions.hold_repeat {
-            Some(ButtonTrigger::Single)
-                if !long_enabled
-                    && !defer_single_until_release
-                    && actions.single.allows_repeat() =>
-            {
-                interval
-            }
+        let effective_repeat = actions.effective_hold_repeat(button);
+        let repeat_single = match effective_repeat {
+            Some(ButtonTrigger::Single) => interval,
             _ => None,
         };
-        let repeat_long = match actions.hold_repeat {
-            Some(ButtonTrigger::Long) if actions.long.allows_repeat() => interval,
+        let repeat_long = match effective_repeat {
+            Some(ButtonTrigger::Long) => interval,
             _ => None,
         };
         Some(Self {
@@ -91,7 +87,7 @@ impl GestureConfig {
     }
 
     /// 原始单击路径：未配置双击/长按时单击在按下沿立即触发（零延迟，
-    /// Mac 同款），开关=单击时按住按间隔连续触发（无连发能力的按键不重复）。
+    /// Mac 同款），有效单击连发时按间隔连续触发（无连发能力的按键不重复）。
     fn raw_path(&self) -> bool {
         self.single_configured
             && !self.double_enabled
@@ -170,14 +166,14 @@ impl GestureRecognizer {
             state.long_deadline = Some(now + LONG_PRESS_THRESHOLD);
         }
         if config.raw_path() {
-            // 原始单击路径：按下沿立即触发单击；开关=单击时 350ms 起连续触发。
+            // 原始单击路径：按下沿立即触发单击；有效连发时 350ms 起连续触发。
             if config.repeat_single.is_some() {
                 state.repeat_deadline = Some(now + REPEAT_START_DELAY);
             }
             return vec![ButtonTrigger::Single];
         }
         if config.double_enabled && config.repeat_single.is_some() {
-            // 开关=单击 + 双击：按住超过双击窗即确认为单击（不补发第一击）。
+            // 单击连发 + 双击：按住超过双击窗即确认为单击（不补发第一击）。
             state.single_conclude_deadline = Some(now + DOUBLE_CLICK_WINDOW);
             state.repeat_deadline = Some(now + REPEAT_START_DELAY);
         }
@@ -358,7 +354,7 @@ impl GestureRecognizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
+    use crate::send_input::{ButtonAction, ButtonActions, HoldRepeat, KeyChord, KeyCode};
 
     fn mappings_with(
         button: RemoteButton,
@@ -374,7 +370,7 @@ mod tests {
         single: Option<KeyCode>,
         double: Option<KeyCode>,
         long: Option<KeyCode>,
-        hold_repeat: Option<ButtonTrigger>,
+        hold_repeat: Option<HoldRepeat>,
     ) -> ButtonMappings {
         let action = |keys: Option<KeyCode>| match keys {
             Some(key) => ButtonAction::Shortcut {
@@ -405,7 +401,7 @@ mod tests {
             Some(KeyCode::Up),
             None,
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         ));
 
         // 按下沿立即触发单击。
@@ -563,7 +559,7 @@ mod tests {
             Some(KeyCode::Escape),
             None,
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         );
         // OK 无连发区间：即便手改文件给上开关也不连续（引擎按无区间降级）。
         mappings.actions.insert(
@@ -574,7 +570,7 @@ mod tests {
                         keys: vec![KeyCode::Enter],
                     },
                 },
-                hold_repeat: Some(ButtonTrigger::Single),
+                hold_repeat: Some(HoldRepeat::Single),
                 ..ButtonActions::default()
             },
         );
@@ -703,11 +699,12 @@ mod tests {
     fn hold_repeat_off_never_repeats_while_held() {
         let t0 = Instant::now();
         let mut recognizer = GestureRecognizer::new();
-        recognizer.configure(&mappings_with(
+        recognizer.configure(&mappings_with_repeat(
             RemoteButton::Up,
             Some(KeyCode::Up),
             None,
             None,
+            Some(HoldRepeat::Off),
         ));
         assert_eq!(
             recognizer.press(RemoteButton::Up, t0),
@@ -721,7 +718,33 @@ mod tests {
     }
 
     #[test]
-    fn single_hold_repeat_with_double_concludes_at_the_window() {
+    fn missing_hold_repeat_defaults_to_single_until_release() {
+        let mappings: ButtonMappings = serde_json::from_str(
+            r#"{"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["backspace"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}},"right":{"single":{"type":"shortcut","chord":{"keys":["right"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#,
+        ).unwrap();
+        for button in [RemoteButton::Back, RemoteButton::Right] {
+            let t0 = Instant::now();
+            let mut recognizer = GestureRecognizer::new();
+            recognizer.configure(&mappings);
+            assert_eq!(recognizer.press(button, t0), vec![ButtonTrigger::Single]);
+            assert_eq!(
+                recognizer.advance(t0 + REPEAT_START_DELAY),
+                vec![(button, ButtonTrigger::Single)],
+                "未设置长按动作或连发选项，应默认重复单击"
+            );
+            let next = t0 + REPEAT_START_DELAY + button.repeat_interval().unwrap();
+            assert_eq!(
+                recognizer.advance(next),
+                vec![(button, ButtonTrigger::Single)]
+            );
+            assert!(recognizer.release(button, next).is_empty());
+            assert!(recognizer.advance(next + Duration::from_secs(3)).is_empty());
+            assert_eq!(recognizer.next_deadline(), None);
+        }
+    }
+
+    #[test]
+    fn automatic_hold_repeat_with_double_concludes_at_the_window() {
         let t0 = Instant::now();
         let mut recognizer = GestureRecognizer::new();
         recognizer.configure(&mappings_with_repeat(
@@ -729,7 +752,7 @@ mod tests {
             Some(KeyCode::Delete),
             Some(KeyCode::Space),
             None,
-            Some(ButtonTrigger::Single),
+            None,
         ));
 
         // 按住：按下沿不触发（要等双击窗）；到 300ms 确认为单击并进入连续。
@@ -780,7 +803,7 @@ mod tests {
             Some(KeyCode::Delete),
             Some(KeyCode::Space),
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         ));
 
         // 第一击快速点按 → 双击窗；第二击按住超过窗 → 取消双击、确认为单击。
@@ -808,6 +831,44 @@ mod tests {
     }
 
     #[test]
+    fn automatic_repeat_yields_to_long_and_cancels_on_reset_or_reconfiguration() {
+        let t0 = Instant::now();
+        let mut recognizer = GestureRecognizer::new();
+        let automatic = mappings_with(RemoteButton::Back, Some(KeyCode::Backspace), None, None);
+        let with_long = mappings_with(
+            RemoteButton::Back,
+            Some(KeyCode::Backspace),
+            None,
+            Some(KeyCode::Delete),
+        );
+        recognizer.configure(&with_long);
+        assert!(recognizer.press(RemoteButton::Back, t0).is_empty());
+        assert!(recognizer.advance(t0 + REPEAT_START_DELAY).is_empty());
+        assert_eq!(
+            recognizer.advance(t0 + LONG_PRESS_THRESHOLD),
+            vec![(RemoteButton::Back, ButtonTrigger::Long)]
+        );
+        assert!(recognizer.advance(t0 + Duration::from_secs(2)).is_empty());
+        recognizer.release(RemoteButton::Back, t0 + Duration::from_secs(2));
+
+        for reconfigure in [false, true] {
+            recognizer.configure(&automatic);
+            recognizer.press(RemoteButton::Back, t0);
+            assert_eq!(
+                recognizer.advance(t0 + REPEAT_START_DELAY),
+                vec![(RemoteButton::Back, ButtonTrigger::Single)]
+            );
+            if reconfigure {
+                recognizer.configure(&automatic);
+            } else {
+                recognizer.release_all();
+            }
+            assert!(recognizer.advance(t0 + Duration::from_secs(5)).is_empty());
+            assert_eq!(recognizer.next_deadline(), None);
+        }
+    }
+
+    #[test]
     fn hold_repeat_long_fires_once_then_repeats_until_release() {
         let t0 = Instant::now();
         let mut recognizer = GestureRecognizer::new();
@@ -816,7 +877,7 @@ mod tests {
             Some(KeyCode::Delete),
             None,
             Some(KeyCode::Backspace),
-            Some(ButtonTrigger::Long),
+            Some(HoldRepeat::Long),
         ));
 
         // 快速点按：释放沿触发单击（长按动作不参与点按）。
@@ -871,7 +932,7 @@ mod tests {
                 long: ButtonAction::OpenApp {
                     target: "notepad".to_owned(),
                 },
-                hold_repeat: Some(ButtonTrigger::Long),
+                hold_repeat: Some(HoldRepeat::Long),
                 ..ButtonActions::default()
             },
         );
@@ -907,7 +968,7 @@ mod tests {
                         keys: vec![KeyCode::Backspace],
                     },
                 },
-                hold_repeat: Some(ButtonTrigger::Single),
+                hold_repeat: Some(HoldRepeat::Single),
                 ..ButtonActions::default()
             },
         );
@@ -934,7 +995,7 @@ mod tests {
             RemoteButton::Up,
             ButtonActions {
                 single: ButtonAction::FocusInput,
-                hold_repeat: Some(ButtonTrigger::Single),
+                hold_repeat: Some(HoldRepeat::Single),
                 ..ButtonActions::default()
             },
         );
@@ -956,7 +1017,7 @@ mod tests {
             Some(KeyCode::Escape),
             Some(KeyCode::Space),
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         ));
         // 双击窗口待触发时复位：不得补发单击。
         recognizer.press(RemoteButton::Back, t0);
@@ -1023,7 +1084,7 @@ mod tests {
             Some(KeyCode::Up),
             None,
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         );
         mappings.actions.insert(
             RemoteButton::Down,
@@ -1062,7 +1123,7 @@ mod tests {
             Some(KeyCode::Delete),
             Some(KeyCode::Space),
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         ));
         recognizer.press(RemoteButton::Back, t0);
         assert_eq!(recognizer.next_deadline(), Some(t0 + DOUBLE_CLICK_WINDOW));
@@ -1077,7 +1138,7 @@ mod tests {
             Some(KeyCode::Delete),
             Some(KeyCode::Space),
             None,
-            Some(ButtonTrigger::Single),
+            Some(HoldRepeat::Single),
         ));
 
         // 快速点按：双击窗超时补发的单击不是连续拍（2026-10-05 评审发现 1）。
@@ -1109,7 +1170,7 @@ mod tests {
             None,
             None,
             Some(KeyCode::Backspace),
-            Some(ButtonTrigger::Long),
+            Some(HoldRepeat::Long),
         ));
 
         // 首次长按是手势本身，不是连续拍；其后按间隔续拍才是。

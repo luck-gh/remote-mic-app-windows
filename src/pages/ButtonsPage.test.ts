@@ -611,7 +611,8 @@ describe("buttons mapping page", () => {
     expect(voiceCard.text()).toContain("按住说话");
     expect(wrapper.text()).not.toContain("静音（设备支持时）");
     const selectors = wrapper.findAll(".mapping-header-controls select");
-    expect(selectors).toHaveLength(1);
+    expect(selectors).toHaveLength(2);
+    expect(selectors.map(selector => selector.attributes("aria-label"))).toEqual(["当前使用的按键模板", undefined]);
   });
 
   it("does not register listeners or polling after unmounting during initial load", async () => {
@@ -1189,6 +1190,111 @@ describe("buttons mapping page", () => {
 
 
 describe("hold repeat and OK click in local editing drafts", () => {
+  it("reads a saved explicit off without treating it as the automatic default", async () => {
+    const base = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({ ...base, commonMappings: {
+      ...base.commonMappings, schemaVersion: 2, actions: { up: {
+        single: { type: 'shortcut', chord: { keys: ['up'] } },
+        double: { type: 'disabled' }, long: { type: 'disabled' }, holdRepeat: 'off',
+      } },
+    } });
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      expect(wrapper.find('.repeat-auto-hint').exists()).toBe(false);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("explains why automatic mode does not repeat a combination shortcut or an unset action", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('未设置单击动作');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['control', 'c'] } });
+      await flushPromises();
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('只执行一次');
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!.classes()).toContain('selected');
+      const menu = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '菜单')!;
+      await menu.findAll('.mapping-cell')[0]!.trigger('click');
+      expect(wrapper.find('.repeat-group').exists()).toBe(false);
+      expect(wrapper.get('.voice-card').find('.repeat-group').exists()).toBe(false);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("defaults to automatic repeat and follows long-action edits without changing the saved configuration", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      const auto = () => wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!;
+      expect(auto().classes()).toContain('selected');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['up'] } });
+      await flushPromises();
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('连续执行单击动作');
+      await up.findAll('.mapping-cell')[2]!.trigger('click');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['left'] } });
+      await flushPromises();
+      expect(auto().classes()).toContain('selected');
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('长按动作一次');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'disabled' });
+      await flushPromises();
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('连续执行单击动作');
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0];
+      expect(saved.schemaVersion).toBe(2);
+      expect(saved.actions.up).not.toHaveProperty('holdRepeat');
+    } finally { wrapper.unmount(); }
+  });
+
+  it("persists an explicit off and removes it only when automatic is selected", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['up'] } });
+      await flushPromises();
+      await wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.trigger('click');
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[0]![0]).toMatchObject({ schemaVersion: 2, actions: { up: { holdRepeat: 'off' } } });
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      await wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!.trigger('click');
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[1]![0].actions.up).not.toHaveProperty('holdRepeat');
+    } finally { wrapper.unmount(); }
+  });
+
+  it("keeps an explicit off in the draft after a save failure and subsequent action edits", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['up'] } });
+      await flushPromises();
+      await wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.trigger('click');
+      vi.mocked(saveButtonMappings).mockRejectedValueOnce(new Error('写入失败'));
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(wrapper.text()).toContain('写入失败');
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['down'] } });
+      await flushPromises();
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[1]![0].actions.up).toMatchObject({ holdRepeat: 'off', single: { chord: { keys: ['down'] } } });
+      expect(selectCurrentTemplate).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
   it("keeps explicit app focus settings in the common draft until saved", async () => {
     const wrapper = await mountPage();
     try {
@@ -1290,16 +1396,19 @@ describe("hold repeat and OK click in local editing drafts", () => {
       await wrapper.findAll(".repeat-group button").find(button => button.text() === "重复单击动作")!.trigger("click");
       expect(saveButtonMappings).not.toHaveBeenCalled();
       expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
-      expect(wrapper.get('[aria-label="当前使用的按键模板"]').text()).toBe("Agent");
+    expect((wrapper.get('[aria-label="当前使用的按键模板"]').element as HTMLSelectElement).value).toBe("preset-agent");
       await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
       await flushPromises();
       expect(updateButtonMappingTemplate).toHaveBeenCalledWith("profile-a", expect.objectContaining({ actions: expect.objectContaining({ up: expect.objectContaining({ holdRepeat: "single" }) }) }));
       await up.findAll(".mapping-cell")[2]!.trigger("click");
       wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "shortcut", chord: { keys: ["control", "c"] } });
       await flushPromises();
-      expect(wrapper.findAll(".repeat-group button")[0]!.classes()).toContain("selected");
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
       expect(wrapper.text()).toContain("连续执行”已关闭");
       expect(saveButtonMappings).not.toHaveBeenCalled();
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(updateButtonMappingTemplate).mock.calls[1]![1].actions.up).toMatchObject({ holdRepeat: 'off' });
     } finally { wrapper.unmount(); }
   });
 
