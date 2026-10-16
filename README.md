@@ -1,41 +1,14 @@
 # 无线麦 Windows 个人版
 
-本个人版由 luck-gh 修改；修改日期 2026-10-06。基于 GetSayAll 的 GPL-3.0-only Windows 项目，版权和来源保留。
+本个人版由 luck-gh 修改；个人版改造始于 2026-10-06。基于上游 GPL-3.0-only Windows 项目，原版权保留；来源与素材归属见 [ATTRIBUTION.md](ATTRIBUTION.md)。
 
 <p align="center">
-  <img src="Screenshots/sayall-key-mapping.png" alt="无线麦 SayAll Windows 版按键映射界面" width="960">
+  <img src="public/app-logo-personal.svg" alt="无线麦个人版图标" width="96">
 </p>
 
 <p align="center">小米蓝牙遥控器的可视化按键映射</p>
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="Screenshots/wechat-group-qrcode.jpg" alt="无线麦 SayAll Windows 版微信群二维码" width="220"><br>
-      <strong>Windows 用户交流群</strong><br>
-      微信扫码加入交流群
-    </td>
-    <td align="center">
-      <a href="Screenshots/xhs-sayall.jpg"><img src="Screenshots/xhs-sayall.jpg" alt="无线麦小红书二维码" width="220"></a><br>
-      <strong>小红书</strong><br>
-      扫码关注无线麦
-    </td>
-  </tr>
-</table>
-
-## 视频介绍
-
-《可能是我最近用过最不像工具的工具》展示了无线麦如何把蓝牙语音遥控器变成随手表达、控制电脑和与 AI 协作的新入口。视频中的产品界面以当时展示版本为准。
-
-<p align="center">
-  <a href="https://www.bilibili.com/video/BV13Pep6BEXe">
-    <img src="Screenshots/video-introduction-cover.jpg" alt="《可能是我最近用过最不像工具的工具》视频封面" width="960">
-  </a>
-</p>
-
-<p align="center"><a href="https://www.bilibili.com/video/BV13Pep6BEXe">点击封面或前往 Bilibili 观看原视频</a></p>
-
-视频作者：[可乐不甜的跑焦日记](https://space.bilibili.com/327214328)
+[个人版仓库](https://github.com/luck-gh/remote-mic-app-windows) · [版本与下载](https://github.com/luck-gh/remote-mic-app-windows/releases) · [问题反馈](https://github.com/luck-gh/remote-mic-app-windows/issues)
 
 无线麦 Windows 个人版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
 
@@ -46,19 +19,21 @@
 
 ## 主要功能
 
-本地 RC003 的来源、映射、键盘并用与部分生命周期已有分项实证；新候选受影响场景仍需本机验收，RC001 无当前实机时保持 `deferred`。语音、安装器、VB-CABLE 和第三方输入法按测试手册分项记录。公开发布目前仍处于预览阶段，更新包包含 updater minisign 签名，但尚无 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。
+本地 RC003 的来源、映射、键盘并用与部分生命周期已有分项实证；新候选受影响场景仍需本机验收，RC001 无当前实机时保持 `deferred`。语音、安装器、VB-CABLE 和第三方输入法按测试手册分项记录。个人版更新使用独立的 updater minisign 签名，尚无 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。签名和实际发布状态以个人版交付记录及 Releases 为准。
 
 本次上游整合新增可选电量显示、通用配置的鼠标点击/移动/滚轮、系统级快捷键录入和 Windows 应用库。它们不改变已有默认绑定；完整模板仍为固定键/组合键，不扫描第三方窗口内容。按键页编辑后显式保存，已安装应用库不写入可分享的配置导出。合并候选验证状态见 TODO。
 
 ## 用户安装与配置
 
-首次安装、遥控器配对、语音软件设置、按键映射、更新和排障步骤，见 [安装与配置指南](docs/installation-and-configuration.md)。各版本的更新内容见 [GitHub Releases](https://github.com/GetSayAll/remote-mic-app-windows/releases)。
+下载入口仅使用[个人版 Releases](https://github.com/luck-gh/remote-mic-app-windows/releases)。若尚无可用发行包，使用维护者提供的本地测试包，不改用上游安装包。
 
-<p align="center">
-  <img src="Screenshots/sayall-connection-audio-setup.png" alt="无线麦 SayAll Windows 版连接与语音输入设置界面" width="960">
-</p>
+首次安装、遥控器配对、语音软件设置、按键映射、更新和排障步骤，见 [安装与配置指南](docs/installation-and-configuration.md)。版本更新内容随个人版 Releases 提供。
 
-<p align="center">连接遥控器，选择语音设备与输入工具</p>
+当前个人版设置界面（1.0.0，2026-10-16 安装版实拍）：
+
+![无线麦个人版设置界面](Screenshots/personal/settings-1.0.0.png)
+
+截图展示版本与外观；功能实际通过范围仍见 [能力与验证边界](docs/FEATURES.md)。
 
 ## 参与开发
 

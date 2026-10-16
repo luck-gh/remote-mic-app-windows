@@ -336,3 +336,78 @@ UI 的确定缺陷是仅以持久化 `enabled=false` 显示“未开启”，忽
 最小改动以已有手势状态机执行默认自动规则，明确关闭单独保存为 off，显式单击/长按保留；时间常量、动作白名单、来源捕获、实际应用/编辑分离及语音路径保持。历史缺字段无法区分未设置与明确关闭，按用户新要求解释缺省；不批量改模板、不新增迁移。只用于场景/任务识别的占位动作明确关闭重复，诊断记录有效单击/长按、自动与明确关闭掩码。新增无字段默认长按行为先实测失败（350ms 没有续拍）；新增菜单/任务/合并占位三项在新默认下亦先红，随后加窄护栏。完整自动化、候选与实体结果统一归原连发手册和 Preview。
 
 `5fd60bef` 包正常覆盖安装后，新普通权限主程序 46728 于 11:58:15 应用 Agent，有效默认单击连发掩码为 6385；随后左/右/返回七趟共 50 续拍均以 release 终止，用户明确确认连发、松开停止、菜单和实体键盘均正常。本次当前 PC/RC003 默认规则 **passed**；明确关闭/长按模式的完整实体矩阵、其他按键逐项、RC001、长闲置及断连睡眠等仍 deferred。该结果不关闭原三轮启动未知、音频旧设备 Code 10 或其他独立问题。完整身份、命令、安装和剩余边界归 [本轮 Preview](../Testing/WindowsRC003Preview.md#2026-10-12-默认长按连续单击修订)；现场复用 `target/dev/foreground-input/hold-default-lifecycle.log`。
+
+### 2026-10-15 Marvis 前台失效：管理员窗口输入边界
+
+- 状态：权限差异已确认，恢复验证 `deferred`；本轮只读诊断，未修改生产实现、第三方程序或运行权限。
+- 复现：用户确认北京时间 15:55 再测仍失败。Marvis 中无线麦可见语音键按下和收音，但微信输入法绿色话筒未显示；实体键盘 Ctrl+Win 可用，遥控 Menu 能打开模板面板，其他映射无效。设备具体型号本轮未核，不外推双型号。
+- 被测运行身份：主程序 PID 59956，0.8.6，基线 `af710b757897cb0567b63c63a7ceb40f62426652`，`source_state=dirty`、`payload_inputs=included`、`build_channel=local`，指纹 `8a38c43cce592fff5636e0aa9aafa06abd38f0b6092b21e73e34cff1cc774007`。这是安装实例身份，不代表当前工作区所有字节。
+- 日志证据：默认诊断日志 07:55Z（北京时间 15:55）全分钟共 23 条 `map_inject`，其中 8 条 `echo_delta=2`，15 条 `echo_delta=0`；零回声集中于 07:55:50.174–07:55:54.379，覆盖方向、确认及音量映射，均已到达 `map_fire`，不能归为未配置或设备没收到。session 93/94/95 均在 800ms 与约 2500ms 记录 `mic=not_observed`，对应 generation 339/340/341 实际收到 236/142/90 个音频包，解码错误为 0，并以 `control_stop` 收尾。07:55:56.495 模板菜单 `actual_foreground=true result=true`。同分钟 session 92 曾 `mic=observed`，因此不能把整分钟都描述成失败，或在没有逐次目标身份日志时认定每一条都发生在 Marvis。
+- 权限实测 `passed`：通过公开 OpenProcess / OpenProcessToken / GetTokenInformation 只读查询，Marvis 26192、MarvisAgent 61200、MarvisHost 75376 均为 `elevated=1 integrity_rid=12288 ui_access=0`；无线麦主程序 59956 及按键宿主 34392 均为 `elevated=0 integrity_rid=8192 ui_access=0`。微信输入法 renderer 为中完整性且 `ui_access=1`，不能以其工作状态反推普通无线麦具有相同跨权限能力。
+- 可执行文件公开清单实测 `passed`：仅以数据资源方式读取 EXE 的 RT_MANIFEST，Marvis 明确声明 `requestedExecutionLevel level='requireAdministrator' uiAccess='false'`；Agent 为 `asInvoker`，Host 未找到此声明。当前 Marvis 主程序要求管理员权限，不能把“取消快捷方式的管理员勾选”当作已经成立的解决方案。未读取第三方私有配置、数据库或进程内存，未更改清单或尝试绕过提权。
+- 归因：管理员目标与普通无线麦之间的完整性差异是已确认的兼容边界；[Microsoft SendInput 契约](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) 明确限制注入到相同或更低完整性的应用。该限制能同时解释普通映射和模拟 Ctrl+Win 不响应、实体键盘仍可用，以及应用内部 Menu 仍能打开。当前日志不能证明第三方具体消费情况，零回声本身也不能独立证明 UIPI；本轮尚未做同目标/同配置的受控权限对照，不将推断写为修复通过。
+- 验证边界：`failed` 为用户复现及上述语音/映射结果；`passed` 只覆盖日志分层、进程令牌和公开清单读取；`deferred` 为兼容方案、Marvis 实际恢复、冷态首用及双型号矩阵。主程序保持普通权限，现有硬件捕获 Helper 不自动等于已经实现管理员窗口按键投递。本轮没有运行电源、无线电、额外输入注入、重启或部署实验，没有生成过程文件；日志中必要脱敏计数已归本节，不复制完整日志。
+
+### 2026-10-15 晚间 Menu 未唤醒：捕获续约超时与桥接重连
+
+- 状态：已完成最小修复、自动化与负载对照、正常覆盖安装和运行身份验证；2026-10-16 用户确认 VSCode 菜单和语音正常、无调试弹窗，实际日志支持菜单打开与四段语音正常结束，最长33.895秒。超过45秒实体语音、菜单关闭恢复及双型号完整矩阵仍未通过；新实例仍有两次短暂所有权超时，详见本节末尾。以下为最初只读调查事实，当时未改捕获生命周期、配置或部署；同晚后续授权、修复及验收分别见本节末尾。
+- 现象：用户反馈切换到新界面后偶发按键功能对不上、Menu 无法唤醒模板切换，询问是否因模板过多；随后明确补充“没有模板切换的弹出，但是有鼠标右键的那个菜单弹出”。这是用户对实际可见结果的确认，符合捕获失效时原生 Menu 透传到前台程序的行为；没有据此认定应用注入了鼠标右键。尚未获得每次失败的目标程序或精确动作对应，不把所有“功能对不上”归为单一原因。
+- 被测身份：实际运行 App PID 64252，1.0.0，基线 `8b9dd31460f1b3b4c6859b2216de61ede0966206`，指纹 `4487283408be7d7c703c2fcd9be074b5003c1c1f57ae3129c5b8f0048d4014c9`，dirty/local/included；Helper PID 78564，设备宿主的已鉴权 Agent 报告 build=`2026-10-10.request-source`。身份来自活体日志，不以当前工作区字节或版本号替代。
+- 方法与范围：读取默认诊断日志及现存五份轮转日志，先按小时/PID 聚合，再核对失败窗口。统计固定截止 2026-10-15 14:25:00Z（北京时间 22:25:00）；该 App 当前保留记录从 09:15:34.197Z 起，累计 71 次 `ownership_timeout`、32 次 `closed reason=silence_timeout`、73 次所有权恢复（含初始取得）。不同事件不能按一对一事故计数；恢复事件也不单独证明按键实际生效。
+- 本机配置只读摘要：6 个模板，`menuTemplateSwitchEnabled=true`、`buttonMappingFollowEnabled=false`，存在手选模板记忆。本次失败前后 14:16:45Z–14:25:00Z 没有 `targets_changed` 或 `template_selection phase=requested`；目标代次保持 4。没有因模板数量进行删减或改配置。
+- 对应失败链（北京时间）：
+
+  | 时间 | 实际观察 |
+  | --- | --- |
+  | 22:17:00.500–00.506 | 蓝牙仍为 connected=true、requested_mask=7167，但 captured_mask/execution_mask/recognition_mask 全部为 0；模板来源仍为 remembered，actions_available=false；随后明确记录所有权续约超过 1500ms，原生输入放行 |
+  | 22:17:01.986 | 桥接超过 3000ms 没收到数据，silence_timeout 断开 |
+  | 22:17:02.215–10.567 | 四次 Menu DOWN/UP 共八条边沿均收到，但 configured=false / fired_count=0 / reason=unconfigured，没有进入菜单打开流程 |
+  | 22:17:04.454–14.934 | Helper 已重新鉴权；Agent 回执尚未恢复，出现 voice_synth_resend 与 agent_never_acked，说明“桥接已连”仍不是捕获 ready |
+  | 22:17:17.335–18.273 | 所有权恢复，实际映射重新可用；下一次 Menu fired，菜单实际前台核验与 native_focus 均通过 |
+  | 22:22:56.060–22:23:34.683 | 另一次所有权中断后经历重复重连，至恢复共 38.623 秒；这段间隔直接来自运行日志，不是推算的自愈承诺 |
+
+- 直接原因：`rc003_bridge.rs` 所有权回执超过 1500ms 会撤销捕获资格，超过 3000ms 收不到桥接数据则断开；`button_mapping.rs::InputConfiguration::apply_input_capabilities` 在 RC003 captured_mask=0 时过滤执行和菜单映射。因此已抓到的四次 Menu 失败发生在模板选择之前，属于捕获资格暂时失效；保存的模板数据并没有被清空。复核 22:17:00–18 的四次失败按压共八条 Menu 边沿，均为 configured=false，同窗口没有 map_fire button=Menu；结合 native=passthrough 和用户观察的上下文菜单，可解释为原生 Menu 进入前台程序，未进入模板执行链。用户未给出逐次时间及目标，故不将右键菜单观察与某一条边沿强行一一关联；其他未对齐目标/时间的失败仍未知。
+- 深层归因边界：同一统计窗口 Helper 诊断已观察到 append 最大 9191ms、bridge_queue 最大 10742ms、agent_rx_age 最大 9672ms、bridge_write 最大 823ms。源码 `Logger::line` 和 `latency_summary` 同步执行文件追加，桥接队列也确有秒级延迟。22:23:29.770 记录 bridge_queue=5931ms、agent_rx_age=6597ms，随后桥接再次超时。这些是已测事实和需要继续验证的阻塞方向，尚无同次受控实验将具体续约超时归到日志、线程调度或底层 Agent；不能把最大耗时简单相加，也不能认定前台切换触发断链。维持原超时与安全失效策略，不凭推理延长常量或绕过所有权校验。
+- 独立菜单关闭边界：22:17:19.677 原目标恢复失败，reason=stale_window；菜单按现有策略保留，随后 close 被 target_restore_failed 阻止。它发生在菜单已成功打开之后，需要与前述“未唤醒”分开判断；目标具体为何失效尚未知。
+- 验证：`failed` 为上述四次实体 Menu 手势未触发、续约/桥接超时与一次恢复原窗口失败；`passed` 仅指日志聚合、配置摘要与源码分支相互印证，以及随后菜单实际前台核验；`deferred` 为底层阻塞的受控归因、修复、冷态/连续/断连/睡眠和双型号回归。本轮没有生产代码变更，不重复构建或运行与定位无关的测试。
+- 隐私与产物：只保留上述脱敏计数、时间、运行身份和最小事件链，不保存模板名称/自定义按键、目标窗口内容、设备身份或个人路径；未复制全量日志、生成临时脚本或新增过程台账。既有现场材料和其他任务未提交修改保留。
+
+#### 同晚获准修复：受控日志阻塞与最小候选
+
+- 用户随后明确“现在修复这个问题”，本段仅推进上述 Menu 未唤醒故障，不恢复其他已暂停的捕获设计或电源实验。
+- 已确认缺陷：`handle_line` 的 HB 首条/状态变化日志先同步输出，再投递所有权；edge 也先日志再转发。桥接线程与持有续约流锁的续约线程同样同步输出。初次独立闩锁实验中旧同步实现实际在 1.71 秒后仍没有投递所有权；随后审查收紧实验同步：先确认共享 sink 闩锁已经阻塞，再接收心跳和真实 Menu usage `0x0065` 的按放。最终可复核红测仅临时将捕获线程的 Logger 置回旧同步输出路径，实际 1.92 秒后在所有权断言失败（退出码 101）；移除该注入后绿测通过。此受控实验结合现场 append 秒级延迟证明日志阻塞能直接触发该失败链；没有证明原现场 71 次超时均且仅由日志造成，也没有将各延迟最大值相加。
+- 最小修复范围：仅 `hardware/RC003/helper/src/main.rs` 的日志投递与收尾。捕获开始前建立单个 256 条有界日志 worker，接收/桥接/续约线程共享 `try_send`；stdout 与共享日志追加/轮转/回退都离开控制路径。满时只丢诊断并恢复后记计数；所有权、绝对按键状态及释放仍用原通道。日志线程无法启动则拒绝开始捕获。Agent/桥接清理后关闭日志队列，正常排空后 join；永久慢 sink 最多等 2 秒，只 detach 诊断线程，不伪称取消磁盘 I/O 或清理成功。原所有权/桥接超时、鉴权、代次、来源和边沿配对均未更改；`stale_window` 仍是独立未解决边界。
+- 自动化：最终精确 Menu 夹具红测 `capture_log_stall_tests::slow_log_sink` 实际 1 failed（预期）；移除同步输出注入后完整 Helper 套件为 61 passed / 3 ignored，新 3 项覆盖受控慢 sink 下所有权和真实 Menu usage 的 DOWN/UP 仍在 1500ms 内转发、满队列的有界丢弃/恢复计数与共享 worker、超时/重复关闭及迟到 sink 不重开队列。异步共享日志成功及共享失败转备用落点沿用实际文件读回测试。
+- 候选仍为当前 dirty 工作区，不以 HEAD 宣称可重建；本候选及后续 Voice/audio 扩展已完成独立审查与最终工作区检查，部署与当前实体验收边界见本节末尾。未改用户六模板、跟随开关或手选记忆，不把自动化通过当作 RC001/RC003 实体通过。
+- 本轮过程输出复用 `target/dev/menu-capture-reliability/`：`red.log` 保留预期失败对照；`helper-test.log` 为当前完整套件；其他成功编译/首轮绿测输出待审查结束按 LOGGING 收尾，仅长期保留必要脱敏结论。未保存源码快照、全量用户日志或设备身份。
+
+#### 同晚用户纠正：长按语音中断后 VSCode 调试提示
+
+- 用户进一步明确，新一次是“长按语音键时，录音断了，然后就一直弹窗”，并给出 VSCode 的“没有用于调试 Markdown 的扩展”提示。因此此现象不能继续称为 Menu 原生上下文菜单；此前真实 Menu 的 `configured=false` 证据仍成立，属于另一条链。未读取 VSCode 的私有配置、窗口内容或内部状态，未向用户前台注入测试键。
+- 就近旧 App 64252 的实际语音链：15:02:10.260Z 开始 generation 17；15:02:38.670Z `shared_pcm_queue` 溢出，`pending_samples=31774 incoming_samples=240 limit_samples=32000`；38.686 `wasapi_pipeline_failed`，38.787 正常释放语音和弦，38.841 `voice_flow terminal=abort`。该会话 28.732s、1897 回调、455280 解码样本，最大 callback gap 198ms / worker 队列延迟 149ms；音频统计 accepted455040 / submitted423684 / queued31356，最后非零提交年龄 0ms、累计 zero-available 1149 次/9211ms。它不是“WASAPI 从未输出”或仅模板失配。用户没有逐动作关联 ID，以上是与新反馈一致的就近日志实例，不强行认定每次弹窗的唯一时间对应。
+- 原生语音键配对缺口：停止/中止会撤销 session 武装，250ms 宽限过后，旧 `decide` 忽略已接管的物理 hold，仍按住时的重复 DOWN 开始透传。39.185Z 观察到 DOWN `swallow=0 hold=2`；随后宿主连续报告 `requested=1 actual=0`，直到 44.413Z UP `swallow=0 hold=2`。宿主持续放行已泄 DOWN 的重复和 UP 是正确配对，不能通过强吞 UP 或中途接管已泄按住修复。最小修改 `key_suppressor.rs`：全吞 DOWN 的当前 hold 锁存到真实 UP；已泄 hold 保持原生，未知首沿仍由 session/grace 判定。没有延长语音生命周期、增加长按阈值或重建设备宿主。
+- Voice 回归实际先红后绿：新增“abort+grace 已结束但物理仍按住”的重复/真实 UP/下一次无武装按压，以及“已泄 hold 不被新 session/armed 中途接管”两项，旧逻辑 2 failed，候选 6 passed（包含既有配对测试）。Helper 日志隔离不能单独解释或宣称修复该录音中止。
+- 音频受控验证只用自家保存的同一个 CABLE 端点与自有 WASAPI session。开始前确认旧 App 最近语音和弦已释放且超过 10 秒，拒绝已静音端点；发送纯零值 PCM，不录音、不改配置、不操作第三方程序。输入节奏为 240 样本/15ms、45 秒共 720000 样本，采用绝对截止时刻，避免 Windows sleep 粒度让生产端自动降速。无构建负载基线实际全部提交/排空，45.08 秒 passed，设置文件前后 SHA 相同，未复现固定格式/持续速率不匹配。
+- 在必需的真实 release 构建负载期间，同节奏重跑于 44.759 秒实际溢出：accepted715200 / submitted683400 / queued31800。新终态诊断读回 buffer418 帧（16k 格式下 26.125ms）、最大 pump gap99ms、超 buffer 时长的 gap64 次/累计 excess1152ms、空 render buffer 观察73次；空间查询/写入最大 0ms，会话静音检查最大98ms。耗时含线程调度，不能单凭 98ms 区分 COM 等待与被剥夺 CPU。失败后真实 interrupt1ms、worker正常退出，配置不变。
+- 最小生产改动使用现有 windows API 在渲染 worker 注册官方 MMCSS `Audio` 任务，不改采样率、重采样、32000 样本队列或5ms轮询，不改系统全局设置。RAII 不可 Send/Sync，正常/异常离开作用域在同线程撤销；失败记录 HRESULT 并保留原功能路径。相同本机/端点/45秒输入，在另一轮必需 release 构建负载下实际 passed：45.308秒后720000样本全部提交并排空，最大pump gap20ms、late-pump0/excess0、静音检查最大1ms；注册与撤销均 passed。停止请求前有4702样本排队，后续已实际排空，不能把该中间快照误写成丢样本。两轮编译阶段/CPU强度不保证完全相同，此对照支持本机候选效果，不证明所有负载/长时语音或双型号稳定性。
+- 音频诊断保持最小：open 读回 mix rate（本机48000）、实际 buffer frames/period；pump 只更新内存计数，在正常 finish 与失败终态输出。`empty_render_buffer_count` 是观察次数，不等同断音次数；`late_pump_excess_ms` 不是直接丢帧数。最大耗时包含失败调用，WASAPI 写入计时在失败日志之前结束。普通 interrupt/Shutdown 不额外宣称有该汇总。
+- 证据：`voice-hold-red.log` / `voice-hold-green.log`、基线 `paced-audio-test.log` / `paced-audio-diagnostic.log`、无 MMCSS 的负载 `paced-audio-loaded-before-*`、MMCSS 候选 `paced-audio-loaded-*`。前后负载实验在本机保留作为当前未完成硬件回归的必要对照，后续原位结论充分且不再需要复核时按 LOGGING 回收。未保存源码副本、真实语音或端点身份。最终源码仍 dirty，计时修正后的最终检查及部署已完成，VSCode 实体 Menu/长语音仍 deferred；不将整项标为通过。
+
+#### 最终本地候选与安装读回（2026-10-15 23:41–23:43，UTC+08:00）
+
+- 源码/审查范围为 `hardware/RC003/helper/src/main.rs`、`crates/sayall-windows/src/key_suppressor.rs`、`audio.rs`。最终 SHA-256 分别为 `17a5dde1a4fc440a3d456d8060594a5e9a01abdebc56d4a9b2a4d3d44ab0be40`、`13cb8f5853bb5c747aff746ad7f04a8b28deff32f114c8c5ab1b39c7a3399a7c`、`afdf28271df37e9055110194705953d8c014a3f7bcccfbbb4c43a32cc47332e5`。独立审查已闭合受控 sink 建立时序与失败调用计时问题，无未处理的必修项；未提交、推送或发布。
+- **passed（最终自动化）**：Helper 独立 workspace `cargo test` 61 passed / 3 ignored；最终 `cargo fmt --all -- --check`、`cargo test --workspace`（core32、Windows541/21ignored、Host160/1ignored，其他库/契约通过）、`cargo check --workspace`、`cargo check -p sayall-windows-app --features runtime-simulation`，以及受影响文件 `git diff --check` 均通过。Helper 使用同一精确源码的既有证据，没有为收尾重复执行。45秒 CABLE 基线与负载前后实测按上述各自范围记实；不能扩大为遥控器/转写通过。
+- **passed（本地包）**：唯一当前安装器为 `target/release/bundle/nsis/无线麦_1.0.0_x64-setup.exe`，SHA-256 `ea99d929d74112698f52218f36fe096a3ce256f7e30d72d094b06c8d2aa91f0d`；实际个人 updater 公钥验签、fresh 前端嵌入内容门禁及 production simulation 隔离通过。本轮为 x64 四项载荷（Helper、Gadget、两许可）；ARM64 增强未覆盖。基线 `8b9dd31460f1b3b4c6859b2216de61ede0966206`，`sourceCommit=null`、dirty/local/included，源码/实际载荷指纹 `6ac22ec4cf4c22228a306a690f848dee8aef33014bf798991f673280d022e304`；不以基线代表完整未提交源码。
+- **passed（安装/启动）**：先确认当前语音已结束，再以真实桌面同账户管理员覆盖；安装器退出0/12.495秒，旧 App64252、子75624、Helper78564均正常退出，没有强杀。四项实际载荷/Helper PE 机型与本轮 staging 对齐；主 EXE 全文件比较仅 `UNK→NSS` 三字节安装标记差。五份现有配置安装前、安装后及新启动后哈希完全一致。安装后首次控制器在子 PowerShell 验证调用处报告 RemoteException；随后只读地用显式 StagedDirectory 继续验证并通过，没有重复安装，未据该验证器异常判为安装失败。
+- **passed（实际新实例）**：真实 Explorer6432 的桌面 `Document.Application.ShellExecute` 启动 App79676，精确安装路径匹配、TokenElevation0；Helper76260精确安装路径/TokenElevation1。实际日志读回的五个构建身份字段与上述最终 manifest 一致，Helper 新 `[LOG-QUEUE] started capacity=256`、MMCSS 注册及捕获 ownership ready 均已观测。至23:43:24，累计137秒（含闲置）没有 ownership timeout、bridge silence timeout、日志队列 overflow 或音频队列失败；此窗口 Menu fired0、voice attempt0，因此只证明启动/空闲保持，不证明实体行为。
+- **deferred（用户实体/兼容性）**：已请用户在 VSCode 短按 Menu 选择确认/连续开关，再按住语音超过45秒并松开，核对录音连续、释放及调试弹窗是否再现；截至上述观察尚无相应新 PID 动作或用户回复。本轮 RC001、RC003 完整冷首用/连续/断连/睡眠矩阵、ARM64及第三方实际转写仍未通过；睡眠/无线电实验许可仍未恢复。原 `stale_window` 返回失败与未对齐的其他前台配置问题保持独立未知。
+- **收尾**：保留唯一当前包及当前红测、最终套件、安装/运行读回和负载前后必要对照，均在同一任务目录；未保存源码快照。过时首绿、重复成功检查和中间包构建输出在核对无正式引用后按回收站规则处理。后续用户动作可在当前安装版继续核查，不自动重启/重装或扩展发布。
+
+#### 用户实体反馈与日志复核（2026-10-16，UTC+08:00）
+
+- **passed（用户报告）**：用户回复既定 VSCode 复验请求：“菜单和语音都正常，没有调试弹窗”。请求包含菜单选择确认、连续开关及超过45秒语音，但回复没有逐项次数或持续时长，因此只记录实际反馈，不据此补写这些细节。未读取 VSCode 私有数据或注入按键。
+- **身份/取证范围**：仍为 App79676、Helper76260，启动时间均为10月15日23:41，主程序日志指纹仍为 `6ac22ec4cf4c22228a306a690f848dee8aef33014bf798991f673280d022e304`。本次只读核对安装后默认诊断日志，统计固定截止10月16日09:48:27.194（01:48:27.194Z）；不混入旧 App64252 的失败。长期证据以本节脱敏摘要为准，未复制完整日志或语音。
+- **passed（可观察语音链）**：四段 `voice_flow terminal=control_stop` 分别在09:45:30.439、09:45:52.135、09:47:08.285、09:47:54.891结束，持续33.895、7.092、9.509、18.433秒；对应音频 `normal_finish` 接收/实际提交样本分别为540000、111600、149760、293040，全部 `queued_samples=0`。四次语音和弦释放均 `result=ok reason=released`；2033次原生语音键 DOWN（含自动重复）及4次UP均 `swallow=1 hold=1`，没有 `requested=1 actual=0` 或 ASK_TIMEOUT。四次 pump 最大间隔20–21ms、late计数0；没有 queue_overflow、wasapi_pipeline_failed 或 voice abort。日志支持这些会话正常结束与排空，第三方实际体验以用户报告为准；实体超过45秒仍 `deferred`，此前独立45秒静音负载对照保持其原 `passed` 范围。
+- **菜单成功与独立残留并存**：09:46:43–55有7条 `Menu configured=true fired_count=1`，generation22/26实测 `visible=true`、`foreground_verified result=true`，支持模板面板能被唤醒；用户报告菜单正常。但09:46:44.410及09:46:55.101再次出现 `stale_window`，09:46:45.167出现 `return_target_unavailable`，随后关闭记录 `blocked reason=target_restore_failed`；09:46:51与58另有完成隐藏记录。这是已知前台返回/关闭边界，不能把连续开关或每次确认全部记为日志通过，也不能改称捕获未唤醒复发。
+- **捕获超时并未完全消失**：新实例在09:38:35.365及09:48:24.699各记录一次 `ownership_timeout`。从有效mask归零到恢复7167分别为09:38:35.363→36.138（775ms）、09:48:24.696→24.752（56ms）；若从超时日志行计则为773ms、53ms。安装后至固定截止没有 bridge `silence_timeout` 或 Helper `[LOG-QUEUE] result=overflow`。两次窗口（09:38:33–39、09:48:22–27）没有 Menu 边沿/手势记录，无法与用户某次动作对应；不能声称所有续约故障已消失，也不据后台短暂事件自行扩大修复。
+- **验收边界/收尾**：本次用户体验通过，以上日志成功与失败分别保留；整体TODO仍未完成。RC001/RC003完整冷首用、连续、断连、睡眠、超过45秒实体语音、ARM64及第三方转写逐项矩阵不由本反馈替代，`stale_window`仍独立未解决。只更新原Bug、TODO及当前能力入口，不改生产源码/ATTRIBUTION、不重建或重启/重装，不提交或发布。

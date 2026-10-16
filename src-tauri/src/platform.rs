@@ -208,6 +208,10 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn observed_last_key(&self) -> Option<u32> {
         None
     }
+    /// 观察窗口诊断：窗口内计入的按键码列表（空 = 未计入或不可用）。
+    fn observed_keys(&self) -> Vec<u32> {
+        Vec::new()
+    }
 
     #[cfg(feature = "runtime-simulation")]
     fn run_simulated_voice_session(&self) -> Result<PlatformSnapshot, PlatformError> {
@@ -613,12 +617,14 @@ mod simulation {
                     name: "Xiaomi Bluetooth Remote 2".to_owned(),
                     model: RemoteModel::Rc001,
                     is_supported_candidate: true,
+                    token: sayall_windows::device_token(RC001_ID),
                 },
                 PairedRemote {
                     id: RC003_ID.to_owned(),
                     name: "Xiaomi Bluetooth Remote 2 Pro".to_owned(),
                     model: RemoteModel::Rc003,
                     is_supported_candidate: true,
+                    token: sayall_windows::device_token(RC003_ID),
                 },
             ]
         }
@@ -646,6 +652,8 @@ mod simulation {
                 phase: ConnectionPhase::Ready,
                 remote_name: Some(remote.name),
                 remote_model: remote.model,
+                // 与真机同形：连接成功后带上设备稳定令牌，界面才能把"已连接"标到正确那一行。
+                remote_token: Some(remote.token),
                 capabilities: Some(Self::capabilities()),
                 voice_state: VoiceSessionState::Idle,
                 generation: state.connection.generation,

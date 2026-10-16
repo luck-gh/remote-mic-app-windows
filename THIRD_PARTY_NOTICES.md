@@ -2,7 +2,7 @@
 
 ## SayAll App Logo and App Icon
 
-`public/app-logo.png`、`public/favicon.png` 以及 `src-tauri/icons/` 下的应用图标属于 HD838A 保留版权的专有品牌资产。它们不属于本项目 GPL-3.0-only 软件代码许可范围，复制、改编或用于其他项目须遵守 [LOGO-LICENSE.md](LOGO-LICENSE.md)。
+上游原 App Logo 和 App Icon 属于 HD838A 保留版权的专有品牌资产，不属于本项目 GPL-3.0-only 软件代码许可范围，复制、改编或用于其他项目须遵守 [LOGO-LICENSE.md](LOGO-LICENSE.md)。本个人版的 `public/app-logo.png`、`public/favicon.png` 和运行用应用图标已由独立“轻放”母版生成；原 `src-tauri/icons/icon-source.png` 仅保留历史取证，不用于运行或打包。当前与历史素材的归属边界见 [ATTRIBUTION.md](ATTRIBUTION.md#app-logo-版权)。
 
 ## RC003 product photo
 

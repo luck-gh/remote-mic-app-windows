@@ -14,9 +14,9 @@
 #    RFC 7396 顺序合并（数组整体覆盖），因此两份配置叠加是安全的。默认
 #    src-tauri/tauri.conf.json 必须保持 x64 单载荷，理由见 RELEASING.md。
 #
-# 签名：默认读取本机测试密钥 %LOCALAPPDATA%\SayAll\local-test-updater.key；口令取
-# -SigningKeyPassword → 环境变量 TAURI_SIGNING_PRIVATE_KEY_PASSWORD → 本机测试约定
-# "sayall-local-test"。该密钥与生成的 .sig 只用于本机测试，**绝不可发布**；密钥不存在则跳过签名。
+# 签名：默认读取仓库外的个人密钥 %LOCALAPPDATA%\SayAll\personal-updater.key；
+# 口令取参数或环境变量，未提供时使用空口令。公私钥必须通过实际产物验签。
+# 本地产物身份仍为 local/dirty，不因使用个人密钥而获得发布授权。
 #
 # 用法：
 #   powershell -File scripts\build-local-test-package.ps1
@@ -98,16 +98,16 @@ if ($LASTEXITCODE -ne 0) { throw "前端构建失败" }
 Write-Host "[5/6] tauri build --bundles nsis"
 (Get-Item (Join-Path $repo "src-tauri\src\lib.rs")).LastWriteTime = Get-Date
 if ($CargoTargetDir) { $env:CARGO_TARGET_DIR = $CargoTargetDir }
-if (-not $SigningKeyPath) { $SigningKeyPath = Join-Path $env:LOCALAPPDATA "SayAll\local-test-updater.key" }
+if (-not $SigningKeyPath) { $SigningKeyPath = Join-Path $env:LOCALAPPDATA "SayAll\personal-updater.key" }
 if (Test-Path $SigningKeyPath) {
     if (-not $SigningKeyPassword) {
-        $SigningKeyPassword = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { "sayall-local-test" }
+        $SigningKeyPassword = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { "" }
     }
     $env:TAURI_SIGNING_PRIVATE_KEY = ((Get-Content $SigningKeyPath -Raw) -replace "`r", "").TrimEnd("`n")
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $SigningKeyPassword
-    Write-Host "[5/6] 使用本机测试密钥签名（与 CI pubkey 不匹配的警告是预期；产物与 .sig 绝不可发布）"
+    Write-Host "[5/6] 使用个人更新密钥签名；稍后验证配置公钥与实际产物匹配"
 } else {
-    Write-Host "[5/6] 未找到本机测试密钥，跳过 updater 签名"
+    throw "缺少个人更新签名密钥；本地包必须与配置公钥匹配"
 }
 # arm64 双载荷：只有 staging 真的把两件都落到 src-tauri 之后，才用 --config 覆盖式
 # 声明它们（默认 src-tauri/tauri.conf.json 必须保持 x64 单载荷：tauri-build 在编译期
@@ -139,6 +139,8 @@ $setup = Get-ChildItem (Join-Path $targetRoot "release\bundle\nsis") -Filter "*.
 if (-not $setup) { throw "找不到 NSIS 产物" }
 $sha = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
 $sig = Join-Path $setup.DirectoryName ($setup.Name + ".sig")
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts/verify-updater-signing.ps1') -Installer $setup.FullName
+if ($LASTEXITCODE -ne 0) { throw '个人更新签名核验失败' }
 Write-Host ""
 Write-Host ("SETUP       : " + $setup.FullName)
 Write-Host ("SETUP_SHA256: " + $sha)

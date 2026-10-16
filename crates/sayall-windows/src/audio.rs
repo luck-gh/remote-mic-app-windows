@@ -428,6 +428,7 @@ fn worker_loop(
     }
     crate::ble::gatt_note("audio_worker phase=ready result=passed com_apartment=mta".to_owned());
     let _apartment = WasapiApartment;
+    let _audio_task = AudioThreadTask::register();
     let mut sink: Option<AudioSink> = None;
     let mut pending_drain: Option<(u64, Sender<Result<AudioSnapshot, PlatformError>>)> = None;
 
@@ -1118,6 +1119,14 @@ fn begin_session(
     active_sink.zero_available_count = 0;
     active_sink.zero_available_since = None;
     active_sink.zero_available_elapsed = Duration::ZERO;
+    active_sink.last_pump = None;
+    active_sink.max_pump_gap = Duration::ZERO;
+    active_sink.late_pump_count = 0;
+    active_sink.late_pump_excess = Duration::ZERO;
+    active_sink.empty_render_buffer_count = 0;
+    active_sink.max_space_query = Duration::ZERO;
+    active_sink.max_write = Duration::ZERO;
+    active_sink.max_mute_check = Duration::ZERO;
     let mut snapshot = lock(state);
     snapshot.phase = AudioPhase::Streaming;
     snapshot.queued_samples = 0;
@@ -1150,6 +1159,7 @@ fn finish_drain(
     snapshot.last_error = None;
     let result = snapshot.clone();
     drop(snapshot);
+    active_sink.timing_note(generation);
     crate::ble::gatt_note(format!("audio_flow generation={generation} terminal=normal_finish accepted_samples={} submitted_samples={} queued_samples={} elapsed_ms={} first_submit_ms={} last_submit_age_ms={}",
         queue.accepted(), result.submitted_samples, result.queued_samples, active_sink.session_started_at.elapsed().as_millis(),
         active_sink.first_nonzero_submit.map(|t| t.saturating_duration_since(active_sink.session_started_at).as_millis().to_string()).unwrap_or_else(|| "none".to_owned()),
@@ -1213,6 +1223,7 @@ fn fail_audio(
         "wasapi_pipeline"
     };
     if let Some(sink) = sink.as_ref() {
+        sink.timing_note(snapshot_before.generation);
         let zero_elapsed = sink.zero_available_elapsed
             + sink
                 .zero_available_since
@@ -1263,9 +1274,69 @@ struct AudioSink {
     zero_available_count: u64,
     zero_available_since: Option<Instant>,
     zero_available_elapsed: Duration,
+    buffer_frames: u32,
+    last_pump: Option<Instant>,
+    max_pump_gap: Duration,
+    late_pump_count: u64,
+    late_pump_excess: Duration,
+    empty_render_buffer_count: u64,
+    max_space_query: Duration,
+    max_write: Duration,
+    max_mute_check: Duration,
+}
+
+/// MMCSS registration belongs to this render thread; its handle is not a kernel
+/// handle and must be reverted on the same thread, including unwind/early exit.
+struct AudioThreadTask {
+    handle: Option<windows::Win32::Foundation::HANDLE>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl AudioThreadTask {
+    fn register() -> Self {
+        use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+        let mut index = 0;
+        let result =
+            unsafe { AvSetMmThreadCharacteristicsW(windows::core::w!("Audio"), &mut index) };
+        let (handle, error_code) = match result {
+            Ok(handle) => (Some(handle), 0),
+            Err(error) => (None, error.code().0),
+        };
+        crate::ble::gatt_note(format!(
+            "audio_scheduling action=register task=audio result={} error_code=0x{:08X}",
+            if handle.is_some() { "passed" } else { "failed" },
+            error_code as u32
+        ));
+        Self {
+            handle,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for AudioThreadTask {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let result =
+            unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle) };
+        crate::ble::gatt_note(format!(
+            "audio_scheduling action=revert task=audio terminal_result={} error_code=0x{:08X}",
+            if result.is_ok() { "passed" } else { "failed" },
+            result.err().map(|error| error.code().0 as u32).unwrap_or(0)
+        ));
+    }
 }
 
 impl AudioSink {
+    /// Aggregate only; do not add file I/O to the per-packet render loop.
+    fn timing_note(&self, generation: u64) {
+        crate::ble::gatt_note(format!("audio_pump generation={generation} buffer_frames={} max_pump_gap_ms={} late_pump_count={} late_pump_excess_ms={} empty_render_buffer_count={} max_space_query_ms={} max_write_ms={} max_mute_check_ms={}",
+            self.buffer_frames, self.max_pump_gap.as_millis(), self.late_pump_count, self.late_pump_excess.as_millis(), self.empty_render_buffer_count,
+            self.max_space_query.as_millis(), self.max_write.as_millis(), self.max_mute_check.as_millis()));
+    }
+
     fn open(endpoint_id: &str, attempt_id: u64) -> Result<Self, PlatformError> {
         let enumerator =
             DeviceEnumerator::new().map_err(|error| audio_error("创建端点枚举器", error))?;
@@ -1291,7 +1362,10 @@ impl AudioSink {
                 .map_err(|error| audio_error("创建 WASAPI 客户端", error))?;
             // 预热：读一次设备混音格式会把端点音频引擎拉起来；现场实证冷引擎
             // 直接 Initialize 会拿到 0x8889000A，读过之后同一参数即可成功。
-            let _ = candidate.get_mixformat();
+            let mix_rate = candidate
+                .get_mixformat()
+                .ok()
+                .map(|format| format.get_samplespersec());
             let (default_period, _) = candidate
                 .get_device_period()
                 .map_err(|error| audio_error("读取 WASAPI 设备周期", error))?;
@@ -1313,7 +1387,9 @@ impl AudioSink {
             ) {
                 Ok(()) => {
                     crate::ble::gatt_note(format!(
-                        "audio_endpoint attempt_id={attempt_id} action=open phase=client_initialized result=passed share_mode=shared autoconvert=true requested_sample_rate=16000 requested_channels=1 buffer_period_hns={default_period} open_attempt={}",
+                        "audio_endpoint attempt_id={attempt_id} action=open phase=client_initialized result=passed share_mode=shared autoconvert=true requested_sample_rate=16000 requested_channels=1 mix_sample_rate={} buffer_frames={} buffer_period_hns={default_period} open_attempt={}",
+                        mix_rate.map(|rate| rate.to_string()).unwrap_or_else(|| "unknown".into()),
+                        candidate.get_buffer_size().map(|frames| frames.to_string()).unwrap_or_else(|_| "unknown".into()),
                         index + 1
                     ));
                     opened = Some((candidate, default_period));
@@ -1358,6 +1434,7 @@ impl AudioSink {
         let render_client = client
             .get_audiorenderclient()
             .map_err(|error| audio_error("创建 WASAPI 渲染客户端", error))?;
+        let buffer_frames = client.get_buffer_size().unwrap_or(0);
         let mut sink = Self {
             endpoint_id: endpoint_id.to_owned(),
             name,
@@ -1373,6 +1450,15 @@ impl AudioSink {
             zero_available_count: 0,
             zero_available_since: None,
             zero_available_elapsed: Duration::ZERO,
+            buffer_frames,
+            last_pump: None,
+            max_pump_gap: Duration::ZERO,
+            late_pump_count: 0,
+            late_pump_excess: Duration::ZERO,
+            empty_render_buffer_count: 0,
+            max_space_query: Duration::ZERO,
+            max_write: Duration::ZERO,
+            max_mute_check: Duration::ZERO,
         };
         sink.ensure_session_unmuted("open", true)?;
         Ok(sink)
@@ -1458,16 +1544,42 @@ impl AudioSink {
         draining: bool,
         generation: u64,
     ) -> Result<usize, PlatformError> {
+        let entered = Instant::now();
+        if self.started {
+            if let Some(previous) = self.last_pump {
+                let gap = entered.saturating_duration_since(previous);
+                self.max_pump_gap = self.max_pump_gap.max(gap);
+                if self.buffer_frames > 0 {
+                    let buffer_duration = Duration::from_secs_f64(
+                        self.buffer_frames as f64 / SOURCE_SAMPLE_RATE as f64,
+                    );
+                    if gap > buffer_duration {
+                        self.late_pump_count += 1;
+                        self.late_pump_excess += gap - buffer_duration;
+                    }
+                }
+            }
+        }
+        self.last_pump = Some(entered);
         if self.started && self.last_session_mute_check.elapsed() >= SESSION_MUTE_WATCH_INTERVAL {
-            self.ensure_session_unmuted("stream_watch", false)?;
+            let started = Instant::now();
+            let result = self.ensure_session_unmuted("stream_watch", false);
+            self.max_mute_check = self.max_mute_check.max(started.elapsed());
+            result?;
         }
         if !self.started && queue.len() < PREBUFFER_SAMPLES && !draining {
             return Ok(0);
         }
-        let available =
-            self.client
-                .get_available_space_in_frames()
-                .map_err(|error| audio_error("读取 WASAPI 可写空间", error))? as usize;
+        let query_started = Instant::now();
+        let available_result = self
+            .client
+            .get_available_space_in_frames()
+            .map_err(|error| audio_error("读取 WASAPI 可写空间", error));
+        self.max_space_query = self.max_space_query.max(query_started.elapsed());
+        let available = available_result? as usize;
+        if self.started && !queue.is_empty() && available == self.buffer_frames as usize {
+            self.empty_render_buffer_count += 1;
+        }
         if available == 0 && !queue.is_empty() {
             self.zero_available_count += 1;
             self.zero_available_since.get_or_insert_with(Instant::now);
@@ -1483,13 +1595,13 @@ impl AudioSink {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         let write_started = Instant::now();
-        self.render_client
-            .write_to_device(frames, &bytes, None)
-            .map_err(|error| {
-                note_audio_stage_failure(generation, "write", write_started.elapsed());
-                audio_error("写入 WASAPI 音频", error)
-            })?;
+        let write_result = self.render_client.write_to_device(frames, &bytes, None);
         let write_elapsed = write_started.elapsed();
+        self.max_write = self.max_write.max(write_elapsed);
+        write_result.map_err(|error| {
+            note_audio_stage_failure(generation, "write", write_elapsed);
+            audio_error("写入 WASAPI 音频", error)
+        })?;
         if !self.started {
             let start_started = Instant::now();
             self.client.start_stream().map_err(|error| {
@@ -2367,6 +2479,57 @@ mod tests {
         );
         assert_eq!(runtime.snapshot().phase, AudioPhase::Unconfigured);
         assert_eq!(runtime.snapshot().generation, 0);
+    }
+
+    #[test]
+    #[ignore = "explicit saved CABLE endpoint required; sends 45 seconds of paced silence without changing saved configuration"]
+    fn saved_endpoint_sustains_a_long_realtime_voice_stream() {
+        let id =
+            std::env::var("SAYALL_TEST_CABLE_ENDPOINT_ID").expect("explicit endpoint ID required");
+        let name = std::env::var("SAYALL_TEST_CABLE_ENDPOINT_NAME")
+            .expect("explicit endpoint name required");
+        wasapi::initialize_mta().ok().expect("COM apartment");
+        let _apartment = WasapiApartment;
+        assert!(
+            !endpoint_muted(&id).expect("endpoint mute query"),
+            "test refuses an already-muted endpoint"
+        );
+        let runtime = AudioRuntime::new();
+        runtime
+            .restore_endpoint(id, name)
+            .expect("restore saved endpoint");
+        runtime.begin_session(30, None).expect("begin real stream");
+        let started = Instant::now();
+        let mut next_report = Duration::from_secs(1);
+        let mut accepted = 0;
+        let mut failed = false;
+        // Match RC003's actual 240 samples / 15 ms, with an absolute producer
+        // deadline so Windows sleep granularity cannot lower the test input rate.
+        for packet in 0..3000 {
+            thread::sleep(
+                (started + Duration::from_millis(packet * 15))
+                    .saturating_duration_since(Instant::now()),
+            );
+            if runtime.enqueue_samples(30, vec![0; 240]).is_err() {
+                failed = true;
+                break;
+            }
+            accepted += 240;
+            if started.elapsed() >= next_report {
+                let snapshot = runtime.snapshot();
+                println!("paced_audio elapsed_ms={} accepted_samples={accepted} submitted_samples={} queued_samples={} failed={}", started.elapsed().as_millis(), snapshot.submitted_samples, snapshot.queued_samples, runtime.failure().is_some());
+                next_report += Duration::from_secs(1);
+            }
+        }
+        let before_stop = runtime.snapshot();
+        if failed {
+            runtime.interrupt_session().expect("cleanup failed stream");
+        } else {
+            runtime.finish_session(30).expect("real stream drains");
+        }
+        println!("paced_audio terminal={} elapsed_ms={} accepted_samples={accepted} submitted_samples={} queued_samples={}", if failed { "failed" } else { "passed" }, started.elapsed().as_millis(), before_stop.submitted_samples, before_stop.queued_samples);
+        assert!(!failed, "real-time audio consumer fell behind");
+        assert_eq!(accepted, 720_000);
     }
 
     #[test]

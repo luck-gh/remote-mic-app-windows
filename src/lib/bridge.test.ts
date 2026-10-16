@@ -122,7 +122,7 @@ describe("connection phase presentation", () => {
 describe("diagnostic report presentation", () => {
   it("adds an explicit generation time without changing the captured report", () => {
     const report: DiagnosticReport = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       appVersion: "0.1.0",
       appBuild: "1001",
       sourceRevision: "0123456789012345678901234567890123456789",
@@ -182,6 +182,13 @@ describe("diagnostic report presentation", () => {
         firedGestures: 0,
         errorPresent: false,
       },
+  ime: {
+    detected: false,
+    activeName: null,
+    installedNames: [],
+    expectedName: null,
+    matchesExpected: null,
+  },
     };
 
     const formatted = JSON.parse(formatDiagnosticReport(report, "2026-09-01T00:00:00.000Z"));

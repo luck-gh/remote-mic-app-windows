@@ -1568,11 +1568,68 @@ mod imp {
         }
     }
 
+    const LOG_QUEUE_CAPACITY: usize = 256;
+    const LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    struct LogRecord {
+        record: String,
+        console: Option<String>,
+    }
+
+    /// Only diagnostic records may be dropped. Capture/control messages never use this queue.
+    struct LogQueue {
+        sender: Mutex<Option<mpsc::SyncSender<LogRecord>>>,
+        dropped: Arc<AtomicU64>,
+        finished: Arc<AtomicBool>,
+        completion: Mutex<Option<(mpsc::Receiver<()>, JoinHandle<()>)>>,
+    }
+
+    impl LogQueue {
+        fn enqueue(&self, record: LogRecord) {
+            let sent = self.sender.lock().ok().is_some_and(|sender| {
+                sender
+                    .as_ref()
+                    .is_some_and(|sender| sender.try_send(record).is_ok())
+            });
+            if !sent {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn close(&self) -> bool {
+            // Never hold this lock while waiting for filesystem/stdout I/O.
+            if let Ok(mut sender) = self.sender.lock() {
+                sender.take();
+            }
+            let Some((done, handle)) = self.completion.lock().ok().and_then(|mut slot| slot.take())
+            else {
+                return self.finished.load(Ordering::Acquire);
+            };
+            if done.recv_timeout(LOG_DRAIN_TIMEOUT).is_ok() {
+                handle.join().is_ok()
+            } else {
+                // Rust cannot cancel synchronous filesystem I/O. Detach only this diagnostic
+                // worker; capture/Agent/bridge cleanup has already finished before normal exit.
+                false
+            }
+        }
+    }
+
+    impl Drop for LogQueue {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    #[derive(Clone)]
     struct Logger {
         /// 助手自己的文件：主程序日志不可用时的回退落点（`--log` / `--follow-app` 默认）。
         fallback: Option<PathBuf>,
         /// 主程序诊断日志。有它时**只写它**——用户报障只拉一份日志（2026-10-01 要求）。
         shared: Option<PathBuf>,
+        queue: Option<Arc<LogQueue>>,
+        #[cfg(test)]
+        test_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     }
 
     impl Logger {
@@ -1592,6 +1649,9 @@ mod imp {
             Self {
                 fallback: path,
                 shared: None,
+                queue: None,
+                #[cfg(test)]
+                test_sink: None,
             }
         }
 
@@ -1600,6 +1660,58 @@ mod imp {
             let mut logger = Self::new(fallback);
             logger.shared = shared;
             logger
+        }
+
+        /// Enable once before capture starts; clones share the same bounded output worker.
+        fn nonblocking(&self) -> std::io::Result<Self> {
+            if self.queue.is_some() {
+                return Ok(self.clone());
+            }
+            let sink = self.clone();
+            let (tx, rx) = mpsc::sync_channel::<LogRecord>(LOG_QUEUE_CAPACITY);
+            let dropped = Arc::new(AtomicU64::new(0));
+            let worker_dropped = Arc::clone(&dropped);
+            let finished = Arc::new(AtomicBool::new(false));
+            let worker_finished = Arc::clone(&finished);
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = std::thread::Builder::new()
+                .name("rc003-log".into())
+                .spawn(move || {
+                    let report_drops = || {
+                        let count = worker_dropped.swap(0, Ordering::Relaxed);
+                        if count > 0 {
+                            sink.line(&format!(
+                                "[LOG-QUEUE] result=overflow dropped_count={count}"
+                            ));
+                        }
+                    };
+                    for record in rx {
+                        report_drops();
+                        sink.write_record(record);
+                    }
+                    report_drops();
+                    sink.line("[LOG-QUEUE] event=stopped terminal_result=drained");
+                    worker_finished.store(true, Ordering::Release);
+                    let _ = done_tx.send(());
+                })?;
+            let mut logger = self.clone();
+            logger.queue = Some(Arc::new(LogQueue {
+                sender: Mutex::new(Some(tx)),
+                dropped,
+                finished,
+                completion: Mutex::new(Some((done_rx, handle))),
+            }));
+            logger.line(&format!("[LOG-QUEUE] event=started capacity={LOG_QUEUE_CAPACITY} overflow=drop_diagnostics capture_io=isolated"));
+            Ok(logger)
+        }
+
+        fn shutdown(&self) -> bool {
+            self.queue.as_ref().is_none_or(|queue| queue.close())
+        }
+
+        fn exit(&self, code: i32) -> ! {
+            self.shutdown();
+            std::process::exit(code)
         }
 
         /// 记录一行"落点决策"，让下一次报障一眼看出日志去了哪里。
@@ -1651,18 +1763,41 @@ mod imp {
             // 目的地优先级：主程序诊断日志（用户只拉一份）→ 助手自己的文件。
             // 脱敏对两个落点都做：两份文件都可能被用户发出来。
             let text = redact_personal_paths(msg);
-            let stdout_started = Instant::now();
-            println!("{text}");
-            LATENCY.record(LatencyStage::Stdout, elapsed_ms(stdout_started));
             let record = format!(
                 "{} pid={} component=rc003-helper {}",
                 utc_stamp(),
                 std::process::id(),
                 text
             );
+            self.output(LogRecord {
+                record,
+                console: Some(text),
+            });
+        }
+
+        fn output(&self, record: LogRecord) {
+            if let Some(queue) = &self.queue {
+                queue.enqueue(record);
+            } else {
+                self.write_record(record);
+            }
+        }
+
+        fn write_record(&self, record: LogRecord) {
+            if let Some(text) = &record.console {
+                let stdout_started = Instant::now();
+                // Broken stdout must not panic and terminate the capture process.
+                let _ = writeln!(std::io::stdout().lock(), "{text}");
+                LATENCY.record(LatencyStage::Stdout, elapsed_ms(stdout_started));
+            }
             let append_started = Instant::now();
+            #[cfg(test)]
+            if let Some(sink) = &self.test_sink {
+                sink(&record.record);
+                return;
+            }
             for target in self.shared.iter().chain(self.fallback.iter()) {
-                if append_record(target, &record) {
+                if append_record(target, &record.record) {
                     break;
                 }
             }
@@ -1679,13 +1814,10 @@ mod imp {
             // 不经 println/Logger::line，避免递归或再争用 stdout。
             let record = format!("{} pid={} component=rc003-helper [LATENCY] diagnosis=unknown slow_ms={} min_interval_ms={} agent_rx_clock=wall clock_invalid={}{}",
                 utc_stamp(), std::process::id(), LATENCY_SLOW_MS, LATENCY_REPORT_MS, summary.clock_invalid, summary.fields());
-            let started = Instant::now();
-            for target in self.shared.iter().chain(self.fallback.iter()) {
-                if append_record(target, &record) {
-                    break;
-                }
-            }
-            LATENCY.record(LatencyStage::Append, elapsed_ms(started));
+            self.output(LogRecord {
+                record,
+                console: None,
+            });
         }
 
         fn kv(&self, tag: &str, kv: &[(&str, String)]) {
@@ -1697,6 +1829,202 @@ mod imp {
                 s.push_str(v);
             }
             self.line(&s);
+        }
+    }
+
+    #[cfg(test)]
+    mod capture_log_stall_tests {
+        use super::*;
+
+        #[test]
+        fn slow_log_sink_does_not_delay_ownership_or_menu_edges() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let sink_gate = Arc::clone(&gate);
+            let block_once = AtomicBool::new(true);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |_| {
+                if block_once.swap(false, Ordering::Relaxed) {
+                    let _ = entered_tx.send(());
+                }
+                let _released = sink_gate
+                    .1
+                    .wait_while(sink_gate.0.lock().unwrap(), |released| !*released)
+                    .unwrap();
+            }));
+            let logger = logger.nonblocking().unwrap();
+            // Establish the blocked sink before the capture thread can receive any HB/edge.
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let bridge = AppBridge {
+                tx,
+                handle: None,
+                stop: Arc::new(AtomicBool::new(false)),
+                stats: Arc::new(BridgeStats::default()),
+                targets: Arc::new(Mutex::new(BridgeCaptureTargets::default())),
+                voice_synth: Arc::new(Mutex::new(None)),
+                voice_synth_dirty: Arc::new(AtomicBool::new(false)),
+                voice_gate: Arc::new(AtomicBool::new(false)),
+                voice_gate_dirty: Arc::new(AtomicBool::new(false)),
+            };
+            let capture_logger = logger.clone();
+            let handle = std::thread::spawn(move || {
+                let logger = capture_logger;
+                let mut session = Session {
+                    connected_at: Instant::now(),
+                    last_rx: Instant::now(),
+                    hello: None,
+                    edges: Vec::new(),
+                    lines: 0,
+                    authenticated: true,
+                    config_sent: true,
+                    target_ack: Some(BridgeCaptureTargets {
+                        generation: 4,
+                        usages: vec![0x65],
+                    }),
+                    last_hb_log: None,
+                };
+                handle_line(
+                    r#"{"type":"hb","lease_ok":true,"handshake":true}"#,
+                    &mut session,
+                    &logger,
+                    "test",
+                    Some(&bridge),
+                );
+                handle_line(
+                    r#"{"type":"edge","usages":[101]}"#,
+                    &mut session,
+                    &logger,
+                    "test",
+                    Some(&bridge),
+                );
+                handle_line(
+                    r#"{"type":"edge","usages":[]}"#,
+                    &mut session,
+                    &logger,
+                    "test",
+                    Some(&bridge),
+                );
+            });
+            // Hold the sink beyond the real 1500 ms ownership safety window.
+            let held_at = Instant::now();
+            let ownership = rx.recv_timeout(Duration::from_millis(1700));
+            let down = rx.recv_timeout(Duration::from_millis(100));
+            let up = rx.recv_timeout(Duration::from_millis(100));
+            let forwarded_in_ms = elapsed_ms(held_at);
+            std::thread::sleep(Duration::from_millis(1700).saturating_sub(held_at.elapsed()));
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            handle.join().unwrap();
+            assert!(logger.shutdown());
+            assert!(
+                matches!(
+                    ownership,
+                    Ok(QueuedBridgeOutbound {
+                        message: BridgeOutbound::Ownership(_),
+                        ..
+                    })
+                ),
+                "logging stalled ownership past the safety window"
+            );
+            assert!(forwarded_in_ms < 1500, "forwarded_in_ms={forwarded_in_ms}");
+            assert!(
+                matches!(down, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges(ref keys), .. }) if keys == &[101])
+            );
+            assert!(
+                matches!(up, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges(ref keys), .. }) if keys.is_empty())
+            );
+        }
+
+        #[test]
+        fn full_log_queue_is_bounded_and_reports_drops_after_recovery() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let once = AtomicBool::new(true);
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&records);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                if once.swap(false, Ordering::Relaxed) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                captured.lock().unwrap().push(record.to_owned());
+            }));
+            let logger = logger.nonblocking().unwrap();
+            let same = logger.nonblocking().unwrap();
+            assert!(Arc::ptr_eq(
+                logger.queue.as_ref().unwrap(),
+                same.queue.as_ref().unwrap()
+            ));
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            for _ in 0..LOG_QUEUE_CAPACITY + 19 {
+                same.line("[TEST] state=queued");
+            }
+            assert_eq!(
+                logger
+                    .queue
+                    .as_ref()
+                    .unwrap()
+                    .dropped
+                    .load(Ordering::Relaxed),
+                19
+            );
+            release_tx.send(()).unwrap();
+            assert!(logger.shutdown());
+            assert!(same.shutdown());
+            same.line("[TEST] state=late");
+            let records = records.lock().unwrap();
+            assert!(records
+                .iter()
+                .any(|s| s.contains("result=overflow dropped_count=19")));
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|s| s.contains("state=queued"))
+                    .count(),
+                LOG_QUEUE_CAPACITY
+            );
+            assert!(records.last().unwrap().contains("terminal_result=drained"));
+            assert!(!records.iter().any(|s| s.contains("state=late")));
+        }
+
+        #[test]
+        fn shutdown_has_a_budget_and_a_late_sink_cannot_reopen_the_queue() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let once = AtomicBool::new(true);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                if once.swap(false, Ordering::Relaxed) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                if record.contains("terminal_result=drained") {
+                    let _ = finished_tx.send(());
+                }
+            }));
+            let logger = logger.nonblocking().unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let started = Instant::now();
+            let result = logger.shutdown();
+            let bounded = started.elapsed() < LOG_DRAIN_TIMEOUT + Duration::from_secs(1);
+            let repeated = logger.shutdown();
+            logger.line("[TEST] state=late");
+            release_tx.send(()).unwrap();
+            finished_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(!result && !repeated && bounded);
+            assert!(logger
+                .queue
+                .as_ref()
+                .unwrap()
+                .sender
+                .lock()
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -4247,7 +4575,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let voice_gate_dirty = Arc::new(AtomicBool::new(false));
         let worker_gate = Arc::clone(&voice_gate);
         let worker_gate_dirty = Arc::clone(&voice_gate_dirty);
-        let worker_logger = Logger::with_shared(logger.fallback.clone(), logger.shared.clone());
+        let worker_logger = logger.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_stats = Arc::clone(&stats);
         // 首次未完成实际身份绑定时沿用同一宽限期，避免提权 Helper 长期遗留。
@@ -5294,6 +5622,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             }
         };
 
+        // Start the diagnostic worker before any capture/control thread can log.
+        // If it cannot start, refuse capture rather than restoring synchronous I/O.
+        let logger = match logger.nonblocking() {
+            Ok(logger) => logger,
+            Err(_) => {
+                logger.line("[LOG-QUEUE] event=start_failed capture_authorized=false");
+                std::process::exit(17);
+            }
+        };
         // ---- 主程序桥接（捕获链第 ② 段）----
         // 刻意放在端口绑定之前：它只决定"边沿能不能送到主程序"，与"能不能捕获、
         // 能不能清键"完全解耦。主程序没运行时它会安静地每 2 秒重试（日志折叠成
@@ -5320,7 +5657,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     logger.line(
                         "[FOLLOW-APP] event=exit reason=startup_bridge_unavailable injected=false",
                     );
-                    std::process::exit(15);
+                    logger.exit(15);
                 }
                 logger.kv(
                     "[APP-BRIDGE]",
@@ -5349,14 +5686,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             logger.line(
                 "[STOP] result=blocked reason=prior_cleanup_unconfirmed receipt_preserved=true",
             );
-            std::process::exit(15);
+            logger.exit(15);
         }
 
         let prepared = match prepare_runtime(&args, &gadget_src, &logger, &plan) {
             Ok(f) => f,
             Err(e) => {
                 logger.line(&format!("[STOP] {e}"));
-                std::process::exit(7);
+                logger.exit(7);
             }
         };
         if matches!(plan, DllPlan::Generation(_)) {
@@ -5376,7 +5713,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         {
             let written = write_cleanup_state("not_started", true).is_ok();
             logger.line("[START-CANCELLED] stop_intent_observed injected=false");
-            std::process::exit(if written { 0 } else { 15 });
+            logger.exit(if written { 0 } else { 15 });
         }
 
         let mut injection: Option<Injection> = match plan {
@@ -5402,14 +5739,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             _ => {
                 if cleanup.begin_capture().is_err() {
                     logger.line("[STOP] cleanup_state_write_failed；未注入宿主");
-                    std::process::exit(15);
+                    logger.exit(15);
                 }
                 match inject_gadget(target_pid, &prepared.dll, &logger) {
                     Ok(i) => Some(i),
                     Err(e) => {
                         logger.line(&format!("[STOP] {e}"));
                         let _ = write_cleanup_state("unconfirmed", true);
-                        std::process::exit(9);
+                        logger.exit(9);
                     }
                 }
             }
@@ -5434,7 +5771,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let renew_source_instance = source_instance;
         // 注意：这里是 `new` **不是** `open_round` —— 续约线程不是新一轮运行，
         // 它若写分隔线会让"每轮起点"的 grep 多算一次（2026-09-23 实测）。
-        let renew_logger = Logger::with_shared(args.log.clone(), shared_log.clone());
+        let renew_logger = logger.clone();
         let renew_handle = std::thread::spawn(move || {
             let mut tick: u64 = 0;
             while !renew_stop.load(Ordering::Relaxed) {
@@ -5708,7 +6045,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         };
         if write_cleanup_state(cleanup_status, true).is_err() {
             logger.line("[CLEANUP] result=unconfirmed reason=state_write_failed");
-            std::process::exit(15);
+            logger.exit(15);
         }
         logger.kv(
             "[CLEANUP]",
@@ -5724,10 +6061,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
         if version_blocked {
             logger.line("[START-FAILED] reason=resident_agent_version_mismatch capture_acquired=false terminal_result=agent_version_blocked retryable=false");
-            std::process::exit(16);
+            logger.exit(16);
         }
         if cleanup_failed {
-            std::process::exit(15);
+            logger.exit(15);
         }
         if no_hello {
             logger.line(&format!(
@@ -5739,8 +6076,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                  \x20 4) 宿主进程被安全软件拦下了 CreateRemoteThread。",
                 args.await_hello
             ));
-            std::process::exit(12);
+            logger.exit(12);
         }
+        logger.shutdown();
     }
 
     /// 控制台事件处理器：只置位、不做事，把收尾留给主线程（那里才能安全地
@@ -9122,7 +9460,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
             // 1) 共用日志可用：只写它，不再产生第二份文件。
             let logger = Logger::with_shared(Some(fallback.clone()), Some(shared.clone()));
+            let logger = logger.nonblocking().unwrap();
             logger.line("shared_sink_line");
+            assert!(logger.shutdown());
             let written = fs::read_to_string(&shared).expect("共用日志必须被写入");
             assert!(written.contains("shared_sink_line"), "{written}");
             assert!(written.contains("component=rc003-helper"), "{written}");
@@ -9132,7 +9472,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let blocked = dir.join("blocked");
             fs::write(&blocked, b"x").expect("prepare blocked path");
             let logger = Logger::with_shared(Some(fallback.clone()), Some(blocked.join("app.log")));
+            let logger = logger.nonblocking().unwrap();
             logger.line("fallback_sink_line");
+            assert!(logger.shutdown());
             let written = fs::read_to_string(&fallback).expect("回退文件必须被写入");
             assert!(written.contains("fallback_sink_line"), "{written}");
 

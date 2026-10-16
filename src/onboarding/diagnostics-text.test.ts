@@ -7,7 +7,8 @@ import {
 } from "./diagnostics-text";
 
 const report: DiagnosticReport = {
-  schemaVersion: 2,
+  schemaVersion: 3,
+  ime: { detected: false, activeName: null, installedNames: [], expectedName: null, matchesExpected: null },
   appVersion: "0.5.0",
   appBuild: "1001",
   sourceRevision: "fe326f8a1b2c3d4e5f60718293a4b5c6d7e8f901",

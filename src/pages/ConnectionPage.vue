@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import EnhancedCaptureConfirmDialog from "../components/EnhancedCaptureConfirmDialog.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
-import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+import { reportFrontendEvent, reasonToken } from "../lib/frontend-diagnostics";
 import type {
   AudioEndpoint,
   AudioSnapshot,
@@ -573,7 +573,7 @@ async function applyCaptureToggle() {
         event: "rc003_capture_toggle",
         phase: "completed",
         result: "failed",
-        reason: `page=connection was_enabled=${String(wasEnabled === true)} error=${next.lastError}`,
+        reason: reasonToken("page_connection", "was_enabled", wasEnabled === true, "switch_failed"),
       });
       return;
     }
@@ -583,7 +583,7 @@ async function applyCaptureToggle() {
       event: "rc003_capture_toggle",
       phase: "completed",
       result: "passed",
-      reason: `page=connection enabled=${String(next.enabled)}`,
+      reason: reasonToken("page_connection", "enabled", next.enabled),
     });
   } catch (error) {
     rc003CaptureHint.value = error instanceof Error ? error.message : String(error);
@@ -591,7 +591,7 @@ async function applyCaptureToggle() {
       event: "rc003_capture_toggle",
       phase: "completed",
       result: "failed",
-      reason: `page=connection was_enabled=${String(wasEnabled === true)} switch_reverted`,
+      reason: reasonToken("page_connection", "was_enabled", wasEnabled === true, "switch_reverted"),
     });
     // 同步回退到点击前的状态，并用权威状态校正一次（与 ButtonsPage 同源）。
     rc003CaptureEnabled.value = wasEnabled === true;

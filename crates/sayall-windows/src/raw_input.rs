@@ -178,8 +178,58 @@ pub fn normalize_device_path(path: &str) -> String {
     path.trim().to_ascii_lowercase()
 }
 
+/// 指定目标后，Raw Input 报文是否属于"应用正在用的那支"（2026-10-13 现场，纯逻辑便于单测）。
+///
+/// - `target = Some(address)`：**只认这个地址**——绑定路径与同地址的其他实例路径都算；
+///   绑定若还停在"另一支"上（例如启动时按枚举顺序先绑了一路），那一支的报文一律不算。
+///   现场教训：只看"报文路径 == 绑定路径"会在换机或启动抢绑时把**另一支遥控器**的按键
+///   当成本机按键（用户连的是 2 Pro、按 2 却让②步通过了）。
+/// - `target = None`（还没连任何一支）：沿用旧行为——只认绑定路径。
+pub fn report_path_accepted(bound_path: &str, target: Option<u64>, report_path: &str) -> bool {
+    match target {
+        Some(address) => crate::remote_target::matches_address(report_path, address),
+        None => normalize_device_path(report_path) == normalize_device_path(bound_path),
+    }
+}
+
 pub fn select_single_device_path(paths: &[String]) -> Result<String, DevicePathError> {
     select_single_device_path_preferring(paths, "")
+}
+
+/// 只留属于**应用正在用的那支遥控器**的候选（2026-10-13 现场：两台同型号遥控器
+/// 同时在线时，两条链路都拒绝盲选，整机按键全断且没有解释）。
+///
+/// - `target = None`（地址未知）⇒ 原样返回，行为与过去完全一致；
+/// - 地址已知 ⇒ 按地址过滤；**一个都不匹配时返回空**，由调用方按「设备不在位」
+///   处理（转等待、等接口恢复）——绝不能退回未过滤集合：那会在两支同型号遥控器
+///   之间绑错设备（用户按 A 支、程序听 B 支），比暂时不绑定更糟。
+pub fn filter_paths_for_target(paths: &[String], target: Option<u64>) -> Vec<String> {
+    match target {
+        None => paths.to_vec(),
+        Some(address) => paths
+            .iter()
+            .filter(|path| crate::remote_target::matches_address(path, address))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Common selection policy for startup, arrival and periodic binding audit.
+pub fn select_device_path_for_target(
+    paths: &[String],
+    preferred: &str,
+    target: Option<u64>,
+) -> Result<String, DevicePathError> {
+    let paths = filter_paths_for_target(paths, target);
+    if target.is_none() {
+        return select_single_device_path(&paths);
+    }
+    match select_single_device_path_preferring(&paths, preferred) {
+        Err(DevicePathError::Ambiguous(_)) => {
+            paths.first().cloned().ok_or(DevicePathError::Missing)
+        }
+        result => result,
+    }
 }
 
 /// 在多个候选中选出唯一绑定，且**优先保持既有绑定**（2026-09-18）。
@@ -430,6 +480,58 @@ fn edges_between(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_selection_rejects_unknown_ambiguity_and_accepts_known_siblings() {
+        let target = 0xc05d_39c2_d9db;
+        let one = r"\\?\HID#VID_2717&PID_32B8#c05d39c2d9db-one".to_owned();
+        let sibling = r"\\?\HID#VID_2717&PID_32B8#c05d39c2d9db-two".to_owned();
+        let other = r"\\?\HID#VID_2717&PID_32B8#e85540b1b76b-other".to_owned();
+        let paths = vec![other.clone(), one.clone(), sibling.clone()];
+        assert_eq!(
+            select_device_path_for_target(&paths, "", None),
+            Err(DevicePathError::Ambiguous(3))
+        );
+        assert_eq!(
+            select_device_path_for_target(&paths, &other, None),
+            Err(DevicePathError::Ambiguous(3))
+        );
+        assert_eq!(
+            select_device_path_for_target(&paths, "", Some(target)),
+            Ok(one.clone())
+        );
+        assert_eq!(
+            select_device_path_for_target(&paths, &sibling, Some(target)),
+            Ok(sibling)
+        );
+        assert_eq!(
+            select_device_path_for_target(&[other], "", Some(target)),
+            Err(DevicePathError::Missing)
+        );
+    }
+
+    #[test]
+    fn report_path_accepted_follows_the_current_target() {
+        // 两条同型号遥控器（只差地址）与"同一支的另一个 HID 实例"（只差实例号）。
+        let address = 0xc05d_39c2_d9db_u64;
+        let bound = "\\\\?\\hid#{00001812-0000-1000-8000-00805f9b34fb}_dev_vid&012717_pid&32b8_rev&00a4_c05d39c2d9db#a&29fe826e&2&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
+        let sibling = "\\\\?\\hid#{00001812-0000-1000-8000-00805f9b34fb}_dev_vid&012717_pid&32b8_rev&00a4_c05d39c2d9db#a&29fe826e&1&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
+        let other = "\\\\?\\hid#{00001812-0000-1000-8000-00805f9b34fb}_dev_vid&012717_pid&32b8_rev&00a4_e85540b1b76b#a&842e54&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
+
+        // 有目标：只认目标地址——绑定路径与同地址的其他实例都算，另一支不算。
+        assert!(report_path_accepted(bound, Some(address), bound));
+        assert!(report_path_accepted(bound, Some(address), sibling));
+        assert!(!report_path_accepted(bound, Some(address), other));
+        // 绑定停在另一支上时，那一支同样不算、目标那一支照样算
+        // （2026-10-13 现场：连的是 2 Pro，按 2 却让②步通过了）。
+        assert!(!report_path_accepted(other, Some(address), other));
+        assert!(report_path_accepted(other, Some(address), bound));
+        // 还没有目标：沿用旧行为——只认绑定路径（大小写不敏感）。
+        assert!(report_path_accepted(bound, None, bound));
+        assert!(report_path_accepted(bound, None, &bound.to_uppercase()));
+        assert!(!report_path_accepted(bound, None, sibling));
+        assert!(!report_path_accepted(bound, None, other));
+    }
 
     fn report(usages: &[u16]) -> Vec<u8> {
         let mut bytes = vec![0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0];

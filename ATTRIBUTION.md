@@ -2,6 +2,8 @@
 
 本仓库是面向 Windows 的 Rust/Tauri 工程。
 
+本个人版基于 [GetSayAll/remote-mic-app-windows](https://github.com/GetSayAll/remote-mic-app-windows)，软件代码按 GPL-3.0-only 保留原作者版权与来源；个人修改者为 luck-gh。上游项目链接用于来源追溯，个人版下载与反馈入口由 README 维护。
+
 ## 统一上游全按键支持（2026-10-03）
 
 - 固定来源为 [GetSayAll/remote-mic-app-windows `4d4de099`](https://github.com/GetSayAll/remote-mic-app-windows/tree/4d4de099f823cc67f334ff2a498e98c2806e4455)，采用 `hardware/RC003/helper` 的 Rust Helper、内嵌 agent、固定 Gadget 构建输入，以及 `rc003_bridge.rs`、`rc003_task.rs` 和授权交互。项目与来源均按已有 GPL-3.0-only 归属保留；Frida 固定 17.18.0 的许可和下载散列随资源锁定及安装包提供。
@@ -11,6 +13,9 @@
 - 本节按用户新方向替代下文历史同步“不采用计划任务、Gadget 与报告层合成”的实现选择；历史来源与证据保留。当前部署和验证结果见 既有输入证据（历史 Git `334c372:artifacts/hid-gatt-access-20260919/evidence.md`）。
 
 ### 前台回归调查的参考边界（2026-10-03）
+
+- 2026-10-15 Menu 续约故障的 Helper 日志隔离复用项目已用的 Rust 标准库通道，不新增依赖、不复制外部实现。官方 [SyncSender::try_send](https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.try_send) 保证队列满时立即返回，适用于可计数丢弃的诊断；所有权与按键控制仍走既有独立通道，不套用丢弃策略。[stdout](https://doc.rust-lang.org/std/io/fn.stdout.html) 说明进程共享输出缓冲受锁保护，因此控制台与文件输出一起离开捕获线程；[JoinHandle](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html) 的 drop 是 detach、不是取消 I/O，故关闭采用有界等待并明确记录实际排空，不能宣称同步磁盘调用可被终止。未改 1500/3000ms 安全时限；受控 sink 锁实验能证明此阻塞缺陷，不证明现场所有延迟只有一个来源，实测归 [既有故障](Bugs/2026-10-03-foreground-input-regression.md#2026-10-15-晚间-menu-未唤醒捕获续约超时与桥接重连)。
+- 同晚用户纠正的“长按语音中断后 VSCode 调试提示”另有音频队列溢出及物理按住配对证据。音频线程调度采用 Microsoft [MMCSS](https://learn.microsoft.com/en-us/windows/win32/procthread/multimedia-class-scheduler-service) 的内置 `Audio` 任务，复用现有 windows 0.62.2 / `Win32_System_Threading`，不新增依赖或更改系统全局优先级设置/计时器/注册表。[AvSetMmThreadCharacteristicsW](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avsetmmthreadcharacteristicsw) 只注册调用线程、首次 task index 为 0；[AvRevertMmThreadCharacteristics](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avrevertmmthreadcharacteristics) 要求在同线程撤销，因此采用不可 Send/Sync 的 worker 局部 RAII。注册失败记录 HRESULT，保持原普通权限功能；不要求管理员。官方 [GetCurrentPadding](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-getcurrentpadding) 与 [Rendering a Stream](https://learn.microsoft.com/en-us/windows/win32/coreaudio/rendering-a-stream) 确认可写帧数为实际 buffer 减 padding，复核现有 wasapi 0.24.0 实现一致，没有自行重采样或改变 32000 样本容量/5ms 轮询。当前 PC/CABLE 的 45 秒实际构建负载对照：未注册时溢出且最大 pump 间隔 99ms，注册后 720000 样本全部提交并排空、最大间隔 20ms、同线程撤销通过；两轮编译阶段和 CPU 强度不完全相同，不外推全部负载或双型号实机。具体身份、失败回归与终态指标边界归同主题 Bug。
 
 - 2026-10-04 未部署的脚本重载实验曾参考 [Frida Gadget Script](https://frida.re/docs/gadget/#script)，在自有进程中观察到两次不同实例重载。复审发现共享脚本跨宿主、重载握手期限及失败观测证据仍有缺口；用户正常重启后，同一安装版已恢复菜单和增强键，因此撤回实验，不作为当前产品能力。根因和恢复证据归同主题 Bug；保留原 ignore 模式的真实部署边界，不把实验扩大解释为真机更新通过。
 
@@ -74,6 +79,7 @@
 
 - 历史应用使用的上游 App Logo 与 App Icon 沿用 `HD838A/remote-mic-app` 的版权边界：属于 HD838A 保留版权的专有品牌资产，不纳入 GPL-3.0-only；Windows 版适用范围和授权条件见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。
 - 2026-10-06 个人修改版使用 [SVG 母版](public/app-logo-personal.svg) 与 [PNG 预览](public/app-logo-personal.png)：用户确认的“轻放”独立几何设计，未复制或改编上游小鸭品牌资产。`scripts/generate-app-icons.py` 从固定母版派生 UI/favicon、Windows ICO、窗口和 16/20/24/32 px 托盘资产；小尺寸仅做光学调整，未新增运行依赖。贡献范围为**仅本地定制**，这是上游贡献范围，不限制 GPL 赋予的再分发权利。正式运行路径不使用历史专有品牌资产；`icon-source.png` 仅保留历史取证身份，不进入运行或打包资产。修改者展示身份为 `luck-gh`，本版当前展示“个人版”，修改日期 2026-10-06；商标授权未核实，GPL 不作为商标授权依据。原软件版权、GPL-3.0-only 与第三方许可保持。
+- 2026-10-15 用户确认清理上游推广展示：移除 README 中的上游社交账号、二维码、宣传视频与网盘入口，并回收两张二维码及视频封面。`Screenshots/sayall-key-mapping.png` 和 `Screenshots/sayall-connection-audio-setup.png` 保留为上游历史界面素材，不作为当前个人版界面证明；README 使用已有个人版 SVG 母版。新增个人版截图使用 `Screenshots/personal/`，不覆盖这些历史同名文件。2026-10-16 README 增加当前安装版 1.0.0 设置页实拍，身份与范围见 [截图说明](Screenshots/personal/README.md)。同步边界见 [分支规范](BRANCH_MANAGEMENT.md#个人版展示与上游同步)。推广素材清理不改变软件版权、第三方许可或历史来源记录。
 
 ## 产品与 UI 基准
 
@@ -170,7 +176,14 @@
 
 ## BLE 僵死链路自动恢复调研来源（2026-09-05，重连健壮性专项）
 
-场景：应用被强杀（未走正常关闭）后 Windows 侧残留僵死 GATT/HID 链路或服务缓存，普通重试永不恢复（本机真机取证：CCCD 订阅写入 E_ABORT、HID 接口从系统消失；examples\radio_probe 与 examples\gatt_snoop 探针复现）。已实现 `bluetooth_radio.rs` 自动恢复：重连连续失败达阈值时关开蓝牙无线电；每窗口最多 2 次并在 60 秒冷却后重开窗口，避免无限普通重连；应用启动时预取 Radio 对象与权限，避免故障发生后 WinRT 枚举自身也返回 `0x80070008`。2026-09-13 依据微软 `Close` 所有权边界与 MS Q&A 99038 的 service/device 成对释放结论，进一步补齐连接构建中途失败的全量显式清理；此前仅订阅后期分支清理，会让普通重试自身可能累积 WinRT BLE 资源。真机验证：系统栈健康时无线电开关周期后重连循环立即成功（Testing\investigation\sayall-gatt-20260905-live.log T/C 能力交换取证）；预热缓存和失败路径清理版僵死态仍待安装包复验。关键参考：
+### 2026-10-14 蓝牙鼠标共存与连接参数读回
+
+- Microsoft `BluetoothLEPreferredConnectionParameters.ThroughputOptimized` 说明该模式提高吞吐、增加功耗，并减少其他蓝牙设备的并发连接容量：<https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.bluetoothlepreferredconnectionparameters.throughputoptimized>。
+- Microsoft `BluetoothLEDevice.RequestPreferredConnectionParameters` 建议只在需要高吞吐的时段持有请求，并在多外设场景考虑更保守的参数；`GetConnectionParameters` 返回系统合并后的实际连接参数，须与请求返回结果分开观察：<https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.bluetoothledevice.requestpreferredconnectionparameters>、<https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.bluetoothledevice.getconnectionparameters>。
+- Microsoft `BluetoothLEDevice.ConnectionParametersChanged` 在连接参数变化时发出事件：<https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.bluetoothledevice.connectionparameterschanged>。
+- 本轮只用公开 WinRT `ConnectionParametersChanged` / `GetConnectionParameters` 增加遥控器链路读回与生命周期日志，未复制外部代码，未改连接参数策略。旧版 MX Anywhere 3 报障缺同一时刻日志，不能据此认定该参数是鼠标卡住的根因；先验收已合入的无线电恢复删除（`74aa3bb`），见[上游历史鼠标故障记录](https://github.com/GetSayAll/remote-mic-app-windows/blob/05c37cf5f740db7f34cc2d9a4270dca7bd2c2e6d/Bugs/2026-10-14-bluetooth-mouse-freeze.md)，其现场结果不代表个人版通过。
+
+场景：应用被强杀（未走正常关闭）后 Windows 侧残留僵死 GATT/HID 链路或服务缓存，普通重试永不恢复（本机真机取证：CCCD 订阅写入 E_ABORT、HID 接口从系统消失；examples\radio_probe 与 examples\gatt_snoop 探针复现）。已实现 `bluetooth_radio.rs` 自动恢复：重连连续失败达阈值时关开蓝牙无线电；每窗口最多 2 次并在 60 秒冷却后重开窗口，避免无限普通重连；应用启动时预取 Radio 对象与权限，避免故障发生后 WinRT 枚举自身也返回 `0x80070008`。2026-09-13 依据微软 `Close` 所有权边界与 MS Q&A 99038 的 service/device 成对释放结论，进一步补齐连接构建中途失败的全量显式清理；此前仅订阅后期分支清理，会让普通重试自身可能累积 WinRT BLE 资源。真机验证：系统栈健康时无线电开关周期后重连循环立即成功（Testing\investigation\sayall-gatt-20260905-live.log T/C 能力交换取证）；预热缓存和失败路径清理版僵死态仍待安装包复验。**2026-10-14 更新：整套"自动关开蓝牙无线电"（含 PnP 重启回退）已按产品决策移除**——该动作会断开用户全部蓝牙设备（现场报障「整个蓝牙周期性中断」），失败路径改为只按退避持续重连；僵死态文案与分类日志保留，见 `crates/sayall-windows/src/bluetooth_radio.rs` 模块头。关键参考：
 
 - **微软官方 GATT 客户端文档**（Dispose 后系统"小超时"自动断开、重建设备对象按需重连；BluetoothLEDevice.Close 仅当本应用是唯一持有者才关连接；GATT 连接/发现可能因系统队列等待数分钟且当前不能取消）：`learn.microsoft.com/windows/apps/develop/devices-sensors/gatt-client`、`learn.microsoft.com/uwp/api/windows.devices.bluetooth.bluetoothledevice.close`
 - **微软 BluetoothLEDevice 构造入口文档**：`FromIdAsync` 明确要求从 UI 线程调用（可能触发访问授权）；`FromBluetoothAddressAsync` 无此线程要求，并支持从已进入系统缓存的配对设备地址重建设备对象。2026-09-12 现场的 MTA `FromIdAsync` 先返回 Windows 资源错误，后续日志时序显示下一次请求占住 BLE 工作线程（阶段日志缺失，属结合代码的推断），故改用配对 AssociationEndpoint ID 内的对端地址调用后者；不记录真实地址。官方依据：`learn.microsoft.com/uwp/api/windows.devices.bluetooth.bluetoothledevice.fromidasync`、`learn.microsoft.com/uwp/api/windows.devices.bluetooth.bluetoothledevice.frombluetoothaddressasync`。
@@ -207,6 +220,13 @@
 重连，日志落 `ble_recovery_decision action=skip_recovery reason=stack_exhausted_proven_ineffective`；
 非僵死码仍走原 Off/On 路径保留兜底。复算脚本 `scripts/analyze-radio-recovery-ab.py`，
 操作与判读标准见 `Testing/WindowsBleResourceRecovery.md`。
+
+**2026-10-14 后续（本次决策）**：Off/On 与 PnP 路径已**整体移除**（不再区分僵死
+态：所有失败一律只按退避持续重连）。触发点是外部报障——应用开启时"整个蓝牙
+周期性中断"（用户可感的全局断开），关闭应用后恢复；复核本机日志发现该机制
+曾真实执行 2 次（10-08、10-13），其中一次与恢复无关、一次无法与"时间自然
+恢复"区分，且每次都会让全部蓝牙设备断开约 4 秒。`ble_recovery_decision`
+不再产生（僵死态改记 `ble_failure_class action=persistent_retry`）。
 
 ### 2026-09-10 重连窗口 F5 泄漏补充
 
@@ -325,6 +345,8 @@
 - **预览版通道（2026-09-08 增补）**：Tauri 官方 Runtime Configuration 文档明确支持通过 `UpdaterBuilder::endpoints` 在运行时选择 stable/beta 等独立通道；本仓库据此保持默认稳定端点不变，仅在用户显式开启“检查预览版更新”后覆盖端点。GitHub Releases 页面公开提供标准 Atom feed（`releases.atom`），包含已发布的正式版与 Pre-release、排除 Draft；实现从本仓库 feed 的 `alternate` 链接读取 SemVer tag，选择最高版本并自行构造本仓库 `https://github.com/GetSayAll/remote-mic-app-windows/releases/download/<tag>/latest.json`，避开匿名 REST API 每 IP 60 次/小时限流。最终安装包仍由 Tauri minisign 强制验签。
 
 ### 2026-10-10 个人版更新源核查与 Gitee 选择
+
+2026-10-15 用户明确要求恢复个人 GitHub 更新源并本地合并最新上游，随后明确授权创建仓库外个人签名密钥并替换内置公钥。固定上游为 `05c37cf5f740db7f34cc2d9a4270dca7bd2c2e6d`；整合身份、保留/排除模块与本机验证只归 [更新源故障记录](Bugs/2026-10-15-personal-updater-source.md)。接入 [Tauri 官方 updater](https://v2.tauri.app/plugin/updater/) 的独立公钥与静态清单模式；校验工具逐项对照本机锁定 `tauri-plugin-updater 2.11.0` 的 `verify_signature`，复用其既有 `base64`/`minisign-verify` 依赖，没有自行实现签名算法。稳定/预览/下载白名单均锁定个人 `luck-gh/remote-mic-app-windows`；生产禁止环境源覆盖，不回退上游。新公钥不代表远端 Secret 已配置，个人仓库尚无发行资产，Gitee仍待实际仓库。历史默认源描述保留为当时事实，不再代表当前候选。
 
 - **默认与运行时边界（2026-10-12）**：稳定源配置及预览源代码路径的默认值仍为 `GetSayAll/remote-mic-app-windows`；`SAYALL_UPDATER_ENDPOINT` 可覆盖运行时端点。本轮没有检查当前进程环境，也没有观察网络请求，因此只确认默认配置，不能断言当前运行实例实际请求了哪个源。用户要求本轮暂停修改更新源；个人 GitHub/Gitee 来源接入仍以既有 TODO 条目为准。
 

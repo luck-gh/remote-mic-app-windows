@@ -30,7 +30,8 @@
 //!   才吞对应 UP 沿；任一 DOWN 沿泄漏（HOLD_LEAKED，含 typematic 重复沿）
 //!   或配对未知（钩子中途启动，HOLD_NONE）一律放行 UP，宁可向 OS 多送
 //!   一个孤立 UP（无害）也不留粘键。
-//! - 会话结束保留 250ms 宽限，覆盖 BLE 通知晚到的物理 F5 释放沿。
+//! - 音频会话停止/中止后，已经接管的物理按住持续吞掉重复沿直到真实 UP；
+//!   250ms 宽限只用于尚未建立按住配对的首沿，不能提前放掉仍按住的原生键。
 //!
 //! 护栏：回调内只读原子状态 + 短睡眠轮询，无 IO/锁；线程退出时卸钩。
 
@@ -81,7 +82,13 @@ mod windows_impl {
     }
 
     fn swallow_ready() -> bool {
-        decide(VK_F5, false, session_active(), armed(), HOLD_NONE)
+        decide(
+            VK_F5,
+            false,
+            session_active(),
+            armed(),
+            HOLD_PAIRING.load(Ordering::Relaxed),
+        )
     }
 
     /// 微信输入法自注入的存活标记（break key）：其钩子存活时，吞掉语音和弦的
@@ -110,7 +117,8 @@ mod windows_impl {
         WETYPE_MARKER_LAST_EXTRA.load(Ordering::Relaxed)
     }
 
-    /// 纯决策函数：给定状态与按键，是否吞键（单元测试覆盖）。
+    /// 纯决策函数：首个 DOWN 由会话/武装决定，已接管的按住锁存到真实 UP；
+    /// 已经泄漏的按住不因新会话中途接管（单元测试覆盖）。
     /// UP 沿只按配对状态裁决（会话/武装不参与）：本次按住的 DOWN 沿全部被
     /// 吞下（hold==HOLD_SWALLOWED_ALL）才吞 UP，防"DOWN 泄漏 + UP 吞下"粘键；
     /// 配对未知（钩子中途启动）与已泄漏一律放行 UP（宁可送孤立 UP，不留粘键）。
@@ -127,7 +135,13 @@ mod windows_impl {
         if is_key_up {
             return hold_pairing == HOLD_SWALLOWED_ALL;
         }
-        session || armed_now
+        match hold_pairing {
+            // Audio stop/abort does not end the physical hold. Keep its repeats
+            // private until actual UP, including after the arming grace expires.
+            HOLD_SWALLOWED_ALL => true,
+            HOLD_LEAKED => false,
+            _ => session || armed_now,
+        }
     }
 
     /// 纯状态转移：DOWN 沿裁决后更新配对状态。任一 DOWN 沿泄漏（含 typematic
@@ -180,9 +194,10 @@ mod windows_impl {
             }
             HostSuppressorMessage::F5Down => {
                 // DOWN 沿：先试武装状态，未武装则 60ms 有界等待。
-                let waited = !swallow_ready();
+                let ready = swallow_ready();
+                let waited = !ready && HOLD_PAIRING.load(Ordering::Relaxed) != HOLD_LEAKED;
                 let swallowed = if !waited {
-                    true
+                    ready
                 } else {
                     let deadline = now_ms() + BOUNDED_WAIT_MS;
                     let mut armed_late = false;
@@ -318,8 +333,47 @@ pub use windows_impl::{decide, track_down, HOLD_LEAKED, HOLD_NONE, HOLD_SWALLOWE
 #[cfg(test)]
 mod tests {
     #[test]
+    fn captured_hold_survives_audio_abort_until_physical_release() {
+        let mut hold = super::HOLD_NONE;
+        let first = super::decide(0x74, false, true, false, hold);
+        hold = super::track_down(hold, first);
+        assert!(first);
+        // Audio abort and its 250 ms grace have ended, while the physical key
+        // remains down. Repeats belong to the already captured hold.
+        for _ in 0..5 {
+            let repeated = super::decide(0x74, false, false, false, hold);
+            assert!(repeated, "captured repeat leaked after audio abort");
+            hold = super::track_down(hold, repeated);
+        }
+        assert!(super::decide(0x74, true, false, false, hold));
+        // Real UP clears the hold; a later unrelated first DOWN is native.
+        hold = super::HOLD_NONE;
+        assert!(!super::decide(0x74, false, false, false, hold));
+    }
+
+    #[test]
+    fn previously_native_hold_is_not_adopted_by_a_new_voice_session() {
+        for (session, armed) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(!super::decide(
+                0x74,
+                false,
+                session,
+                armed,
+                super::HOLD_LEAKED
+            ));
+            assert!(!super::decide(
+                0x74,
+                true,
+                session,
+                armed,
+                super::HOLD_LEAKED
+            ));
+        }
+    }
+
+    #[test]
     fn only_remote_or_session_f5_down_is_swallowed() {
-        // DOWN 沿：非 F5 一律透传；F5 仅在会话或武装时吞（配对状态不参与）。
+        // 首个 DOWN：非 F5 一律透传；F5 在会话或武装时开始捕获。
         assert!(!super::decide(0x41, false, false, false, super::HOLD_NONE));
         assert!(!super::decide(
             0x41,

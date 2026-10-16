@@ -78,7 +78,11 @@ jobs:
 
       - name: Generate updater manifest and stage release assets
         shell: pwsh
-        run: ./scripts/generate-updater-manifest.ps1 -Tag $env:GITHUB_REF_NAME
+        run: |
+          $installers = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer.' }
+          ./scripts/verify-updater-signing.ps1 -Installer $installers[0].FullName
+          ./scripts/generate-updater-manifest.ps1 -Tag $env:GITHUB_REF_NAME -Repository $env:GITHUB_REPOSITORY
 
       - name: Show staged assets before release (delete-free verification)
         shell: pwsh
@@ -115,7 +119,7 @@ jobs:
           - latest.json
           - SHA256SUMS.txt
           "@
-          gh release create $tag --draft --prerelease --title "无线麦 SayAll Windows $tag 预览版" --notes $notes @assets
+          gh release create $tag --draft --prerelease --title "无线麦 · 个人版 $tag 预览版" --notes $notes @assets
           if ($LASTEXITCODE -ne 0) {
             throw "gh release create 失败（exit $LASTEXITCODE；若 Release 已存在请人工核对后处理，本流程不做任何删除/覆盖）"
           }

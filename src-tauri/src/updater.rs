@@ -10,8 +10,8 @@
 //! - 默认端点来自 tauri.conf.json（GitHub Releases stable latest.json）；用户
 //!   显式开启预览版后，通过 GitHub Releases Atom feed 选择最高 SemVer 的已发布
 //!   Release（包含 Pre-release）并在运行时覆盖为其 latest.json；环境变量
-//!   `SAYALL_UPDATER_ENDPOINT` 可覆盖端点（release 构建强制 https，仅用于
-//!   本地/开发验证，正式配置不含任何 dangerous 开关）。
+//!   `SAYALL_UPDATER_ENDPOINT` 仅可在调试构建覆盖端点；生产构建忽略它，
+//!   稳定与预览均只检查个人仓库，正式配置不含任何 dangerous 开关。
 //! - 超时：检查请求 30s；下载 20 分钟（安装器 ~10-20MB，慢速链路兜底）。
 
 use crate::AppState;
@@ -26,9 +26,39 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const PROGRESS_EMIT_MIN_INTERVAL_BYTES: u64 = 128 * 1024;
 const ENDPOINT_OVERRIDE_ENV: &str = "SAYALL_UPDATER_ENDPOINT";
 const PREVIEW_RELEASES_FEED: &str =
-    "https://github.com/GetSayAll/remote-mic-app-windows/releases.atom";
+    "https://github.com/luck-gh/remote-mic-app-windows/releases.atom";
 const PREVIEW_MANIFEST_NAME: &str = "latest.json";
-const RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/GetSayAll/remote-mic-app-windows/releases/download/";
+const RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/luck-gh/remote-mic-app-windows/releases/download/";
+static CHECK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Check both manifest discovery and its asset: an accepted manifest must never
+/// redirect installation back to the upstream product. Minisign remains mandatory.
+fn validate_download_source(url: &reqwest::Url) -> bool {
+    #[cfg(debug_assertions)]
+    if url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
+        return true;
+    }
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(asset) = url.path().strip_prefix(RELEASE_DOWNLOAD_PATH_PREFIX) else {
+        return false;
+    };
+    let Some((tag, name)) = asset.split_once('/') else {
+        return false;
+    };
+    semver::Version::parse(tag.trim_start_matches('v')).is_ok()
+        && !name.contains('/')
+        && name.starts_with("SayAll-Windows-")
+        && name.ends_with("-x64-setup.exe")
+}
 /// 前端进度事件名（downloaded/contentLength/finished）。
 const PROGRESS_EVENT: &str = "app-update-progress";
 
@@ -156,9 +186,8 @@ fn preview_manifest_endpoint(
                 .find(|link| link.rel == "alternate")?
                 .href
                 .trim_end_matches('/');
-            let tag = href.strip_prefix(
-                "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/",
-            )?;
+            let tag = href
+                .strip_prefix("https://github.com/luck-gh/remote-mic-app-windows/releases/tag/")?;
             semver::Version::parse(tag.trim_start_matches('v'))
                 .ok()
                 .map(|version| (tag.to_owned(), version))
@@ -168,7 +197,7 @@ fn preview_manifest_endpoint(
         return Ok(None);
     };
     let url = format!(
-        "https://github.com/GetSayAll/remote-mic-app-windows/releases/download/{tag}/{PREVIEW_MANIFEST_NAME}"
+        "https://github.com/luck-gh/remote-mic-app-windows/releases/download/{tag}/{PREVIEW_MANIFEST_NAME}"
     )
     .parse::<reqwest::Url>()
     .map_err(|_| PreviewManifestError::InvalidReleaseUrl)?;
@@ -182,6 +211,7 @@ fn preview_manifest_endpoint(
 }
 
 async fn resolve_update_endpoint(include_prereleases: bool) -> Result<UpdateEndpoint, String> {
+    #[cfg(debug_assertions)]
     if let Some(endpoint) = std::env::var_os(ENDPOINT_OVERRIDE_ENV) {
         let endpoint = endpoint
             .to_string_lossy()
@@ -223,7 +253,6 @@ async fn resolve_update_endpoint(include_prereleases: bool) -> Result<UpdateEndp
         .header("Accept", "application/atom+xml")
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
         .map_err(|_error| {
             note(format!(
                 "check.fail channel=preview stage=releases_request error_domain=http error_code=request_failed reason=network_or_status retryable=true took_ms={}",
@@ -231,6 +260,19 @@ async fn resolve_update_endpoint(include_prereleases: bool) -> Result<UpdateEndp
             ));
             "网络连接失败，请稍后重试".to_owned()
         })?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        note(
+            "check.preview_resolved available=false reason=personal_releases_not_found".to_owned(),
+        );
+        return Ok(UpdateEndpoint::NoPublishedPreview);
+    }
+    let response = response.error_for_status().map_err(|_| {
+        note(
+            "check.fail channel=preview stage=releases_status reason=personal_source_unavailable"
+                .to_owned(),
+        );
+        "个人版更新暂时不可用，请稍后重试".to_owned()
+    })?;
     let feed_xml = response.text().await.map_err(|_error| {
         note(format!(
             "check.fail channel=preview stage=releases_read error_domain=http error_code=body_read_failed reason=response_body_unavailable retryable=true took_ms={}",
@@ -306,6 +348,15 @@ pub async fn check_app_update(
     state: State<'_, AppState>,
 ) -> Result<AppUpdateInfo, String> {
     let started = Instant::now();
+    let generation = {
+        let mut pending = state
+            .pending_update
+            .lock()
+            .map_err(|_| "更新状态异常".to_owned())?;
+        let generation = CHECK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        *pending = None;
+        generation
+    };
     let include_prereleases = state
         .settings
         .load()
@@ -319,11 +370,13 @@ pub async fn check_app_update(
     } else {
         "stable"
     };
-    note(format!("check.start source=command channel={channel}"));
+    note(format!(
+        "check.start source=personal_github channel={channel} generation={generation}"
+    ));
     let endpoint = resolve_update_endpoint(include_prereleases).await?;
     if matches!(&endpoint, UpdateEndpoint::NoPublishedPreview) {
-        if let Ok(mut pending) = state.pending_update.lock() {
-            *pending = None;
+        if CHECK_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return Err("更新设置已改变，请重新检查".to_owned());
         }
         return Ok(AppUpdateInfo {
             current_version: app.package_info().version.to_string(),
@@ -339,8 +392,23 @@ pub async fn check_app_update(
         UpdateEndpoint::ConfiguredStable | UpdateEndpoint::NoPublishedPreview => None,
     };
     let updater = build_updater(&app, exit_cleanup, runtime_endpoint)?;
-    match updater.check().await {
+    let checked = updater.check().await;
+    let mut pending = state
+        .pending_update
+        .lock()
+        .map_err(|_| "更新状态异常".to_owned())?;
+    if CHECK_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        note(format!(
+            "check.cancel generation={generation} reason=superseded"
+        ));
+        return Err("更新设置已改变，请重新检查".to_owned());
+    }
+    match checked {
         Ok(Some(update)) => {
+            if !validate_download_source(&update.download_url) {
+                note(format!("check.fail generation={generation} stage=asset_source reason=foreign_asset retryable=false"));
+                return Err("更新包不属于个人版，已停止更新".to_owned());
+            }
             let info = AppUpdateInfo {
                 current_version: update.current_version.clone(),
                 available: true,
@@ -354,10 +422,7 @@ pub async fn check_app_update(
                 update.version,
                 elapsed_ms(started)
             ));
-            *state
-                .pending_update
-                .lock()
-                .map_err(|_error| "更新状态异常，请重启应用后重试".to_owned())? = Some(update);
+            *pending = Some(update);
             Ok(info)
         }
         Ok(None) => {
@@ -365,9 +430,7 @@ pub async fn check_app_update(
                 "check.ok available=false took_ms={}",
                 elapsed_ms(started)
             ));
-            if let Ok(mut pending) = state.pending_update.lock() {
-                *pending = None;
-            }
+            *pending = None;
             Ok(AppUpdateInfo {
                 current_version: app.package_info().version.to_string(),
                 available: false,
@@ -384,9 +447,7 @@ pub async fn check_app_update(
             // 取不到清单（404 类）→ 呈现为"已经是最新版本"（2026-09-06 终裁）。
             if release_not_found_counts_as_up_to_date(&error) {
                 note("check.presented_as_up_to_date reason=release_not_found".to_owned());
-                if let Ok(mut pending) = state.pending_update.lock() {
-                    *pending = None;
-                }
+                *pending = None;
                 return Ok(AppUpdateInfo {
                     current_version: app.package_info().version.to_string(),
                     available: false,
@@ -425,6 +486,14 @@ pub async fn set_app_update_preferences(
     include_prereleases: bool,
     state: State<'_, AppState>,
 ) -> Result<AppUpdatePreferences, String> {
+    {
+        let mut pending = state
+            .pending_update
+            .lock()
+            .map_err(|_| "更新状态异常".to_owned())?;
+        CHECK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *pending = None;
+    }
     let settings = state.settings.clone();
     let save_result = tauri::async_runtime::spawn_blocking(move || {
         settings.save_check_prerelease_updates(include_prereleases)
@@ -442,6 +511,14 @@ pub async fn set_app_update_preferences(
         ));
         "保存预览版更新设置失败，请稍后重试".to_owned()
     })?;
+    {
+        let mut pending = state
+            .pending_update
+            .lock()
+            .map_err(|_| "更新状态异常".to_owned())?;
+        CHECK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *pending = None;
+    }
     note(format!(
         "preference.save result=ok include_prereleases={include_prereleases}"
     ));
@@ -466,6 +543,10 @@ pub async fn install_app_update(app: AppHandle, state: State<'_, AppState>) -> R
             "请先检查更新，再下载安装".to_owned()
         })?;
     note(format!("install.start version={}", update.version));
+    if !validate_download_source(&update.download_url) {
+        note("install.fail stage=asset_source reason=foreign_asset retryable=false".to_owned());
+        return Err("更新包不属于个人版，已停止安装".to_owned());
+    }
     // 下载整体超时（check 的超时不作用于下载请求）。
     update.timeout = Some(DOWNLOAD_TIMEOUT);
 
@@ -539,6 +620,41 @@ pub async fn install_app_update(app: AppHandle, state: State<'_, AppState>) -> R
 mod tests {
     use super::*;
 
+    #[test]
+    fn personal_asset_source_rejects_upstream_and_spoofed_urls() {
+        let good = "https://github.com/luck-gh/remote-mic-app-windows/releases/download/v1.0.0/SayAll-Windows-1.0.0-x64-setup.exe";
+        assert!(validate_download_source(&good.parse().unwrap()));
+        for bad in [
+            good.replace("luck-gh", "GetSayAll"),
+            good.replace("github.com", "github.com.evil.example"),
+            good.replace("github.com/", "github.com:8443/"),
+            good.replace("https://", "http://"),
+            good.replace("/v1.0.0/", "/not-a-version/"),
+            good.replace("/v1.0.0/", "/v1.0.0/extra/"),
+            format!("{good}?redirect=upstream"),
+        ] {
+            assert!(
+                !validate_download_source(&bad.parse().unwrap()),
+                "foreign source accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn personal_preview_never_uses_upstream_release_links() {
+        let mut releases = feed(&["v1.0.1-beta.1", "v1.0.0"]);
+        releases.entries.push(ReleaseFeedEntry {
+            links: vec![ReleaseFeedLink {
+                rel: "alternate".to_owned(),
+                href: "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/v99.0.0"
+                    .to_owned(),
+            }],
+        });
+        let (url, tag) = preview_manifest_endpoint(&releases).unwrap().unwrap();
+        assert_eq!(tag, "v1.0.1-beta.1");
+        assert!(url.path().starts_with(RELEASE_DOWNLOAD_PATH_PREFIX));
+    }
+
     fn feed(tags: &[&str]) -> ReleasesFeed {
         ReleasesFeed {
             entries: tags
@@ -547,7 +663,7 @@ mod tests {
                     links: vec![ReleaseFeedLink {
                         rel: "alternate".to_owned(),
                         href: format!(
-                            "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/{tag}"
+                            "https://github.com/luck-gh/remote-mic-app-windows/releases/tag/{tag}"
                         ),
                     }],
                 })
@@ -562,7 +678,7 @@ mod tests {
         assert_eq!(tag, "v0.2.2");
         assert_eq!(
             endpoint.as_str(),
-            "https://github.com/GetSayAll/remote-mic-app-windows/releases/download/v0.2.2/latest.json"
+            "https://github.com/luck-gh/remote-mic-app-windows/releases/download/v0.2.2/latest.json"
         );
     }
 
@@ -577,7 +693,7 @@ mod tests {
                     },
                     ReleaseFeedLink {
                         rel: "self".to_owned(),
-                        href: "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/not-a-version"
+                        href: "https://github.com/luck-gh/remote-mic-app-windows/releases/tag/not-a-version"
                             .to_owned(),
                     },
                 ],

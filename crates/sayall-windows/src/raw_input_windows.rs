@@ -2,7 +2,8 @@ use crate::button_mapping::EngineMessage;
 use crate::key_gate;
 use crate::raw_input::{
     button_for_usage, decode_report_usages, normalize_device_path, parse_raw_hid_body,
-    select_single_device_path, DevicePathError, RawInputPhase, RawInputSnapshot, RawKeyboardEvent,
+    select_device_path_for_target, DevicePathError, RawInputPhase, RawInputSnapshot,
+    RawKeyboardEvent,
 };
 use crate::PlatformError;
 use std::cell::RefCell;
@@ -55,6 +56,8 @@ const AWAITING_DEVICE_MESSAGE: &str =
      睡眠唤醒或蓝牙栈僵死）。监听已就位，系统恢复该接口后会自动重新绑定，\
      无需手动重连或重启应用。";
 static CLASS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+/// "目标地址兜底路径"是否已经记过日志（每次监听器启动重置；2026-10-13）。
+static TARGET_PATH_ACCEPT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static THREAD_CONTEXT: RefCell<Option<ListenerContext>> = const { RefCell::new(None) };
@@ -389,14 +392,18 @@ fn run_listener(
     }
 
     // 设备选择：缺失（系统 HOGP 接口缺失/遥控器未连接）不视为失败，进入 Awaiting；
-    // 多设备歧义仍按失败处理，由上层重启。
-    let selected_path = match select_single_device_path(&paths) {
+    // 多候选（两支同型号遥控器同时在线，或同一支换过实例、旧实例还在枚举里）**不再判失败**
+    // ——2026-10-13 现场：此时判失败会让监听器每 10 秒重启一次（日志里连续 listener_start_failed），
+    // 这 10 秒 | 更长窗口内按键完全不可用，而且失败与用户看到的现象毫无关联。候选只决定
+    // "从哪一路开始听"；真正的归属由「应用正在用的那支」（`remote_target`）在枚举过滤
+    // （`filter_paths_for_target`）、绑定审计与报文接受（同地址的其他实例路径也接受）三处收窄。
+    let selected_path = match select_device_path_for_target(&paths, "", crate::remote_target::get())
+    {
         Ok(path) => normalize_device_path(&path),
         Err(DevicePathError::Missing) => String::new(),
-        Err(error) => {
-            let _ = unsafe { DestroyWindow(window) };
-            let _ = unsafe { UnregisterClassW(class_name_ptr, Some(instance)) };
-            return Err(error.to_string());
+        Err(DevicePathError::Ambiguous(count)) => {
+            crate::ble::gatt_note(format!("raw_input binding_initial action=awaiting reason=unknown_target_ambiguous matched_device_count={count}"));
+            String::new()
         }
     };
     THREAD_CONTEXT.with(|slot| {
@@ -409,6 +416,8 @@ fn run_listener(
             binding_present: !selected_path.is_empty(),
         });
     });
+    // 每次监听器启动重置"目标兜底路径"的日志标记（2026-10-13）。
+    TARGET_PATH_ACCEPT_LOGGED.store(false, Ordering::Relaxed);
 
     {
         let mut state = snapshot.lock().unwrap();
@@ -423,8 +432,9 @@ fn run_listener(
     // 启动时的绑定结论要留痕：后续所有 binding_audit 记录都以此为基准，
     // 没有这一条就无法判断"是从未绑上"还是"绑上后掉了"（2026-09-18）。
     crate::ble::gatt_note(format!(
-        "raw_input binding_initial selected_path={selected_path} matched_device_count={} \
+        "raw_input binding_initial binding_present={}  matched_device_count={} \
          phase={}",
+        !selected_path.is_empty(),
         paths.len(),
         if selected_path.is_empty() {
             "awaiting"
@@ -456,7 +466,7 @@ fn run_listener(
         _ => {
             crate::ble::gatt_note(format!(
                 "raw_input binding_audit action=timer_armed interval_ms={BINDING_AUDIT_INTERVAL_MS} \
-                 selected_path={selected_path} binding_present={}",
+                 binding_present={}",
                 !selected_path.is_empty()
             ));
         }
@@ -614,7 +624,10 @@ fn handle_device_change(handle: HRAWINPUT, event: u32) {
                     Ok(paths) => paths,
                     Err(_) => return,
                 };
-                if let Ok(found) = select_single_device_path(&paths) {
+                if let Ok(found) = select_device_path_for_target(&paths, &context.selected_path, crate::remote_target::get()) {
+                    if !context.selected_path.is_empty() && normalize_device_path(&found) != context.selected_path {
+                        let _ = context.engine.send(EngineMessage::DeviceRemoved);
+                    }
                     context.selected_path = normalize_device_path(&found);
                     context.binding_present = true;
                     let mut state = context.snapshot.lock().unwrap();
@@ -646,12 +659,17 @@ fn handle_device_change(handle: HRAWINPUT, event: u32) {
                     if became_ready {
                         notify_device_arrived();
                     }
-                } else if was_unbound && is_remote {
-                    // 此前未绑定、遥控器接口已出现但暂未选出唯一路径：保持等待。
+                } else if is_remote {
+                    // Unknown multi-device ownership must also revoke an old binding.
+                    context.selected_path.clear();
+                    context.binding_present = false;
                     let mut state = context.snapshot.lock().unwrap();
                     state.phase = RawInputPhase::Awaiting;
+                    state.last_error = Some(AWAITING_DEVICE_MESSAGE.to_owned());
+                    drop(state);
+                    let _ = context.engine.send(EngineMessage::DeviceRemoved);
+                    key_gate::set_listener_active(false);
                 }
-                // 已绑定且本次选择变歧义：保留既有绑定，不回退。
             }
         } else if event == GIDC_REMOVAL {
             if device_path == context.selected_path {
@@ -705,10 +723,8 @@ fn audit_binding() {
                 return;
             }
         };
-        let still_bound = !context.selected_path.is_empty()
-            && paths
-                .iter()
-                .any(|path| normalize_device_path(path) == context.selected_path);
+        let selection = select_device_path_for_target(&paths, &context.selected_path, crate::remote_target::get());
+        let still_bound = !context.selected_path.is_empty() && selection.as_ref().is_ok_and(|path| normalize_device_path(path) == context.selected_path);
         if still_bound {
             if !context.binding_present {
                 context.binding_present = true;
@@ -728,14 +744,16 @@ fn audit_binding() {
         // 永远等不到释放边沿（粘键），代价远高于沿用旧绑定。旧路径确实还在候选里时
         // 沿用它是无代价的；真换了设备/实例（旧路径不在候选里）才退回 Ambiguous。
         let candidate_count = paths.len();
-        match crate::raw_input::select_single_device_path_preferring(&paths, &context.selected_path)
+        match selection
         {
             Ok(path) => {
                 let rebound_path = normalize_device_path(&path);
                 // 换了还是没换？前者说明设备/实例真的变了，后者说明多候选里沿用了
                 // 旧绑定。两者的诊断含义完全不同，所以分开记（2026-09-18）。
                 let kept_previous = rebound_path == context.selected_path;
-                let previous_path = context.selected_path.clone();
+                if !kept_previous && !context.selected_path.is_empty() {
+                    let _ = context.engine.send(EngineMessage::DeviceRemoved);
+                }
                 context.selected_path = rebound_path;
                 context.binding_present = true;
                 let stale_remote_event_count = {
@@ -750,8 +768,7 @@ fn audit_binding() {
                 crate::ble::gatt_note(format!(
                     "raw_input binding_audit action=rebound kept_previous={kept_previous} \
                      matched_device_count={candidate_count} stale_remote_event_count={stale_remote_event_count} \
-                     previous_path={previous_path} rebound_path={}",
-                    context.selected_path
+                     binding_present=true"
                 ));
             }
             Err(crate::raw_input::DevicePathError::Missing) => {
@@ -760,7 +777,6 @@ fn audit_binding() {
                     return;
                 }
                 context.binding_present = false;
-                let previous_path = context.selected_path.clone();
                 context.selected_path.clear();
                 let stale_remote_event_count = {
                     let mut state = context.snapshot.lock().unwrap();
@@ -776,20 +792,23 @@ fn audit_binding() {
                 // 报文被路径过滤丢弃"的关键一组数字（2026-09-18）。
                 crate::ble::gatt_note(format!(
                     "raw_input binding_audit action=unbound reason=device_missing \
-                     stale_remote_event_count={stale_remote_event_count} lost_path={previous_path}"
+                     stale_remote_event_count={stale_remote_event_count}"
                 ));
             }
             Err(crate::raw_input::DevicePathError::Ambiguous(count)) => {
-                // 多候选且旧绑定已不在其中：不猜，保持现状并报告。
-                // 换绑会让按住中的按键丢失释放边沿（粘键），代价高于等下一次审计。
-                if context.binding_present {
+                // No target proves which candidate owns this binding. Revoke it
+                // and release held edges rather than accepting a previously guessed path.
+                if context.binding_present || !context.selected_path.is_empty() {
                     context.binding_present = false;
+                    context.selected_path.clear();
+                    let _ = context.engine.send(EngineMessage::DeviceRemoved);
+                    key_gate::set_listener_active(false);
+                    context.snapshot.lock().unwrap().phase = RawInputPhase::Awaiting;
                     let stale_remote_event_count =
                         context.snapshot.lock().unwrap().stale_remote_event_count;
                     crate::ble::gatt_note(format!(
                         "raw_input binding_audit action=ambiguous candidate_count={count} \
-                         stale_remote_event_count={stale_remote_event_count} kept_path={}",
-                        context.selected_path
+                         stale_remote_event_count={stale_remote_event_count} binding_present=false"
                     ));
                 }
             }
@@ -832,9 +851,19 @@ fn handle_raw_input(handle: HRAWINPUT) -> Result<(), String> {
             .as_mut()
             .ok_or_else(|| "Raw Input listener context is unavailable".to_owned())?;
         let normalized = normalize_device_path(&device_path);
-        if normalized != context.selected_path {
-            // 绑定失配：报文可能来自别的设备（物理键盘等），也可能是遥控器的 HID
-            // 接口换了实例而本地绑定还没跟上。只有后者值得计数——它是"绑定失效"
+        // 接受判据（2026-10-13 现场，纯逻辑在 `raw_input::report_path_accepted`）：
+        // 有目标地址时**只认那一支**（绑定路径或同地址的其他实例）；绑定若停在另一支上，
+        // 那一支的报文一律按"另一支"处理；还没有目标时沿用旧行为（只认绑定路径）。
+        // 现场教训：只看"报文路径 == 绑定路径"，会在启动抢绑或换机时把**另一支遥控器**的
+        // 按键当成本机按键（用户连的是 2 Pro、按 2 却让②步通过了）。
+        let accepted = crate::raw_input::report_path_accepted(
+            &context.selected_path,
+            crate::remote_target::get(),
+            &normalized,
+        );
+        if !accepted {
+            // 绑定失配或"不是当前那一支"：报文可能来自别的设备（物理键盘等），也可能是
+            // 遥控器的 HID 接口换了实例而本地绑定还没跟上。只有后者值得计数——它是"绑定失效"
             // 的直接证据，也是把「设备根本没发报文」与「报文被路径过滤丢弃」
             // 区分开的唯一线索（2026-09-18 现场正是无法区分这两者才迟迟定不了位）。
             if crate::raw_input::device_path_matches_xiaomi_remote(&normalized) {
@@ -849,13 +878,11 @@ fn handle_raw_input(handle: HRAWINPUT) -> Result<(), String> {
                 // 只在第一次失配时写日志（计数的**开始时刻**才是定位线索；
                 // 后续每条都写会把诊断日志刷满，而这批报文的真实来源靠计数即可）。
                 if first {
-                    let bound_path = context.selected_path.clone();
                     let binding_present = context.binding_present;
                     let phase = context.snapshot.lock().unwrap().phase;
                     crate::ble::gatt_note(format!(
-                        "raw_input stale_remote_event first_seen bound_path={bound_path} \
+                        "raw_input stale_remote_event first_seen \
                          binding_present={binding_present} phase={phase:?} \
-                         event_path={normalized} \
                          hint=遥控器仍在发报文但路径与绑定不符（多候选时期最可能），\
                          或绑定被审计清空后报文仍到达"
                     ));
@@ -863,6 +890,15 @@ fn handle_raw_input(handle: HRAWINPUT) -> Result<(), String> {
                 let _ = count;
             }
             return Ok(());
+        }
+        if normalized != context.selected_path {
+            // 走的是新增的"目标地址"兜底路径：旧绑定没跟上实例变化，但输入没受影响。
+            // 只记第一次（无设备身份、无路径），下一次现场看这条就知道兜底在工作。
+            if !TARGET_PATH_ACCEPT_LOGGED.swap(true, Ordering::Relaxed) {
+                crate::ble::gatt_note(
+                    "raw_input target_path_accept first_seen path_matches_bound=false".to_owned(),
+                );
+            }
         }
         context.snapshot.lock().unwrap().raw_event_count += 1;
 
@@ -937,7 +973,12 @@ fn enumerate_matching_device_paths() -> Result<Vec<String>, String> {
             }
         }
     }
-    Ok(paths)
+    // 两台同型号遥控器同时在线时按「应用正在用的那支」收窄候选（2026-10-13）：
+    // 地址未知时这一行是恒等变换（行为与过去完全一致）。
+    Ok(crate::raw_input::filter_paths_for_target(
+        &paths,
+        crate::remote_target::get(),
+    ))
 }
 
 fn get_device_name(device: windows::Win32::Foundation::HANDLE) -> Result<String, String> {
