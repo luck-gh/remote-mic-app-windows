@@ -100,7 +100,7 @@
 - 个人 updater 公钥与上游隔离；本机私钥位于仓库外 `%LOCALAPPDATA%\SayAll\personal-updater.key`。用户须自行安全备份，丢失将阻断已装个人客户端后续更新；不得将它提交或输出。2026-10-15 用户仅授权本机生成和公钥替换，尚未配置远端Secret或发布。本地打包使用个人密钥的实际口令（未加密密钥为空），不再使用旧测试固定口令。
 - 发布前 `scripts/verify-updater-signing.ps1 -Installer <精确包>` 必须用配置公钥对实际包与 `.sig` 验签；不匹配直接停止，不能因为 Secret 非空或 Tauri 产出了 `.sig` 就上传。
 
-- 正式 Release workflow 必须从精确 Tag/Commit 构建，缺少 `TAURI_SIGNING_PRIVATE_KEY` 或 Authenticode 发布凭据时 fail closed；CI 临时 updater key 只允许测试构建。
+- Tag Release workflow 必须从精确 Tag/Commit 构建，缺少 `TAURI_SIGNING_PRIVATE_KEY` 时 fail closed；当前产物为无 Authenticode 代码签名的 Draft / Pre-release，仅供受限测试，不自动公开，公开正式分发的代码签名门禁尚需完成。CI 始终使用临时 updater key，只允许测试构建，当前 CI 工作流不读取正式签名 Secret。Tag 工作流的构建与验签共用 `SAYALL_BUNDLE_BUILD=1`，确保构建身份包含本轮载荷回执及实际字节。
 - `scripts/generate-updater-manifest.ps1` 生成 `latest.json`、ASCII 安装器名、`.sig` 和 `SHA256SUMS.txt`。清单中的签名是 `.sig` 内容，不是路径；下载地址必须为 HTTPS。
 - 发布前打印并核对待上传资产清单、大小和 SHA-256；删除或覆盖远端资产不属于正常重试流程。
 - 应用内更新退出前必须显式断开 BLE、释放键态和停止音频；不能依赖 `Drop`，也不能强杀正在连接的旧进程。

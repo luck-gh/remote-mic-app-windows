@@ -22,9 +22,8 @@ permissions:
   contents: read
 
 # tauri.conf.json 配置 updater pubkey 后，bundle 构建需要 TAURI_SIGNING_PRIVATE_KEY；
-# Secret 未配置（PR/fork）时由 ensure-updater-signing-key.ps1 生成一次性临时密钥兜底。
-env:
-  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+# CI 始终由 ensure-updater-signing-key.ps1 生成一次性临时密钥；
+# 不读取正式发布 Secret，避免同仓库 PR 中执行的代码接触个人更新私钥。
 
 concurrency:
   group: windows-ci-${{ github.event.pull_request.number || github.ref }}
@@ -97,7 +96,7 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Ensure updater signing key (CI fallback for missing secret)
+      - name: Generate throwaway updater signing key for CI
         shell: pwsh
         run: ./scripts/ensure-updater-signing-key.ps1
 
@@ -200,7 +199,7 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Ensure updater signing key (CI fallback for missing secret)
+      - name: Generate throwaway updater signing key for CI
         shell: pwsh
         run: ./scripts/ensure-updater-signing-key.ps1
 

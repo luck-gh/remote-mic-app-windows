@@ -17,6 +17,8 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      SAYALL_BUNDLE_BUILD: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -109,6 +111,7 @@ jobs:
 
           ## 已知边界
 
+          - 当前测试安装器仅具备 updater 签名，尚无 Windows Authenticode 代码签名。
           - 全按键支持需要用户显式授权；基础语音保持普通用户权限。
           - 自动恢复只使用协作停止与真实释放确认，不强制结束设备宿主。
           - 当前候选的 RC001、RC003 和 ARM64 真机覆盖需分别确认。
