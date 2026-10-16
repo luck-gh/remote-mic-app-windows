@@ -31,6 +31,7 @@ import {
   resetBuiltinTemplate,
   type ButtonAction,
   type ButtonActions,
+  type AppFocusProfile,
   type ButtonEdge,
   type ButtonMappingSnapshot,
   type ButtonMappings,
@@ -38,6 +39,7 @@ import {
   type TemplateCatalogEntry,
   type ButtonTrigger,
   type FiredGesture,
+  type KeyCode,
   type PresetAppInfo,
   type RawInputPhase,
   type RemoteButton,
@@ -388,6 +390,24 @@ const editingSourceOptions = computed(() => [
   })),
 ]);
 
+const activeTemplateOptions = computed(() => {
+  const activeId = currentTemplate.templateId.value;
+  const active = activeId ? templateCatalog.value.find(entry => entry.id === activeId) : null;
+  return [
+    { value: "common", label: "通用配置" },
+    ...(activeId && !active ? [{ value: activeId, label: currentTemplate.applied.value?.name ?? "当前模板" }] : []),
+    ...templateCatalog.value.map(entry => ({ value: entry.id, label: entry.name })),
+  ];
+});
+
+function selectActiveTemplate(event: Event): void {
+  const select = event.currentTarget as HTMLSelectElement;
+  const requested = select.value === "common" ? null : select.value;
+  // The control always reflects the confirmed mapping; the API result/event moves it.
+  select.value = currentTemplate.applied.value?.templateId ?? "common";
+  void currentTemplate.activate(requested);
+}
+
 function cloneMappings(value: ButtonMappings): ButtonMappings {
   return JSON.parse(JSON.stringify(value)) as ButtonMappings;
 }
@@ -420,6 +440,36 @@ function loadEditingSource(source: EditingSource): boolean {
 const voiceActive = computed(
   () => props.runtime?.platform.connection.voiceState === "streaming",
 );
+const voiceButtonPressed = computed(() => currentTemplate.sceneSnapshot.value?.voiceButtonPressed === true);
+const voiceReceived = ref(false);
+const voiceStarted = ref(false);
+// Observe each edge synchronously: a quick DOWN/UP may share a Vue render tick.
+// Keep the receipt visible after UP without inventing a longer physical hold.
+watch(voiceButtonPressed, (pressed) => {
+  if (pressed) {
+    voiceReceived.value = true;
+    voiceStarted.value = voiceActive.value;
+  }
+  reportFrontendEvent({ event: "buttons_voice_observation", phase: "completed", result: "passed", reason: pressed ? "pressed" : "released" });
+}, { flush: "sync" });
+watch(voiceActive, (active) => {
+  if (active && voiceReceived.value) voiceStarted.value = true;
+}, { flush: "sync" });
+const voiceFeedback = computed(() => {
+  if (!voiceReceived.value) return "";
+  if (voiceActive.value) return "已收到语音键，语音进行中。";
+  const error = props.runtime?.platform.connection.lastError;
+  if (error) {
+    const detail = error === "select an output endpoint before starting voice"
+      ? "声音通道尚未就绪，请到“连接与语音”选择可用的声音通道。"
+      : error === "the selected audio endpoint is temporarily unavailable; its saved selection is retained"
+        ? "所选声音通道暂不可用，请到“连接与语音”检查。"
+        : error;
+    return `已收到语音键。当前语音状态：${detail}`;
+  }
+  if (voiceStarted.value) return "已收到语音键，语音已结束。";
+  return voiceButtonPressed.value ? "已收到语音键，正在等待语音开始。" : "已收到语音键，未观察到语音开始。";
+});
 
 function actionsOf(button: RemoteButton): ButtonActions {
   return (
@@ -446,6 +496,237 @@ function openEditor(button: RemoteButton, trigger: ButtonTrigger): void {
   editingTarget.value = { button, trigger };
 }
 
+const REPEAT_CAPABLE_BUTTONS: RemoteButton[] = [
+  "back",
+  "up",
+  "down",
+  "left",
+  "right",
+  "volume_up",
+  "volume_down",
+];
+/** 单独修饰键：不可作为「可连续执行」的单键动作（与 Rust `KeyCode::is_modifier` 一致）。 */
+const REPEAT_MODIFIER_KEYS = new Set<KeyCode>([
+  "control",
+  "left_control",
+  "right_control",
+  "shift",
+  "left_shift",
+  "right_shift",
+  "alt",
+  "left_alt",
+  "right_alt",
+  "left_windows",
+  "right_windows",
+]);
+
+/** 动作是否可连续执行（与 Rust `ButtonAction::allows_repeat` 同源口径）。 */
+function actionAllowsRepeat(action: ButtonAction): boolean {
+  if (action.type === "scroll" || action.type === "mouse_move") return true;
+  if (action.type !== "shortcut") return false;
+  return action.chord.keys.length === 1 && !REPEAT_MODIFIER_KEYS.has(action.chord.keys[0]);
+}
+
+const repeatGroupVisible = computed(() => {
+  const target = editingTarget.value;
+  if (!target) return false;
+  return (
+    REPEAT_CAPABLE_BUTTONS.includes(target.button) &&
+    (target.trigger === "single" || target.trigger === "long")
+  );
+});
+
+type HoldRepeatChoice = "auto" | "off" | "single" | "long";
+
+/** 选项不可选的原因（null = 可选）；radio 展示与一致性收口共用同一判据。 */
+function holdRepeatBlockedReason(
+  actions: ButtonActions,
+  slot: "single" | "long",
+): string | null {
+  if (slot === "long") {
+    if (actions.long.type === "disabled") return "先给这个按键配置长按动作";
+    if (!actionAllowsRepeat(actions.long)) {
+      return "“长按”的动作只执行一次（组合快捷键、打开应用等），不能连续执行；把它改成单个按键后可选";
+    }
+    return null;
+  }
+  if (actions.single.type === "disabled") return "先给这个按键配置单击动作";
+  if (!actionAllowsRepeat(actions.single)) {
+    return "“单击”的动作只执行一次（组合快捷键、打开应用等），不能连续执行；改成单个按键后可选";
+  }
+  if (actions.long.type !== "disabled") {
+    // 指路前先确认「重复长按动作」真的可选：长按动作只执行一次时它同样是
+    // 灰的，原句会指向一个点不到的选项（2026-10-05 用户反馈）。
+    return holdRepeatBlockedReason(actions, "long") === null
+      ? "这个按键已有长按动作，按住会先执行长按；要连续执行，请选“重复长按动作”"
+      : "这个按键已有长按动作：按住会执行长按。要连续执行单击动作，请先清除长按动作";
+  }
+  return null;
+}
+
+/** 当前按键的「按住时连续执行」状态（按键级，两页同源）。 */
+const repeatChoice = computed<HoldRepeatChoice>(() => {
+  const target = editingTarget.value;
+  const hold = target ? actionsOf(target.button).holdRepeat : undefined;
+  return hold ?? "auto";
+});
+
+const repeatAutoHint = computed(() => {
+  const target = editingTarget.value;
+  if (!target) return "";
+  const actions = actionsOf(target.button);
+  if (actions.long.type !== "disabled") return "当前：按住后执行长按动作一次。";
+  if (actions.single.type === "disabled") return "当前：未设置单击动作，按住不执行动作。";
+  return actionAllowsRepeat(actions.single)
+    ? "当前：按住会连续执行单击动作。"
+    : "当前：单击动作只执行一次。";
+});
+
+const repeatSingleReason = computed<string | null>(() => {
+  const target = editingTarget.value;
+  return target ? holdRepeatBlockedReason(actionsOf(target.button), "single") : null;
+});
+
+const repeatLongReason = computed<string | null>(() => {
+  const target = editingTarget.value;
+  return target ? holdRepeatBlockedReason(actionsOf(target.button), "long") : null;
+});
+
+/** 常驻原因行：只解释当前页面对应的选项。 */
+const repeatPageReason = computed<string | null>(() => {
+  const target = editingTarget.value;
+  if (!target || repeatChoice.value === "auto") return null;
+  if (target.trigger === "single") return repeatSingleReason.value;
+  if (target.trigger === "long") return repeatLongReason.value;
+  return null;
+});
+
+/** 当前编辑按键是否配置了双击（单击页说明句与「重复单击动作」悬停据此切换口径）。 */
+const doubleConfiguredOnEditingButton = computed(() => {
+  const target = editingTarget.value;
+  return !!target && actionsOf(target.button).double.type !== "disabled";
+});
+
+/** 「重复单击动作」的悬停说明（不可选时为原因；配双击时按压住确认口径）。 */
+const repeatSingleTitle = computed(() => {
+  if (repeatSingleReason.value) return repeatSingleReason.value;
+  return doubleConfiguredOnEditingButton.value
+    ? "按住超过约 0.3 秒开始，单击动作会不断重复，直到松手"
+    : "按住不放，单击动作会不断重复，直到松手";
+});
+
+/** 「重复长按动作」的悬停说明（不可选时为原因）。 */
+const repeatLongTitle = computed(
+  () => repeatLongReason.value ?? "按住约 0.55 秒后，长按动作会不断重复，直到松手",
+);
+
+/**
+ * OK 键「移动光标后按 OK 点击」（2026-10-06 定稿，方案见
+ * `docs/plan/2026-10-06-ok-context-click.md`、产品逻辑见
+ * `docs/product/button-behavior.md` §2）：按键级开关、默认关、只对 OK 键提供，
+ * 三个槽位页都在同一位置显示（与当前编辑哪个槽位无关）。
+ */
+const okClickVisible = computed(
+  () => editingSource.value === "common" && editingTarget.value?.button === "ok" && editingTarget.value.trigger !== "double",
+);
+
+const okClickChecked = computed(() => actionsOf("ok").okContextClick === true);
+
+function toggleOkContextClick(): void {
+  if (busy.value || editingSource.value !== "common") return;
+  const target = editingTarget.value;
+  if (!target || target.button !== "ok") return;
+  const actions = { ...actionsOf("ok") };
+  if (actions.okContextClick) {
+    delete actions.okContextClick;
+  } else {
+    actions.okContextClick = true;
+  }
+  mappings.value = {
+    ...mappings.value,
+    actions: { ...mappings.value.actions, [target.button]: actions },
+  };
+  reportFrontendEvent({ event: "button_mapping_ok_click", phase: "draft_changed", result: "passed", reason: actions.okContextClick ? "enabled" : "disabled" });
+  statusMessage.value = (
+    actions.okContextClick
+      ? "已开启：用遥控器移动光标后，按 OK 会点击光标位置"
+      : "已关闭：移动光标后按 OK 点击"
+  );
+}
+
+/**
+ * 动作变更后的「按住时连续执行」一致性收口：已选目标不再可用时自动回到
+ * 「关闭」并返回提示（不偷改选择到另一个目标，保留用户的显式选择）。
+ * 提示经 `persist(message)` 展示，避免被 persist 的清理逻辑覆盖。
+ */
+function reconcileHoldRepeat(
+  button: RemoteButton,
+  actions: ButtonActions,
+): { actions: ButtonActions; notice: string | null } {
+  const hold = actions.holdRepeat;
+  if (!hold || hold === "off") return { actions, notice: null };
+  const slot = hold === "long" ? "long" : "single";
+  const valid =
+    REPEAT_CAPABLE_BUTTONS.includes(button) && holdRepeatBlockedReason(actions, slot) === null;
+  if (valid) return { actions, notice: null };
+  const next = { ...actions };
+  next.holdRepeat = "off";
+  // 自动关闭的提示同样不得指向灰掉的选项（长按动作只执行一次时它不可选）。
+  const notice =
+    slot === "single" && actions.long.type !== "disabled"
+      ? holdRepeatBlockedReason(actions, "long") === null
+        ? "这个按键已配置长按动作：按住会先执行长按，“按住时连续执行”已关闭（要连续执行，请选“重复长按动作”）"
+        : "这个按键已配置长按动作：按住会执行长按，而它只执行一次，“按住时连续执行”已关闭"
+      : "动作已变更，“按住时连续执行”已关闭";
+  return { actions: next, notice };
+}
+
+function selectHoldRepeat(choice: HoldRepeatChoice): void {
+  if (busy.value) return;
+  const target = editingTarget.value;
+  if (!target) return;
+  const reason =
+    choice === "single"
+      ? repeatSingleReason.value
+      : choice === "long"
+        ? repeatLongReason.value
+        : null;
+  if (reason) {
+    statusMessage.value = reason;
+    return;
+  }
+  if (repeatChoice.value === choice) return;
+  const actions = { ...actionsOf(target.button) };
+  if (choice === "auto") {
+    delete actions.holdRepeat;
+  } else {
+    actions.holdRepeat = choice;
+  }
+  mappings.value = {
+    ...mappings.value,
+    actions: { ...mappings.value.actions, [target.button]: actions },
+  };
+  reportFrontendEvent({ event: "button_mapping_repeat", phase: "draft_changed", result: "passed", reason: choice });
+  statusMessage.value = (
+    choice === "auto"
+      ? "已选择自动：未设置长按时连续执行可重复的单击动作；设置长按后只执行一次"
+      : choice === "off"
+        ? "已关闭“按住时连续执行”"
+        : choice === "long"
+          ? "已开启：长按后不松手会继续连续执行"
+          : "已开启：按住不放会连续执行"
+  );
+}
+
+
+function applyFocusProfile(target: string, profile: AppFocusProfile): void {
+  const editing = editingTarget.value;
+  if (busy.value || editingSource.value !== "common" || !editing || menuReserved(editing.button)) return;
+  const action = actionOf(editing.button, editing.trigger);
+  if (action.type !== "open_app" || action.target !== target) return;
+  mappings.value = { ...mappings.value, focusProfiles: { ...mappings.value.focusProfiles, [target]: profile } };
+}
+
 function applyAction(action: ButtonAction): void {
   if (busy.value) return;
   const target = editingTarget.value;
@@ -456,7 +737,9 @@ function applyAction(action: ButtonAction): void {
   };
   const actions = { ...actionsOf(target.button) };
   actions[target.trigger] = action;
-  next.actions[target.button] = actions;
+  const reconciled = reconcileHoldRepeat(target.button, actions);
+  next.actions[target.button] = reconciled.actions;
+  if (reconciled.notice) statusMessage.value = reconciled.notice;
   mappings.value = next;
 }
 
@@ -464,6 +747,7 @@ async function persist(message?: string): Promise<boolean> {
   const request = ++saveSequence;
   const source = editingSource.value;
   const payload = cloneMappings(mappings.value);
+  payload.schemaVersion = 2;
   busy.value = true;
   statusMessage.value = null;
   reportFrontendEvent({ event: "button_mapping_editor_save", phase: "started", result: "passed", reason: source === "common" ? "common" : "template" });
@@ -550,7 +834,7 @@ async function saveAsTemplate(): Promise<void> {
   const started = performance.now();
   reportFrontendEvent({ event: "button_template_create", phase: "started", result: "passed", reason: editingSource.value === "common" ? "common_draft" : "template_draft" });
   try {
-    const template = await saveButtonMappingTemplate(name, cloneMappings(mappings.value));
+    const template = await saveButtonMappingTemplate(name, { ...cloneMappings(mappings.value), schemaVersion: 2 });
     if (configuration.value) {
       configuration.value = {
         ...configuration.value,
@@ -770,7 +1054,10 @@ onUnmounted(() => {
       <div class="mapping-header-controls">
         <div class="current-template-display">
           <span>当前使用</span>
-          <output aria-label="当前使用的按键模板">{{ !currentTemplate.applied.value ? '正在确认当前模板…' : currentTemplate.templateId.value ? currentTemplate.applied.value.name ?? '当前模板' : '通用配置' }}</output>
+          <select aria-label="当前使用的按键模板" :value="!currentTemplate.applied.value ? '' : currentTemplate.templateId.value ?? 'common'" :disabled="busy || currentTemplate.applying.value || !currentTemplate.applied.value" :aria-busy="currentTemplate.applying.value" @change="selectActiveTemplate">
+            <option value="" disabled>正在确认当前模板…</option>
+            <option v-for="option in activeTemplateOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
         </div>
         <label class="editing-source-picker">
           <span>编辑配置</span>
@@ -782,7 +1069,9 @@ onUnmounted(() => {
 
       </div>
       <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
-      <p class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
+      <p v-if="currentTemplate.persistenceMessage.value" class="mapping-header-status muted" role="status" aria-live="polite">{{ currentTemplate.persistenceMessage.value }}</p>
+      <p v-if="voiceFeedback" class="voice-feedback" role="status">{{ voiceFeedback }}</p>
+      <p v-else class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
     </header>
 
     <div id="global-mapping-panel">
@@ -806,10 +1095,10 @@ onUnmounted(() => {
         </template>
         <path
           :d="connectionPath(VOICE_PLACEMENT)"
-          :class="{ active: voiceActive }"
+          :class="{ active: voiceButtonPressed }"
           fill="none"
         />
-        <polygon :points="arrowPolygon(VOICE_PLACEMENT)" :class="{ active: voiceActive }" />
+        <polygon :points="arrowPolygon(VOICE_PLACEMENT)" :class="{ active: voiceButtonPressed }" />
       </svg>
 
       <figure ref="remotePhotoEl" class="remote-photo" :style="{ left: `${remoteLeft}px`, top: `${REMOTE_TOP}px` }">
@@ -827,7 +1116,7 @@ onUnmounted(() => {
       ></span>
       <span
         class="anchor-dot voice"
-        :class="{ visible: voiceActive }"
+        :class="{ visible: voiceButtonPressed }"
         :style="{
           left: `${anchorPoint(VOICE_PLACEMENT).x - 4}px`,
           top: `${anchorPoint(VOICE_PLACEMENT).y - 4}px`,
@@ -903,7 +1192,7 @@ onUnmounted(() => {
       <article
         class="mapping-card mapping-readonly voice-card center"
         aria-disabled="true"
-        :class="{ active: voiceActive }"
+        :class="{ active: voiceButtonPressed }"
         :style="{ top: `${VOICE_CARD_TOP}px`, width: `${cardWidth}px` }"
       >
         <div class="mapping-card-title">
@@ -923,7 +1212,7 @@ onUnmounted(() => {
           <svg class="readonly-icon" viewBox="0 0 24 24" fill="none" aria-label="固定功能，不可自定义">
             <path :d="READONLY_ICON" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
-          <span class="badge pending voice-badge" :class="{ active: voiceActive }">按住说话</span>
+          <span class="badge pending voice-badge" :class="{ active: voiceButtonPressed }">{{ voiceActive ? '语音进行中' : voiceButtonPressed ? '已收到按键' : '按住说话' }}</span>
         </div>
         <p class="voice-note">按下开始、松开结束；不参与自定义映射，不加双击/长按延迟。</p>
       </article>
@@ -959,19 +1248,82 @@ onUnmounted(() => {
         :key="`${editingSource}:${editingTarget.button}:${editingTarget.trigger}`"
         :shortcuts-only="editingSource !== 'common'"
         :mappings="mappings"
+        :saved-mappings="savedSnapshot"
+        :busy="busy"
         :button="editingTarget.button"
         :trigger="editingTarget.trigger"
         :preset-apps="presetApps"
         @update="applyAction"
+        @focus-profile="applyFocusProfile"
         @applications="mappings = { ...mappings, applications: $event }"
         @status="statusMessage = $event"
       />
 
+      <div v-if="repeatGroupVisible" class="repeat-group">
+        <span class="repeat-label">按住时连续执行</span>
+        <div class="repeat-options">
+          <button
+            class="chip"
+            :class="{ selected: repeatChoice === 'auto' }"
+            type="button"
+            title="未设置长按动作时，连续执行可重复的单击动作；设置长按后只执行一次"
+            :disabled="busy"
+            @click="selectHoldRepeat('auto')"
+          >
+            自动（默认）
+          </button>
+          <button
+            class="chip"
+            :class="{ selected: repeatChoice === 'off' }"
+            type="button"
+            title="按住不放只执行一次"
+            :disabled="busy"
+            @click="selectHoldRepeat('off')"
+          >
+            关闭
+          </button>
+          <button
+            class="chip"
+            :class="{ selected: repeatChoice === 'single' }"
+            type="button"
+            :title="repeatSingleTitle"
+            :disabled="busy || (!!repeatSingleReason && repeatChoice !== 'single')"
+            @click="selectHoldRepeat('single')"
+          >
+            重复单击动作
+          </button>
+          <button
+            class="chip"
+            :class="{ selected: repeatChoice === 'long' }"
+            type="button"
+            :title="repeatLongTitle"
+            :disabled="busy || (!!repeatLongReason && repeatChoice !== 'long')"
+            @click="selectHoldRepeat('long')"
+          >
+            重复长按动作
+          </button>
+        </div>
+        <p v-if="repeatChoice === 'auto'" class="muted repeat-hint repeat-auto-hint">{{ repeatAutoHint }}</p>
+        <p v-if="repeatPageReason" class="muted repeat-hint">{{ repeatPageReason }}</p>
+      </div>
+      <label v-if="okClickVisible" class="toggle-row ok-click-toggle" title="刚用遥控器移动过光标时，按 OK 会点击光标位置">
+        <span>移动光标后按 OK 点击</span>
+        <input
+          class="toggle-input"
+          type="checkbox"
+          :checked="okClickChecked"
+          :disabled="busy"
+          @change="toggleOkContextClick"
+        />
+      </label>
+      <p v-if="okClickVisible" class="muted ok-click-hint">
+        刚用遥控器移动过光标（5 秒内），按 OK 会点击光标位置。这时 OK 的单击、双击、长按都不会执行。
+      </p>
       <p v-if="editingTarget.trigger === 'single'" class="muted editor-note">
-        未配置双击与长按时，单击在按下瞬间触发（零延迟）；返回/方向/音量键按住会连续触发。
+        {{ doubleConfiguredOnEditingButton ? "配置了双击：单击会稍等片刻（约 0.3 秒）以区分双击。" : "单击在按下瞬间执行。" }}
       </p>
       <p v-else class="muted editor-note">
-        {{ editingTarget.trigger === "double" ? "双击判定窗口约 0.3 秒：配置后单击会稍等片刻以区分双击。" : "长按约 0.55 秒触发；配置后按住连发停用。" }}
+        {{ editingTarget.trigger === "double" ? "双击判定窗口约 0.3 秒：配置后单击会稍等片刻以区分双击。" : "长按约 0.55 秒后执行。" }}
       </p>
     </article>
 
@@ -1098,20 +1450,7 @@ onUnmounted(() => {
   font-size: 0.78rem;
 }
 .editing-source-picker select { min-height: 36px; min-width: 0; width: 100%; }
-.current-template-display output {
-  display: block;
-  box-sizing: border-box;
-  min-height: 36px;
-  padding: 0 8px;
-  line-height: 34px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text-secondary);
-  background: var(--surface-control);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.current-template-display select { min-height: 36px; min-width: 0; width: 100%; }
 .save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
 .mapping-header {
   display: grid;
@@ -1137,8 +1476,17 @@ onUnmounted(() => {
   width: 100%;
 }
 .mapping-header-status { min-height: 20px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-feedback { min-height: 20px; margin: 0; font-size: 13px; line-height: 20px; }
 @media (max-width: 620px) {
   .mapping-heading-row { grid-template-columns: 1fr; gap: 8px; }
   .mapping-heading-row .device-chip { justify-self: start; }
 }
+.repeat-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.repeat-label { font-size: 13px; }
+.repeat-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.repeat-hint { flex-basis: 100%; margin: 0; font-size: 12px; }
+/* OK 键「移动光标后按 OK 点击」：按键级开关 + 常驻说明句（2026-10-06）。 */
+.ok-click-toggle { margin-top: 12px; }
+.ok-click-hint { margin: 6px 0 0; font-size: 12px; }
+
 </style>

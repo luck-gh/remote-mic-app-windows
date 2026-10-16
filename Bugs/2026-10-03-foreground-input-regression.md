@@ -1,7 +1,7 @@
 # 主窗口前台时的菜单、按键链路与语音启动异常
 
 - 发现日期：2026-10-03。
-- 状态：调查中；最终本地候选已正常安装并打开，菜单、音频队列、助手误退及状态界面修复已通过自动化。10 月 4 日已取得旧实例真实停止证明并解除清理阻断；版本拒绝不再制造清理债务，真实正常退出/重开通过。旧共享宿主仍驻留，待 Windows 正常重启后加载新 Agent 并完成实体回归；报告迟到与冷态延迟未闭合。
+- 状态：部分修复、剩余边界调查中；历史菜单、音频队列、助手误退及状态界面修复和验证各归下文对应候选。2026-10-12 用户重启后，0.8.6 来源修复候选已实际加载新 Agent，菜单完整链与用户确认的菜单、实体键盘恢复通过。同日修复音频端点名称识别与语音键 UI 反馈耦合，经用户明确选择新同线通道、正常安装后，四次语音会话及用户确认的按键反馈/语音输入通过；原声卡 Code 10 原因、显式连发开启、完整双型号矩阵及历史三轮/单击退格异常仍未全部闭合。
 - 影响范围：Windows 本地 0.5.0 候选；用户报告在无线麦主窗口为当前激活窗口时较易发生。不是“始终置顶”功能。RC003 统一捕获链与原 ATVV 语音路径；不外推 RC001。
 - 被测身份：基于 `c089497133c7588b6ea4418d2e824d67a35890f9` 的未提交统一按键候选，安装包 SHA256 `02515fb8d0b73373c7738172a528bbf202093ab180f5b64188ef94ac17548c51`，固定上游来源 `4d4de099f823cc67f334ff2a498e98c2806e4455`。包与安装验证归既有输入 evidence。
 - 功能点：完整模板菜单的返回焦点；报告 Agent → Helper → App 传输和硬件观察；语音启动准备及音频消息队列。
@@ -131,7 +131,182 @@ UI 的确定缺陷是仅以持久化 `enabled=false` 显示“未开启”，忽
 
 本次撤回验证采用精确源码身份比对，复用上述同一交付身份已有的软件验证。追加 `cargo fmt --all -- --check` 在工具启动阶段被环境拒绝访问，`pnpm build` 在 pnpm 自身版本获取阶段网络失败，均未进入产品编译；未通过提权重放失败工具、安装依赖或修改环境。相应小日志保留在本机同主题 `revert-fmt-check.log`、`revert-frontend-build.log`，不记为新的构建通过，也不影响已核对的源码及正在运行的安装载荷。此次未重跑完整测试或重装；新的根因与恢复证据为上文真实重启、同载荷运行日志及用户确认。
 
+## 2026-10-06 朋友的 RC003 返回键报障（待现场日志）
+
+- 用户确认型号为 RC003；现象为本地版返回键无法正常使用、官方版正常。尚无朋友的安装包身份、映射配置、全按键支持状态及现场日志，音量键表现未知，不能归因到单一环节或宣称修复。
+- 核对本地 `50f21e005b4f1bf3455268eb013d58259196d6a2` 与第二父提交 `a3ff225b37fd15e0f60b6b07afb0e27426e6859e`，源码树一致。额外 worktree 的归档没有修改此源码树，不存在“合入 main 漏带返回键”的差异证据。
+- 官方 `v0.5.0` 标签精确指向 `e5374a9d9232afaf1024d4545353a4463608d11e`；本地与该版本的返回 usage `0x00F1`、9 字节报告槽及白名单相同。两边新配置均默认不启用增强，不能将此默认值说成版本差异。本地 RC003 映射额外要求当前目标已获捕获所有权；蓝牙连接或 Helper 连接本身不是就绪证据。官方与本地 Agent build 不同，旧模块拒绝也是需要由现场日志确认的候选，不能恢复强杀设备宿主的做法。
+- 本地三个内置模板的返回为 Backspace，浏览器导航需显式配置 Alt+Left；动作已发送和目标程序实际响应分开判断。本机现有日志（2026-10-06 07:35 UTC，PID 42296）可见 `Back=true → map_route PassThrough → map_fire Backspace → map_inject result=ok → Back=false`，只证明该实例有实际输入和注入提交，不代表朋友环境、物理按键验收或浏览器导航通过。
+- 本轮仅补充桥接边沿与映射决策的脱敏日志，不改捕获授权、默认配置、协议、Helper/Agent、按键动作或等待时序。重点区分目标过滤、所有权未确认、识别配置为空、手势等待、取消后等待释放、场景消费、无动作和注入结果；测试使用真实映射 runtime 与记录型 injector 核对动作数量，而非只核对 UI。
+- 首按候选边界：Helper 在 `targets_ack` 后等 `lease_ok` 心跳才发送所有权确认，而边沿可能先到。此顺序可能使启用/切换窗口的首按未执行，但不能解释稳定状态持续失败。本轮记录桥接消息序号、代次及所有权用于取证，不据推测修改该时序。
+
+朋友取证步骤：
+
+1. 安装本次本地诊断包，记录“驱动”页全按键支持状态与“按键”页当前使用模板，不重置或替换原配置。
+2. 在原来失效的程序中短按返回 3 次（每次间隔约 1 秒），再试一次音量加、音量减；记录测试时间、是否有按键页响应和实际结果。第一次失败后先取日志，不先重连或反复安装。
+3. 打开“权限 → 诊断摘要”，选择“生成摘要 / 复制摘要”和“打开日志目录”，提供 `sayall-diagnostic.log`（较大可压缩）、摘要和上述现象即可；无需提供个人配置、录音或第三方应用数据。日志默认持续记录，不需提前开启开关。
+
+`passed`（自动化，2026-10-06）：新增映射诊断 2 项、桥接诊断 3 项均先红后绿；映射测试覆盖未授权、等待手势、场景处理/阻止、无动作、注入成功/失败 7 条路径，以及返回/菜单/音量±的重复边沿、取消释放和相同状态去重，并断言实际 injector 调用数。`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo check --workspace` 与仿真 feature 编译检查通过；主要测试分组为 core 31 + 4、Windows 362 passed / 20 ignored、Host 99 passed / 1 ignored。最终快照开销修正后，桥接套件 25/25 再验通过。受限环境最初 6 个桥接夹具因临时描述文件不可见失败，正常宿主环境全套通过；这不是实体按键故障复现。既有 ignored 项不改记为通过。
+
+`passed`（本机构建与部署，2026-10-06）：既有 `scripts/build-local-input-candidate.ps1` 构建 NSIS，前端构建及生产仿真隔离检查通过。0.5.0 诊断包为 13,036,910 字节，SHA256 `308b73469efdbb1acd777e04b105b8ef33b88d2a7af92f82c9961b5044de394c`；日志标识 `build=rc003-back-diagnostics-20261006 build_channel=local release_tag=none`。源码基线为上文 `50f21e0` 加当前两处诊断工作区差异，无自动提交、推送或发布。安装时观察原 App/Helper 正常退出，管理员覆盖后原配置哈希一致；安装 EXE 与构建 EXE 除预期 NSIS 标记外逐字一致，Helper/Gadget 与包内资源哈希一致。Explorer 启动 PID 3092，实际令牌查询为非提权；真实 UIAutomation 读到六个页面入口，并点击“生成摘要”后观察到报告显示。生产日志记录 Vue 挂载、首次 IPC、RC003 连接和当前菜单目标所有权确认。以上不是返回键或输入法的物理验收。
+
+朋友现场 RC003、冷/闲置首用以及 RC001 仍为 `deferred`。本次只在原工作目录修改，Git 注册工作树仍为一个；原有 `artifacts/` 保留。临时验证复用 `target/dev/back-key-diagnostics/`：`verification.json` 记录源码指纹、包及部署身份，五份检查/构建日志保留至朋友问题归因闭合后按 LOGGING 回收可再生输出。当前安装包仅保存在既有 `target/release/bundle/nsis/`，不复制第二份；红绿失败判据已在本节保留，不另建源码快照或 worktree。
+
+## 2026-10-10 用户报告：同次开机的三轮启动（部分定位，未闭合）
+
+用户在准备下一任务时补充如下观察；报告时尚未核对三轮时间、PID、安装载荷与配置，不能据此认定与历史故障同根因：
+
+1. 第一次打开无法正常使用；按音量加减，驱动页有异常显示，全按键支持无法正常开启，随后关闭。
+2. 第二次打开时，实体键盘数字 1 左侧的键输出成 Tab；方向键/返回键不能按住连续移动或删除，但返回键与音量加减的普通使用正常。用户称该实体键为“单引号”，后续须核对实际键位/键码，不能直接按引号键建立测试。长按异常对应的当前模板、显式连发开关和焦点场景也未确认。
+3. 第三次打开，用户观察目前所有功能正常；这仅描述当前正常边界，不证明前两轮问题已修复或已完成完整矩阵。
+
+本轮在重启、构建和合并前冻结当前及轮转日志，并按系统本次启动时间 `2026-10-10T02:15:20.500Z` 提取时间线。现场安装 EXE SHA256 为 `707880d02f6dc40edfe7f4030e3fe73af5c93de7f72b1514d28fe50fc1312f7c`，与 10/9 候选一致；源码身份仍是 `9f4ead5` 加未提交工作，不因版本号或空 `sourceCommit` 推断精确内容。以下本地时间均为 UTC+8；三轮与用户观察按顺序关联，不声称用户每次操作的时刻已被直接记录。
+
+| 轮次 | 主程序 / 按键宿主 | Helper / 设备宿主 | 配置与捕获 | 退出终态 |
+| --- | --- | --- | --- | --- |
+| 第一轮 10:19:32 | 27224 / 15164 | 后续 10:26:46 才见 Helper 5700；设备宿主 11972 | 启动 reset 提交 cleanup-only，8 秒后 timeout，recovery_attempted=true；后来 generation=1 的 owned_mask=0，另有 ownership_timeout；未见映射动作/连发 | 10:34:39 socket_closed；10:34:41 Helper 跟随主程序结束并清理 passed；缺少主程序完整 shutdown 终态，退出方式未知 |
+| 第二轮 10:34:56 | 11672 / 1448 | 29220 / 11972 | 11:10:33 菜单手动应用模板，selection generation=101/102、foreground generation=113；捕获 target generation=4，requested/owned mask=7167；出现方向/返回等 map_fire，未见 map_repeat | 11:20:00 请求正常退出；按键宿主 shutdown_requested；Helper explicit_stop 清理 passed；整体 shutdown 938ms、failed_stages=0 |
+| 第三轮 11:20:09 | 23708 / 32756 | 46672 / 11972 | common 无配置动作、自动跟随关闭；requested/owned/recognition mask=256（保留 Menu），execution mask=0；无 map_fire/map_repeat | 取证时仍在运行；12:10:16 部署前正常退出，overall passed、728ms；用户观察正常只覆盖当时操作 |
+
+三个 Helper 均报告 `2026-10-03.cleanup-instance`；第二、三轮复用设备宿主 11972，不等于旧版本阻塞。第一轮可定位到启动清理未确认及后续捕获所有权未就绪，但现有日志没有当时 Helper 进程/回执匹配判据或任务启动失败码，无法确定为何提交后超时。当前任务状态和当前回执不能替代历史事实；TaskScheduler Operational 当时未启用，未为调查改其设置。
+
+第二轮实际记录返回持有 2941ms、左方向 2227ms、右方向 1680ms，没有连续拍。稍后只读配置快照为 schemaVersion=1，common 和六个模板均没有显式 holdRepeat，按当前契约表示关闭；映射 tap 只执行一次与这个设置一致。第三轮没有同样的动作执行配置，可由原生路径表现出按住重复，不能用它证明第二轮已修复。历史模板 ID/完整配置及前台程序没有足够日志，也未收到用户确认，因此“第二轮确切模板与场景”仍未知；未开启连发、未改用户模板、未再次执行迁移。
+
+实体键盘数字 1 左侧的实际键帽、布局与扫描码仍待用户确认，不能写成单引号键，也不能确认就是 VK_OEM_3。代码中 TV 候选 VK=0xC0/usage=0x0035 可映射 Tab，但这是遥控器映射事实，不能证明实体键盘被识别成 TV。LL 门对该类必须有报告来源的实体边沿放行，并排除注入边沿；Raw Input 又按所选设备过滤。历史日志不足以把该次物理键、报告来源、注入回声或残留键态串成因果链，暂不修改来源识别或吞键逻辑。
+
+仅新增脱敏诊断，继续保持未提交：reset 在观测变化时记录 Helper 数量、预期 Helper PID、回执存在/有效/完成/可恢复/匹配、新旧启动和排队恢复判据；map_reconfig 记录引擎 revision、实际 execution/recognition 位图、enhanced 及显式单击/长按连发位图。无需记录设备路径、模板名称、窗口类哈希、用户组合键或字符内容。下一次异常先读取这些判据，再结合有界按键观察及用户前台场景复现；确认根因后先补失败回归再修复。本轮没有把上游输入法首按恢复当作上述异常的修复。
+
+最小现场留在既有 `target/dev/foreground-input/`，长期结论归本节；构建/安装结果归 [Preview 验证记录](../Testing/WindowsRC003Preview.md)。实体键盘共存、异常轮次复现、明确模板下显式关闭/开启的长按对照、冷态首用与双型号硬件边界继续 deferred。
+
+当前可对照基线为 10 月 9 日实际安装的 0.8.5 个人版，包与安装 EXE 指纹、配置保持及启动观察归 [安装记录](../Testing/WindowsRC003Preview.md#同日按用户要求覆盖安装并打开1128)；新任务仍须只读核对实际运行载荷，不能假定期间未变化。原修改的保护 stash `0d401298648e18b66685e9e0b116c97b9d52a8c9` 属于合并前备份，原修改已在 `9f4ead5` 合并后恢复并保持未提交，不再次盲目 apply。保护 manifest 留在本机 `target/dev/upstream-sync/merge-20261009.json`，不以 stash 代替当前工作区。
+
+## 2026-10-10 17:56 Codex 返回键失效后菜单确认恢复（根因未闭合）
+
+用户报告：同一次应用运行中此前返回键确实可以退格；17:56 左右在 Codex 中短按和按住均无法退格，立即按菜单键、直接按确定，随后退格恢复。此前成功操作的准确时间与输入路径未知；不能因启动配置为空而否定这项观察，也不能把菜单确认后的恢复当作已经找到根因。
+
+现场身份为已安装 0.8.6（EXE SHA256 `307a5ebe5720a2b6154e254df91133d3830daf968420331a36ee50b8778147f3`），主程序 38828、按键宿主 50032；同一主程序自 13:47:09 运行至本轮取证。先冻结当前日志及相关时段轮转检查，再只读核对实际配置；没有重启、构建、安装、修改模板或开启连发。
+
+| 本地时间（UTC+8） | 可确认事实 |
+| --- | --- |
+| 13:42:28 → 13:45:38 → 13:47:09 | 上一主程序 32448 菜单手选后正常退出；38828 重新启动时实际来源 common、自动跟随关闭、execution_mask=0。手选只在进程内保留，重开不恢复手选是现行契约，不是本轮新发现的运行中自动切换 |
+| 13:47:09 至 17:56:39 | 仅见 common 来源，未见 program_default 或其他模板选择请求；各次映射重配 execution_mask 均为 0。保存配置的 common actions 数为 0，模板内容和自动跟随开关与本日早先快照一致 |
+| 17:31:16–17:32:00 | 增强桥接静默超时，两次 Helper 重建并恢复；当前恢复者 39152 复用设备宿主 11972。恢复前后捕获仍只有 Menu（mask=256、target generation=2），没有接管 Back；不能据时间相邻推断此次恢复导致退格失效 |
+| 17:56:35.889/36.041、38.575/38.726 | 两组 Back DOWN/UP 的观察边沿均存在，但未进入 map_fire/map_inject；当时 Back 不在有效执行映射与捕获所有权中 |
+| 17:56:39.437–41.512 | Menu 打开，确认提交 source=menu、generation=285（随后配置确认 286）；目标捕获更新为 7167，执行位图变为 6911，实际映射确认 actions_available=true。菜单初始 selected=0，目录首项为内置 Agent，其保存覆盖的 Back Single 仅为 Backspace。默认关联保存不等于重新开启自动跟随 |
+| 17:56:42.275、46.291 | Back Single 注入 queued，均观察到 echo_delta=2、VK=0x08、scan=0x0E；注入回声只证明按键链提交/被钩子观察，用户进一步确认 Codex 实际退格恢复 |
+
+结论：当前日志没有支持“同次运行中模板异常自动切走”的证据；菜单确认确实建立了此前不存在的退格映射。现行手选不跨重启、关闭自动跟随忽略程序默认关联，可解释当前 common 状态，**不能独立解释用户明确观察到的同次运行先成功、后失败**。此前成功退格的原始键码、来源（原生/映射/其他）、焦点与修饰键状态没有对应对照记录，仍未知；不把未知成功路径、Helper 重连、模板启动规则或菜单窗口恢复失败串成根因。菜单本次 `restore_completed ... failed reason=window_operation_failed` 是独立焦点边界，不能解释此前的失败。
+
+短按失败与切换后短按恢复为用户实际观察；长期按住是否连续删除仍未验证。当前 repeat_single_mask=0、repeat_long_mask=0，Agent 保存覆盖无 holdRepeat，不能自动开启连发作为修复。现有 `restarting_runtime_keeps_preferences_and_defaults_but_not_manual_selection` 在本日同源码的 `cargo test --workspace` 记录中通过，只证明启动契约；本轮只读分析不新增修复通过结论。后续对照须补齐已选设备的原生返回/Backspace 键码与路由、同代实际 Back 动作类别、成功/失败两次的焦点及修饰键分类；现有日志不能追溯补回这些历史事实。
+
+必要现场仅本机留于既有 `target/dev/foreground-input/template-switch-current.log` 与 `template-switch-configuration.json`，前者保留 13:42:25 至本轮冻结终点的完整相关会话，后者用于核对用户映射并比较早先快照；含本机敏感配置与旧日志字段，不提交原件。本页仅记录脱敏时间、PID、位图、标准退格键码、包指纹及用户观察。保留至该次正常/异常路径对照闭合，随后按 LOGGING 回收，不新增重复台账。
+
+### 2026-10-13 当前启动与菜单手选（旧启动契约与新记忆要求）
+
+用户补充确认：当前重选使用模板后正常响应；按键被收到与实际存在映射须分开判断。本轮只读核对安装身份 `f7c679a6ed822b9a2cbcf1a335fdc3ab06140bef6034825410b81657e95e2b99` 的 App 53020 当前生命周期，不重启、不改配置、不模拟按键。北京时间17:07:07启动，17:07:08实际应用 `source=common / generation=2 / actions_available=false`；自动跟随关闭、common actions为0，捕获随后仅有Menu（mask=256），17:07:25的Left已收到但 `configured=false`。17:17:43首次且唯一手选请求为 `source=menu / common=false / scope=session / persisted=false`，generation19→20；17:17:44捕获确认后 `actions_available=true`。随后Back有142条手势/执行/提交事件，17:20:03–06多次Single为fired/queued；最后17:20:45仍是 `source=menu / generation=33 / actions_available=true`，未见重新应用common。用户确认手选Agent后的可用性是实际观察；queued本身只证明提交。
+
+当前事实符合连续覆盖安装后的新启动不恢复上次进程内手选这一旧明确契约，不是0.8.6随机覆盖；它不证明以前17:56同运行先成功、后失败的原因。菜单请求日志不含template ID，不能只凭 `source=menu` 断言确切模板；当前保存的Agent覆盖确为单键Backspace，与用户说明一致。未直接调用活体SceneSnapshot IPC或采集UI像素，不将日志检查当作灰标签显示核验。编辑源选择只更新前端草稿；向导语音绑定只推送语音设置，映射暂挂只设置suspended；本轮未发现它们清除当前手选的新代码/日志竞争证据。17:17–18分钟另有菜单返回目标恢复失败/保留面板日志，是独立焦点边界，不据此解释当前映射丢失。
+
+用户随后明确要求替换旧契约：关闭自动跟随时，手动使用经映射引擎确认后记住，重启恢复；明确选通用清除记忆。开启跟随清除全局记忆，按已有程序规则选择；再次关闭从通用开始，程序默认关联不改。候选只新增 `rememberedTemplateId` 设置，缺字段为None；删除/无效ID安全回通用，重命名/编辑保留同ID。菜单与UI共用引擎确认后的保存事件，保存只更新记忆字段，不重新套用整套映射；整包编辑保存合并最新记忆。`manualSaveStatus=saving/saved/failed` 区分实际应用与持久化结果；保存失败保留当前已应用模板，重启仍使用上次保存的选择，不谎报回滚或已记住。迟到旧保存核对本次手选代次，未确认新选择的previous可结清旧保存；引擎超时/拒绝不请求保存。捕获租约/驻留换代开发继续暂停。
+
+定向验证：初始四项重启/首次配置/开关/ACK回归先红后绿，旧保存与未确认新请求交错另先红后绿；场景套件79 passed、0 failed、1个既有真前台探针ignored。真实Host的四项记忆事务测试passed，覆盖旧编辑合并/重开/通用、迟到与无效选择、重命名/删除/开关以及自有文件共享锁造成的真实写入失败后旧字节保持。独立有界review发现启动记忆来源被旧分支误标program_default，补断言先红后修正为remembered，最终记忆定向9/9 passed。冻结源码完整矩阵passed：前端407项/28文件、类型检查/构建；Rust workspace728 passed/23 ignored（Windows531/22、Host158/1、core32、scene4、集成3），另有独立诊断子进程1项；fmt、普通/仿真check；Helper58/3 ignored及父测试实际执行的子入口、Agent95、身份夹具及前端嵌入内容门禁12项。真实隔离WebView/Tauri模拟18步passed且正常清理，但模拟接口不支持select_current_template，不把它当作本次模板记忆验收。沙箱内tauri-build/rustfmt的os error5不计产品失败，实际检查由真实宿主执行。
+
+本地候选运行身份 `d884cf3d7399e892c0bbc2ab9cb87879886ca744888d9baa6187e1017e7242fc` 安装后，用户明确确认模板列表鼠标“使用”和按键页当前使用下拉均正常、编辑目标不变，当前PC此次两入口交互passed。用户另反馈成功提示闪动；仅删除成功提示，不更改应用/保存链，重跑前端检查后正常覆盖安装后续静默候选：setup SHA-256 `1a2a01a08ce5effda6260b4d52cff5a625b2ead404bef9c7d166a5162161505c`，运行 source fingerprint `8a38c43cce592fff5636e0aa9aafa06abd38f0b6092b21e73e34cff1cc774007`，base `af710b757897cb0567b63c63a7ceb40f62426652`、dirty/local/included。六个相关Rust文件hash保持，因此复用上述同内容Rust/Helper/模拟证据；不凭新前端包自动扩大硬件结论。
+
+真实退出/安装/重启分层证据：旧App23840正常退出overall passed、failed_stages=0、808ms；安装前记忆为browser，安装前后五份配置哈希保持。Explorer12848启动安装版59956，Session1、TokenElevation0、主窗可见，实际身份与静默候选匹配、Helper connected。北京时间18:25:49–52新进程首先读回 `source=remembered / generation=2 / actions_available=true`；18:25:55.096随后有 `source=buttons_page / generation=3` 请求、应用确认及记忆保存passed，稍后读回Agent。用户最终明确说明Agent是自己启动后手动选择，并确认再次切换不闪动。启动初始browser恢复依据是安装前后配置与新进程日志，不声称用户亲眼确认了该初始画面；之后Agent是已确认的人为使用，不是自动覆盖记忆。本次两入口、正常重启记忆恢复和去成功提示的限定验收passed；它不关闭旧17:56同进程失映射、其他设备/完整硬件矩阵或暂停capture边界。
+
+最小现场为既有主题下 `target/dev/foreground-input/template-current-session-evidence.json`（6,933字节），保留35条脱敏生命周期/应用/捕获事件及Back首尾样本；当前与最近轮转原件原位保留，无整树复制。归因已在本节独立保存；本次入口验收闭合后按LOGGING回收，不提交原始配置或语音内容。红绿与场景日志复用同目录 `remembered-template-*`，不新增重复台账。
+
+## 2026-10-10 晚方向键长按与实体键盘共存（来源调查中）
+
+用户再次报告遥控器方向与返回按住不能连续执行，并补充实体键盘也异常：ESC 下方、数字 1 左侧的键变成 Tab（用户称 Table），方向键按住只移动一次，实体 Backspace 仍能连续退格。此补充扩大到键盘共存，不能只以遥控器模板连发关闭解释整组现象；尚未取得本轮只按实体键盘的准确时段及连接方式。
+
+现场仍为同一安装 0.8.6、主程序 38828、按键宿主 50032、EXE SHA256 `307a5ebe5720a2b6154e254df91133d3830daf968420331a36ee50b8778147f3`，源码基线 `af710b7` 加既有未提交工作。Helper 2600 接管宿主 11972。先冻结当前及轮转日志，再只读核对配置、系统键盘设置与源码；未重启无线麦、构建安装、改模板、重做迁移或开启连发。
+
+- **遥控器实际配置**：冻结的 `button-mappings.json` 与 17:56 调查快照字节一致，最后写入为 17:56:40.857；Agent 保存覆盖的方向/Back 只有单击，双击/长按 Disabled，没有 holdRepeat。17:56:41 的 revision=17 和 18:02:33 恢复后的 revision=19 均为 execution_mask=6911、recognition_mask=7167、repeat_single_mask=0、repeat_long_mask=0。19:38:00.471–01.836 的 Left DOWN/UP 相隔约 1.36 秒，只有首次 Single 注入，无续拍。冻结终点之前同主程序无 map_repeat。只能确认该配置不会连续执行，不能证明这些边沿都来自实体遥控器。
+- **未见运行中关闭连发的证据**：17:56 确认后至最初冻结时段未见新模板选择请求，配置也未变化。随后现场 19:40 又出现菜单选择记录，属于初次冻结之后，不能倒推为 19:38 的原因；具体是谁操作仍以用户对照为准。此前原生/映射路径正常的时间和来源仍未知。
+- **系统设置只读结果**：真实桌面用户 KeyboardSpeed=31、KeyboardDelay=1，FilterKeys Flags=126 的启用位为 false，系统 Scancode Map 不存在。源码检索未发现写入这些键盘配置的操作。这不排除钩子、报告拦截或其他软件改写输入，亦不把注册表读回扩大为所有系统状态正常。
+- **确认的源码来源缺口**：18:02:31 Helper 已记录 selected host 的 members=7、rc003_members=1，七项均属 BTHLEDevice，仍以 `continue_with_usage_gate` 继续。`rc003_agent.js::installHook` 只检查 IOCTL、输入长度/内容、报告 ID 与 usage，没有在上报或清空前证明逐报告属于所选 RC003；FileHandle 仅被记录用于停止释放核对。主程序后续的所有权位图确认的是允许的按键，不能补回设备来源。共享宿主与标准方向/TV usage 的组合构成实际来源隔离缺口。
+- **隔离代码实验**：复用现有 agent_logic_test.mjs 的可控桩，在内存中运行当前 agent 源码，不接触活体宿主。下发 TV=0x0035、Right=0x004F 后，同报告分别使用模拟句柄 10、11，四项均被清为 0；两项普通 Backspace=0x002A 保持原值。实验确认源码会按内容接管不同句柄且保留普通 Backspace；它与用户描述相符，但模拟句柄没有真实设备身份，不能据此宣称本轮实体键盘根因已闭合，更不能外推三轮启动或 17:56 单击失败同根因。
+- **实际键位边界**：两分钟公开 API 只读探针成功注册独立 Raw Input 与始终放行的 LL 观察钩子，当前前台布局对 scan=0x29 返回 VK=0xC0、language=0x0804。观察窗口 19:49:17–19:51:17 未收到所查键的事件，随后正常撤钩结束；这只是布局查询，尚非用户实体按压的实际键码。暂不将该键定为单引号、反引号或遥控 TV。
+
+- **20:17–20:18 实体键盘对照**：用户按只用键盘的观察指令操作，追加反馈为该键与左右方向键组合时能够打出反引号。公开只读观察实际收到非注入 `VK_C0 / scan=0x29`，不再仅依赖布局查询。20:17:45.233 的 Helper Left 与 45.277 的映射注入、20:17:47.486 的 Right 与 47.557 的映射注入对应；此窗口各有一组成对的注入 Left/Right。20:17:57.559 Helper TV=0x0035，57.735 主程序记录 TV Single 注入 Tab；观察器 57.726 收到注入 Tab。整个观察有 11 对注入 Tab、102 次非注入 C0 DOWN、33 次非注入 Left DOWN、69 次非注入 Right DOWN；原生重复主要出现在用户组合按压期间。源码缺口与这次键盘误路由的实机证据闭合。多键改变报告形态是解释组合差异的推断，未读取其他设备原始报告，不为此增加多键特判。键盘连接类型尚未由用户确认。
+- **最小源码修复**：先补来源回归，旧实现七项来源隔离断言失败，再引入已验证的固定 WDF 完成请求来源。每个请求同步查询 queue→device→功能 PDO，以线程嵌套作用域关联复制 IOCTL；只接受当前 Helper 从已启动功能节点读回的精确 PDO。其他设备、缺失/失败查询、不同线程、旧来源代次和结束后的作用域不改写、不上报、不改变遥控器持键状态；原有同 handle 完成释放与停止回执保留，停止时配对撤除新增钩子。Helper 对固定 x64 系统模块路径及 SHA256 持锁核验，未知模块/架构零注入，不猜偏移；沿用租约传递私有身份，不记录 PDO/实例或控制帧原文。Agent/Helper 代次同步为 `2026-10-10.request-source`。这不是恢复已删除的旧生产链，也没有修改模板、连发或系统键盘设置。
+- **自动化**：Agent 95/95，包括真实生产回调的来源、零帧、嵌套、线程、节点失效、按键释放及日志隐私；Helper 58 passed / 3 ignored，独立 fmt/check；工作区 669 passed / 22 ignored，fmt/check 与 Windows runtime-simulation 编译；前端 348 passed，生产构建；覆盖安装契约 5 passed。测试均在必要时使用正常 Windows 环境，sandbox 的访问/套接字失败不计为产品失败。Python Frida 传输自检适配了私有续约、测试进程来源桩和真实绑定拒绝用例，但现有 Python 无 frida，执行 `deferred`，不能以语法检查替代其运行。
+
+状态：本次实体键盘误接管根因已确认，源码修复及自动化完成；10 月 10 日安装时新 Agent 未实际接管的边界保留在下文历史记录，10 月 12 日重启后的接管和用户观察见本节续验。当前模板没有显式连发，遥控器方向/返回不重复的配置行为与来源错误分别记录；此前为何能重复、三轮启动及 17:56 单击退格失效仍未全部闭合，不外推为同根因。安装和实际代次归本轮 Preview 记录。
+
+2026-10-12 有限代码复核未发现当前来源分支绕过精确 PDO/线程作用域/代次校验而再次接管其他键盘的明确路径；这不等于全库或所有调度边界通过。另发现待回归的租约边界：Agent 在报告回调内先 `emitEdgesIfChanged`，后检查 `leaseOk` 决定是否清除原报告；Helper 对已鉴权边沿继续转发，false 租约心跳不立即撤销主程序捕获所有权，主程序另按所有权超时清除。续约迟到时是否会在原生已放行、映射仍认为持有的窗口双执行，尚未用可控调度回归或实机证实；原生首拍对冲对该路径的覆盖也未闭合。仅记录静态风险，不将它认定为本次历史症状根因，不据此修改生产代码、放宽来源检查或调整超时常量。当前菜单恢复不关闭下述驻留组件升级限制；音频 UI 两端选择循环及旧端点回滚仍归输入切换专项。
+
+本轮最小材料复用 `target/dev/foreground-input/keyboard-coexist-current.log`、`hold-repeat-configuration.json`、`keyboard-readonly-probe.ps1/.log`、`source-keyboard-observation.log` 与 `agent-source-boundary-check.mjs/.log`。只读探针第二轮 20:16:36–20:18:36 有实际键盘对照并正常撤钩；第一轮无事件结果已记于正文，过程日志复用同一路径。准确旧包 `source-gap-baseline-e4d20971-setup.exe` 只用于本次源码不可由单一提交还原的故障对照，待新来源验收闭合后回收。原始日志/配置只留本机且不提交；正文保留脱敏字段、时间与计数。最初临时复制的三份历史轮转日志逐份哈希确认与原件一致后移入回收站，原件未动；相邻完整日志副本在提取相关时段后回收。只保留独有实验和必要包身份，不新增源码副本或过程台账。
+
+### 2026-10-11 菜单已勾选但触发原生上下文菜单（当日现场未恢复）
+
+冻结当前完整日志后按主程序 PID 聚合，仍为 10/10 20:28 启动的 50156、按键宿主 36976；设备宿主 11972 创建于 10/10 10:15:37，没有宿主代次变化。11:48:08、11:49:19、11:49:57、11:49:58 四次 Menu 均有成对 DOWN/UP，全部 `configured=false fired_count=0 reason=unconfigured`，无模板菜单打开。11:49:45 用户关闭再开启菜单选项，两次保存成功；最终配置 `menuTemplateSwitchEnabled=true`、自动跟随关闭、六个模板。开启后 `requested_mask=256 captured_mask=0 recognition_mask=0`。勾选已保存，但捕获权限没有取得，不是按键未收到或设置自动取消。
+
+部署根因明确：上轮正常退出已撤除旧钩子，但未卸载旧驻留模块。当前清理回执仍为 Helper 46912 / host 11972 的 `agent_version_blocked`；启动记录确认 running=`2026-10-03.cleanup-instance`、expected=`2026-10-10.request-source`、`capture_acquired=false`。本次实际安装主程序/Helper 与候选 SHA256 均与 Preview 最终包一致，排除误开另一安装版本。**安装文件更新成功不等于新捕获脚本已加载；上轮菜单功能交付尚未完成。**
+
+代码对应：`InputConfiguration::apply_input_capabilities` 在 RC003 所有权为零时移除菜单识别；统一报告模式的 LL 路径保留实体键盘原生输入，场景控制也拒绝对已经进入系统的 Menu 再次执行模板菜单。因此原生 `VK_APPS (0x5D)` 进入上下文菜单，与用户“像鼠标右键”的观察一致。不能删除门控或重新启用旧脚本恢复菜单，否则重现已证实的键盘误捕获或原生/映射双执行。
+
+只读核对旧脚本命令集及 Frida 生命周期：当前 script/默认 ignore 实例无 reload 命令或 Frida 控制服务，写磁盘配置、重开主程序/Helper 不能追溯赋予热更新能力；来源归 ATTRIBUTION。不通过第二份 Gadget 或强制卸载共享宿主试错。恢复需旧宿主正常结束、新 Agent 加载，再观察配置 ACK 与实际菜单/键盘行为。Windows 正常重启需用户明确许可，本轮未执行；新来源链路未实测，不能预先保证重启后功能通过。
+
+本次仅只读调查和文档更新，未改代码、模板、连发、系统键盘配置或运行状态，未重复构建/安装；沿用同内容自动化证据。`failed`：四次菜单无法打开；`passed`：保存状态、事件成对到达、载荷身份与版本阻断核对；`deferred`：新版实际接管、菜单短按/确认/长按、实体键盘共存和冷首用。最小现场复用 `target/dev/foreground-input/menu-source-current.log`，留到新来源验收闭合；原日志及轮转未动，不新增台账。
+
+### 2026-10-12 用户重启后的来源、菜单与连发配置续验
+
+本节缺省连发关闭是当时的规则与观察；用户随后明确要求“未设置长按时连续单击”，新规则与对应验证归下述补充及 [连发手册](../Testing/WindowsButtonGestureRepeat.md#2026-10-12-用户调整无长按动作时默认连续单击)，不反改当时证据为引擎丢拍。
+
+本节时间均为北京时间（UTC+08:00）。用户已自行重启，公开启动时间为 10:06:55.5；本次主程序 10780、按键宿主 26108、Helper 29896、设备宿主 12192，区别于前两日旧进程。冻结的 `target/dev/foreground-input/post-reboot-current.log` 包含当天旧会话，以下结论按本次 PID 筛选，不将重启前记录混入新代次。沿用已安装的 `04ba26c6` 包及下文 Preview 中的完整载荷身份，本次未为观察重复构建或安装。
+
+- **passed（新来源实际接管）**：10:12:01.692 Helper 与宿主完成鉴权，实际 Agent 为 `2026-10-10.request-source`，不再是旧版本拒绝；10:12:02.202 Menu 目标 generation 2、owned_mask=256 生效。10:13:02.449 心跳记录 `source_selected=74 / source_other=198 / source_unknown=120`，`clears_ok=23 / clears_fail=0 / restores_ok=23 / edges_sent=46`，证明当前来源判定与报告处理已实际运行；这些计数本身不替代用户可见输入结果。
+- **passed（菜单打开、确认、恢复与用户观察）**：10:12:07.511 Helper 收到 Menu，07.564 主程序接受 DOWN，07.570 路由为 `Handled / native_delivered=false`；07.613 前台读回由 main 变为 menu，07.614 菜单快照应用。07.764 收到 Menu UP，取消等待释放状态且未追加手势。08.625 确认键 DOWN 被菜单处理，08.776 真实 UP 后，08.777 才请求 `source=menu` 模板选择；08.798 原窗口恢复读回通过、08.816 `target_restored=true`、08.817 隐藏菜单。用户随后明确确认“菜单和实体键盘都已正常”。此为本次 RC003 与当前 PC 的观察，不外推每种组合键、每个前台程序或 RC001。
+- **passed（配置代次隔离）**：打开菜单使捕获目标 generation 2→3，确认模板使 3→4；08.877 拒绝迟到 generation 3 回执，09.384 当前 generation 4 恢复 owned_mask=7167，09.385 `template_selection source=menu actions_available=true`。中间 `actions_available=false` 是重新确认捕获期间的状态，不是又切回通用模板。菜单确认还记录保存默认请求完成，属于用户菜单操作，不据此认定发生自动异常切换。
+- **passed（缺省被解释为关闭的实际配置与行为）**：只读核对当前 `preset-agent`：返回 Single=Backspace、四方向 Single=对应方向，五键 Double/Long 均 disabled、`holdRepeat` 均缺省，按当时 schema 解释为关闭。实际 revision 9 的 `repeat_single_mask=0 / repeat_long_mask=0`；Left 10:12:24.744–25.591 持有 847ms、Right 25.897–26.913 持有 1016ms、Back 30.206–31.621 持有 1415ms，各只执行一次 Single 并收到正常 UP，期间没有重新配置或丢失捕获所有权。现有证据符合缺字段在当时代码中的解释，不证明用户主动关闭过连发，也不支持“连发已开启但引擎丢重复”的归因。
+- **deferred / 未知**：用户关于连发应由用户选择的讨论，不构成修改五键配置的授权；本轮保持模板与系统键盘设置，不重复迁移。开启“重复单击动作”或“重复长按动作”后的实体持续输出、UP 停止、冷/闲置首用、断连与完整双型号验收仍待验证。10 月 6 日上游历史验收不外推当前包。三轮启动及 17:56 单击退格问题保留各自未知点。
+
+同次启动的语音问题独立调查如下；菜单、实体键盘恢复不说明语音已恢复。以上为已部署来源修复的现场续验，未新增修复提交；必要脱敏结论原位保留，原始日志仍仅本机留存至相关边界闭合。
+
+#### 同次重启后的语音端点失效与识别修复
+
+10:11:57.481–57.489 启动恢复先报告 `endpoint_identity_mismatch / persisted_endpoint_missing_or_changed`，严格配对随后因 `capture_missing` 失败并清空运行期写入端。之后本次进程十次语音开始均在 `audio_session begin` 因 `endpoint_not_selected` 中止，尚未进入默认麦克风切换、目标快捷键或输入法恢复。因此语音键已经到达应用，当前阻断点是音频路由，不据此修改语音按键或输入法时序。
+
+只读公开 CoreAudio/PnP 检查确认：保存的两个端点均为 `NOTPRESENT`（状态 4）、`IsPresent=false`，它们的 PnP Parent 均精确对应启动失败的 VB-Audio 适配器，而非仅时间相邻。该适配器为 Code 10、ProblemStatus=`0x80000011`；同机另一实例 Code 0，驱动包同为 `oem88.inf` / 3.3.1.7。错误码表示设备忙，不足以解释为何产生两个实例或为何原实例启动失败，这一层根因仍未知。未禁启、重装设备或操作无线电。
+
+当前可用实例的官方属性还暴露两处应用识别缺口：接口友好名带 Windows 数字前缀 `2- `，以及实际 pin 名为 `CABLE In 16 Ch`；旧代码分别只接受无前缀家族名和无空格的 `16ch`。先新增两项回归并观察失败，再最小修改 `audio_route.rs`，仅接受纯数字前缀与该精确官方拼写，仍以精确 PnP 适配器身份配对，不按相似名称替换用户目标。配对日志增加所选 Capture 是否存在、元数据/家族是否识别和已知端点计数，不记录名称或身份。
+
+13 项路由单测通过。生产 resolver 的真实只读检查证明：显式指定当前 Capture 的同线 16Ch 写入端可以配对，零默认设备写入、零音频流；未指定时，另一写入端仅能读到“扬声器”，没有足够证据证明标准 CABLE Input pin，仍按 `RenderMissing` 拒绝自动配对。此边界不通过新增 Speakers/扬声器 fallback 绕过。原保存目标与新实例并非同一身份，调查期间未擅自替换；用户随后明确同意使用已核实的新同线通道。正常退出后只更新四个端点字段，保留临时麦克风切换与全部其他设置；启动严格配对、真实语音和四次原默认角色恢复已通过，打包部署与完整身份归 [Preview](../Testing/WindowsRC003Preview.md#2026-10-12-音频通道识别与语音键反馈修复)、输入切换专项。该次显式配置恢复不代表两端 UI 选择循环或旧目标失效的回滚缺口已经修复。
+
+用户同时报告语音键没有界面反馈。代码确认 `ButtonsPage.voiceActive` 原先仅判断 `connection.voiceState=streaming`，音频准备失败退回 Idle 后，收到的按键也不再显示。最小修复新增独立 ATVV Start/Stop 观察，经现有 scene snapshot 即时传递，不改变录音状态或快捷键控制。观察位于当前连接代次检查之后、Idle 状态的 Stop 早退之前；断连、连接失效和退出清除。该状态表示已归因的遥控语音控制生命周期，不声称能读到实体触点或在设备自动停止后继续代表持有。独立字段契约回归先失败，修复后四项控制器/管线组合测试通过；旧代次与清理接线另经代码核对，未以单测冒充真实 BLE worker 失败注入。
+
+前端复用现有 scene 订阅，以独立观察高亮、以 streaming 显示语音进行中；同步观察快速 DOWN/UP 后仍保留顶部收到按键说明，不延长按住状态。初始读取与新事件同代但迟到时不覆盖；卸载后回调失效。另复现并修复旧 streaming 状态导致本次错误被“语音已结束”遮蔽的问题，当前错误优先于结束提示，不推断未证实的开始事实。最终定向 78 项、全前端 355 项通过。
+
+11:19:00.519–49.903 主程序 30736 观察四组 Start/Stop，前端每组都在约 2–5ms 后记录 pressed/released；真实 UIA 观察到按下 badge=received、收到按键说明，结束后“已收到语音键，语音已结束。”与“按住说话”可见。短期 UIA 连续观察因空控件名提前结束，没有将它记作完整 45 秒采样；事件链与终态读回独立有效。用户明确回复“按键反馈和语音输入都正常”。四组音频均有非零提交、队列排空与原三角色恢复，恢复 journal 为 null；本次当前 PC/RC003 正常通道的反馈与语音 **passed**。错误通道在新安装包上的受控实机显示、真实断连/睡眠中清理、其他输入工具长闲置首用和 RC001/ARM64 仍未验证；不据此关闭整个历史 Bug。
+
+最小脱敏证据复用 `target/dev/foreground-input/post-reboot-audio-{topology,metadata,association,route-red,route-green,route-readonly}.log` 与 `voice-button-feedback-{red,green}.log`，用于复核本次未知端点与回归。最终实机用例已分开，`explicit_16ch` passed 与 `standard_writer` failed 分别记录，避免一条用例混写终态。另保留既有菜单/键盘已确认候选 `source-confirmed-04ba26c6-setup.exe`（SHA256 `04ba26c64bfcccaff065c00aedf3746672c29e188fbe827c73c87dd7de2bbaf2`）供新增语音修复的回退对照。新候选现场验收与未知边界闭合后按 LOGGING 提炼/回收；未创建源码副本或重复台账。
+
 ## 验证与留存
+
+2026-10-12 后续两端恢复事务：旧 Capture 缺失、只有显式 16Ch 可用时，两个保存入口循环要求旧另一端可用的根因已由隔离回归复现；当前以用户明确选定的未保存 Capture 草稿和高级 writer 一次严格配对提交解决。旧目标不可用时的配置身份回滚另有独立恢复路径，不依赖硬件读回；审查发现的旧名称读回超时缺口已用真实 controller 阻塞注入先红后绿修复，保留取消/超时与语音互斥。组合自动化、失效场景的 mock/controller 边界和实际部署归 [输入切换专项](../Testing/CaptureInputSession.md#2026-10-12-两端恢复事务与失败回滚)。不修改当前正常通道来制造故障，不把旧 Code 10、三轮启动/17:56 或暂缓的捕获安全换代与租约问题整体关闭。
+
+2026-10-12 15:53 后组合候选已安装，真实日志五字段与 manifest/载荷一致，完整内容身份归 [组合 Preview](../Testing/WindowsRC003Preview.md#2026-10-12-音频两端恢复与构建身份组合交付)。用户确认该包方向/返回连发松开、实体键盘实际键和方向长按、闲置首次/连续语音及反馈正常；菜单首次在 Codex 前台出现后释放瞬间消失，误开主页后恢复，切回 Codex 后仍正常，菜单当次验收 **failed**。旧现场 generation15–27 的 `requested=false` 将窗口操作前置结果与激活 API BOOL 合并，不能据此断言 13 次都实际调用 API 并返回 false；首hide在21.436、UP在21.564，确认关闭早于UP，但不能归为UP触发。文档已在15:53加载；主页与后续 foreground/focus 时间相关不证明恢复因果。最小脱敏现场 `target/dev/foreground-input/audio-recovery-menu-regression-evidence.log` 为548行/199,632字节，保留身份、代次、菜单、隐藏、主页及焦点关键事件。
+
+### 2026-10-12 菜单诊断候选与根因边界
+
+诊断包 `e39e642c42299f440492838a9fb268c9e17a8a0c5f7a0fbdb1e519636f7a374d`（12,858,164 字节）基线 `af710b757897cb0567b63c63a7ceb40f62426652`，source fingerprint `fb31da04e942670b294ec83aa4a0015db84f787d149fc95168f260900b27d77d`，dirty/local/included，`sourceCommit=null`。raw EXE SHA-256 `84cc2f515d014003f47fa010af6ad52cf21e27b721940cf4849f78fa0b5d2219`，installed EXE `94a6ab4999e058e537de51ec4de354b2f5558b70625fc970d976cc0c22705f66`，各 20,696,576 字节；除 NSIS offset 15467490–15467492 的 ASCII `UNK`→`NSS` 构建标记外与 raw 一致。正常退出约544ms、held=0、cleanup passed；覆盖安装四 payload/四配置字节保持，Explorer ShellExecute 普通权限启动 App 36272/子21196、Helper20812，五字段身份匹配。NSIS 生成及核验 passed；Tauri 总命令仍因缺 updater 私钥退出1，无 `.sig`，未签名本地候选。本包仅加诊断，没有改变关闭策略。
+
+用户在 Codex 前台未先打开主页/主窗时再次短按 Menu，仍观察到菜单出现后消失，验收 `failed`。现场 `target/dev/foreground-input/menu-diagnostics-current-repro.log`（80,981字节，SHA-256 `f322012c6888137f35b964a83e932b19f719e5ca34e4264d82a4fcafd48997b9`）记录 generation8–18 共11次：面板 visible=true、minimized=false、no_activate=false，调用方为窗口线程；激活 API 实际返回 false，实际 foreground 未变，随后程序清面板并隐藏。由此确认直接消失原因是激活拒绝被本地策略当作立即取消；native focused=true 不等同真实前台。只读 Git blame 核实，该 `requested && overlay_is_foreground` 门禁及失败后清理/隐藏策略来自本地 `7d9b068d`（2026-09-27），清理与返回目标处理强化来自本地 `51f0f5c5`（2026-10-05），不是 0.8.6 合并新引入；来源见 [ATTRIBUTION](../ATTRIBUTION.md#2026-10-12-菜单激活失败后的本地关闭策略来源)。Windows 为何拒绝激活仍未知，尚无行为修复。Host 全工作区 695 passed/0 failed/23 ignored（`menu-diagnostics-final-workspace-test-host.log`）；一次 sandbox 超时只结束测试进程，不构成代码回归。上一组合包通过的连发、实体键盘和语音观察不外推到本诊断包。捕获 lease/hotreload 依用户要求暂缓，更新源未改；后续菜单行为修复归当前诊断任务，不在本记录声称已解决。
+
+### 2026-10-12 菜单恢复实现与自动化（局部用户交互已实测）
+
+经独立审查后，菜单行为修复的五文件工作区已冻结，无 P0/P1/P2 必修项。源码变化集中在 `scene_control.rs`、`application_control.rs` 的只读 window ID getter、Windows library 透传、Tauri platform 透传及 Tauri menu host。首次 `SetForegroundWindow` 被拒时，仅当同次开窗捕获目标仍为实际前台才保持 remote-only 菜单；真实键盘操作及确认严格使用该菜单 HWND。每次遥控/原生手势与 UP 重新读回实际窗口，前台切出即取消；开窗 pending、前台观察、语音/配置取消后的迟到 UP、Menu Long 保存和旧代次清理均有回归覆盖。未改模板、前端、更新源或捕获 lease/hotreload。
+
+自动化 **passed**：`cargo test --workspace` core 32 passed、Windows 522 passed/22 ignored、Host 153 passed/1 ignored；其余 workspace 库及文档测试通过。窄测 71 passed/1 ignored、Host 菜单专项 7 passed；`cargo fmt --all -- --check`、`cargo check --workspace`、`cargo check -p sayall-windows-app --features runtime-simulation` 与五文件 diff check passed。日志位于 `target/dev/foreground-input/menu-fix-workspace-test.log`、`menu-fix-workspace-check.log`、`menu-fix-runtime-simulation-check.log`。最终 `scene_control.rs` SHA-256 前缀/后缀为 `022F1FE0…375`；仍是 dirty 工作区，不以 HEAD 代替完整内容身份。
+
+上一个 e39 诊断候选上的用户菜单复现仍是 `failed`，不因新包观察回写。修复候选 `无线麦_0.8.6_x64-setup.exe`（12,870,141 字节，SHA-256 `370b51b214cefac324d6966ee0631188d5155db7faa9b9978e9a7834c264c32b`）已正常覆盖安装并普通权限启动；安装/启动身份、四配置保持和 payload 核验通过，精确身份及签名边界见 [最终候选 Preview](../Testing/WindowsRC003Preview.md#菜单恢复修复候选安装用户观察)。用户明确回复“一二三都成功了”：Codex 前台短按 Menu 后松开菜单保持；遥控方向选择模板并确认后正确应用；重新打开菜单后切换到其他软件，菜单关闭。记录为本机本次用户观察 `passed`，不外推 RC001、其他 RC003、长期稳定或完整按键矩阵。
+
+结构化运行日志由 `build_identity_fix` 只读核对，五个身份字段与包记录一致（base `af710b757897cb0567b63c63a7ceb40f62426652`、dirty、sourceCommit=null、fingerprint `ad1c0484b521c21bd5ebd5a220b66c13c168ee51d857a89021cdda1af56cdaaf`、local、included）。generation 13 于 `10:37:17.776Z`（北京时间 `18:37:17.776`）activation API 返回 false / actual_foreground=false；窗口可见、未最小化、no-activate=false、调用方为窗口线程。随后 `activation_denied_policy` 记录 panel_before=true / panel_after=true，`snapshot_applied` passed，确认本轮真实运行出现“激活拒绝后面板保留”状态。generation 22 于 `10:38:15.075Z` API 与实际前台均成功且面板保持；generation 23 于 `10:38:16.756Z` 模板选择 `actions_available=true`，随后有 `focus_ignored hide_completed`。脱敏证据为 `target/dev/foreground-input/menu-focus-fix-user-validation-evidence.json`（1,823 字节）。没有用户动作关联 ID，不能唯一断定 generation 13 对应用户第一项操作，也不能证明“拒绝→继续遥控→确认模板”完整同次链；日志无 remote-only 专属字段，不能宣称该语义路径专项覆盖。Windows 拒绝激活的具体原因仍未知。捕获 lease/hotreload 暂缓，更新源未改。
+
+当前候选的用户三项操作已按上段记为本机观察 passed；对应细节、范围与保留条件见 [最终候选 Preview](../Testing/WindowsRC003Preview.md#菜单恢复修复候选安装用户观察)。保留 `370b51b2` 当前部署候选、e39 失败对照和 `5fd60bef` 音频/构建身份基线，待完整链路验收及引用/唯一性核对后再决定回收；当前不删除。
 
 - `passed`（2026-10-04 最终候选）：本地 0.5.0 NSIS 包 SHA256 `bd79c2c1eb3d4c1ed48e905761a812803e026e8a7adba234085c85b718f844b0`，12,582,424 字节；Helper `f02adfc9ba114cdd6362e238de16b2bca333e57c68728e3618453f1c7d956912`，内嵌 Agent 字节已核。09:30:52Z 完成管理员覆盖安装，App 53572 经真实 Explorer 普通用户启动，主程序和 Explorer 的 TokenElevation 均 0，安装 App `a3e6e36f57cbd2c45a76acb89784be550461b97faf49247ec40cac547f62946d` 与构建载荷除 NSIS 标记外一致；三份用户配置在安装阶段保持，主窗口可见。
 - `passed`（同候选真实故障分支）：Helper 68852 确认原宿主旧 build 后退出，写 `agent_version_blocked`、`capture_acquired=false`；App 状态为 `cleanup_pending=false`，实际 UIA 文本和截图显示旧组件被 Windows 占用的具体说明及可用关闭按钮，蓝牙连接单独显示。随后请求自身正常退出、实际 Installer 清理检查返回通过，再由 Explorer 普通权限重新打开；没有强杀或再次手工改回执。此为真实版本拒绝与收尾验证，不是新 Agent 接管或三个按键功能通过。
@@ -151,3 +326,88 @@ UI 的确定缺陷是仅以持久化 `enabled=false` 显示“未开启”，忽
 - 隐私检查：本页仅包含时间、临时进程号、计数和源码/包指纹，不含个人路径、设备身份、窗口标题、语音内容或凭据。
 - 晚间安装验收继续复用本机同主题目录：`interactive-install-*.json` 与两张选项截图保留两条真实向导的同用户权限、配置保持和文件状态证据，`reinstall-flow-test.log`、`reinstall-recycle-test.log` 与当前部署/运行/包身份摘要保留至本安装问题验收闭合；随后保留本页结论并按回收站规则整理。已核对并回收九个不再使用的临时界面检查/导航脚本、摘要和可再生 NSIS fixture 文件，共 70,246 字节；没有移除本地交付包、硬件故障材料或含 junction 的测试边界目录。
 - 本轮恢复与覆盖安装过程仍复用 `target/dev/unified-input/`：保留 `reset-*`、`helper-reset-*`、`installer-*` 中必要红绿/构建/诊断日志、已验证可反向重建的最小 Helper 差异及现有部署/运行/包身份摘要；重复 Helper 源码与两份空格式日志已回收；安装器的 19 个已核对普通再生产物（3,179,218 字节）亦经 IFileOperation 确认进入回收站，必要句柄实验日志及两份小探针保留用于首次 1603 复核。当前包只在既有 NSIS 目录留一份，不复制旧候选；首次 1603 与两次成功对照的脱敏结论已写在本页。含 junction 的隔离回收夹具保持为测试边界证据，不整体递归清理。留存仅用于当前旧宿主边界、覆盖异常与实体验收，闭合后按同一规则回收，不扩展至历史任务材料。
+
+### 2026-10-12 后续要求：缺省长按连续单击
+
+历史归因补充：`9f4ead5^1` → `9f4ead5` 的手势代码对比确认，0.8.5 合并把“只配单击时默认连发”改成了“必须显式指定连发槽位”；本地同时保留旧模板内容、不应用上游隐式连发迁移，导致无字段模板的实际行为改变。此前仅归纳为“当前配置关闭”不完整，不能归责为用户改错设置。这项变化早于 0.8.6；它解释缺字段模板不重复，但不补全此前每次成功输入的原生/映射路径，也不关闭 17:56 短按失效或首次启动所有权问题。来源边界见 [0.8.5 合并记录](../ATTRIBUTION.md#2026-10-09-上游-085-合并)。
+
+用户确认语音反馈与输入恢复后，再次指出方向/返回长按不连续，并明确要求未配置长按动作时默认连续执行单击。11:37:51.963 当前主程序 30736 的 revision 38 仍为 repeat_single_mask=0 / repeat_long_mask=0，符合旧缺字段关闭规则；没有证据证明已开启连发被丢失。新预期是默认规则调整，不归因于旧宿主、输入法焦点或音频通道。
+
+最小改动以已有手势状态机执行默认自动规则，明确关闭单独保存为 off，显式单击/长按保留；时间常量、动作白名单、来源捕获、实际应用/编辑分离及语音路径保持。历史缺字段无法区分未设置与明确关闭，按用户新要求解释缺省；不批量改模板、不新增迁移。只用于场景/任务识别的占位动作明确关闭重复，诊断记录有效单击/长按、自动与明确关闭掩码。新增无字段默认长按行为先实测失败（350ms 没有续拍）；新增菜单/任务/合并占位三项在新默认下亦先红，随后加窄护栏。完整自动化、候选与实体结果统一归原连发手册和 Preview。
+
+`5fd60bef` 包正常覆盖安装后，新普通权限主程序 46728 于 11:58:15 应用 Agent，有效默认单击连发掩码为 6385；随后左/右/返回七趟共 50 续拍均以 release 终止，用户明确确认连发、松开停止、菜单和实体键盘均正常。本次当前 PC/RC003 默认规则 **passed**；明确关闭/长按模式的完整实体矩阵、其他按键逐项、RC001、长闲置及断连睡眠等仍 deferred。该结果不关闭原三轮启动未知、音频旧设备 Code 10 或其他独立问题。完整身份、命令、安装和剩余边界归 [本轮 Preview](../Testing/WindowsRC003Preview.md#2026-10-12-默认长按连续单击修订)；现场复用 `target/dev/foreground-input/hold-default-lifecycle.log`。
+
+### 2026-10-15 Marvis 前台失效：管理员窗口输入边界
+
+- 状态：权限差异已确认，恢复验证 `deferred`；本轮只读诊断，未修改生产实现、第三方程序或运行权限。
+- 复现：用户确认北京时间 15:55 再测仍失败。Marvis 中无线麦可见语音键按下和收音，但微信输入法绿色话筒未显示；实体键盘 Ctrl+Win 可用，遥控 Menu 能打开模板面板，其他映射无效。设备具体型号本轮未核，不外推双型号。
+- 被测运行身份：主程序 PID 59956，0.8.6，基线 `af710b757897cb0567b63c63a7ceb40f62426652`，`source_state=dirty`、`payload_inputs=included`、`build_channel=local`，指纹 `8a38c43cce592fff5636e0aa9aafa06abd38f0b6092b21e73e34cff1cc774007`。这是安装实例身份，不代表当前工作区所有字节。
+- 日志证据：默认诊断日志 07:55Z（北京时间 15:55）全分钟共 23 条 `map_inject`，其中 8 条 `echo_delta=2`，15 条 `echo_delta=0`；零回声集中于 07:55:50.174–07:55:54.379，覆盖方向、确认及音量映射，均已到达 `map_fire`，不能归为未配置或设备没收到。session 93/94/95 均在 800ms 与约 2500ms 记录 `mic=not_observed`，对应 generation 339/340/341 实际收到 236/142/90 个音频包，解码错误为 0，并以 `control_stop` 收尾。07:55:56.495 模板菜单 `actual_foreground=true result=true`。同分钟 session 92 曾 `mic=observed`，因此不能把整分钟都描述成失败，或在没有逐次目标身份日志时认定每一条都发生在 Marvis。
+- 权限实测 `passed`：通过公开 OpenProcess / OpenProcessToken / GetTokenInformation 只读查询，Marvis 26192、MarvisAgent 61200、MarvisHost 75376 均为 `elevated=1 integrity_rid=12288 ui_access=0`；无线麦主程序 59956 及按键宿主 34392 均为 `elevated=0 integrity_rid=8192 ui_access=0`。微信输入法 renderer 为中完整性且 `ui_access=1`，不能以其工作状态反推普通无线麦具有相同跨权限能力。
+- 可执行文件公开清单实测 `passed`：仅以数据资源方式读取 EXE 的 RT_MANIFEST，Marvis 明确声明 `requestedExecutionLevel level='requireAdministrator' uiAccess='false'`；Agent 为 `asInvoker`，Host 未找到此声明。当前 Marvis 主程序要求管理员权限，不能把“取消快捷方式的管理员勾选”当作已经成立的解决方案。未读取第三方私有配置、数据库或进程内存，未更改清单或尝试绕过提权。
+- 归因：管理员目标与普通无线麦之间的完整性差异是已确认的兼容边界；[Microsoft SendInput 契约](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) 明确限制注入到相同或更低完整性的应用。该限制能同时解释普通映射和模拟 Ctrl+Win 不响应、实体键盘仍可用，以及应用内部 Menu 仍能打开。当前日志不能证明第三方具体消费情况，零回声本身也不能独立证明 UIPI；本轮尚未做同目标/同配置的受控权限对照，不将推断写为修复通过。
+- 验证边界：`failed` 为用户复现及上述语音/映射结果；`passed` 只覆盖日志分层、进程令牌和公开清单读取；`deferred` 为兼容方案、Marvis 实际恢复、冷态首用及双型号矩阵。主程序保持普通权限，现有硬件捕获 Helper 不自动等于已经实现管理员窗口按键投递。本轮没有运行电源、无线电、额外输入注入、重启或部署实验，没有生成过程文件；日志中必要脱敏计数已归本节，不复制完整日志。
+
+### 2026-10-15 晚间 Menu 未唤醒：捕获续约超时与桥接重连
+
+- 状态：已完成最小修复、自动化与负载对照、正常覆盖安装和运行身份验证；2026-10-16 用户确认 VSCode 菜单和语音正常、无调试弹窗，实际日志支持菜单打开与四段语音正常结束，最长33.895秒。超过45秒实体语音、菜单关闭恢复及双型号完整矩阵仍未通过；新实例仍有两次短暂所有权超时，详见本节末尾。以下为最初只读调查事实，当时未改捕获生命周期、配置或部署；同晚后续授权、修复及验收分别见本节末尾。
+- 现象：用户反馈切换到新界面后偶发按键功能对不上、Menu 无法唤醒模板切换，询问是否因模板过多；随后明确补充“没有模板切换的弹出，但是有鼠标右键的那个菜单弹出”。这是用户对实际可见结果的确认，符合捕获失效时原生 Menu 透传到前台程序的行为；没有据此认定应用注入了鼠标右键。尚未获得每次失败的目标程序或精确动作对应，不把所有“功能对不上”归为单一原因。
+- 被测身份：实际运行 App PID 64252，1.0.0，基线 `8b9dd31460f1b3b4c6859b2216de61ede0966206`，指纹 `4487283408be7d7c703c2fcd9be074b5003c1c1f57ae3129c5b8f0048d4014c9`，dirty/local/included；Helper PID 78564，设备宿主的已鉴权 Agent 报告 build=`2026-10-10.request-source`。身份来自活体日志，不以当前工作区字节或版本号替代。
+- 方法与范围：读取默认诊断日志及现存五份轮转日志，先按小时/PID 聚合，再核对失败窗口。统计固定截止 2026-10-15 14:25:00Z（北京时间 22:25:00）；该 App 当前保留记录从 09:15:34.197Z 起，累计 71 次 `ownership_timeout`、32 次 `closed reason=silence_timeout`、73 次所有权恢复（含初始取得）。不同事件不能按一对一事故计数；恢复事件也不单独证明按键实际生效。
+- 本机配置只读摘要：6 个模板，`menuTemplateSwitchEnabled=true`、`buttonMappingFollowEnabled=false`，存在手选模板记忆。本次失败前后 14:16:45Z–14:25:00Z 没有 `targets_changed` 或 `template_selection phase=requested`；目标代次保持 4。没有因模板数量进行删减或改配置。
+- 对应失败链（北京时间）：
+
+  | 时间 | 实际观察 |
+  | --- | --- |
+  | 22:17:00.500–00.506 | 蓝牙仍为 connected=true、requested_mask=7167，但 captured_mask/execution_mask/recognition_mask 全部为 0；模板来源仍为 remembered，actions_available=false；随后明确记录所有权续约超过 1500ms，原生输入放行 |
+  | 22:17:01.986 | 桥接超过 3000ms 没收到数据，silence_timeout 断开 |
+  | 22:17:02.215–10.567 | 四次 Menu DOWN/UP 共八条边沿均收到，但 configured=false / fired_count=0 / reason=unconfigured，没有进入菜单打开流程 |
+  | 22:17:04.454–14.934 | Helper 已重新鉴权；Agent 回执尚未恢复，出现 voice_synth_resend 与 agent_never_acked，说明“桥接已连”仍不是捕获 ready |
+  | 22:17:17.335–18.273 | 所有权恢复，实际映射重新可用；下一次 Menu fired，菜单实际前台核验与 native_focus 均通过 |
+  | 22:22:56.060–22:23:34.683 | 另一次所有权中断后经历重复重连，至恢复共 38.623 秒；这段间隔直接来自运行日志，不是推算的自愈承诺 |
+
+- 直接原因：`rc003_bridge.rs` 所有权回执超过 1500ms 会撤销捕获资格，超过 3000ms 收不到桥接数据则断开；`button_mapping.rs::InputConfiguration::apply_input_capabilities` 在 RC003 captured_mask=0 时过滤执行和菜单映射。因此已抓到的四次 Menu 失败发生在模板选择之前，属于捕获资格暂时失效；保存的模板数据并没有被清空。复核 22:17:00–18 的四次失败按压共八条 Menu 边沿，均为 configured=false，同窗口没有 map_fire button=Menu；结合 native=passthrough 和用户观察的上下文菜单，可解释为原生 Menu 进入前台程序，未进入模板执行链。用户未给出逐次时间及目标，故不将右键菜单观察与某一条边沿强行一一关联；其他未对齐目标/时间的失败仍未知。
+- 深层归因边界：同一统计窗口 Helper 诊断已观察到 append 最大 9191ms、bridge_queue 最大 10742ms、agent_rx_age 最大 9672ms、bridge_write 最大 823ms。源码 `Logger::line` 和 `latency_summary` 同步执行文件追加，桥接队列也确有秒级延迟。22:23:29.770 记录 bridge_queue=5931ms、agent_rx_age=6597ms，随后桥接再次超时。这些是已测事实和需要继续验证的阻塞方向，尚无同次受控实验将具体续约超时归到日志、线程调度或底层 Agent；不能把最大耗时简单相加，也不能认定前台切换触发断链。维持原超时与安全失效策略，不凭推理延长常量或绕过所有权校验。
+- 独立菜单关闭边界：22:17:19.677 原目标恢复失败，reason=stale_window；菜单按现有策略保留，随后 close 被 target_restore_failed 阻止。它发生在菜单已成功打开之后，需要与前述“未唤醒”分开判断；目标具体为何失效尚未知。
+- 验证：`failed` 为上述四次实体 Menu 手势未触发、续约/桥接超时与一次恢复原窗口失败；`passed` 仅指日志聚合、配置摘要与源码分支相互印证，以及随后菜单实际前台核验；`deferred` 为底层阻塞的受控归因、修复、冷态/连续/断连/睡眠和双型号回归。本轮没有生产代码变更，不重复构建或运行与定位无关的测试。
+- 隐私与产物：只保留上述脱敏计数、时间、运行身份和最小事件链，不保存模板名称/自定义按键、目标窗口内容、设备身份或个人路径；未复制全量日志、生成临时脚本或新增过程台账。既有现场材料和其他任务未提交修改保留。
+
+#### 同晚获准修复：受控日志阻塞与最小候选
+
+- 用户随后明确“现在修复这个问题”，本段仅推进上述 Menu 未唤醒故障，不恢复其他已暂停的捕获设计或电源实验。
+- 已确认缺陷：`handle_line` 的 HB 首条/状态变化日志先同步输出，再投递所有权；edge 也先日志再转发。桥接线程与持有续约流锁的续约线程同样同步输出。初次独立闩锁实验中旧同步实现实际在 1.71 秒后仍没有投递所有权；随后审查收紧实验同步：先确认共享 sink 闩锁已经阻塞，再接收心跳和真实 Menu usage `0x0065` 的按放。最终可复核红测仅临时将捕获线程的 Logger 置回旧同步输出路径，实际 1.92 秒后在所有权断言失败（退出码 101）；移除该注入后绿测通过。此受控实验结合现场 append 秒级延迟证明日志阻塞能直接触发该失败链；没有证明原现场 71 次超时均且仅由日志造成，也没有将各延迟最大值相加。
+- 最小修复范围：仅 `hardware/RC003/helper/src/main.rs` 的日志投递与收尾。捕获开始前建立单个 256 条有界日志 worker，接收/桥接/续约线程共享 `try_send`；stdout 与共享日志追加/轮转/回退都离开控制路径。满时只丢诊断并恢复后记计数；所有权、绝对按键状态及释放仍用原通道。日志线程无法启动则拒绝开始捕获。Agent/桥接清理后关闭日志队列，正常排空后 join；永久慢 sink 最多等 2 秒，只 detach 诊断线程，不伪称取消磁盘 I/O 或清理成功。原所有权/桥接超时、鉴权、代次、来源和边沿配对均未更改；`stale_window` 仍是独立未解决边界。
+- 自动化：最终精确 Menu 夹具红测 `capture_log_stall_tests::slow_log_sink` 实际 1 failed（预期）；移除同步输出注入后完整 Helper 套件为 61 passed / 3 ignored，新 3 项覆盖受控慢 sink 下所有权和真实 Menu usage 的 DOWN/UP 仍在 1500ms 内转发、满队列的有界丢弃/恢复计数与共享 worker、超时/重复关闭及迟到 sink 不重开队列。异步共享日志成功及共享失败转备用落点沿用实际文件读回测试。
+- 候选仍为当前 dirty 工作区，不以 HEAD 宣称可重建；本候选及后续 Voice/audio 扩展已完成独立审查与最终工作区检查，部署与当前实体验收边界见本节末尾。未改用户六模板、跟随开关或手选记忆，不把自动化通过当作 RC001/RC003 实体通过。
+- 本轮过程输出复用 `target/dev/menu-capture-reliability/`：`red.log` 保留预期失败对照；`helper-test.log` 为当前完整套件；其他成功编译/首轮绿测输出待审查结束按 LOGGING 收尾，仅长期保留必要脱敏结论。未保存源码快照、全量用户日志或设备身份。
+
+#### 同晚用户纠正：长按语音中断后 VSCode 调试提示
+
+- 用户进一步明确，新一次是“长按语音键时，录音断了，然后就一直弹窗”，并给出 VSCode 的“没有用于调试 Markdown 的扩展”提示。因此此现象不能继续称为 Menu 原生上下文菜单；此前真实 Menu 的 `configured=false` 证据仍成立，属于另一条链。未读取 VSCode 的私有配置、窗口内容或内部状态，未向用户前台注入测试键。
+- 就近旧 App 64252 的实际语音链：15:02:10.260Z 开始 generation 17；15:02:38.670Z `shared_pcm_queue` 溢出，`pending_samples=31774 incoming_samples=240 limit_samples=32000`；38.686 `wasapi_pipeline_failed`，38.787 正常释放语音和弦，38.841 `voice_flow terminal=abort`。该会话 28.732s、1897 回调、455280 解码样本，最大 callback gap 198ms / worker 队列延迟 149ms；音频统计 accepted455040 / submitted423684 / queued31356，最后非零提交年龄 0ms、累计 zero-available 1149 次/9211ms。它不是“WASAPI 从未输出”或仅模板失配。用户没有逐动作关联 ID，以上是与新反馈一致的就近日志实例，不强行认定每次弹窗的唯一时间对应。
+- 原生语音键配对缺口：停止/中止会撤销 session 武装，250ms 宽限过后，旧 `decide` 忽略已接管的物理 hold，仍按住时的重复 DOWN 开始透传。39.185Z 观察到 DOWN `swallow=0 hold=2`；随后宿主连续报告 `requested=1 actual=0`，直到 44.413Z UP `swallow=0 hold=2`。宿主持续放行已泄 DOWN 的重复和 UP 是正确配对，不能通过强吞 UP 或中途接管已泄按住修复。最小修改 `key_suppressor.rs`：全吞 DOWN 的当前 hold 锁存到真实 UP；已泄 hold 保持原生，未知首沿仍由 session/grace 判定。没有延长语音生命周期、增加长按阈值或重建设备宿主。
+- Voice 回归实际先红后绿：新增“abort+grace 已结束但物理仍按住”的重复/真实 UP/下一次无武装按压，以及“已泄 hold 不被新 session/armed 中途接管”两项，旧逻辑 2 failed，候选 6 passed（包含既有配对测试）。Helper 日志隔离不能单独解释或宣称修复该录音中止。
+- 音频受控验证只用自家保存的同一个 CABLE 端点与自有 WASAPI session。开始前确认旧 App 最近语音和弦已释放且超过 10 秒，拒绝已静音端点；发送纯零值 PCM，不录音、不改配置、不操作第三方程序。输入节奏为 240 样本/15ms、45 秒共 720000 样本，采用绝对截止时刻，避免 Windows sleep 粒度让生产端自动降速。无构建负载基线实际全部提交/排空，45.08 秒 passed，设置文件前后 SHA 相同，未复现固定格式/持续速率不匹配。
+- 在必需的真实 release 构建负载期间，同节奏重跑于 44.759 秒实际溢出：accepted715200 / submitted683400 / queued31800。新终态诊断读回 buffer418 帧（16k 格式下 26.125ms）、最大 pump gap99ms、超 buffer 时长的 gap64 次/累计 excess1152ms、空 render buffer 观察73次；空间查询/写入最大 0ms，会话静音检查最大98ms。耗时含线程调度，不能单凭 98ms 区分 COM 等待与被剥夺 CPU。失败后真实 interrupt1ms、worker正常退出，配置不变。
+- 最小生产改动使用现有 windows API 在渲染 worker 注册官方 MMCSS `Audio` 任务，不改采样率、重采样、32000 样本队列或5ms轮询，不改系统全局设置。RAII 不可 Send/Sync，正常/异常离开作用域在同线程撤销；失败记录 HRESULT 并保留原功能路径。相同本机/端点/45秒输入，在另一轮必需 release 构建负载下实际 passed：45.308秒后720000样本全部提交并排空，最大pump gap20ms、late-pump0/excess0、静音检查最大1ms；注册与撤销均 passed。停止请求前有4702样本排队，后续已实际排空，不能把该中间快照误写成丢样本。两轮编译阶段/CPU强度不保证完全相同，此对照支持本机候选效果，不证明所有负载/长时语音或双型号稳定性。
+- 音频诊断保持最小：open 读回 mix rate（本机48000）、实际 buffer frames/period；pump 只更新内存计数，在正常 finish 与失败终态输出。`empty_render_buffer_count` 是观察次数，不等同断音次数；`late_pump_excess_ms` 不是直接丢帧数。最大耗时包含失败调用，WASAPI 写入计时在失败日志之前结束。普通 interrupt/Shutdown 不额外宣称有该汇总。
+- 证据：`voice-hold-red.log` / `voice-hold-green.log`、基线 `paced-audio-test.log` / `paced-audio-diagnostic.log`、无 MMCSS 的负载 `paced-audio-loaded-before-*`、MMCSS 候选 `paced-audio-loaded-*`。前后负载实验在本机保留作为当前未完成硬件回归的必要对照，后续原位结论充分且不再需要复核时按 LOGGING 回收。未保存源码副本、真实语音或端点身份。最终源码仍 dirty，计时修正后的最终检查及部署已完成，VSCode 实体 Menu/长语音仍 deferred；不将整项标为通过。
+
+#### 最终本地候选与安装读回（2026-10-15 23:41–23:43，UTC+08:00）
+
+- 源码/审查范围为 `hardware/RC003/helper/src/main.rs`、`crates/sayall-windows/src/key_suppressor.rs`、`audio.rs`。最终 SHA-256 分别为 `17a5dde1a4fc440a3d456d8060594a5e9a01abdebc56d4a9b2a4d3d44ab0be40`、`13cb8f5853bb5c747aff746ad7f04a8b28deff32f114c8c5ab1b39c7a3399a7c`、`afdf28271df37e9055110194705953d8c014a3f7bcccfbbb4c43a32cc47332e5`。独立审查已闭合受控 sink 建立时序与失败调用计时问题，无未处理的必修项；未提交、推送或发布。
+- **passed（最终自动化）**：Helper 独立 workspace `cargo test` 61 passed / 3 ignored；最终 `cargo fmt --all -- --check`、`cargo test --workspace`（core32、Windows541/21ignored、Host160/1ignored，其他库/契约通过）、`cargo check --workspace`、`cargo check -p sayall-windows-app --features runtime-simulation`，以及受影响文件 `git diff --check` 均通过。Helper 使用同一精确源码的既有证据，没有为收尾重复执行。45秒 CABLE 基线与负载前后实测按上述各自范围记实；不能扩大为遥控器/转写通过。
+- **passed（本地包）**：唯一当前安装器为 `target/release/bundle/nsis/无线麦_1.0.0_x64-setup.exe`，SHA-256 `ea99d929d74112698f52218f36fe096a3ce256f7e30d72d094b06c8d2aa91f0d`；实际个人 updater 公钥验签、fresh 前端嵌入内容门禁及 production simulation 隔离通过。本轮为 x64 四项载荷（Helper、Gadget、两许可）；ARM64 增强未覆盖。基线 `8b9dd31460f1b3b4c6859b2216de61ede0966206`，`sourceCommit=null`、dirty/local/included，源码/实际载荷指纹 `6ac22ec4cf4c22228a306a690f848dee8aef33014bf798991f673280d022e304`；不以基线代表完整未提交源码。
+- **passed（安装/启动）**：先确认当前语音已结束，再以真实桌面同账户管理员覆盖；安装器退出0/12.495秒，旧 App64252、子75624、Helper78564均正常退出，没有强杀。四项实际载荷/Helper PE 机型与本轮 staging 对齐；主 EXE 全文件比较仅 `UNK→NSS` 三字节安装标记差。五份现有配置安装前、安装后及新启动后哈希完全一致。安装后首次控制器在子 PowerShell 验证调用处报告 RemoteException；随后只读地用显式 StagedDirectory 继续验证并通过，没有重复安装，未据该验证器异常判为安装失败。
+- **passed（实际新实例）**：真实 Explorer6432 的桌面 `Document.Application.ShellExecute` 启动 App79676，精确安装路径匹配、TokenElevation0；Helper76260精确安装路径/TokenElevation1。实际日志读回的五个构建身份字段与上述最终 manifest 一致，Helper 新 `[LOG-QUEUE] started capacity=256`、MMCSS 注册及捕获 ownership ready 均已观测。至23:43:24，累计137秒（含闲置）没有 ownership timeout、bridge silence timeout、日志队列 overflow 或音频队列失败；此窗口 Menu fired0、voice attempt0，因此只证明启动/空闲保持，不证明实体行为。
+- **deferred（用户实体/兼容性）**：已请用户在 VSCode 短按 Menu 选择确认/连续开关，再按住语音超过45秒并松开，核对录音连续、释放及调试弹窗是否再现；截至上述观察尚无相应新 PID 动作或用户回复。本轮 RC001、RC003 完整冷首用/连续/断连/睡眠矩阵、ARM64及第三方实际转写仍未通过；睡眠/无线电实验许可仍未恢复。原 `stale_window` 返回失败与未对齐的其他前台配置问题保持独立未知。
+- **收尾**：保留唯一当前包及当前红测、最终套件、安装/运行读回和负载前后必要对照，均在同一任务目录；未保存源码快照。过时首绿、重复成功检查和中间包构建输出在核对无正式引用后按回收站规则处理。后续用户动作可在当前安装版继续核查，不自动重启/重装或扩展发布。
+
+#### 用户实体反馈与日志复核（2026-10-16，UTC+08:00）
+
+- **passed（用户报告）**：用户回复既定 VSCode 复验请求：“菜单和语音都正常，没有调试弹窗”。请求包含菜单选择确认、连续开关及超过45秒语音，但回复没有逐项次数或持续时长，因此只记录实际反馈，不据此补写这些细节。未读取 VSCode 私有数据或注入按键。
+- **身份/取证范围**：仍为 App79676、Helper76260，启动时间均为10月15日23:41，主程序日志指纹仍为 `6ac22ec4cf4c22228a306a690f848dee8aef33014bf798991f673280d022e304`。本次只读核对安装后默认诊断日志，统计固定截止10月16日09:48:27.194（01:48:27.194Z）；不混入旧 App64252 的失败。长期证据以本节脱敏摘要为准，未复制完整日志或语音。
+- **passed（可观察语音链）**：四段 `voice_flow terminal=control_stop` 分别在09:45:30.439、09:45:52.135、09:47:08.285、09:47:54.891结束，持续33.895、7.092、9.509、18.433秒；对应音频 `normal_finish` 接收/实际提交样本分别为540000、111600、149760、293040，全部 `queued_samples=0`。四次语音和弦释放均 `result=ok reason=released`；2033次原生语音键 DOWN（含自动重复）及4次UP均 `swallow=1 hold=1`，没有 `requested=1 actual=0` 或 ASK_TIMEOUT。四次 pump 最大间隔20–21ms、late计数0；没有 queue_overflow、wasapi_pipeline_failed 或 voice abort。日志支持这些会话正常结束与排空，第三方实际体验以用户报告为准；实体超过45秒仍 `deferred`，此前独立45秒静音负载对照保持其原 `passed` 范围。
+- **菜单成功与独立残留并存**：09:46:43–55有7条 `Menu configured=true fired_count=1`，generation22/26实测 `visible=true`、`foreground_verified result=true`，支持模板面板能被唤醒；用户报告菜单正常。但09:46:44.410及09:46:55.101再次出现 `stale_window`，09:46:45.167出现 `return_target_unavailable`，随后关闭记录 `blocked reason=target_restore_failed`；09:46:51与58另有完成隐藏记录。这是已知前台返回/关闭边界，不能把连续开关或每次确认全部记为日志通过，也不能改称捕获未唤醒复发。
+- **捕获超时并未完全消失**：新实例在09:38:35.365及09:48:24.699各记录一次 `ownership_timeout`。从有效mask归零到恢复7167分别为09:38:35.363→36.138（775ms）、09:48:24.696→24.752（56ms）；若从超时日志行计则为773ms、53ms。安装后至固定截止没有 bridge `silence_timeout` 或 Helper `[LOG-QUEUE] result=overflow`。两次窗口（09:38:33–39、09:48:22–27）没有 Menu 边沿/手势记录，无法与用户某次动作对应；不能声称所有续约故障已消失，也不据后台短暂事件自行扩大修复。
+- **验收边界/收尾**：本次用户体验通过，以上日志成功与失败分别保留；整体TODO仍未完成。RC001/RC003完整冷首用、连续、断连、睡眠、超过45秒实体语音、ARM64及第三方转写逐项矩阵不由本反馈替代，`stale_window`仍独立未解决。只更新原Bug、TODO及当前能力入口，不改生产源码/ATTRIBUTION、不重建或重启/重装，不提交或发布。

@@ -1,5 +1,5 @@
 use sayall_core::{
-    AppIconIdentifier, AppSettings, ThemePreference, UsageStatistics, VoiceInputTool,
+    normalize_gain_db, AppSettings, ThemePreference, UsageStatistics, VoiceInputTool,
 };
 use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord, KeyCode};
 use sayall_windows::templates::{
@@ -13,6 +13,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::onboarding::{self, OnboardingState, OnboardingStep};
 
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
@@ -174,11 +176,6 @@ impl SettingsStore {
     }
 
     /// 应用图标（设置页「应用图标」，2026-10-02）。
-    pub fn save_app_icon(&self, identifier: AppIconIdentifier) -> Result<(), String> {
-        self.update("保存应用图标设置", move |settings| {
-            settings.app_icon = identifier;
-        })
-    }
 
     /// 连接页显式选择的输入工具；None 保持未选择，不因初始化或读取失败写盘。
     pub fn save_voice_input_tool(&self, tool: Option<VoiceInputTool>) -> Result<(), String> {
@@ -187,8 +184,260 @@ impl SettingsStore {
         })
     }
 
+    /// 首次使用向导状态（`onboarding.json`，设计稿 §6）。
+    ///
+    /// 第一次调用执行一次性迁移判定并落盘，必须在任何其他设置写入之前调用
+    /// （Tauri setup 最前段）。之后每次读取都返回已持久化的状态，不重写。
+    pub fn ensure_onboarding_state(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        self.ensure_onboarding_state_unlocked()
+    }
+
+    fn ensure_onboarding_state_unlocked(&self) -> Result<OnboardingState, String> {
+        let path = onboarding::state_path(&self.path);
+        match fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str::<OnboardingState>(&contents) {
+                Ok(state) => Ok(state.normalized()),
+                Err(_) => {
+                    // 损坏状态：保守修复（有旧安装证据按老用户、否则全新开始），
+                    // 立即重写为有效文件，绝不静默丢弃成"没走过向导"。
+                    let repaired = onboarding::resolve_initial_state(
+                        onboarding::install_evidence_exists(&self.path),
+                    );
+                    self.write_onboarding_state(&repaired)?;
+                    sayall_windows::gatt_note(format!(
+                        "onboarding event=migration phase=completed result=passed source={} reason=state_repaired_from_corrupt completed_version={}",
+                        if repaired.completed_version > 0 {
+                            "existing_install"
+                        } else {
+                            "fresh_install"
+                        },
+                        repaired.completed_version
+                    ));
+                    Ok(repaired)
+                }
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // 全新安装 vs 老用户升级：只看配置目录里有没有旧安装证据，
+                // 一次性 migration_version 防止第二次启动误判（设计稿 §6.2）。
+                let evidence = onboarding::install_evidence_exists(&self.path);
+                let state = onboarding::resolve_initial_state(evidence);
+                self.write_onboarding_state(&state)?;
+                sayall_windows::gatt_note(format!(
+                    "onboarding event=migration phase=completed result=passed source={} completed_version={} migration_version={}",
+                    if evidence { "existing_install" } else { "fresh_install" },
+                    state.completed_version,
+                    state.migration_version
+                ));
+                Ok(state)
+            }
+            Err(error) => {
+                sayall_windows::gatt_note(
+                    "onboarding event=state_read phase=completed terminal_result=failed error_domain=settings error_code=read_failed reason=state_file_unreadable retryable=true".to_owned(),
+                );
+                Err(format!("读取向导状态失败：{error}"))
+            }
+        }
+    }
+
+    /// 持久化当前步骤。步骤未变化时不重写、不重复刷日志。
+    pub fn save_onboarding_step(&self, step: OnboardingStep) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        if state.step != step {
+            state.step = step;
+            state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+            self.write_onboarding_state(&state)?;
+            sayall_windows::gatt_note(format!(
+                "onboarding event=step_persisted step={}",
+                state.step.as_str()
+            ));
+        }
+        Ok(state)
+    }
+
+    /// 设置页「重新运行设置向导」：先回滚未提交的 staged 绑定，再重置向导进度；
+    /// 不清除设备/映射/音频/其他设置。
+    pub fn restart_onboarding(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        self.restore_onboarding_staged_binding_unlocked("wizard_restart")?;
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        state.step = OnboardingStep::Welcome;
+        state.completed_version = 0;
+        state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+        self.write_onboarding_state(&state)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=restarted flow_version={}",
+            state.flow_version
+        ));
+        Ok(state)
+    }
+
+    /// 完成向导：提交 staged 事务（保留当前正式值、清除回滚快照）并标记完成。
+    pub fn complete_onboarding(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        if let Some(staged) = state.staged.take() {
+            sayall_windows::gatt_note(format!(
+                "onboarding event=binding action=verified tool={} hotkey_count={}",
+                crate::voice_input_tool_name(staged.tool),
+                staged
+                    .voice_hotkey
+                    .as_ref()
+                    .map(|chord| chord.keys.len())
+                    .unwrap_or(0)
+            ));
+        }
+        state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+        state.completed_version = state.flow_version;
+        self.write_onboarding_state(&state)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=completed flow_version={}",
+            state.flow_version
+        ));
+        Ok(state)
+    }
+
+    /// 退出或跳过未完成验证：撤销临时绑定，再关闭自动展示。
+    /// completed_version 表示本版向导已处理；只有 complete_onboarding 宣称验证通过。
+    pub fn dismiss_onboarding(&self) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        self.restore_onboarding_staged_binding_unlocked("wizard_dismissed")?;
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        state.flow_version = onboarding::CURRENT_FLOW_VERSION;
+        state.completed_version = state.flow_version;
+        self.write_onboarding_state(&state)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=dismissed terminal_result=cancelled flow_version={} step={} binding=restored",
+            state.flow_version, state.step.as_str()
+        ));
+        Ok(state)
+    }
+
+    fn write_onboarding_state(&self, state: &OnboardingState) -> Result<(), String> {
+        let path = onboarding::state_path(&self.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                log_onboarding_write_failure("create_dir_failed", true);
+                format!("创建应用设置目录失败：{error}")
+            })?;
+        }
+        let contents = serde_json::to_vec_pretty(state).map_err(|error| {
+            log_onboarding_write_failure("serialize_failed", false);
+            format!("序列化向导状态失败：{error}")
+        })?;
+        fs::write(&path, contents).map_err(|error| {
+            log_onboarding_write_failure("file_write_failed", true);
+            format!("保存向导状态失败：{error}")
+        })
+    }
+
+    /// 语音增益（dB，0–24，对齐 Mac `gainDB` 的持久化口径）。
+    ///
+    /// 越界与非有限值在这里钳制后落盘，并返回实际保存值供界面显示：
+    /// 界面滑块与配置文件的取值从此只有一种语义（0 = 原始音量）。
+    pub fn save_gain_db(&self, gain_db: f32) -> Result<f32, String> {
+        let normalized = normalize_gain_db(gain_db);
+        self.update("保存增益设置", move |settings| {
+            settings.gain_db = normalized;
+        })?;
+        Ok(normalized)
+    }
+
     pub fn usage_statistics(&self) -> Result<UsageStatistics, String> {
         self.load().map(|settings| settings.usage_statistics)
+    }
+
+    /// 暂存语音绑定（第④步选输入工具）：先落回滚快照，再应用正式值。
+    ///
+    /// 必须在向导进行中调用；快照只取**第一次**进入事务时的正式值（后续换工具
+    /// 不覆盖回滚基线）。持久化顺序：快照先写、正式值后写——中途崩溃也不会
+    /// 丢失回滚目标（设计稿 §5.4 / §6）。运行时应用（platform）由命令层负责。
+    pub fn stage_onboarding_voice_binding(
+        &self,
+        tool: VoiceInputTool,
+        hotkey: Option<KeyChord>,
+    ) -> Result<OnboardingState, String> {
+        let _guard = lock(&self.access);
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        if !state.is_active() {
+            return Err("首次设置向导未在进行中".to_owned());
+        }
+        let staged = match state.staged.clone() {
+            Some(existing) => onboarding::OnboardingStagedBinding {
+                tool: Some(tool),
+                voice_hotkey: hotkey.clone(),
+                revert_tool: existing.revert_tool,
+                revert_voice_hotkey: existing.revert_voice_hotkey,
+            },
+            None => onboarding::OnboardingStagedBinding {
+                tool: Some(tool),
+                voice_hotkey: hotkey.clone(),
+                revert_tool: self.load_unlocked()?.voice_input_tool,
+                revert_voice_hotkey: self.load_voice_hold_hotkey_unlocked()?,
+            },
+        };
+        state.staged = Some(staged.clone());
+        self.write_onboarding_state(&state)?;
+        self.update_unlocked("保存输入工具设置", move |settings| {
+            settings.voice_input_tool = Some(tool);
+        })?;
+        self.save_voice_hold_hotkey_unlocked(hotkey)?;
+        sayall_windows::gatt_note(format!(
+            "onboarding event=binding action=staged tool={} hotkey_count={} revert_tool={} revert_hotkey_count={}",
+            crate::voice_input_tool_name(Some(tool)),
+            staged
+                .voice_hotkey
+                .as_ref()
+                .map(|chord| chord.keys.len())
+                .unwrap_or(0),
+            crate::voice_input_tool_name(staged.revert_tool),
+            staged
+                .revert_voice_hotkey
+                .as_ref()
+                .map(|chord| chord.keys.len())
+                .unwrap_or(0)
+        ));
+        Ok(state)
+    }
+
+    /// 回滚并清除 staged 事务（启动恢复 / 重跑向导用）。返回是否处理了事务。
+    ///
+    /// 写序：先把回滚值写回正式配置，成功后才清除快照——中途失败时快照保留，
+    /// 下次启动重试（幂等）。已完成状态下残留快照只清除、不动正式配置。
+    pub fn restore_onboarding_staged_binding(&self, reason: &str) -> Result<bool, String> {
+        let _guard = lock(&self.access);
+        self.restore_onboarding_staged_binding_unlocked(reason)
+    }
+
+    fn restore_onboarding_staged_binding_unlocked(&self, reason: &str) -> Result<bool, String> {
+        let mut state = self.ensure_onboarding_state_unlocked()?;
+        let Some(staged) = state.staged.clone() else {
+            return Ok(false);
+        };
+        if state.is_active() {
+            self.update_unlocked("恢复输入工具设置", move |settings| {
+                settings.voice_input_tool = staged.revert_tool;
+            })?;
+            self.save_voice_hold_hotkey_unlocked(staged.revert_voice_hotkey.clone())?;
+            sayall_windows::gatt_note(format!(
+                "onboarding event=binding action=restored reason={reason} tool={} hotkey_count={}",
+                crate::voice_input_tool_name(staged.revert_tool),
+                staged
+                    .revert_voice_hotkey
+                    .as_ref()
+                    .map(|chord| chord.keys.len())
+                    .unwrap_or(0)
+            ));
+        } else {
+            // 异常组合（已完成却留有未提交快照）：只清快照，不动正式配置。
+            sayall_windows::gatt_note(format!(
+                "onboarding event=binding action=cleared reason={reason}_state_inconsistent"
+            ));
+        }
+        state.staged = None;
+        self.write_onboarding_state(&state)?;
+        Ok(true)
     }
 
     pub fn record_usage(
@@ -296,9 +545,15 @@ impl SettingsStore {
         let _guard = lock(&self.access);
         // A mapping editor may have opened before the menu preference changed.
         // Only the dedicated preference transaction owns this setting.
-        configuration.menu_update_default = self
-            .load_mapping_configuration_unlocked()?
-            .menu_update_default;
+        let latest = self.load_mapping_configuration_unlocked()?;
+        configuration.menu_update_default = latest.menu_update_default;
+        configuration.remembered_template_id = if configuration.button_mapping_follow_enabled
+            != latest.button_mapping_follow_enabled
+        {
+            None
+        } else {
+            latest.remembered_template_id
+        };
         let saved = self.save_mapping_configuration_unlocked(configuration)?;
         apply(&saved);
         Ok(saved)
@@ -339,10 +594,36 @@ impl SettingsStore {
     ) -> Result<(MappingConfiguration, R), String> {
         let _guard = lock(&self.access);
         let mut configuration = self.load_mapping_configuration_unlocked()?;
+        let following_before = configuration.button_mapping_follow_enabled;
         let result = update(&mut configuration)?;
+        if configuration.button_mapping_follow_enabled != following_before {
+            configuration.remembered_template_id = None;
+        }
         let saved = self.save_mapping_configuration_unlocked(configuration)?;
         apply(&saved);
         Ok((saved, result))
+    }
+
+    /// The engine has already applied this choice. Do not reapply mappings while
+    /// remembering it: a disk callback must not cancel a newer engine request.
+    pub fn save_remembered_template(
+        &self,
+        request_id: u64,
+        template_id: Option<&str>,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<bool, String> {
+        let _guard = lock(&self.access);
+        let mut configuration = self.load_mapping_configuration_unlocked()?;
+        if configuration.button_mapping_follow_enabled || !is_current() {
+            sayall_windows::gatt_note(format!("manual_template_memory phase=save_skipped request_id={request_id} reason=selection_changed"));
+            return Ok(false);
+        }
+        if template_id.is_some_and(|id| configuration.template_mappings(id).is_none()) {
+            return Err("已应用的模板已不存在，未能记住本次选择".into());
+        }
+        configuration.remembered_template_id = template_id.map(str::to_owned);
+        self.save_mapping_configuration_unlocked(configuration)?;
+        Ok(true)
     }
 
     fn save_mapping_configuration_unlocked(
@@ -688,6 +969,13 @@ impl SettingsStore {
         hotkey: Option<KeyChord>,
     ) -> Result<Option<KeyChord>, String> {
         let _guard = lock(&self.access);
+        self.save_voice_hold_hotkey_unlocked(hotkey)
+    }
+
+    fn save_voice_hold_hotkey_unlocked(
+        &self,
+        hotkey: Option<KeyChord>,
+    ) -> Result<Option<KeyChord>, String> {
         if let Some(chord) = &hotkey {
             chord
                 .clone()
@@ -758,6 +1046,14 @@ impl SettingsStore {
 
     fn update(&self, operation: &str, update: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
         let _guard = lock(&self.access);
+        self.update_unlocked(operation, update)
+    }
+
+    fn update_unlocked(
+        &self,
+        operation: &str,
+        update: impl FnOnce(&mut AppSettings),
+    ) -> Result<(), String> {
         let mut settings = self.load_unlocked()?;
         settings.schema_version = AppSettings::default().schema_version;
         update(&mut settings);
@@ -907,6 +1203,7 @@ fn resolve_mapping_import(
                     menu_template_switch_enabled: current.menu_template_switch_enabled,
                     menu_update_default: current.menu_update_default,
                     button_mapping_follow_enabled: v.button_mapping_follow_enabled,
+                    remembered_template_id: current.remembered_template_id.clone(),
                     templates: v.templates,
                     application_bindings: v
                         .application_bindings
@@ -990,6 +1287,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn log_onboarding_write_failure(reason: &str, retryable: bool) {
+    sayall_windows::gatt_note(format!(
+        "onboarding event=state_write phase=completed terminal_result=failed error_domain=settings error_code=write_failed reason={reason} retryable={retryable}"
+    ));
+}
+
 fn parse_settings(contents: &str) -> Result<AppSettings, String> {
     serde_json::from_str(contents)
         .map(AppSettings::normalized)
@@ -1062,6 +1365,160 @@ mod tests {
             std::env::temp_dir().join(format!("sayall-template-test-{}", new_template_id()));
         fs::create_dir_all(&directory).unwrap();
         SettingsStore::new(directory.join("settings.json"))
+    }
+
+    #[test]
+    fn remembered_template_transaction_preserves_latest_choice_through_editor_save_and_reopen() {
+        let store = template_test_store();
+        let mut stale_editor = store.load_mapping_configuration().unwrap();
+        assert!(store
+            .save_remembered_template(
+                4,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true
+            )
+            .unwrap());
+        stale_editor.mapping_notice_enabled = false;
+        let saved = store.save_mapping_configuration(stale_editor).unwrap();
+        assert_eq!(
+            saved.remembered_template_id.as_deref(),
+            Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID)
+        );
+        let reopened = SettingsStore::new(store.path.clone())
+            .load_mapping_configuration()
+            .unwrap();
+        assert_eq!(reopened, saved);
+        assert!(store.save_remembered_template(5, None, || true).unwrap());
+        assert!(SettingsStore::new(store.path.clone())
+            .load_mapping_configuration()
+            .unwrap()
+            .remembered_template_id
+            .is_none());
+    }
+
+    #[test]
+    fn remembered_template_transaction_rejects_stale_missing_and_auto_choices() {
+        let store = template_test_store();
+        let original = store.load_mapping_configuration().unwrap();
+        assert!(!store
+            .save_remembered_template(
+                1,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || false
+            )
+            .unwrap());
+        assert!(store
+            .save_remembered_template(2, Some("missing-template"), || true)
+            .is_err());
+        assert_eq!(store.load_mapping_configuration().unwrap(), original);
+        store
+            .update_mapping_configuration(
+                |c| {
+                    c.button_mapping_follow_enabled = true;
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert!(!store
+            .save_remembered_template(
+                3,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true
+            )
+            .unwrap());
+        assert!(store
+            .load_mapping_configuration()
+            .unwrap()
+            .remembered_template_id
+            .is_none());
+    }
+
+    #[test]
+    fn remembered_template_mode_switch_delete_and_rename_have_distinct_memory_semantics() {
+        let store = template_test_store();
+        let (_, template) = store
+            .update_mapping_configuration(|c| c.create_template("local test".into()), |_| {})
+            .unwrap();
+        store
+            .save_remembered_template(1, Some(&template.id), || true)
+            .unwrap();
+        let renamed = store
+            .update_mapping_configuration(
+                |c| {
+                    c.templates[0].name = "renamed test".into();
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            renamed.remembered_template_id.as_deref(),
+            Some(template.id.as_str())
+        );
+        let deleted = store
+            .update_mapping_configuration(
+                |c| {
+                    c.templates.clear();
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap()
+            .0;
+        assert!(deleted.remembered_template_id.is_none());
+        store
+            .save_remembered_template(
+                2,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true,
+            )
+            .unwrap();
+        for following in [true, false] {
+            let changed = store
+                .update_mapping_configuration(
+                    |c| {
+                        c.button_mapping_follow_enabled = following;
+                        Ok(())
+                    },
+                    |_| {},
+                )
+                .unwrap()
+                .0;
+            assert!(changed.remembered_template_id.is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remembered_template_write_failure_leaves_previous_file_and_returns_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let store = template_test_store();
+        let path = store.button_mappings_path();
+        store
+            .save_mapping_configuration(MappingConfiguration::default())
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(store
+            .save_remembered_template(
+                1,
+                Some(sayall_windows::templates::BUILTIN_AGENT_TEMPLATE_ID),
+                || true
+            )
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(store
+            .load_mapping_configuration()
+            .unwrap()
+            .remembered_template_id
+            .is_none());
+        drop(guard);
     }
 
     #[test]
@@ -1724,6 +2181,27 @@ mod tests {
     }
 
     #[test]
+    fn retired_icon_choice_does_not_reset_saved_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-retired-icon-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path,
+            r#"{"schema_version":3,"gain_db":12.0,"voice_trigger_mode":"hold","app_icon":"standard","theme_preference":"dark"}"#,
+        ).unwrap();
+        let store = SettingsStore::new(path.clone());
+        let settings = store.load().unwrap();
+        assert_eq!(settings.gain_db, 12.0);
+        assert_eq!(settings.theme_preference, ThemePreference::Dark);
+        store.save_gain_db(settings.gain_db).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.get("app_icon").is_none());
+        assert_eq!(store.load().unwrap().gain_db, 12.0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn theme_preference_defaults_to_system_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "sayall-test-theme-preference-{}.json",
@@ -1791,6 +2269,30 @@ mod tests {
     }
 
     #[test]
+    fn audio_gain_defaults_to_zero_and_persists_clamped() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-audio-gain-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        // 新装 / 老配置：默认 0 dB（原始音量）。
+        assert_eq!(store.load().unwrap().gain_db, 0.0);
+
+        assert_eq!(store.save_gain_db(12.0).unwrap(), 12.0);
+        assert_eq!(store.load().unwrap().gain_db, 12.0);
+
+        // 越界与非法值：按 0–24 dB 钳制后落盘，并返回实际保存值（界面显示同源）。
+        assert_eq!(store.save_gain_db(30.0).unwrap(), 24.0);
+        assert_eq!(store.load().unwrap().gain_db, 24.0);
+        assert_eq!(store.save_gain_db(f32::NAN).unwrap(), 0.0);
+        assert_eq!(store.load().unwrap().gain_db, 0.0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn launch_at_login_defaults_off_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "sayall-test-launch-at-login-{}.json",
@@ -1830,6 +2332,8 @@ mod tests {
                         keys: vec![KeyCode::Escape],
                     },
                 },
+                hold_repeat: None,
+                ok_context_click: false,
             },
         );
         let encoded = serde_json::to_string(&mappings).unwrap();
@@ -1876,6 +2380,8 @@ mod tests {
                 },
                 double: ButtonAction::Disabled,
                 long: ButtonAction::Disabled,
+                hold_repeat: None,
+                ok_context_click: false,
             },
         );
 
@@ -2046,6 +2552,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    fn onboarding_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sayall-test-onboarding-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn onboarding_fresh_install_starts_at_welcome_and_is_idempotent() {
+        let base = onboarding_test_dir("fresh");
+        let store = SettingsStore::new(base.join("settings.json"));
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert!(state.is_active());
+        assert_eq!(state.step, OnboardingStep::Welcome);
+        assert_eq!(state.flow_version, onboarding::CURRENT_FLOW_VERSION);
+        assert_eq!(
+            state.migration_version,
+            onboarding::CURRENT_MIGRATION_VERSION
+        );
+        assert!(onboarding::state_path(&store.path).exists());
+
+        // 二次调用幂等：不重写、不重置进度。
+        let again = store.ensure_onboarding_state().unwrap();
+        assert_eq!(state, again);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn imported_builtin_edit_becomes_a_copy_without_overwriting_local_default() {
         let base =
@@ -2100,5 +2637,448 @@ mod tests {
             .unwrap()
             .actions
             .is_empty());
+    }
+
+    #[test]
+    fn onboarding_existing_install_is_migrated_to_completed() {
+        let base = onboarding_test_dir("existing");
+        let store = SettingsStore::new(base.join("settings.json"));
+        std::fs::write(
+            base.join("settings.json"),
+            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert!(!state.is_active());
+        assert_eq!(state.completed_version, onboarding::CURRENT_FLOW_VERSION);
+
+        // 第二次启动仍是完成态（一次性迁移位防止误判）。
+        let again = store.ensure_onboarding_state().unwrap();
+        assert!(!again.is_active());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_corrupt_state_is_repaired_conservatively() {
+        // 有旧安装证据：按老用户修复，重写为有效文件。
+        let base = onboarding_test_dir("repair-existing");
+        let store = SettingsStore::new(base.join("settings.json"));
+        std::fs::write(base.join("settings.json"), "{}").unwrap();
+        std::fs::write(onboarding::state_path(&store.path), "not json").unwrap();
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert!(!state.is_active());
+        let repaired: OnboardingState = serde_json::from_str(
+            &std::fs::read_to_string(onboarding::state_path(&store.path)).unwrap(),
+        )
+        .unwrap();
+        assert!(!repaired.is_active());
+
+        // 无任何证据：按全新修复，从欢迎开始。
+        let base2 = onboarding_test_dir("repair-fresh");
+        let store2 = SettingsStore::new(base2.join("settings.json"));
+        std::fs::write(onboarding::state_path(&store2.path), "not json").unwrap();
+        let state2 = store2.ensure_onboarding_state().unwrap();
+        assert!(state2.is_active());
+        assert_eq!(state2.step, OnboardingStep::Welcome);
+
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base2);
+    }
+
+    #[test]
+    fn onboarding_unknown_step_in_file_normalizes_to_welcome_without_losing_completion() {
+        let base = onboarding_test_dir("unknown-step");
+        let store = SettingsStore::new(base.join("settings.json"));
+        std::fs::write(
+            onboarding::state_path(&store.path),
+            r#"{"flow_version":1,"completed_version":1,"step":"legacy_step","migration_version":1}"#,
+        )
+        .unwrap();
+
+        let state = store.ensure_onboarding_state().unwrap();
+        assert_eq!(state.step, OnboardingStep::Welcome);
+        assert!(!state.is_active());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_step_save_restart_and_complete_lifecycle() {
+        let base = onboarding_test_dir("lifecycle");
+        let store = SettingsStore::new(base.join("settings.json"));
+
+        store
+            .save_onboarding_step(OnboardingStep::VoiceTest)
+            .unwrap();
+        assert_eq!(
+            store.ensure_onboarding_state().unwrap().step,
+            OnboardingStep::VoiceTest
+        );
+
+        let restarted = store.restart_onboarding().unwrap();
+        assert!(restarted.is_active());
+        assert_eq!(restarted.step, OnboardingStep::Welcome);
+
+        let completed = store.complete_onboarding().unwrap();
+        assert!(!completed.is_active());
+        assert_eq!(
+            completed.completed_version,
+            onboarding::CURRENT_FLOW_VERSION
+        );
+        // 完成后再次读取不被重置，重启也不会重新激活。
+        assert!(!store.ensure_onboarding_state().unwrap().is_active());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_staged_binding_snapshots_once_applies_formal_and_restores() {
+        let base = onboarding_test_dir("staged-binding");
+        let store = SettingsStore::new(base.join("settings.json"));
+        let right_alt = KeyChord {
+            keys: vec![KeyCode::RightAlt],
+        };
+
+        // 迁移判定先行（全新 → 进行中）；再模拟"老用户完成过、又主动重跑向导"：
+        // 正式配置是他之前的选择，重跑后进入 active，staged 应以此为回滚基线。
+        assert!(store.ensure_onboarding_state().unwrap().is_active());
+        store.complete_onboarding().unwrap();
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        store
+            .save_voice_hold_hotkey(SettingsStore::default_voice_hold_hotkey())
+            .unwrap();
+        assert!(store.restart_onboarding().unwrap().is_active());
+
+        // 第一次暂存：应用正式值，并记录回滚基线。
+        let state = store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, Some(right_alt.clone()))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Doubao)
+        );
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            Some(right_alt.clone())
+        );
+        let staged = state.staged.clone().unwrap();
+        assert_eq!(staged.revert_tool, Some(VoiceInputTool::Wechat));
+        assert_eq!(
+            staged.revert_voice_hotkey,
+            SettingsStore::default_voice_hold_hotkey()
+        );
+
+        // 二次暂存（换工具）：回滚基线保持第一次的值，不被覆盖。
+        store
+            .stage_onboarding_voice_binding(VoiceInputTool::Vokie, None)
+            .unwrap();
+        let staged = store.ensure_onboarding_state().unwrap().staged.unwrap();
+        assert_eq!(staged.revert_tool, Some(VoiceInputTool::Wechat));
+        assert_eq!(
+            staged.revert_voice_hotkey,
+            SettingsStore::default_voice_hold_hotkey()
+        );
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), None);
+
+        // 回滚：正式配置恢复、快照清除；再次回滚是幂等空操作。
+        assert!(store
+            .restore_onboarding_staged_binding("test_restore")
+            .unwrap());
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Wechat)
+        );
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            SettingsStore::default_voice_hold_hotkey()
+        );
+        assert!(store.ensure_onboarding_state().unwrap().staged.is_none());
+        assert!(!store
+            .restore_onboarding_staged_binding("test_restore_again")
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_dismiss_rolls_back_binding_without_claiming_verification() {
+        let base = onboarding_test_dir("dismiss-rollback");
+        let store = SettingsStore::new(base.join("settings.json"));
+        store.ensure_onboarding_state().unwrap();
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        let original = store.load_voice_hold_hotkey().unwrap();
+        store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, None)
+            .unwrap();
+        store
+            .save_onboarding_step(OnboardingStep::VoiceTest)
+            .unwrap();
+        let state = store.dismiss_onboarding().unwrap();
+        assert!(!state.is_active());
+        assert_eq!(state.step, OnboardingStep::VoiceTest);
+        assert!(state.staged.is_none());
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Wechat)
+        );
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), original);
+        assert!(!store.dismiss_onboarding().unwrap().is_active());
+        assert!(store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, None)
+            .is_err());
+        assert!(store.restart_onboarding().unwrap().is_active());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_stage_requires_active_flow() {
+        let base = onboarding_test_dir("stage-inactive");
+        let store = SettingsStore::new(base.join("settings.json"));
+        store.complete_onboarding().unwrap();
+
+        assert!(store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, None)
+            .is_err());
+        assert!(!store
+            .restore_onboarding_staged_binding("test_inactive")
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_restart_rolls_back_staged_binding_before_reset() {
+        let base = onboarding_test_dir("restart-rollback");
+        let store = SettingsStore::new(base.join("settings.json"));
+        assert!(store.ensure_onboarding_state().unwrap().is_active());
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        store
+            .stage_onboarding_voice_binding(
+                VoiceInputTool::Doubao,
+                Some(KeyChord {
+                    keys: vec![KeyCode::RightAlt],
+                }),
+            )
+            .unwrap();
+
+        let state = store.restart_onboarding().unwrap();
+        assert!(state.is_active());
+        assert_eq!(state.step, OnboardingStep::Welcome);
+        assert!(state.staged.is_none());
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Wechat)
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn onboarding_complete_commits_staged_binding_values() {
+        let base = onboarding_test_dir("complete-commit");
+        let store = SettingsStore::new(base.join("settings.json"));
+        let right_alt = KeyChord {
+            keys: vec![KeyCode::RightAlt],
+        };
+        assert!(store.ensure_onboarding_state().unwrap().is_active());
+        store
+            .save_voice_input_tool(Some(VoiceInputTool::Wechat))
+            .unwrap();
+        store
+            .stage_onboarding_voice_binding(VoiceInputTool::Doubao, Some(right_alt.clone()))
+            .unwrap();
+
+        let state = store.complete_onboarding().unwrap();
+        assert!(!state.is_active());
+        assert!(state.staged.is_none());
+        // 提交：保留暂存时应用的正式值（验证通过后的最终状态）。
+        assert_eq!(
+            store.load().unwrap().voice_input_tool,
+            Some(VoiceInputTool::Doubao)
+        );
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            Some(right_alt.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn existing_mapping_load_save_and_export_preserve_automatic_repeat_configuration() {
+        use sayall_windows::raw_input::RemoteButton;
+        let store = template_test_store();
+        let path = store.button_mappings_path();
+        let legacy = r#"{"enabled":true,"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["backspace"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let loaded = store.load_button_mappings().unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.actions(RemoteButton::Back).hold_repeat, None);
+        assert_eq!(
+            loaded
+                .actions(RemoteButton::Back)
+                .effective_hold_repeat(RemoteButton::Back),
+            Some(sayall_windows::send_input::ButtonTrigger::Single)
+        );
+        store.save_button_mappings(loaded).unwrap();
+        let configuration = store.load_mapping_configuration().unwrap();
+        assert_eq!(
+            configuration
+                .common_mappings
+                .actions(RemoteButton::Back)
+                .hold_repeat,
+            None
+        );
+        let export = path.with_file_name("export.json");
+        store
+            .export_mapping_configuration(&export, configuration, None)
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(export).unwrap()).unwrap();
+        assert!(value["commonMappings"]["actions"]["back"]["holdRepeat"].is_null());
+    }
+
+    #[test]
+    fn newer_mapping_schema_is_rejected_without_overwriting_original() {
+        let store = template_test_store();
+        let path = store.button_mappings_path();
+        let newer = r#"{"schemaVersion":9,"enabled":true,"actions":{}}"#;
+        std::fs::write(&path, newer).unwrap();
+        assert!(store.load_button_mappings().is_err());
+        assert!(store
+            .save_button_mappings(ButtonMappings::default())
+            .is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[test]
+    fn hold_repeat_off_and_auto_round_trip_common_and_custom_template() {
+        use sayall_windows::raw_input::RemoteButton;
+        use sayall_windows::send_input::{ButtonActions, HoldRepeat, KeyCode};
+        let store = template_test_store();
+        let mut configuration = MappingConfiguration::default();
+        for (button, key, hold_repeat) in [
+            (
+                RemoteButton::Back,
+                KeyCode::Backspace,
+                Some(HoldRepeat::Off),
+            ),
+            (RemoteButton::Right, KeyCode::Right, None),
+        ] {
+            configuration.common_mappings.actions.insert(
+                button,
+                ButtonActions {
+                    single: ButtonAction::Shortcut {
+                        chord: KeyChord { keys: vec![key] },
+                    },
+                    hold_repeat,
+                    ..Default::default()
+                },
+            );
+        }
+        let custom = configuration.create_template("自动与关闭".into()).unwrap();
+        let mut custom_mappings = configuration.common_mappings.clone();
+        custom_mappings
+            .actions
+            .get_mut(&RemoteButton::Back)
+            .unwrap()
+            .hold_repeat = None;
+        custom_mappings
+            .actions
+            .get_mut(&RemoteButton::Right)
+            .unwrap()
+            .hold_repeat = Some(HoldRepeat::Off);
+        configuration
+            .templates
+            .iter_mut()
+            .find(|template| template.id == custom.id)
+            .unwrap()
+            .mappings = custom_mappings.clone();
+        let saved = store.save_mapping_configuration(configuration).unwrap();
+        assert_eq!(store.load_mapping_configuration().unwrap(), saved);
+        let exported_path = store.path.with_file_name("repeat-round-trip.json");
+        store
+            .export_mapping_configuration(&exported_path, saved.clone(), None)
+            .unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&fs::read(&exported_path).unwrap()).unwrap();
+        assert_eq!(exported["formatVersion"], 3);
+        assert_eq!(exported["commonMappings"]["schemaVersion"], 2);
+        assert_eq!(exported["templates"][0]["mappings"]["schemaVersion"], 2);
+        assert_eq!(
+            exported["commonMappings"]["actions"]["back"]["holdRepeat"],
+            "off"
+        );
+        assert!(exported["commonMappings"]["actions"]["right"]
+            .get("holdRepeat")
+            .is_none());
+
+        let destination = template_test_store();
+        let preview = destination
+            .preview_mapping_configuration_import(&exported_path)
+            .unwrap();
+        assert_eq!(
+            preview.configuration.common_mappings.actions,
+            saved.common_mappings.actions
+        );
+        assert_eq!(preview.configuration.templates[0].mappings, custom_mappings);
+        let imported = destination
+            .apply_mapping_configuration_import(&preview.token)
+            .unwrap();
+        assert_eq!(
+            imported.common_mappings.actions,
+            saved.common_mappings.actions
+        );
+        assert_eq!(imported.templates[0].mappings, custom_mappings);
+        assert_eq!(destination.load_mapping_configuration().unwrap(), imported);
+    }
+
+    #[test]
+    fn nested_future_mapping_schema_rejects_save_export_and_import_without_writing() {
+        let store = template_test_store();
+        let mut configuration = MappingConfiguration::default();
+        configuration.create_template("测试模板".into()).unwrap();
+        let saved = store.save_mapping_configuration(configuration).unwrap();
+        let original = fs::read(store.button_mappings_path()).unwrap();
+        let export = store.path.with_file_name("future-export.json");
+        store
+            .export_mapping_configuration(&export, saved.clone(), None)
+            .unwrap();
+        let original_export = fs::read(&export).unwrap();
+        let incoming = store.path.with_file_name("future-import.json");
+        for common in [true, false] {
+            let mut invalid = saved.clone();
+            if common {
+                invalid.common_mappings.schema_version = 3;
+            } else {
+                invalid.templates[0].mappings.schema_version = 3;
+            }
+            assert!(store.save_mapping_configuration(invalid.clone()).is_err());
+            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), original);
+            assert!(store
+                .export_mapping_configuration(&export, invalid, None)
+                .is_err());
+            assert_eq!(fs::read(&export).unwrap(), original_export);
+
+            let mut document: serde_json::Value = serde_json::from_slice(&original_export).unwrap();
+            if common {
+                document["commonMappings"]["schemaVersion"] = 3.into();
+            } else {
+                document["templates"][0]["mappings"]["schemaVersion"] = 3.into();
+            }
+            fs::write(&incoming, serde_json::to_vec(&document).unwrap()).unwrap();
+            assert!(store
+                .preview_mapping_configuration_import(&incoming)
+                .is_err());
+            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), original);
+            assert_eq!(store.load_mapping_configuration().unwrap(), saved);
+        }
     }
 }

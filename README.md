@@ -1,75 +1,41 @@
-# 无线麦 SayAll for Windows
+# 无线麦 Windows 个人版
+
+本个人版由 luck-gh 修改；个人版改造始于 2026-10-06。基于上游 GPL-3.0-only Windows 项目，原版权保留；来源与素材归属见 [ATTRIBUTION.md](ATTRIBUTION.md)。
 
 <p align="center">
-  <img src="Screenshots/sayall-key-mapping.png" alt="无线麦 SayAll Windows 版按键映射界面" width="960">
+  <img src="public/app-logo-personal.svg" alt="无线麦个人版图标" width="96">
 </p>
 
 <p align="center">小米蓝牙遥控器的可视化按键映射</p>
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="Screenshots/wechat-group-qrcode.jpg" alt="无线麦 SayAll Windows 版微信群二维码" width="220"><br>
-      <strong>Windows 用户交流群</strong><br>
-      微信扫码加入交流群
-    </td>
-    <td align="center">
-      <a href="Screenshots/xhs-sayall.jpg"><img src="Screenshots/xhs-sayall.jpg" alt="无线麦小红书二维码" width="220"></a><br>
-      <strong>小红书</strong><br>
-      扫码关注无线麦
-    </td>
-  </tr>
-</table>
+[个人版仓库](https://github.com/luck-gh/remote-mic-app-windows) · [版本与下载](https://github.com/luck-gh/remote-mic-app-windows/releases) · [问题反馈](https://github.com/luck-gh/remote-mic-app-windows/issues)
 
-## 视频介绍
+无线麦 Windows 个人版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
 
-《可能是我最近用过最不像工具的工具》展示了无线麦如何把蓝牙语音遥控器变成随手表达、控制电脑和与 AI 协作的新入口。视频中的产品界面以当时展示版本为准。
+支持目标包括两种型号；各型号的当前验收结果以本 fork 的测试记录为准：
 
-<p align="center">
-  <a href="https://www.bilibili.com/video/BV13Pep6BEXe">
-    <img src="Screenshots/video-introduction-cover.jpg" alt="《可能是我最近用过最不像工具的工具》视频封面" width="960">
-  </a>
-</p>
+- 小米蓝牙遥控器 2（RC001）
+- 小米蓝牙遥控器 2 Pro（RC003）
 
-<p align="center"><a href="https://www.bilibili.com/video/BV13Pep6BEXe">点击封面或前往 Bilibili 观看原视频</a></p>
+## 主要功能
 
-视频作者：[可乐不甜的跑焦日记](https://space.bilibili.com/327214328)
-
-无线麦 SayAll Windows 版支持目标为小米蓝牙遥控器 2（RC001）和 2 Pro（RC003）。当前分支的实际通过范围见 [能力与验证边界](docs/FEATURES.md)，上游历史真机结果不能代替本地整合候选验收。项目采用 Rust、Tauri 2 和 Vue 3，Windows 与 macOS 分别维护和发布。
-
-参考源码仓库：[HD838A/remote-mic-app](https://github.com/HD838A/remote-mic-app)（macOS 版）。Windows 版保持独立的平台实现，仅参考其公开的产品行为、协议经验和测试边界，不回填 macOS 代码。
-
-当前仓库处于新架构开发阶段。现阶段已经建立：
-
-- Mac 原版风格的设置界面骨架；
-- ATVV、IMA/DVI ADPCM 和语音会话纯 Rust 核心；
-- WinRT 已配对设备扫描、标准 GATT Model Number（2A24）型号识别、连接/通知/释放和 RC001/RC003 到 PCM 的会话管线；
-- 用户明确选择端点的 WASAPI 共享模式输出、有界 PCM 队列和 padding 排空；
-- 以稳定 endpoint ID 和名称持久化用户选择，启动时只恢复身份完全一致的端点；
-- 记住用户明确选择的 RC001 或 RC003，并以 2–30 秒指数退避自动重连；Windows 睡眠时主动释放会话，恢复后重建 GATT/ATVV；
-- 可区分连接、特征发现、能力确认、就绪、流式接收、排空、断开和失败的真实状态界面；
-- 设备路径限定的 Raw Input、批量 SendInput、映射持久化与显式快捷键测试；
-- 仅保存在本机的每日按键、完整语音会话和语音时长统计，以及今日、本周、全部和最近 7 天展示；
-- Windows 10 1809（build 17763）安装与启动双层版本门禁；
-- 可见安装完成后的 VB-CABLE 缺失提示、官方下载入口，以及首次启动时唯一 CABLE Input 的自动检测和配置；
-- Windows CI 可生成带 SHA-256 和来源元数据的未签名 NSIS Preview artifact；
-- Windows CI、来源归属和真机测试手册。
-
-本地 RC003 的来源、映射、键盘并用与部分生命周期已有分项实证；新候选受影响场景仍需本机验收，RC001 无当前实机时保持 `deferred`。语音、安装器、VB-CABLE 和第三方输入法按测试手册分项记录。公开发布目前仍处于预览阶段，更新包包含 updater minisign 签名，但尚无 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。
+本地 RC003 的来源、映射、键盘并用与部分生命周期已有分项实证；新候选受影响场景仍需本机验收，RC001 无当前实机时保持 `deferred`。语音、安装器、VB-CABLE 和第三方输入法按测试手册分项记录。个人版更新使用独立的 updater minisign 签名，尚无 Authenticode 代码签名，首次运行可能触发 SmartScreen 提示。签名和实际发布状态以个人版交付记录及 Releases 为准。
 
 本次上游整合新增可选电量显示、通用配置的鼠标点击/移动/滚轮、系统级快捷键录入和 Windows 应用库。它们不改变已有默认绑定；完整模板仍为固定键/组合键，不扫描第三方窗口内容。按键页编辑后显式保存，已安装应用库不写入可分享的配置导出。合并候选验证状态见 TODO。
 
 ## 用户安装与配置
 
-首次安装、遥控器配对、VB-CABLE、语音输入软件、按键映射、更新和排障步骤见 [安装与配置指南](docs/installation-and-configuration.md)。文档同时给出了 AI Agent 的安全执行边界与可验证的完成标准。
+下载入口仅使用[个人版 Releases](https://github.com/luck-gh/remote-mic-app-windows/releases)。若尚无可用发行包，使用维护者提供的本地测试包，不改用上游安装包。
 
-<p align="center">
-  <img src="Screenshots/sayall-connection-audio-setup.png" alt="无线麦 SayAll Windows 版连接与语音设备配置界面" width="960">
-</p>
+首次安装、遥控器配对、语音软件设置、按键映射、更新和排障步骤，见 [安装与配置指南](docs/installation-and-configuration.md)。版本更新内容随个人版 Releases 提供。
 
-<p align="center">连接遥控器并选择语音写入设备</p>
+当前个人版设置界面（1.0.0，2026-10-16 安装版实拍）：
 
-## 技术结构
+![无线麦个人版设置界面](Screenshots/personal/settings-1.0.0.png)
+
+截图展示版本与外观；功能实际通过范围仍见 [能力与验证边界](docs/FEATURES.md)。
+
+## 参与开发
 
 ```text
 Vue 3 UI
@@ -117,6 +83,8 @@ cargo fmt --all -- --check
 
 Windows 主机上的完整检查和双型号真机步骤见 [Testing/WindowsRC003Preview.md](Testing/WindowsRC003Preview.md)。
 
+上游新增开发指南见 [DEVELOPMENT.md](DEVELOPMENT.md)，本地验证边界仍以上述文档为准。
+
 ## 开源协议
 
-程序代码使用 GPL-3.0-only。App Logo 和 App Icon 是保留版权的专有品牌资产，不属于 GPL-3.0-only 授权范围；详见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。第三方来源与素材边界见 [ATTRIBUTION.md](ATTRIBUTION.md) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+程序代码使用 GPL-3.0-only。上游原 App Logo 和 App Icon 是保留版权的专有品牌资产，不属于 GPL-3.0-only 授权范围；本个人版运行资产已替换为独立“轻放”设计，历史 icon-source.png 仅供取证，不用于运行；详见 [LOGO-LICENSE.md](LOGO-LICENSE.md)。第三方来源与素材边界见 [ATTRIBUTION.md](ATTRIBUTION.md) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -1,0 +1,562 @@
+[
+  {
+    "time": "2026-09-15T08:11:44.510Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "0",
+    "action": "interrupt",
+    "phase": "requested",
+    "queued_samples": "0",
+    "submitted_samples": "0"
+  },
+  {
+    "time": "2026-09-15T08:11:44.510Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "0",
+    "action": "interrupt",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "elapsed_ms": "0"
+  },
+  {
+    "time": "2026-09-15T08:31:19.079Z",
+    "event": "atvv_control_04",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:31:19.081Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "1",
+    "action": "begin",
+    "phase": "requested"
+  },
+  {
+    "time": "2026-09-15T08:31:19.083Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "1",
+    "action": "begin",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "queued_samples": "0",
+    "elapsed_ms": "2"
+  },
+  {
+    "time": "2026-09-15T08:31:19.206Z",
+    "event": "chord_press",
+    "pid": "71260",
+    "result": "ok",
+    "session": "44",
+    "gap_ms": "80"
+  },
+  {
+    "time": "2026-09-15T08:31:19.261Z",
+    "event": "audio_stream",
+    "pid": "71260",
+    "phase": "started",
+    "result": "passed",
+    "endpoint_kind": "virtual_cable",
+    "first_write_frames": "418"
+  },
+  {
+    "time": "2026-09-15T08:31:22.093Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:31:22.093Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:31:22.197Z",
+    "event": "chord_release",
+    "pid": "71260",
+    "result": "ok",
+    "error_domain": "none",
+    "error_code": "none",
+    "reason": "released",
+    "retryable": "false"
+  },
+  {
+    "time": "2026-09-15T08:31:22.197Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "1",
+    "action": "finish",
+    "phase": "requested",
+    "queued_samples": "1902",
+    "submitted_samples": "43218"
+  },
+  {
+    "time": "2026-09-15T08:31:22.697Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "1",
+    "action": "finish",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "submitted_samples": "45120",
+    "queued_samples": "0"
+  },
+  {
+    "time": "2026-09-15T08:32:22.842Z",
+    "event": "atvv_control_04",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:32:22.843Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "2",
+    "action": "begin",
+    "phase": "requested"
+  },
+  {
+    "time": "2026-09-15T08:32:22.844Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "2",
+    "action": "begin",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "queued_samples": "0",
+    "elapsed_ms": "1"
+  },
+  {
+    "time": "2026-09-15T08:32:22.967Z",
+    "event": "chord_press",
+    "pid": "71260",
+    "result": "ok",
+    "session": "45",
+    "gap_ms": "80"
+  },
+  {
+    "time": "2026-09-15T08:32:23.008Z",
+    "event": "audio_stream",
+    "pid": "71260",
+    "phase": "started",
+    "result": "passed",
+    "endpoint_kind": "virtual_cable",
+    "first_write_frames": "418"
+  },
+  {
+    "time": "2026-09-15T08:32:42.523Z",
+    "event": "audio_flow",
+    "pid": "71260",
+    "generation": "2",
+    "failure_origin": "worker_pcm_queue",
+    "accepted_samples": "308160",
+    "submitted_samples": "276358",
+    "queued_samples": "31802",
+    "elapsed_ms": "19678",
+    "last_nonzero_submit_age_ms": "10",
+    "zero_available_count": "616",
+    "zero_available_elapsed_ms": "5955"
+  },
+  {
+    "time": "2026-09-15T08:32:42.523Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "2",
+    "action": "stream",
+    "phase": "completed",
+    "terminal_result": "failed",
+    "error_domain": "audio",
+    "error_code": "queue_overflow",
+    "reason": "wasapi_pipeline_failed",
+    "retryable": "true",
+    "queued_samples": "31802",
+    "submitted_samples": "276358"
+  },
+  {
+    "time": "2026-09-15T08:32:42.637Z",
+    "event": "chord_release",
+    "pid": "71260",
+    "result": "ok",
+    "error_domain": "none",
+    "error_code": "none",
+    "reason": "released",
+    "retryable": "false"
+  },
+  {
+    "time": "2026-09-15T08:32:42.639Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "2",
+    "action": "interrupt",
+    "phase": "requested",
+    "queued_samples": "0",
+    "submitted_samples": "276358"
+  },
+  {
+    "time": "2026-09-15T08:32:42.639Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "2",
+    "action": "interrupt",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "elapsed_ms": "0"
+  },
+  {
+    "time": "2026-09-15T08:32:42.656Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:32:42.656Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:32:44.786Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:32:44.786Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:32:53.816Z",
+    "event": "atvv_control_04",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:32:53.817Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "3",
+    "action": "begin",
+    "phase": "requested"
+  },
+  {
+    "time": "2026-09-15T08:32:53.842Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "3",
+    "action": "begin",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "queued_samples": "0",
+    "elapsed_ms": "25"
+  },
+  {
+    "time": "2026-09-15T08:32:53.968Z",
+    "event": "chord_press",
+    "pid": "71260",
+    "result": "ok",
+    "session": "46",
+    "gap_ms": "80"
+  },
+  {
+    "time": "2026-09-15T08:32:54.012Z",
+    "event": "audio_stream",
+    "pid": "71260",
+    "phase": "started",
+    "result": "passed",
+    "endpoint_kind": "virtual_cable",
+    "first_write_frames": "418"
+  },
+  {
+    "time": "2026-09-15T08:33:14.526Z",
+    "event": "audio_flow",
+    "pid": "71260",
+    "generation": "3",
+    "failure_origin": "worker_pcm_queue",
+    "accepted_samples": "319200",
+    "submitted_samples": "287380",
+    "queued_samples": "31820",
+    "elapsed_ms": "20683",
+    "last_nonzero_submit_age_ms": "4",
+    "zero_available_count": "633",
+    "zero_available_elapsed_ms": "6807"
+  },
+  {
+    "time": "2026-09-15T08:33:14.526Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "3",
+    "action": "stream",
+    "phase": "completed",
+    "terminal_result": "failed",
+    "error_domain": "audio",
+    "error_code": "queue_overflow",
+    "reason": "wasapi_pipeline_failed",
+    "retryable": "true",
+    "queued_samples": "31820",
+    "submitted_samples": "287380"
+  },
+  {
+    "time": "2026-09-15T08:33:14.628Z",
+    "event": "chord_release",
+    "pid": "71260",
+    "result": "ok",
+    "error_domain": "none",
+    "error_code": "none",
+    "reason": "released",
+    "retryable": "false"
+  },
+  {
+    "time": "2026-09-15T08:33:14.631Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "3",
+    "action": "interrupt",
+    "phase": "requested",
+    "queued_samples": "0",
+    "submitted_samples": "287380"
+  },
+  {
+    "time": "2026-09-15T08:33:14.631Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "3",
+    "action": "interrupt",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "elapsed_ms": "0"
+  },
+  {
+    "time": "2026-09-15T08:33:14.651Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:33:14.652Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:33:16.545Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:33:16.545Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:33:17.215Z",
+    "event": "atvv_control_04",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:33:17.215Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "4",
+    "action": "begin",
+    "phase": "requested"
+  },
+  {
+    "time": "2026-09-15T08:33:17.237Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "4",
+    "action": "begin",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "queued_samples": "0",
+    "elapsed_ms": "21"
+  },
+  {
+    "time": "2026-09-15T08:33:17.360Z",
+    "event": "chord_press",
+    "pid": "71260",
+    "result": "ok",
+    "session": "47",
+    "gap_ms": "80"
+  },
+  {
+    "time": "2026-09-15T08:33:17.412Z",
+    "event": "audio_stream",
+    "pid": "71260",
+    "phase": "started",
+    "result": "passed",
+    "endpoint_kind": "virtual_cable",
+    "first_write_frames": "418"
+  },
+  {
+    "time": "2026-09-15T08:33:20.248Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:33:20.248Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:33:20.565Z",
+    "event": "chord_release",
+    "pid": "71260",
+    "result": "ok",
+    "error_domain": "none",
+    "error_code": "none",
+    "reason": "released",
+    "retryable": "false"
+  },
+  {
+    "time": "2026-09-15T08:33:20.565Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "4",
+    "action": "finish",
+    "phase": "requested",
+    "queued_samples": "1564",
+    "submitted_samples": "44036"
+  },
+  {
+    "time": "2026-09-15T08:33:20.696Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "4",
+    "action": "finish",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "submitted_samples": "45600",
+    "queued_samples": "0"
+  },
+  {
+    "time": "2026-09-15T08:34:13.614Z",
+    "event": "atvv_control_04",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:34:13.615Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "5",
+    "action": "begin",
+    "phase": "requested"
+  },
+  {
+    "time": "2026-09-15T08:34:13.617Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "5",
+    "action": "begin",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "queued_samples": "0",
+    "elapsed_ms": "1"
+  },
+  {
+    "time": "2026-09-15T08:34:13.752Z",
+    "event": "chord_press",
+    "pid": "71260",
+    "result": "ok",
+    "session": "48",
+    "gap_ms": "80"
+  },
+  {
+    "time": "2026-09-15T08:34:13.767Z",
+    "event": "audio_stream",
+    "pid": "71260",
+    "phase": "started",
+    "result": "passed",
+    "endpoint_kind": "virtual_cable",
+    "first_write_frames": "418"
+  },
+  {
+    "time": "2026-09-15T08:34:32.635Z",
+    "event": "audio_flow",
+    "pid": "71260",
+    "generation": "5",
+    "failure_origin": "worker_pcm_queue",
+    "accepted_samples": "297120",
+    "submitted_samples": "265274",
+    "queued_samples": "31846",
+    "elapsed_ms": "19017",
+    "last_nonzero_submit_age_ms": "15",
+    "zero_available_count": "649",
+    "zero_available_elapsed_ms": "6233"
+  },
+  {
+    "time": "2026-09-15T08:34:32.635Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "5",
+    "action": "stream",
+    "phase": "completed",
+    "terminal_result": "failed",
+    "error_domain": "audio",
+    "error_code": "queue_overflow",
+    "reason": "wasapi_pipeline_failed",
+    "retryable": "true",
+    "queued_samples": "31846",
+    "submitted_samples": "265274"
+  },
+  {
+    "time": "2026-09-15T08:34:32.742Z",
+    "event": "chord_release",
+    "pid": "71260",
+    "result": "ok",
+    "error_domain": "none",
+    "error_code": "none",
+    "reason": "released",
+    "retryable": "false"
+  },
+  {
+    "time": "2026-09-15T08:34:32.745Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "5",
+    "action": "interrupt",
+    "phase": "requested",
+    "queued_samples": "0",
+    "submitted_samples": "265274"
+  },
+  {
+    "time": "2026-09-15T08:34:32.745Z",
+    "event": "audio_session",
+    "pid": "71260",
+    "generation": "5",
+    "action": "interrupt",
+    "phase": "completed",
+    "terminal_result": "passed",
+    "elapsed_ms": "0"
+  },
+  {
+    "time": "2026-09-15T08:34:32.769Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:34:32.769Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  },
+  {
+    "time": "2026-09-15T08:34:34.239Z",
+    "event": "atvv_control_00",
+    "pid": "71260"
+  },
+  {
+    "time": "2026-09-15T08:34:34.239Z",
+    "event": "voice_prepare",
+    "pid": "71260",
+    "action": "invalidate",
+    "reason": "source_release"
+  }
+]

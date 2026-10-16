@@ -1,4 +1,5 @@
 use button_mapping::{ButtonMappingRuntime, ButtonMappingSnapshot, MappingInjector};
+use focus::RecordedFocusTarget;
 use raw_input::{RawInputPhase, RawInputSnapshot};
 use sayall_core::settings::VoiceInputTool;
 use sayall_core::{AtvvCapabilities, VoiceSessionState};
@@ -20,24 +21,48 @@ pub mod battery;
 mod ble;
 #[cfg(windows)]
 mod bluetooth_radio;
-#[cfg(windows)]
-pub use bluetooth_radio::prepare_bluetooth_radio_recovery;
 mod button_gestures;
 pub mod button_mapping;
 pub mod capture_input;
 pub mod compatibility;
 pub mod component_support;
+mod diagnostic_log;
 pub mod file_dialog;
+/// 聚焦输入框的纯逻辑（跨平台可编译、可单测）。
+pub mod focus;
+/// 聚焦请求的执行编排（重试、预算与失败分类；不触碰平台 API）。
+pub mod focus_service;
+/// Windows UI Automation 后端（MTA 工作线程；非 Windows 平台不参与编译）。
+#[cfg(windows)]
+pub mod focus_windows;
+/// "前台窗口是不是我们自己"——诊断心跳的门（只比较进程号，不记录窗口身份）。
+pub mod foreground;
 #[cfg(windows)]
 pub mod graceful_exit;
+#[cfg(windows)]
+pub mod instance_signal;
+/// 按键宿主进程（LL 钩子迁出主进程；见 Bugs/2026-10-04-ll-hooks-break-in-app-ime-voice.md）。
+pub mod key_host;
 pub mod rc003_bridge;
+// 硬件信号脚本（仿真回放用；见模块注释）：解析模拟器导出的信号脚本。
+// 无副作用、不进入基础路径，仅仿真平台消费。
+pub mod hardware_script;
 pub mod registered_apps;
+#[cfg(windows)]
+pub(crate) use ble::bluetooth_address_from_device_id;
 #[cfg(windows)]
 pub use ble::{
     diagnostic_log_directory, gatt_note, initialize_diagnostic_log, DiagnosticLogMetadata,
 };
 #[cfg(windows)]
 mod ime;
+/// 输入法状态只读查询与「按工具确保输入法」（试一下页 / 诊断信息，2026-10-13）：
+/// 模块本体私有，只导出这几个入口（见 `ime` 模块头与 `ImeStatus` 的语义约定）。
+#[cfg(windows)]
+pub use ime::{
+    describe_active_ime_name, ime_status_for, ime_status_log_line, list_installed_ime_names,
+    ImeStatus, MAX_INSTALLED_IME_NAMES,
+};
 
 /// 录入期让位：把录入窗口线程的输入区域临时切到非 IME 布局，使输入法的
 /// 语音和弦判定失效（其热键只在自身为当前会话活动输入法时生效），物理边沿
@@ -69,6 +94,8 @@ pub mod key_gate;
 mod key_suppressor;
 #[cfg(windows)]
 mod lock_open_with_guard;
+/// 本机的原生系统架构（x64 / arm64），与"本进程的仿真架构"区分开。
+pub mod os_arch;
 #[cfg(windows)]
 mod power;
 pub mod raw_input;
@@ -76,6 +103,11 @@ pub mod raw_input;
 mod raw_input_windows;
 #[cfg(any(windows, test))]
 mod reconnect;
+/// 「应用正在用的那支遥控器」的单一来源（2026-10-13）：把 BLE 会话的地址发布给
+/// Raw Input 绑定与提权助手，用来消解"两台同型号遥控器同时在线"造成的歧义。
+/// 跨平台可编译（便于单测）；非 Windows 上没有消费者。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod remote_target;
 #[cfg(windows)]
 mod resource_probe;
 pub mod scene_control;
@@ -85,6 +117,7 @@ pub mod send_input;
 #[cfg(windows)]
 pub mod send_input_windows;
 pub mod templates;
+pub mod tray_icons;
 /// Vokie 安装检测（2026-10-01）：连接页“选择输入工具”用它决定是否显示官网入口。
 pub mod vokie;
 #[cfg(windows)]
@@ -120,6 +153,37 @@ pub struct PairedRemote {
     pub name: String,
     pub model: RemoteModel,
     pub is_supported_candidate: bool,
+    /// 设备稳定令牌（`device_token(id)`）：给界面把"已扫描到的某一行"和"当前连着的设备"对上，
+    /// 不用把设备身份送进前端（2026-10-13 现场：两支遥控器名字完全相同，靠名字认不出）。
+    #[serde(default)]
+    pub token: String,
+}
+
+/// 设备身份的**稳定短令牌**：FNV-1a 64 取低 32 位、8 位十六进制。
+///
+/// 用途只有一个——让界面把"扫描列表里的这一行"与"运行时当前连着的设备"对齐
+/// （2026-10-13 现场：两支遥控器在 Windows 里同名，行与连接状态无法对应）。
+/// 它不是安全边界、也不进日志：与 `LOGGING.md` 的脱敏口径一致（只做不可逆的短标识）。
+/// 归一化大小写与首尾空白——注册表实例 id 是大写、Raw Input 路径是小写，同一台设备
+/// 在不同来源里的写法必须得到同一个令牌。
+pub fn device_token(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_lowercase();
+    // 2026-10-13 现场加固：能解析出蓝牙地址就以**地址**为基准。Windows 对同一支遥控器
+    // 可能给出不同形态的 id（扫描拿到的 id 与上次连接保存、启动恢复用的 id 形态可能不同，
+    // 例如分隔符/前后缀差异），只对整串做哈希会让"已连接那一支"与扫描行对不上
+    // （现场：②步下方写着"已连接"，上面两行设备却都没标出来）。解析不出地址的
+    // （模拟设备、其他来源）退回整串，行为与旧版一致。
+    #[cfg(windows)]
+    let normalized = match crate::ble::bluetooth_address_from_device_id(&normalized) {
+        Some(address) => format!("{address:012x}"),
+        None => normalized,
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", (hash & 0xffff_ffff) as u32)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +266,10 @@ pub struct ConnectionSnapshot {
     pub battery_level: Option<u8>,
     pub remote_name: Option<String>,
     pub remote_model: RemoteModel,
+    /// 当前连接设备的稳定令牌（`device_token`；与扫描列表同一套算法）。
+    /// 只用于界面把"已连接"标到正确的那一行——不落日志、不进诊断块（2026-10-13 现场）。
+    #[serde(default)]
+    pub remote_token: Option<String>,
     pub capabilities: Option<AtvvCapabilities>,
     pub voice_state: VoiceSessionState,
     pub decoded_samples: u64,
@@ -250,6 +318,7 @@ impl Default for ConnectionSnapshot {
             battery_level: None,
             remote_name: None,
             remote_model: RemoteModel::Unknown,
+            remote_token: None,
             capabilities: None,
             voice_state: VoiceSessionState::Idle,
             decoded_samples: 0,
@@ -268,6 +337,14 @@ pub struct WindowsPlatform {
     /// 用户在连接页选的语音输入工具：决定语音会话开始前把哪个输入法
     /// 切进当前会话（`ime::ensure_session_ime`）；Vokie / 其他工具不切。
     voice_input_tool: Arc<Mutex<Option<VoiceInputTool>>>,
+    /// 语音增益（dB，0–24）：BLE 工作线程每批音频前读取，改动下一批即生效
+    /// （对齐 Mac 逐帧读 `settings.gainDB` 的语义）。持久化由设置层负责。
+    gain_db: Arc<Mutex<f32>>,
+    /// 「选中工具后的一次性输入法对齐」：自身窗口在前台时不能切（TSF 会话切换曾致
+    /// WebView2 整页重载，Bugs/2026-09-12），此时只布防；本应用窗口失去焦点后由
+    /// `align_ime_after_tool_selection` 取走并执行一次（2026-10-03，Andy 要求消除
+    /// "换工具后第一按必拉不起"的窗口期）。
+    ime_align_pending: Arc<Mutex<Option<(VoiceInputTool, std::time::Instant, u64)>>>,
     button_mapping: Arc<ButtonMappingRuntime>,
     scene_control: Arc<scene_control::SceneController>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
@@ -310,6 +387,22 @@ struct UnsupportedInjector;
 impl MappingInjector for UnsupportedInjector {
     fn tap(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
         Err("SendInput 仅在 Windows 上可用".to_owned())
+    }
+
+    fn focus_frontmost(&self) -> Result<(), String> {
+        Err("聚焦输入框仅在 Windows 上可用".to_owned())
+    }
+
+    fn launch_app_and_focus(
+        &self,
+        _target: &str,
+        _profile: Option<&crate::focus::AppFocusProfile>,
+    ) -> Result<(), String> {
+        Err("打开应用仅在 Windows 上可用".to_owned())
+    }
+
+    fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+        Err("学习输入框仅在 Windows 上可用".to_owned())
     }
 }
 
@@ -360,6 +453,8 @@ impl Default for WindowsPlatform {
         let usage = Arc::new(UsageCounters::default());
         let voice_hold_hotkey = Arc::new(Mutex::new(None));
         let voice_input_tool = Arc::new(Mutex::new(None));
+        let gain_db = Arc::new(Mutex::new(0.0));
+        let ime_align_pending = Arc::new(Mutex::new(None));
         let raw_input_snapshot = Arc::new(Mutex::new(RawInputSnapshot::default()));
         #[cfg(windows)]
         {
@@ -412,6 +507,7 @@ impl Default for WindowsPlatform {
                     }
                 }),
                 Arc::clone(&voice_input_tool),
+                Arc::clone(&gain_db),
             ));
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
@@ -433,6 +529,8 @@ impl Default for WindowsPlatform {
                 usage,
                 voice_hold_hotkey,
                 voice_input_tool,
+                gain_db,
+                ime_align_pending,
                 button_mapping,
                 scene_control,
                 raw_input_snapshot,
@@ -471,6 +569,8 @@ impl Default for WindowsPlatform {
                 usage,
                 voice_hold_hotkey,
                 voice_input_tool,
+                gain_db,
+                ime_align_pending,
                 button_mapping,
                 scene_control,
                 raw_input_snapshot,
@@ -613,6 +713,23 @@ impl WindowsPlatform {
             Err("仅 Windows 支持输入设备切换".into())
         }
     }
+    /// Restore configuration identity after a failed settings transaction. This
+    /// does not activate the device or authorize changing system defaults.
+    pub fn restore_capture_input_configuration(
+        &self,
+        settings: sayall_core::CaptureInputSettings,
+    ) -> Result<capture_input::CaptureInputSnapshot, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.restore_configuration(settings)?;
+            Ok(self.audio.capture.snapshot())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = settings;
+            Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
     pub fn usage_counters(&self) -> Arc<UsageCounters> {
         Arc::clone(&self.usage)
     }
@@ -674,20 +791,145 @@ impl WindowsPlatform {
         lock(&self.voice_hold_hotkey).clone()
     }
 
+    pub fn cancel_voice_test(&self) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        self.runtime.cancel_voice_test()?;
+        Ok(())
+    }
+
     pub fn set_voice_hold_hotkey(&self, hotkey: Option<send_input::KeyChord>) {
+        #[cfg(windows)]
+        ime::note_hotkey_change();
         // ATVV 与输入设备读回继续拥有语音生命周期；普通按键增强不改语音路径。
         *lock(&self.voice_hold_hotkey) = hotkey;
     }
 
-    /// 更新「你在用的输入工具」：BLE 工作线程在**按住语音键**的那一刻按它决定把
-    /// 哪个输入法切进当前会话（`ime::ensure_session_ime`，唯一切换时机——不做
-    /// 聚焦/离开窗口时的预切，2026-10-01 Andy 明确要求）。
+    /// 更新「你在用的输入工具」：BLE 工作线程在按下语音键时按它决定把哪个输入法
+    /// 切进当前会话（`ime::ensure_session_ime`，按下时兜底切换）；并且**选中即对齐**——
+    /// 用户刚选过工具时立即尝试把系统输入法切到该工具（自身窗口在前台时改为布防，
+    /// 待窗口失去焦点后执行一次）。
+    ///
+    /// 为什么要有"选中即对齐"（2026-10-03 Andy）：报告层合成在按下帧到达时立即改写
+    /// （早于应用知情一个 BLE 往返），若按下时系统输入法还不是所选工具，这一按必然
+    /// 赶不上切换——表现为"换工具后第一按拉不起"。选中即对齐把该窗口期清零；
+    /// 按下时的兜底切换保留（覆盖用户手动改走输入法的情况）。
     pub fn set_voice_input_tool(&self, tool: Option<VoiceInputTool>) {
+        // 诊断时间基线（2026-10-09）：失败样本全部来自"切完工具、快速切到目标
+        // 窗口"，按下时"距选工具多久"由此起算并进 `voice_attempt`。
+        ime::note_tool_select();
         *lock(&self.voice_input_tool) = tool;
+        let selection_epoch = ime::recovery_epoch();
+        let Some(tool) = tool else {
+            *lock(&self.ime_align_pending) = None;
+            return;
+        };
+        // Vokie / 其他工具明确不切输入法（`ime_target_for` 为 None），也不布防。
+        let Some(target) = ime::ime_target_for(tool) else {
+            *lock(&self.ime_align_pending) = None;
+            crate::ble::gatt_note(
+                "ime_tool_select action=skipped reason=unsupported_tool".to_owned(),
+            );
+            return;
+        };
+        if ime::foreground_is_self() {
+            // 自身窗口在前台：现在切会触发 TSF 会话切换的 WebView 整页重载
+            //（Bugs/2026-09-12），改为布防——窗口失去焦点（用户回到自己的应用）
+            // 后由 `align_ime_after_tool_selection` 执行一次。
+            *lock(&self.ime_align_pending) =
+                Some((tool, std::time::Instant::now(), selection_epoch));
+            crate::ble::gatt_note(format!(
+                "ime_tool_select action=pending_self_foreground tool={}",
+                target.label,
+            ));
+        } else {
+            let target_ticket = ime::RecoveryTicket::capture_at(selection_epoch);
+            crate::ble::gatt_note(format!(
+                "ime_tool_select action=immediate tool={}",
+                target.label,
+            ));
+            std::thread::Builder::new()
+                .name("sayall-ime-tool-select".to_owned())
+                .spawn(move || {
+                    let _ = ime::ensure_session_ime_for_target(
+                        tool,
+                        ime::ImeSwitchScope::ToolSelect,
+                        target_ticket,
+                    );
+                })
+                .ok();
+        }
+    }
+
+    /// 工具选择后的一次性输入法对齐：本应用窗口失去焦点时调用
+    /// （src-tauri `WindowEvent::Focused(false)`）。未布防时 no-op；布防时取走
+    /// 并执行一次切换。
+    ///
+    /// 2026-10-09（真机实证）：旧实现取走布防后**立刻**在新线程里调
+    /// `ensure_session_ime`——但失焦事件到达时新窗口往往还没完成激活，
+    /// `GetForegroundWindow()` 仍指向我们自己，于是被 `skipped_self_foreground`
+    /// 跳过；布防是 `take()` 一次性的，对齐就此永久丢失（日志
+    /// `last_switch_age_ms=never`）。现在改为**有界等待**：轮询到"前台不再是自己"
+    /// 再执行一次；始终不变则照旧跳过（保留 2026-09-12 的 WebView 整页重载保护）。
+    pub fn align_ime_after_tool_selection(&self) {
+        let Some((tool, armed_at, selection_epoch)) = lock(&self.ime_align_pending).take() else {
+            return;
+        };
+        let tool_now = std::sync::Arc::clone(&self.voice_input_tool);
+        let align_pending = std::sync::Arc::clone(&self.ime_align_pending);
+        let _ = std::thread::Builder::new()
+            .name("sayall-ime-prealign".to_owned())
+            .spawn(move || {
+                let settle = ime::wait_until_foreground_settles(
+                    ime::PREALIGN_SETTLE_BUDGET_MS,
+                    ime::PREALIGN_SETTLE_POLL_MS,
+                );
+                let probe = ime::foreground_probe();
+                crate::ble::gatt_note(format!(
+                    "ime_tool_select action=fired trigger=window_blur waited_ms={} settle_ms={} polls={} still_self={} fg_present={} fg_self={}",
+                    armed_at.elapsed().as_millis(),
+                    settle.elapsed_ms,
+                    settle.polls,
+                    settle.still_self,
+                    probe.present,
+                    probe.self_process,
+                ));
+                if settle.still_self {
+                    // 2026-10-13 现场：这里不能"取走即丢"。用户点一下别的窗口又立刻回到本窗口
+                    // （或点击任务栏）时，失焦事件先到、此刻前台还是自己；旧实现 take() 一次性的
+                    // 对齐就此永久丢失——现场日志两次 `fired … still_self=true` 之后再无任何切换
+                    // 尝试，表现为"系统输入法没有自动切换"。放回布防，等下一次失焦再试。
+                    if ime::recovery_current(selection_epoch) && *lock(&tool_now) == Some(tool) {
+                        let mut pending = lock(&align_pending);
+                        if pending.is_none() {
+                            *pending = Some((tool, armed_at, selection_epoch));
+                        }
+                        crate::ble::gatt_note(format!(
+                            "ime_tool_select action=kept_pending reason=still_self waited_ms={}",
+                            armed_at.elapsed().as_millis(),
+                        ));
+                    }
+                    return;
+                }
+                // 若等待期间用户已重新选择工具（当前值不同于布防值），本次让位给新选择。
+                let superseded = !ime::recovery_current(selection_epoch) || *lock(&tool_now) != Some(tool);
+                if superseded {
+                    crate::ble::gatt_note("ime_tool_select action=superseded".to_owned());
+                    return;
+                }
+                let _ = ime::ensure_session_ime_at(tool, ime::ImeSwitchScope::ToolSelect, selection_epoch);
+            });
     }
 
     pub fn voice_input_tool(&self) -> Option<VoiceInputTool> {
         *lock(&self.voice_input_tool)
+    }
+
+    /// 语音增益（dB，0–24）：写入共享值供 BLE 工作线程逐批读取。
+    ///
+    /// 取值先经 `sayall_core::normalize_gain_db` 钳制——IPC 层已钳过一次，
+    /// 这里再钳一次是为了让"从任何入口进来"的平台状态都落在同一区间。
+    pub fn set_gain_db(&self, gain_db: f32) {
+        *lock(&self.gain_db) = sayall_core::normalize_gain_db(gain_db);
     }
 
     pub fn snapshot(&self) -> PlatformSnapshot {
@@ -774,8 +1016,8 @@ impl WindowsPlatform {
     pub fn set_mapping_configuration(&self, configuration: templates::MappingConfiguration) {
         ble::gatt_note(format!("template_configuration result=applied program_defaults_enabled={} third_party_ui_query=false", configuration.button_mapping_follow_enabled));
         let common = configuration.common_mappings.clone();
-        self.button_mapping.set_mappings(common);
         let _ = self.scene_control.set_configuration(configuration);
+        self.button_mapping.set_mappings(common);
     }
 
     pub fn scene_snapshot(&self) -> scene_control::SceneSnapshot {
@@ -789,8 +1031,19 @@ impl WindowsPlatform {
         self.scene_control.select_template(template_id)
     }
 
-    pub fn set_template_menu_focus(&self, focused: bool) {
-        self.scene_control.set_template_menu_focus(focused);
+    pub fn set_template_menu_focus(
+        &self,
+        focused: bool,
+        reason: &'static str,
+        observed_menu_generation: Option<u64>,
+        menu_window_id: Option<u64>,
+    ) {
+        self.scene_control.set_template_menu_focus(
+            focused,
+            reason,
+            observed_menu_generation,
+            menu_window_id,
+        );
     }
 
     pub fn template_menu_key(
@@ -834,6 +1087,20 @@ impl WindowsPlatform {
         self.scene_control.subscribe(callback);
     }
 
+    pub fn manual_template_save_is_current(
+        &self,
+        request_id: u64,
+        template_id: Option<&str>,
+    ) -> bool {
+        self.scene_control
+            .manual_template_save_is_current(request_id, template_id)
+    }
+
+    pub fn complete_manual_template_save(&self, request_id: u64, saved: bool) {
+        self.scene_control
+            .complete_manual_template_save(request_id, saved);
+    }
+
     pub fn notify_scene_voice_active(&self, active: bool) {
         self.scene_control.notify_voice_active(active);
     }
@@ -850,6 +1117,9 @@ impl WindowsPlatform {
     /// has been cancelled. The barrier is bounded so normal exit cannot wait
     /// forever for the mapping worker.
     pub fn quiesce_input(&self) -> Result<(), PlatformError> {
+        self.button_mapping.close_focus();
+        #[cfg(windows)]
+        ime::stop_recovery();
         self.scene_control.cancel_task_switch("normal_exit");
         self.button_mapping
             .set_input_context(RemoteModel::Unknown, false);
@@ -873,6 +1143,27 @@ impl WindowsPlatform {
         self.button_mapping.snapshot()
     }
 
+    /// UI「测试」按钮：聚焦当前前台应用输入框（异步受理，结果在快照的 `last_focus`）。
+    pub fn test_focus_input(&self) -> Result<(), PlatformError> {
+        self.button_mapping
+            .focus_frontmost_now()
+            .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「测试打开与聚焦」：打开/激活目标并按档案聚焦。
+    pub fn test_app_focus(&self, target: &str) -> Result<(), PlatformError> {
+        self.button_mapping
+            .launch_app_and_focus_now(target)
+            .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「开始学习输入框」：阻塞至多 3 秒捕获当前系统焦点对应的可编辑目标。
+    pub fn learn_focus_target(&self) -> Result<focus::RecordedFocusTarget, PlatformError> {
+        self.button_mapping
+            .learn_focus_target()
+            .map_err(PlatformError::SendInput)
+    }
+
     /// 订阅语义按键边沿（画布高亮数据源）。
     pub fn subscribe_button_edges(&self, callback: button_mapping::ButtonEdgeCallback) {
         self.button_mapping.subscribe_button_observations(callback);
@@ -881,6 +1172,40 @@ impl WindowsPlatform {
     /// 订阅已触发手势（单击/双击/长按反馈）。
     pub fn subscribe_button_gestures(&self, callback: button_mapping::ButtonGestureCallback) {
         self.button_mapping.subscribe_button_gestures(callback);
+    }
+
+    /// 向导第⑥步：按键映射临时暂挂（只观察、不注入；内存态、不改用户配置）。
+    pub fn set_mapping_suspension(&self, suspended: bool) {
+        self.button_mapping.set_suspended(suspended);
+    }
+
+    /// 向导第⑤步前置（探针④）：打开物理键观察窗口（计数语义见 key_gate）。
+    /// 钩子未运行时返回 0（不可用）——调用方按未知处理。
+    pub fn begin_key_observation(&self, exclude_vks: &[u32]) -> u64 {
+        if !key_gate::is_gate_thread_alive() {
+            return 0;
+        }
+        key_gate::begin_key_observation(exclude_vks)
+    }
+
+    /// 关闭物理键观察窗口并取回计数。None = 计量不可靠（窗口过期、钩子
+    /// 中途停止），调用方 fail-open，不得据此判定手动输入。
+    pub fn end_key_observation(&self, window_id: u64) -> Option<u64> {
+        match key_gate::end_key_observation(window_id) {
+            Some(count) if key_gate::is_gate_thread_alive() => Some(count),
+            _ => None,
+        }
+    }
+
+    /// 观察窗口诊断（见 `key_gate::observed_last_vk`）：最后一次计入的虚拟键码。
+    pub fn observed_last_key(&self) -> Option<u32> {
+        key_gate::observed_last_vk()
+    }
+
+    /// 观察窗口诊断（见 `key_gate::observed_keys`）：窗口内计入的按键码列表
+    /// （按计入顺序，最多 12 个）。与 `observed_last_key` 同一读取时机。
+    pub fn observed_keys(&self) -> Vec<u32> {
+        key_gate::observed_keys()
     }
 
     pub fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError> {
@@ -902,6 +1227,16 @@ impl WindowsPlatform {
     pub fn connect_remote(&self, device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
         #[cfg(windows)]
         {
+            // 用户在应用里选/换遥控器的**那一刻**就发布「正在用的那支」的地址
+            // （2026-10-13 现场补充）：会话要等能力协商完才 Ready，而 Raw Input
+            // 绑定与助手选宿主都需要这个地址——只等 Ready 的话，应用刚启动、或
+            // 刚点连接而能力协商还没回来的那段时间里，两支遥控器同时在线就又会
+            // 歧义失败（现场：`raw_input_listener` 每 10 秒失败一次，向导卡在
+            // `remote.listener_not_ready`）。
+            // 目标刚变：立刻叫醒助手的 watchdog（`R` 行），不必等它自己的 2 秒轮询——
+            // 换机后"按下就赶不上"的窗口由此从秒级压到毫秒级（2026-10-13 现场）。
+            let address = crate::bluetooth_address_from_device_id(&device_id);
+            crate::remote_target::set(address);
             self.runtime.connect(device_id)
         }
 
@@ -927,6 +1262,12 @@ impl WindowsPlatform {
     pub fn restore_remote(&self, device_id: String) -> Result<ConnectionSnapshot, PlatformError> {
         #[cfg(windows)]
         {
+            // 启动时按已保存的选择立刻发布（同 `connect_remote` 的理由）：
+            // 不等会话 Ready，Raw Input 就能在"两支同型号同时在位"时绑对那一支。
+            // 目标刚变：立刻叫醒助手的 watchdog（`R` 行），不必等它自己的 2 秒轮询——
+            // 换机后"按下就赶不上"的窗口由此从秒级压到毫秒级（2026-10-13 现场）。
+            let address = crate::bluetooth_address_from_device_id(&device_id);
+            crate::remote_target::set(address);
             self.runtime.restore(device_id)
         }
 
@@ -1101,9 +1442,22 @@ pub fn is_supported_remote_name(raw_name: &str) -> bool {
 }
 
 pub fn remote_model_from_name(raw_name: &str) -> RemoteModel {
-    match raw_name.trim().to_lowercase().as_str() {
-        "xiaomi bluetooth remote 2" | "小米蓝牙遥控器2" => RemoteModel::Rc001,
-        "xiaomi bluetooth remote 2 pro" | "小米蓝牙遥控器2 pro" | "arn9" => {
+    // 系统上报的名称可能是中文（中文 Windows 的「小米蓝牙语音遥控器 2 / 2 Pro」）、
+    // 英文广告名或型号代号，空格与大小写不稳定：先归一化（去空白 + 小写）再按白名单
+    // 精确匹配。2026-10-13 现场：中文「语音遥控器」名此前落到 Unknown，第②步连接后
+    // 只能显示占位文案，用户分不清 2 / 2 Pro。仍然不从通用名称里猜型号
+    // （「小米蓝牙语音遥控器」这类没有型号后缀的名称保持 Unknown）。
+    let compact: String = raw_name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    match compact.as_str() {
+        "xiaomibluetoothremote2" | "小米蓝牙遥控器2" | "小米蓝牙语音遥控器2" => {
+            RemoteModel::Rc001
+        }
+        "xiaomibluetoothremote2pro" | "小米蓝牙遥控器2pro" | "小米蓝牙语音遥控器2pro" | "arn9" => {
             RemoteModel::Rc003
         }
         _ => RemoteModel::Unknown,
@@ -1154,8 +1508,10 @@ fn scan_paired_remotes() -> Result<Vec<PairedRemote>, PlatformError> {
         if !is_supported_remote_name(&name) {
             continue;
         }
+        let id = device.Id().map_err(windows_error)?.to_string();
         remotes.push(PairedRemote {
-            id: device.Id().map_err(windows_error)?.to_string(),
+            token: device_token(&id),
+            id,
             model: remote_model_from_name(&name),
             name,
             is_supported_candidate: true,
@@ -1276,6 +1632,43 @@ mod tests {
     }
 
     #[test]
+    fn device_token_folds_different_id_forms_of_the_same_address() {
+        // 2026-10-13 现场：扫描拿到的 id 与启动恢复保存的 id 可能形态不同（前后缀/分隔符），
+        // 令牌必须由**蓝牙地址**派生，两种形态才算同一支；大小写不影响。
+        let winrt_form = device_token("BluetoothLE#BluetoothLEc0:5d:39:c2:d9:db");
+        let with_adapter_prefix =
+            device_token("BluetoothLE#BluetoothLEaa:bb:cc:dd:ee:ff-c0:5d:39:c2:d9:db");
+        let uppercase_path = device_token(r"\\?\BTHLE#BluetoothLE#C0:5D:39:C2:D9:DB");
+        assert_eq!(winrt_form, with_adapter_prefix);
+        assert_eq!(winrt_form, uppercase_path);
+        assert_ne!(
+            winrt_form,
+            device_token("BluetoothLE#BluetoothLEaa:bb:cc:dd:ee:ff")
+        );
+        // 解析不出地址的 id 退回整串哈希（与旧行为一致），同样归一大小写与空白。
+        assert_eq!(
+            device_token(" ci-simulation-rc001 "),
+            device_token("CI-SIMULATION-RC001")
+        );
+    }
+
+    #[test]
+    fn device_token_is_stable_case_insensitive_and_distinct() {
+        // 同一台设备在不同来源里大小写/空白不同（注册表大写、Raw Input 小写），
+        // 令牌必须一致，否则界面又把"已连接"标错行（2026-10-13 现场）。
+        let upper = "BluetoothLE#BluetoothLEc0:5D:39:C2:D9:DB-11:22";
+        let lower = "  bluetoothle#bluetoothlec0:5d:39:c2:d9:db-11:22  ";
+        assert_eq!(device_token(upper), device_token(lower));
+        assert_eq!(device_token(upper).len(), 8);
+        assert!(device_token(upper).chars().all(|c| c.is_ascii_hexdigit()));
+        // 两支同型号遥控器（只差地址）必须得到不同令牌。
+        assert_ne!(
+            device_token("BluetoothLE#BluetoothLEc0:5d:39:c2:d9:db"),
+            device_token("BluetoothLE#BluetoothLEe8:55:40:b1:b7:6b")
+        );
+    }
+
+    #[test]
     fn identifies_rc001_and_rc003_without_guessing_generic_names() {
         assert_eq!(
             remote_model_from_name("Xiaomi Bluetooth Remote 2"),
@@ -1284,6 +1677,25 @@ mod tests {
         assert_eq!(
             remote_model_from_name("Xiaomi Bluetooth Remote 2 Pro"),
             RemoteModel::Rc003
+        );
+        // 中文 Windows 上报的名称（2026-10-13 现场：此前落到 Unknown，②步连接后
+        // 显示占位文案，分不清 2 / 2 Pro）。
+        assert_eq!(
+            remote_model_from_name("小米蓝牙语音遥控器 2"),
+            RemoteModel::Rc001
+        );
+        assert_eq!(
+            remote_model_from_name("小米蓝牙语音遥控器 2 Pro"),
+            RemoteModel::Rc003
+        );
+        assert_eq!(
+            remote_model_from_name("小米蓝牙遥控器 2 pro"),
+            RemoteModel::Rc003
+        );
+        // 没有型号后缀的名称不猜（两种型号都可能是它）。
+        assert_eq!(
+            remote_model_from_name("小米蓝牙语音遥控器"),
+            RemoteModel::Unknown
         );
         assert_eq!(remote_model_from_name("MI RC"), RemoteModel::Unknown);
 

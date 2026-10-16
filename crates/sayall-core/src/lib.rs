@@ -10,11 +10,11 @@ pub mod voice;
 pub use adpcm::{ImaAdpcmDecoder, NibbleOrder};
 pub use atvv::{AtvvCapabilities, AtvvCommand, AtvvControlEvent, AtvvError, AtvvUuids};
 pub use frame::FrameAccumulator;
-pub use pcm::process_pcm;
+pub use pcm::{normalize_gain_db, process_pcm};
 pub use pipeline::{AtvvVoicePipeline, PipelineError, PipelineOutput};
 pub use settings::{
-    AppIconIdentifier, AppSettings, CaptureInputSettings, ThemePreference, UiPreference,
-    UiPreferences, VoiceInputTool, VoiceTriggerMode,
+    AppSettings, CaptureInputSettings, ThemePreference, UiPreference, UiPreferences,
+    VoiceInputTool, VoiceTriggerMode,
 };
 pub use statistics::{DailyUsage, UsageStatistics};
 pub use voice::{VoiceSession, VoiceSessionError, VoiceSessionEvent, VoiceSessionState};

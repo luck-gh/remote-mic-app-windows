@@ -6,8 +6,12 @@ const bootStarted = performance.now();
 export interface FrontendDiagnosticEvent {
   event: string;
   phase: string;
-  result: "passed" | "failed" | "unknown";
+  result: "passed" | "failed" | "unknown" | "skipped" | "cancelled";
   reason: string;
+  /** 向导等功能的稳定 token 字段（Rust 侧逐字校验，含空格/中文会记为 invalid）。 */
+  step?: string;
+  code?: string;
+  detail?: string;
   elapsedMs?: number;
 }
 
@@ -22,6 +26,28 @@ export function reportFrontendEvent(event: FrontendDiagnosticEvent): void {
     // 日志 IPC 本身失败时不能递归上报；开发控制台保留一个无用户内容的信号。
     console.error("feature=frontend_diagnostics result=failed reason=ipc_unavailable");
   });
+}
+
+/**
+ * 把若干片段拼成结构化日志里的**稳定 token**。
+ *
+ * 为什么必须这样拼：Rust 侧 `diagnostic_token()` 只放行 `[A-Za-z0-9_.-]{1,64}`，
+ * 其余（空格、`=`、中文、自由文本）一律记成 `invalid`——2026-10-10 真机实测：
+ * `reason: \`was_enabled=false switch_reverted\`` 这类写法在日志里全是
+ * `reason=invalid`，失败原因等于没记（原文也不该进日志，见隐私红线）。
+ *
+ * 规则：片段用 `_` 连接；布尔展开成 `true` / `false`；非法字符替换成 `_`；
+ * 去首尾 `_`；截断到 64 字符；全空回落 `unknown`。
+ */
+export function reasonToken(...parts: Array<string | boolean | number | null | undefined>): string {
+  const joined = parts
+    .filter((part) => part !== null && part !== undefined && part !== "")
+    .map((part) => String(part))
+    .join("_")
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64);
+  return joined === "" ? "unknown" : joined;
 }
 
 export function installFrontendDiagnostics(): void {

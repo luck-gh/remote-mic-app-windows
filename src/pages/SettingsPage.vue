@@ -1,18 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import type { AppIconIdentifier, RuntimeSnapshot, ThemePreference } from "../lib/bridge";
+import type { RuntimeSnapshot, ThemePreference } from "../lib/bridge";
 import {
-  getAppIcon,
   getLaunchAtLogin,
-  openGitHubRepository,
-  openOfficialWebsite,
-  setAppIcon,
+  restartOnboarding,
   setLaunchAtLogin,
 } from "../lib/bridge";
 import { appUpdateProgressText, useAppUpdate } from "../lib/app-update";
 import { useTheme } from "../lib/theme";
 
 const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+const emit = defineEmits<{ "restart-onboarding": [] }>();
 
 const {
   phase,
@@ -38,11 +36,6 @@ const themeOptions: Array<{ value: ThemePreference; label: string }> = [
   { value: "system", label: "系统" },
   { value: "light", label: "浅色" },
   { value: "dark", label: "深色" },
-];
-
-const appIconOptions: Array<{ value: AppIconIdentifier; label: string; preview: string }> = [
-  { value: "standard", label: "默认", preview: "/app-logo.png" },
-  { value: "faceted-duck", label: "几何鸭", preview: "/app-icon-faceted-duck.png" },
 ];
 
 /** 版本号与安装包/更新器同源（package_info）；尚未读到时不编造版本。 */
@@ -92,52 +85,28 @@ const launchAtLoginReady = ref(false);
 const launchAtLoginBusy = ref(false);
 const launchAtLoginError = ref("");
 
-/** 应用图标（2026-10-02）：默认内置图标；切换后窗口/任务栏、托盘与设置页顶部一起换。 */
-const appIcon = ref<AppIconIdentifier>("standard");
-const appIconReady = ref(false);
-const appIconBusy = ref(false);
-const appIconError = ref("");
+/** 首次设置：重新运行向导（只重置向导进度，不清除设备/映射/音频/其他设置）。 */
+const onboardingBusy = ref(false);
+const onboardingError = ref("");
 
-/** 顶部标识跟随选择实时换图，与窗口/托盘用同一个 ID。 */
-const appIconPreview = computed(
-  () => appIconOptions.find((option) => option.value === appIcon.value)?.preview ?? "/app-logo.png",
-);
-
-/**
- * “问题反馈”的外部入口（2026-10-01 用户指定：官网与 GitHub 入口；2026-10-02
- * 官网地址带 `?from=win` 来源标记）。打开动作一律走 bridge：浏览器预览开新标签，
- * Tauri 运行时的 URL 白名单在 capabilities/default.json。
- */
-/**
- * 外部入口（2026-10-01 用户指定：官网与 GitHub 入口；2026-10-02 官网地址带
- * `?from=win` 来源标记）。打开动作一律走 bridge：浏览器预览开新标签，Tauri
- * 运行时的 URL 白名单在 capabilities/default.json。
- *
- * 2026-10-02 用户指定：成功不再显示任何提示（“已在系统默认浏览器打开…”已去掉），
- * 只有失败就地给原因——失败文案不能省：capability 拒绝（Not allowed to open url）
- * 与系统没有默认浏览器是两类不同问题，压成"打开失败"会让现场无法归因。
- */
-const linkBusy = ref(false);
-const linkMessage = ref("");
-
-async function openEntry(open: () => Promise<void>): Promise<void> {
-  linkBusy.value = true;
-  linkMessage.value = "";
+async function runOnboardingWizard(): Promise<void> {
+  if (onboardingBusy.value) return;
+  onboardingBusy.value = true;
+  onboardingError.value = "";
   try {
-    await open();
+    const state = await restartOnboarding();
+    if (!state.isActive) {
+      // 重置后仍不是进行中：保守报错，不把用户放进一个空向导。
+      onboardingError.value = "无法开始设置向导，请稍后重试。";
+      return;
+    }
+    emit("restart-onboarding");
   } catch (error) {
-    linkMessage.value = error instanceof Error ? error.message : String(error);
+    onboardingError.value = error instanceof Error && error.message.startsWith("Windows 授权")
+      ? error.message : "无法开始设置向导，请稍后重试。";
   } finally {
-    linkBusy.value = false;
+    onboardingBusy.value = false;
   }
-}
-
-async function onOpenOfficialWebsite(): Promise<void> {
-  await openEntry(openOfficialWebsite);
-}
-
-async function onOpenGitHubRepository(): Promise<void> {
-  await openEntry(openGitHubRepository);
 }
 
 async function onCheck(): Promise<void> {
@@ -169,29 +138,6 @@ async function onLaunchAtLoginChange(event: Event): Promise<void> {
   }
 }
 
-async function onAppIconChange(event: Event): Promise<void> {
-  const desired = (event.target as HTMLInputElement).value as AppIconIdentifier;
-  const previous = appIcon.value;
-  // 乐观显示：先让界面与用户点击一致（与连接页选输入工具同款），失败再回到
-  // 实际生效的图标——否则失败时单选按钮会停在"点击过但没保存"的位置。
-  appIcon.value = desired;
-  appIconBusy.value = true;
-  appIconError.value = "";
-  try {
-    appIcon.value = await setAppIcon(desired);
-  } catch (error) {
-    appIconError.value = error instanceof Error ? error.message : String(error);
-    try {
-      appIcon.value = await getAppIcon();
-    } catch {
-      // 读回也失败时退回最后一次已知生效值，错误信息已经给出原因。
-      appIcon.value = previous;
-    }
-  } finally {
-    appIconBusy.value = false;
-  }
-}
-
 onMounted(() => {
   void loadUpdatePreferences();
   void getLaunchAtLogin()
@@ -200,10 +146,6 @@ onMounted(() => {
     // 就绪标志与初值在同一渲染批次生效：开关此时才被创建，创建即带正确
     // checked，不产生属性变更，故无过渡可触发（无需禁用过渡或等待绘制）。
     .finally(() => { launchAtLoginReady.value = true; });
-  void getAppIcon()
-    .then((identifier) => { appIcon.value = identifier; })
-    .catch((error) => { appIconError.value = error instanceof Error ? error.message : String(error); })
-    .finally(() => { appIconReady.value = true; });
 });
 
 /** 行内图标：形状对齐 Mac 设置页各行的 SF Symbols（Windows 无 SF Symbols）。 */
@@ -217,19 +159,9 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
     // SF "power"：电源圆环 + 竖线
     strokes: ["M12 3.6v7.4", "M7.3 6.4a7 7 0 1 0 9.4 0"],
   },
-  app_icon: {
-    // SF "app.badge" 近似：应用方块 + 右下角标
-    strokes: [
-      "M4.6 3.4h10.4a1.6 1.6 0 0 1 1.6 1.6v10.4a1.6 1.6 0 0 1-1.6 1.6H4.6A1.6 1.6 0 0 1 3 15.4V5a1.6 1.6 0 0 1 1.6-1.6z",
-      "M17.6 13.8a3.6 3.6 0 1 1 0 7.2 3.6 3.6 0 0 1 0-7.2z",
-    ],
-    fills: ["M17.6 15.9a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z"],
-  },
-  feedback: {
-    // SF "bubble.left.and.bubble.right" 近似：单个圆角对话气泡
-    strokes: [
-      "M12 3.8c-4.8 0-8.7 3.1-8.7 7 0 2.3 1.3 4.3 3.3 5.6l-1 3.5 4-2.2c.8.2 1.6.3 2.4.3 4.8 0 8.7-3.1 8.7-7S16.8 3.8 12 3.8z",
-    ],
+  onboarding: {
+    // SF "arrow.triangle.2.circlepath" 近似：环形箭头（重新走一遍）
+    strokes: ["M19.6 12a7.6 7.6 0 1 1-2.3-5.4", "M17.6 2.8v4h-4"],
   },
 };
 </script>
@@ -245,9 +177,10 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
     <!-- 顶部模块（对齐 Mac 设置页：左边应用标识，右边版本与检查更新）。 -->
     <article class="card settings-overview">
       <div class="overview-identity">
-        <img class="app-logo" :src="appIconPreview" alt="无线麦 SayAll 应用图标" />
-        <h2>无线麦 SayAll</h2>
+        <img class="app-logo" src="/app-logo.png" alt="无线麦应用图标" />
+        <h2>无线麦</h2>
         <p class="muted">让语音触手可及</p>
+        <p class="muted personal-build">个人版</p>
       </div>
 
       <div class="overview-update">
@@ -259,6 +192,7 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
             class="toggle-row prerelease-toggle"
             title="开启后，检查更新时也会包含尚在测试中的预览版本。"
           >
+            <span>检查预览版更新</span>
             <input
               type="checkbox"
               class="toggle-input"
@@ -266,7 +200,6 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
               :disabled="preferenceBusy || checking || installing"
               @change="onPreviewToggle"
             />
-            检查预览版更新
           </label>
         </div>
 
@@ -398,9 +331,10 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
           </span>
           <div class="settings-row-text">
             <strong>启动行为</strong>
-            <p class="muted">登录 Windows 后自动启动无线麦 SayAll。</p>
+            <p class="muted">登录 Windows 后自动启动无线麦。</p>
           </div>
           <label class="toggle-row" title="使用当前用户的 Windows 登录启动项，不需要管理员权限。">
+            <span>登录时自动启动</span>
             <input
               v-if="launchAtLoginReady"
               type="checkbox"
@@ -411,68 +345,23 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
               @change="onLaunchAtLoginChange"
             />
             <span v-else class="toggle-placeholder" aria-hidden="true"></span>
-            登录时自动启动
           </label>
         </div>
         <p v-if="launchAtLoginError" class="error-text" role="alert">{{ launchAtLoginError }}</p>
 
-        <div class="settings-row">
-          <span class="settings-row-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none">
-              <path
-                v-for="(path, index) in ROW_ICONS.app_icon.fills"
-                :key="`tf${index}`"
-                :d="path"
-                fill="currentColor"
-              />
-              <path
-                v-for="(path, index) in ROW_ICONS.app_icon.strokes"
-                :key="`ts${index}`"
-                :d="path"
-                stroke="currentColor"
-                stroke-width="1.9"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </span>
-          <div class="settings-row-text">
-            <strong>应用图标</strong>
-          </div>
-          <div class="app-icon-selector" role="radiogroup" aria-label="应用图标">
-            <label
-              v-for="option in appIconOptions"
-              :key="option.value"
-              class="app-icon-option"
-              :class="{ selected: appIcon === option.value }"
-            >
-              <input
-                type="radio"
-                name="app-icon"
-                :value="option.value"
-                :checked="appIcon === option.value"
-                :disabled="!appIconReady || appIconBusy"
-                @change="onAppIconChange"
-              />
-              <img :src="option.preview" alt="" aria-hidden="true" />
-              <span>{{ option.label }}</span>
-            </label>
-          </div>
-        </div>
-        <p v-if="appIconError" class="error-text" role="alert">{{ appIconError }}</p>
       </div>
     </section>
 
-    <!-- 问题反馈（对齐 Mac 设置页的 settingsSupportSection）。 -->
+    <!-- 首次设置（向导重跑入口）：老用户机器已标记完成，需要入口才能重走一遍。 -->
     <section class="settings-section">
-      <h2 class="section-title">问题反馈</h2>
+      <h2 class="section-title">首次设置</h2>
       <div class="card settings-group">
         <div class="settings-row">
           <span class="settings-row-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none">
               <path
-                v-for="(path, index) in ROW_ICONS.feedback.strokes"
-                :key="`fs${index}`"
+                v-for="(path, index) in ROW_ICONS.onboarding.strokes"
+                :key="`os${index}`"
                 :d="path"
                 stroke="currentColor"
                 stroke-width="1.9"
@@ -482,33 +371,22 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
             </svg>
           </span>
           <div class="settings-row-text">
-            <strong>问题反馈</strong>
-            <p class="muted">反馈无线麦 SayAll 的问题，或提出改进建议。</p>
+            <strong>重新运行设置向导</strong>
+            <p class="muted">重新走一遍首次设置；不会清除按键映射、设备与语音设置。</p>
           </div>
-          <div class="button-row">
-            <button
-              class="secondary-button"
-              type="button"
-              :disabled="linkBusy"
-              @click="onOpenOfficialWebsite"
-            >
-              官网
-            </button>
-            <button
-              class="secondary-button"
-              type="button"
-              :disabled="linkBusy"
-              @click="onOpenGitHubRepository"
-            >
-              GitHub
-            </button>
-          </div>
+          <button
+            class="secondary-button"
+            type="button"
+            :disabled="onboardingBusy"
+            @click="runOnboardingWizard"
+          >
+            重新运行向导
+          </button>
         </div>
-        <p v-if="linkMessage" class="operation-message link-message" aria-live="polite">
-          {{ linkMessage }}
-        </p>
+        <p v-if="onboardingError" class="error-text" role="alert">{{ onboardingError }}</p>
       </div>
     </section>
+
   </section>
 </template>
 
@@ -573,28 +451,4 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
 /* 行内错误与行内说明共用左缩进，读起来仍属于上一行。 */
 .settings-group > .error-text { margin: 0 0 8px 50px; }
 
-/* 应用图标：两个带预览图的选项（选中态用强调色描边，对齐 Mac appIconPreferenceRow）。 */
-.app-icon-selector { display: flex; gap: 8px; }
-.app-icon-option {
-  position: relative;
-  width: 96px;
-  display: grid;
-  justify-items: center;
-  gap: 5px;
-  padding: 8px 6px 7px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-control);
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-size: 12.5px;
-  font-weight: 600;
-  text-align: center;
-  transition: border-color 0.15s, background-color 0.15s, color 0.15s;
-}
-.app-icon-option:hover { border-color: var(--accent-border); }
-.app-icon-option.selected { color: var(--accent-text); border-color: var(--accent); background: var(--accent-surface); }
-.app-icon-option:has(input:disabled) { cursor: wait; opacity: 0.6; }
-.app-icon-option input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.app-icon-option img { width: 28px; height: 28px; border-radius: 7px; }
 </style>

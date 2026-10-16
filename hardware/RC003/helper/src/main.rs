@@ -1,10 +1,12 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! rc003-helper —— RC003 增强捕获轨（路线 A）的提权助手。
 //! 下文历史实测来自固定上游提交，不代表当前本地版本已通过真机验收。
 //!
 //! 它做什么
 //! --------
 //! 1. 从注册表定位承载 RC003 的 `WUDFHost.exe`（`Device Parameters\WUDFDiagnosticInfo\HostPid`），
-//!    并核对它是「独占 RC003」宿主；
+//!    并核对所选功能节点；共享宿主逐请求核验来源，不能用键码代替设备身份；
 //! 2. 把**固定版本 + 已校验 SHA-256** 的 Frida Gadget 与我们自持的 agent 脚本准备到运行时目录；
 //! 3. 用 `VirtualAllocEx` / `WriteProcessMemory` / `CreateRemoteThread(LoadLibraryW)` 把 Gadget
 //!    加载进该宿主；
@@ -85,6 +87,11 @@ mod imp {
     /// 只会表现为日志一片安静、程序一直等下去——把"失败"伪装成"正在工作"。
     /// 30 s 足够覆盖 agent 侧的 CONNECT_TIMEOUT(3 s) + 重连周期(1 s)。
     const DEFAULT_AWAIT_HELLO_S: u64 = 30;
+
+    /// `[HB]` 心跳的落盘节流：agent 的 hb 很密（实测约 2 条/秒），逐条写会把日志刷爆
+    /// （2026-10-08 实测单机累计 768 MB、约 107 MB/天）。现在只在**状态变化**时或
+    /// 每 `HB_LOG_EVERY` 记一条；协议动作（ownership 续约等）不受影响，仍按每条处理。
+    const HB_LOG_EVERY: Duration = Duration::from_secs(30);
 
     /// targets 下发后等不到 `targets_ack` 时的重发节奏：前 `ACK_RESEND_FAST_N` 次
     /// 每 `ACK_RESEND_FAST_MS` 一次，之后放慢到 `ACK_RESEND_SLOW_MS`。
@@ -443,6 +450,20 @@ mod imp {
         fn RegCloseKey(key: Handle) -> i32;
     }
 
+    #[link(name = "cfgmgr32")]
+    extern "system" {
+        fn CM_Locate_DevNodeW(node: *mut u32, id: *const u16, flags: u32) -> u32;
+        fn CM_Get_DevNode_Status(state: *mut u32, problem: *mut u32, node: u32, flags: u32) -> u32;
+        fn CM_Get_DevNode_Registry_PropertyW(
+            node: u32,
+            property: u32,
+            kind: *mut u32,
+            buffer: *mut c_void,
+            bytes: *mut u32,
+            flags: u32,
+        ) -> u32;
+    }
+
     #[link(name = "shell32")]
     extern "system" {
         fn IsUserAnAdmin() -> i32;
@@ -540,26 +561,77 @@ mod imp {
         unsafe { IsUserAnAdmin() != 0 }
     }
 
-    /// 隐藏本进程的控制台窗口（`--follow-app` / `--hide-window` 时调用）。
+    /// 控制台引导（GUI 子系统下进程没有系统分配的控制台）。
     ///
-    /// 计划任务拉起的是控制台程序，Windows 必然给它分配一个黑框——
-    /// 但用户面对的界面是主程序，这个框是纯干扰（2026-09-23 验收反馈）。
-    /// 启动后立刻隐藏；日志写文件不依赖窗口，排查能力不受影响。
-    /// 手动运行（run-helper.cmd 等）不带 `--follow-app`，保留窗口看日志。
-    fn hide_console_window() {
+    /// 两条路径：
+    /// * 手动运行（cmd / PowerShell / run-helper*.cmd）——父进程有控制台，
+    ///   `AttachConsole(ATTACH_PARENT_PROCESS)` 成功，把无效的 stdout/stderr
+    ///   句柄接到 CONOUT$（控制台输出设备），诊断输出照旧可见；
+    /// * 后台拉起（计划任务 / ShellExecuteEx 提权安装）——没有父控制台，也
+    ///   **不分配**任何控制台，stdout/stderr 指向 NUL：`Logger::line` 每次都
+    ///   `println!`，无效句柄会让它 panic，指向 NUL 后打印成为无害空写，
+    ///   日志落文件不受影响。
+    ///
+    /// 句柄已有效（父进程重定向输出 / 继承句柄）时不覆盖，保持原有去向。
+    /// 返回值只用于 `[ENV]` 诊断字段。
+    ///
+    /// 为什么不用旧的 `hide_console_window()`（2026-10-04 真机实测）：控制台
+    /// 子系统下 Windows 11 默认终端把控制台显示为 Windows Terminal 窗口，从
+    /// 进程启动一直可见到退出（实测每轮 2.2–2.3 s）；`GetConsoleWindow` 在
+    /// ConPTY 托管下返回的只是隐藏的 pseudo window，隐藏动作对可见窗口无效。
+    /// GUI 子系统 + 本函数从根上不再产生窗口。
+    fn bootstrap_console() -> &'static str {
         #[link(name = "kernel32")]
         extern "system" {
-            fn GetConsoleWindow() -> Handle;
+            fn AttachConsole(process_id: u32) -> i32;
+            fn GetStdHandle(std_handle: u32) -> Handle;
+            fn SetStdHandle(std_handle: u32, handle: Handle) -> i32;
+            fn CreateFileW(
+                file_name: *const u16,
+                desired_access: u32,
+                share_mode: u32,
+                security_attributes: *mut c_void,
+                creation_disposition: u32,
+                flags_and_attributes: u32,
+                template_file: Handle,
+            ) -> Handle;
         }
-        #[link(name = "user32")]
-        extern "system" {
-            fn ShowWindow(window: Handle, command: i32) -> i32;
-        }
-        const SW_HIDE: i32 = 0;
+
+        // STD_*_HANDLE 的 DWORD 形态（winbase.h：-10 / -11 / -12）。
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const OPEN_EXISTING: u32 = 3;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
         unsafe {
-            let window = GetConsoleWindow();
-            if !window.is_null() {
-                ShowWindow(window, SW_HIDE);
+            let attached = AttachConsole(ATTACH_PARENT_PROCESS) != 0;
+            let target = if attached { "CONOUT$" } else { "NUL" };
+            for std in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let current = GetStdHandle(std);
+                if !current.is_null() && current as isize != INVALID_HANDLE_VALUE {
+                    continue; // 已有效（重定向 / 继承）：不覆盖
+                }
+                let handle = CreateFileW(
+                    to_wide(target).as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if handle as isize != INVALID_HANDLE_VALUE {
+                    SetStdHandle(std, handle);
+                }
+            }
+            if attached {
+                "attached"
+            } else {
+                "nul"
             }
         }
     }
@@ -716,6 +788,133 @@ mod imp {
         high: u32,
     }
 
+    fn pe_machine_from_bytes(bytes: &[u8]) -> Option<u16> {
+        if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+            return None;
+        }
+        let e_lfanew =
+            u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+        let sig_end = e_lfanew.checked_add(6)?;
+        if bytes.len() < sig_end || &bytes[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+            return None;
+        }
+        Some(u16::from_le_bytes([
+            bytes[e_lfanew + 4],
+            bytes[e_lfanew + 5],
+        ]))
+    }
+
+    /// 只读文件头（最多 4 KiB）取 machine：不为一个字段读进整份 20 MB 的 DLL。
+    fn pe_machine_of_file(path: &Path) -> Option<u16> {
+        let mut buf = [0u8; 4096];
+        let mut file = fs::File::open(path).ok()?;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match std::io::Read::read(&mut file, &mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        pe_machine_from_bytes(&buf[..filled])
+    }
+
+    /// machine 值的可读名（日志与错误文案共用）。
+    fn machine_name(machine: u16) -> &'static str {
+        match machine {
+            0x8664 => "x64",
+            0xAA64 => "arm64",
+            0x014C => "x86",
+            _ => "unknown",
+        }
+    }
+
+    /// **注入前**的架构闸门（Issue #206 的直接教训）。
+    ///
+    /// 必须满足：助手自身架构 == 目标宿主架构 == Gadget 架构。任一不等都在这里拒绝——
+    /// 放过去的话，失败会以 `CreateRemoteThread` 的 `GetLastError` 形式出现，看起来像
+    /// "安全软件拦截注入"，把排查引向错误方向（Issue #206 现场就是这样被归因的）。
+    fn arch_gate(injector: u16, target: u16, gadget: u16) -> Result<(), String> {
+        if injector != target {
+            return Err(format!(
+                "架构不一致：本助手是 {}（machine=0x{injector:04X}），目标宿主是 {}（machine=0x{target:04X}）。\
+                 x64 助手无法向 ARM64 宿主注入，反之亦然；请使用与系统架构匹配的安装包\
+                 （安装包按系统架构携带两份助手与 Gadget，主程序会自行选择）。",
+                machine_name(injector),
+                machine_name(target)
+            ));
+        }
+        if gadget != target {
+            return Err(format!(
+                "Gadget 架构与目标宿主不一致：Gadget 是 {}（machine=0x{gadget:04X}），宿主是 {}（machine=0x{target:04X}）。\
+                 目标进程无法加载其它架构的镜像；请改用与系统架构匹配的安装包。",
+                machine_name(gadget),
+                machine_name(target)
+            ));
+        }
+        Ok(())
+    }
+
+    /// 注入前把三方架构摆进日志，并在不一致时拒绝。
+    ///
+    /// 目标映像路径读不到时**不阻断**（fail-open + 显式告警）：宿主是系统进程，提权后正常
+    /// 都能读到；若某类环境一律读不到就一律拒绝，会把当前可用的 x64 路径一起打断。
+    /// 但拒绝一定发生在"读得到且不一致"的时候——那正是 Issue #206 的场景。
+    fn arch_preflight(pid: u32, gadget: &Path, logger: &Logger) -> Result<(), String> {
+        let target =
+            process_image_path(pid).and_then(|p| pe_machine_of_file(Path::new(&p)).map(|m| (p, m)));
+        let gadget_machine = pe_machine_of_file(gadget);
+        let injector = format!("{} 0x{:04X}", ARCH_NAME, INJECTOR_MACHINE);
+        match (&target, gadget_machine) {
+            (Some((path, target_machine)), Some(gadget_machine)) => {
+                logger.kv(
+                    "[ARCH]",
+                    &[
+                        ("injector", injector.clone()),
+                        (
+                            "target",
+                            format!("{} 0x{target_machine:04X}", machine_name(*target_machine)),
+                        ),
+                        (
+                            "gadget",
+                            format!("{} 0x{gadget_machine:04X}", machine_name(gadget_machine)),
+                        ),
+                        ("image", normalize_display(Path::new(path))),
+                    ],
+                );
+                arch_gate(INJECTOR_MACHINE, *target_machine, gadget_machine)
+            }
+            _ => {
+                logger.kv(
+                    "[ARCH]",
+                    &[
+                        ("injector", injector),
+                        (
+                            "target",
+                            match &target {
+                                Some((_, m)) => format!("{} 0x{m:04X}", machine_name(*m)),
+                                None => "unreadable".to_string(),
+                            },
+                        ),
+                        (
+                            "gadget",
+                            gadget_machine
+                                .map(|m| format!("{} 0x{m:04X}", machine_name(m)))
+                                .unwrap_or_else(|| "unreadable".to_string()),
+                        ),
+                        (
+                            "note",
+                            "架构校验未完成（映像路径或 Gadget 头读不到）：本次按原路径继续，\
+                             若随后失败请先看本行"
+                                .to_string(),
+                        ),
+                    ],
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn process_creation_time(pid: u32) -> Option<u64> {
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -803,9 +1002,24 @@ mod imp {
     struct HostEntry {
         pid: u32,
         enumerator: String,
-        device: String,
-        instance: String,
+        /// **只在卸载清理时用**：对 RC003 设备做一次禁用→启用，放掉还在映射 Gadget 的
+        /// 宿主进程（2026-10-08 方案 B）。存的是**完整设备实例 ID**
+        /// （`<枚举器>\<设备>\<实例>`）——只存最后一段会让设备枚举找不到它（2026-10-08
+        /// 真机复测实证）。**绝不进日志**——它含设备接口路径（VID/PID/REV/实例序号），
+        /// 属 `LOGGING.md` 隐私红线的"HID 路径"。
+        /// 不保留设备名：它同样含设备接口路径，排错不需要它。
         is_rc003: bool,
+        // 私有来源核验：完整功能实例，不写入日志或 Debug 输出。
+        instance_id: String,
+    }
+
+    /// RC003 识别判据（纯函数）：BTHLEDevice 枚举器 + HID 服务前缀 + 本型号硬件串。
+    /// 抽出来是为了让**扫描与卸载清理共用同一判据**，避免两处漂移。
+    fn device_is_rc003(enumerator: &str, device: &str) -> bool {
+        let folded = device.to_lowercase();
+        enumerator.eq_ignore_ascii_case("bthledevice")
+            && folded.starts_with(&HID_SERVICE_PREFIX.to_lowercase())
+            && folded.contains(RC003_HARDWARE_TOKEN)
     }
 
     fn reg_subkeys(key: Handle) -> Vec<String> {
@@ -1011,20 +1225,17 @@ mod imp {
                                 PidRead::Error(rc) => format!("注册表返回码 {rc}"),
                                 _ => format!("{other:?}"),
                             };
-                            scan.failures
-                                .push(format!("{enumerator} / {} :: {why}", mask_token(&device)));
+                            // 只报枚举器与原因：设备名/接口路径不进日志（隐私红线）。
+                            scan.failures.push(format!("{enumerator} :: {why}"));
                             continue;
                         }
                     };
-                    let folded = device.to_lowercase();
+                    let is_rc003 = device_is_rc003(enumerator.as_str(), device.as_str());
                     scan.entries.push(HostEntry {
                         pid,
                         enumerator: enumerator.clone(),
-                        device: device.clone(),
-                        instance,
-                        is_rc003: enumerator.eq_ignore_ascii_case("bthledevice")
-                            && folded.starts_with(&HID_SERVICE_PREFIX.to_lowercase())
-                            && folded.contains(RC003_HARDWARE_TOKEN),
+                        is_rc003,
+                        instance_id: format!("{enumerator}\\{device}\\{instance}"),
                     });
                 }
                 unsafe { RegCloseKey(device_key) };
@@ -1035,29 +1246,39 @@ mod imp {
         Ok(scan)
     }
 
-    /// 设备实例名里需要脱敏的只有蓝牙地址：紧跟在 `_` 之后的 12 位十六进制。
-    fn mask_token(text: &str) -> String {
-        let bytes: Vec<char> = text.chars().collect();
-        let mut out = String::new();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == '_' && i + 13 <= bytes.len() {
-                let candidate: String = bytes[i + 1..i + 13].iter().collect();
-                let is_hex = candidate.chars().all(|c| c.is_ascii_hexdigit());
-                let boundary_ok = match bytes.get(i + 13) {
-                    None => true,
-                    Some(c) => !c.is_ascii_hexdigit() && *c != '-',
-                };
-                if is_hex && boundary_ok {
-                    out.push_str("_<BT-ADDR>");
-                    i += 13;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        out
+    /// 宿主成员行的分类文本（纯函数，自检覆盖）。
+    ///
+    /// 为什么不再打设备接口路径（2026-10-08 用户要求 + `LOGGING.md` 隐私红线）：原来这一行
+    /// 打的是 `{enumerator}\{device}\{instance}`——地址虽已脱敏，但路径本体、VID/PID/REV 与
+    /// 实例序号仍在，属"不得记录 HID 路径"。排错真正需要的是"这个宿主里有几个成员、哪个
+    /// 是我们的"，用序号 + 分类即可表达。
+    fn member_line(index: usize, enumerator: &str, is_rc003: bool) -> String {
+        format!(
+            "    [{}] index={index} enumerator={enumerator} class={}",
+            if is_rc003 { "RC003" } else { "其它" },
+            if is_rc003 {
+                "rc003_hid_service_match"
+            } else {
+                "other_device"
+            },
+        )
+    }
+
+    // Authentication material must not be logged, including a stable digest or path.
+    fn token_log_fields(
+        source: &str,
+        _path: Option<&Path>,
+        token: &str,
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("source", source.to_owned()),
+            ("token_length", token.len().to_string()),
+            ("token_redacted", "true".to_owned()),
+        ]
+    }
+
+    fn token_redacted(token: &str) -> String {
+        format!("len={} redacted=true", token.len())
     }
 
     // ============================================================ 日志
@@ -1211,9 +1432,23 @@ mod imp {
     ///
     /// **必须整行一次写入**：主程序可能同时在往同一文件追加，逐字段 `write!` 会
     /// 让两边的行互相穿插。写入失败返回 false，由调用方换下一个落点。
+    /// 单个日志文件的体积上限与保留份数：与主程序
+    /// `crates/sayall-windows/src/diagnostic_log.rs` 保持一致
+    /// （10 MB + 保留 5 份）——**两处都改才算改完**（助手与主程序共用同一份日志，
+    /// 见 LOGGING.md「单一日志文件」；两份实现分属不同 workspace，无法直接共享代码）。
+    const SHARED_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+    const SHARED_LOG_KEEP_ROTATED: usize = 5;
+
     fn append_record(path: &Path, record: &str) -> bool {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
+        }
+        // 超上限先轮转（改名成带时间戳的旧文件）再追加；每次都重新打开，
+        // 因此主程序侧轮转之后，这里不会继续写给已被改名的旧文件。
+        let incoming = record.len() as u64 + 1;
+        let current = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        if current + incoming > SHARED_LOG_ROTATE_BYTES {
+            rotate_shared_log(path);
         }
         let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
             return false;
@@ -1224,11 +1459,177 @@ mod imp {
         file.write_all(line.as_bytes()).is_ok()
     }
 
+    /// 轮转共用日志：`<主名>-<UTC 时间戳>-p<进程号>.log`。时间戳只含 ASCII 字母数字
+    /// （可做文件名，也可按字典序当时间序），随后按份数删除最旧的。
+    fn rotate_shared_log(path: &Path) {
+        let stamp: String = utc_stamp()
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect();
+        let stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "sayall-diagnostic".to_string());
+        let rotated = path.with_file_name(format!("{stem}-{stamp}-p{}.log", std::process::id()));
+        if fs::rename(path, &rotated).is_err() {
+            // 主程序已经轮转过（或文件不存在）：不是错误，继续写新文件即可。
+            return;
+        }
+        prune_shared_rotated(path, SHARED_LOG_KEEP_ROTATED);
+    }
+
+    fn is_rotated_log_name(name: &str, stem: &str) -> bool {
+        let prefix = format!("{stem}-");
+        let Some(suffix) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".log"))
+        else {
+            return false;
+        };
+        let Some((stamp, pid)) = suffix.rsplit_once("-p") else {
+            return false;
+        };
+        let stamp = stamp.as_bytes();
+        stamp.len() == 19
+            && stamp[8] == b'T'
+            && stamp[18] == b'Z'
+            && stamp
+                .iter()
+                .enumerate()
+                .all(|(i, byte)| i == 8 || i == 18 || byte.is_ascii_digit())
+            && !pid.is_empty()
+            && pid.bytes().all(|byte| byte.is_ascii_digit())
+            && pid.parse::<u32>().is_ok_and(|pid| pid != 0)
+    }
+
+    fn ordinary_shared_log_file(path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                // FILE_ATTRIBUTE_REPARSE_POINT
+                return false;
+            }
+        }
+        true
+    }
+
+    fn prune_shared_rotated(path: &Path, keep: usize) {
+        let Some(dir) = path.parent() else { return };
+        let stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut rotated: Vec<PathBuf> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| ordinary_shared_log_file(&entry.path()))
+            .filter(|entry| is_rotated_log_name(&entry.file_name().to_string_lossy(), &stem))
+            .map(|entry| entry.path())
+            .collect();
+        if rotated.len() <= keep {
+            return;
+        }
+        rotated.sort();
+        for old in rotated.iter().take(rotated.len() - keep) {
+            let _ = fs::remove_file(old);
+        }
+    }
+
+    #[cfg(test)]
+    mod shared_log_rotation_name_tests {
+        use super::is_rotated_log_name;
+        #[test]
+        fn prunes_only_generated_rotation_names() {
+            assert!(is_rotated_log_name(
+                "sayall-diagnostic-20261009T080722123Z-p42.log",
+                "sayall-diagnostic"
+            ));
+            for name in [
+                "sayall-diagnostic-user.log",
+                "sayall-diagnostic-20261009T080722123Z-p.log",
+                "sayall-diagnostic-20261009T080722123Z-pother.log",
+                "sayall-diagnostic-20261009T080722123Z-p0.log",
+                "sayall-diagnostic-20261009T080722123Z-p4294967296.log",
+                "sayall-diagnostic-20261009T08072212Z-p42.log",
+                "sayall-diagnostic-20261009_080722123Z-p42.log",
+                "other-20261009T080722123Z-p42.log",
+                "sayall-diagnostic-20261009T080722123Z-p42.log.bak",
+            ] {
+                assert!(!is_rotated_log_name(name, "sayall-diagnostic"), "{name}");
+            }
+        }
+    }
+
+    const LOG_QUEUE_CAPACITY: usize = 256;
+    const LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    struct LogRecord {
+        record: String,
+        console: Option<String>,
+    }
+
+    /// Only diagnostic records may be dropped. Capture/control messages never use this queue.
+    struct LogQueue {
+        sender: Mutex<Option<mpsc::SyncSender<LogRecord>>>,
+        dropped: Arc<AtomicU64>,
+        finished: Arc<AtomicBool>,
+        completion: Mutex<Option<(mpsc::Receiver<()>, JoinHandle<()>)>>,
+    }
+
+    impl LogQueue {
+        fn enqueue(&self, record: LogRecord) {
+            let sent = self.sender.lock().ok().is_some_and(|sender| {
+                sender
+                    .as_ref()
+                    .is_some_and(|sender| sender.try_send(record).is_ok())
+            });
+            if !sent {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn close(&self) -> bool {
+            // Never hold this lock while waiting for filesystem/stdout I/O.
+            if let Ok(mut sender) = self.sender.lock() {
+                sender.take();
+            }
+            let Some((done, handle)) = self.completion.lock().ok().and_then(|mut slot| slot.take())
+            else {
+                return self.finished.load(Ordering::Acquire);
+            };
+            if done.recv_timeout(LOG_DRAIN_TIMEOUT).is_ok() {
+                handle.join().is_ok()
+            } else {
+                // Rust cannot cancel synchronous filesystem I/O. Detach only this diagnostic
+                // worker; capture/Agent/bridge cleanup has already finished before normal exit.
+                false
+            }
+        }
+    }
+
+    impl Drop for LogQueue {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    #[derive(Clone)]
     struct Logger {
         /// 助手自己的文件：主程序日志不可用时的回退落点（`--log` / `--follow-app` 默认）。
         fallback: Option<PathBuf>,
         /// 主程序诊断日志。有它时**只写它**——用户报障只拉一份日志（2026-10-01 要求）。
         shared: Option<PathBuf>,
+        queue: Option<Arc<LogQueue>>,
+        #[cfg(test)]
+        test_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     }
 
     impl Logger {
@@ -1239,15 +1640,6 @@ mod imp {
         /// `---------- 新一轮运行 ... ----------`。后果是 `grep '新一轮运行'` 的**运行起点
         /// 计数是错的**：真实 6 轮被数成 11 条。而这条分隔线当初加进来的**唯一目的**
         /// 就是让每轮起点可辨——它自己把它破坏了。
-        /// 派生一个同落点的 Logger：后台线程用（Logger 不是 Send 结构体之外
-        /// 的共享对象，续约线程用的是同款做法）。
-        fn fork(&self) -> Logger {
-            Logger {
-                fallback: self.fallback.clone(),
-                shared: self.shared.clone(),
-            }
-        }
-
         fn new(path: Option<PathBuf>) -> Self {
             if let Some(p) = &path {
                 if let Some(dir) = p.parent() {
@@ -1257,6 +1649,9 @@ mod imp {
             Self {
                 fallback: path,
                 shared: None,
+                queue: None,
+                #[cfg(test)]
+                test_sink: None,
             }
         }
 
@@ -1265,6 +1660,58 @@ mod imp {
             let mut logger = Self::new(fallback);
             logger.shared = shared;
             logger
+        }
+
+        /// Enable once before capture starts; clones share the same bounded output worker.
+        fn nonblocking(&self) -> std::io::Result<Self> {
+            if self.queue.is_some() {
+                return Ok(self.clone());
+            }
+            let sink = self.clone();
+            let (tx, rx) = mpsc::sync_channel::<LogRecord>(LOG_QUEUE_CAPACITY);
+            let dropped = Arc::new(AtomicU64::new(0));
+            let worker_dropped = Arc::clone(&dropped);
+            let finished = Arc::new(AtomicBool::new(false));
+            let worker_finished = Arc::clone(&finished);
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = std::thread::Builder::new()
+                .name("rc003-log".into())
+                .spawn(move || {
+                    let report_drops = || {
+                        let count = worker_dropped.swap(0, Ordering::Relaxed);
+                        if count > 0 {
+                            sink.line(&format!(
+                                "[LOG-QUEUE] result=overflow dropped_count={count}"
+                            ));
+                        }
+                    };
+                    for record in rx {
+                        report_drops();
+                        sink.write_record(record);
+                    }
+                    report_drops();
+                    sink.line("[LOG-QUEUE] event=stopped terminal_result=drained");
+                    worker_finished.store(true, Ordering::Release);
+                    let _ = done_tx.send(());
+                })?;
+            let mut logger = self.clone();
+            logger.queue = Some(Arc::new(LogQueue {
+                sender: Mutex::new(Some(tx)),
+                dropped,
+                finished,
+                completion: Mutex::new(Some((done_rx, handle))),
+            }));
+            logger.line(&format!("[LOG-QUEUE] event=started capacity={LOG_QUEUE_CAPACITY} overflow=drop_diagnostics capture_io=isolated"));
+            Ok(logger)
+        }
+
+        fn shutdown(&self) -> bool {
+            self.queue.as_ref().is_none_or(|queue| queue.close())
+        }
+
+        fn exit(&self, code: i32) -> ! {
+            self.shutdown();
+            std::process::exit(code)
         }
 
         /// 记录一行"落点决策"，让下一次报障一眼看出日志去了哪里。
@@ -1316,18 +1763,41 @@ mod imp {
             // 目的地优先级：主程序诊断日志（用户只拉一份）→ 助手自己的文件。
             // 脱敏对两个落点都做：两份文件都可能被用户发出来。
             let text = redact_personal_paths(msg);
-            let stdout_started = Instant::now();
-            println!("{text}");
-            LATENCY.record(LatencyStage::Stdout, elapsed_ms(stdout_started));
             let record = format!(
                 "{} pid={} component=rc003-helper {}",
                 utc_stamp(),
                 std::process::id(),
                 text
             );
+            self.output(LogRecord {
+                record,
+                console: Some(text),
+            });
+        }
+
+        fn output(&self, record: LogRecord) {
+            if let Some(queue) = &self.queue {
+                queue.enqueue(record);
+            } else {
+                self.write_record(record);
+            }
+        }
+
+        fn write_record(&self, record: LogRecord) {
+            if let Some(text) = &record.console {
+                let stdout_started = Instant::now();
+                // Broken stdout must not panic and terminate the capture process.
+                let _ = writeln!(std::io::stdout().lock(), "{text}");
+                LATENCY.record(LatencyStage::Stdout, elapsed_ms(stdout_started));
+            }
             let append_started = Instant::now();
+            #[cfg(test)]
+            if let Some(sink) = &self.test_sink {
+                sink(&record.record);
+                return;
+            }
             for target in self.shared.iter().chain(self.fallback.iter()) {
-                if append_record(target, &record) {
+                if append_record(target, &record.record) {
                     break;
                 }
             }
@@ -1344,13 +1814,10 @@ mod imp {
             // 不经 println/Logger::line，避免递归或再争用 stdout。
             let record = format!("{} pid={} component=rc003-helper [LATENCY] diagnosis=unknown slow_ms={} min_interval_ms={} agent_rx_clock=wall clock_invalid={}{}",
                 utc_stamp(), std::process::id(), LATENCY_SLOW_MS, LATENCY_REPORT_MS, summary.clock_invalid, summary.fields());
-            let started = Instant::now();
-            for target in self.shared.iter().chain(self.fallback.iter()) {
-                if append_record(target, &record) {
-                    break;
-                }
-            }
-            LATENCY.record(LatencyStage::Append, elapsed_ms(started));
+            self.output(LogRecord {
+                record,
+                console: None,
+            });
         }
 
         fn kv(&self, tag: &str, kv: &[(&str, String)]) {
@@ -1362,6 +1829,202 @@ mod imp {
                 s.push_str(v);
             }
             self.line(&s);
+        }
+    }
+
+    #[cfg(test)]
+    mod capture_log_stall_tests {
+        use super::*;
+
+        #[test]
+        fn slow_log_sink_does_not_delay_ownership_or_menu_edges() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let sink_gate = Arc::clone(&gate);
+            let block_once = AtomicBool::new(true);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |_| {
+                if block_once.swap(false, Ordering::Relaxed) {
+                    let _ = entered_tx.send(());
+                }
+                let _released = sink_gate
+                    .1
+                    .wait_while(sink_gate.0.lock().unwrap(), |released| !*released)
+                    .unwrap();
+            }));
+            let logger = logger.nonblocking().unwrap();
+            // Establish the blocked sink before the capture thread can receive any HB/edge.
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let bridge = AppBridge {
+                tx,
+                handle: None,
+                stop: Arc::new(AtomicBool::new(false)),
+                stats: Arc::new(BridgeStats::default()),
+                targets: Arc::new(Mutex::new(BridgeCaptureTargets::default())),
+                voice_synth: Arc::new(Mutex::new(None)),
+                voice_synth_dirty: Arc::new(AtomicBool::new(false)),
+                voice_gate: Arc::new(AtomicBool::new(false)),
+                voice_gate_dirty: Arc::new(AtomicBool::new(false)),
+            };
+            let capture_logger = logger.clone();
+            let handle = std::thread::spawn(move || {
+                let logger = capture_logger;
+                let mut session = Session {
+                    connected_at: Instant::now(),
+                    last_rx: Instant::now(),
+                    hello: None,
+                    edges: Vec::new(),
+                    lines: 0,
+                    authenticated: true,
+                    config_sent: true,
+                    target_ack: Some(BridgeCaptureTargets {
+                        generation: 4,
+                        usages: vec![0x65],
+                    }),
+                    last_hb_log: None,
+                };
+                handle_line(
+                    r#"{"type":"hb","lease_ok":true,"handshake":true}"#,
+                    &mut session,
+                    &logger,
+                    "test",
+                    Some(&bridge),
+                );
+                handle_line(
+                    r#"{"type":"edge","usages":[101]}"#,
+                    &mut session,
+                    &logger,
+                    "test",
+                    Some(&bridge),
+                );
+                handle_line(
+                    r#"{"type":"edge","usages":[]}"#,
+                    &mut session,
+                    &logger,
+                    "test",
+                    Some(&bridge),
+                );
+            });
+            // Hold the sink beyond the real 1500 ms ownership safety window.
+            let held_at = Instant::now();
+            let ownership = rx.recv_timeout(Duration::from_millis(1700));
+            let down = rx.recv_timeout(Duration::from_millis(100));
+            let up = rx.recv_timeout(Duration::from_millis(100));
+            let forwarded_in_ms = elapsed_ms(held_at);
+            std::thread::sleep(Duration::from_millis(1700).saturating_sub(held_at.elapsed()));
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            handle.join().unwrap();
+            assert!(logger.shutdown());
+            assert!(
+                matches!(
+                    ownership,
+                    Ok(QueuedBridgeOutbound {
+                        message: BridgeOutbound::Ownership(_),
+                        ..
+                    })
+                ),
+                "logging stalled ownership past the safety window"
+            );
+            assert!(forwarded_in_ms < 1500, "forwarded_in_ms={forwarded_in_ms}");
+            assert!(
+                matches!(down, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges(ref keys), .. }) if keys == &[101])
+            );
+            assert!(
+                matches!(up, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges(ref keys), .. }) if keys.is_empty())
+            );
+        }
+
+        #[test]
+        fn full_log_queue_is_bounded_and_reports_drops_after_recovery() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let once = AtomicBool::new(true);
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&records);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                if once.swap(false, Ordering::Relaxed) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                captured.lock().unwrap().push(record.to_owned());
+            }));
+            let logger = logger.nonblocking().unwrap();
+            let same = logger.nonblocking().unwrap();
+            assert!(Arc::ptr_eq(
+                logger.queue.as_ref().unwrap(),
+                same.queue.as_ref().unwrap()
+            ));
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            for _ in 0..LOG_QUEUE_CAPACITY + 19 {
+                same.line("[TEST] state=queued");
+            }
+            assert_eq!(
+                logger
+                    .queue
+                    .as_ref()
+                    .unwrap()
+                    .dropped
+                    .load(Ordering::Relaxed),
+                19
+            );
+            release_tx.send(()).unwrap();
+            assert!(logger.shutdown());
+            assert!(same.shutdown());
+            same.line("[TEST] state=late");
+            let records = records.lock().unwrap();
+            assert!(records
+                .iter()
+                .any(|s| s.contains("result=overflow dropped_count=19")));
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|s| s.contains("state=queued"))
+                    .count(),
+                LOG_QUEUE_CAPACITY
+            );
+            assert!(records.last().unwrap().contains("terminal_result=drained"));
+            assert!(!records.iter().any(|s| s.contains("state=late")));
+        }
+
+        #[test]
+        fn shutdown_has_a_budget_and_a_late_sink_cannot_reopen_the_queue() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let once = AtomicBool::new(true);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                if once.swap(false, Ordering::Relaxed) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                if record.contains("terminal_result=drained") {
+                    let _ = finished_tx.send(());
+                }
+            }));
+            let logger = logger.nonblocking().unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let started = Instant::now();
+            let result = logger.shutdown();
+            let bounded = started.elapsed() < LOG_DRAIN_TIMEOUT + Duration::from_secs(1);
+            let repeated = logger.shutdown();
+            logger.line("[TEST] state=late");
+            release_tx.send(()).unwrap();
+            finished_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(!result && !repeated && bounded);
+            assert!(logger
+                .queue
+                .as_ref()
+                .unwrap()
+                .sender
+                .lock()
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -1647,7 +2310,9 @@ mod imp {
   --port <PORT>         监听端口（默认 47831；自检时可用 0 自动分配）\n\
   --token <TOKEN>       握手令牌（默认读取/创建运行时目录里的 session.token，跨运行稳定）\n\
   --new-token           强制换一个新令牌（**会让常驻 tap 无法接管**，见下）\n\
-  --gadget <PATH>       frida-gadget.dll 路径（默认与可执行文件同目录）\n\
+  --gadget <PATH>       Gadget 路径（默认与可执行文件同目录；文件名随架构：\n\
+                        x64 = frida-gadget.dll，arm64 = frida-gadget-arm64.dll）\n\
+                        由卸载器调用；仍在运行的助手见到卸载标记也会自行执行\n\
   --runtime-dir <PATH>  运行时目录（默认 %ProgramData%\\SayAll\\rc003-helper）\n\
   --duration <SEC>      运行多少秒后自动收尾（默认 0 = 一直运行）。\n\
                         到点会打 [TIMEUP] 并发 disarm；**会话存活期间同样生效**\n\
@@ -1657,7 +2322,9 @@ mod imp {
   --attach-only         只接管宿主里已有的 tap，绝不注入（诊断用）\n\
   --new-generation      旧世代 tap 无法接管时，另起一份复制体注入（实验性：\n\
                         依赖 Frida 允许同一进程内两个 Gadget 实例，未验证）\n\
-  --log <PATH>          同时写日志文件（**追加**语义，每轮带时间戳分隔头）\n\
+  --log <PATH>          同时写日志文件（**追加**语义，每轮带时间戳分隔头）。\n\
+                        要捕获输出请用它：GUI 子系统进程拿不到 cmd / PowerShell 的\n\
+                        `>` 与管道重定向（Windows 只给控制台子系统子进程接这些）\n\
   --dry-run             只做宿主定位、独占性核对与 Gadget 校验；不准备运行目录、不注入、不监听\n\
                         （**无需提权**：全是只读检查）\n\
   --observe             只观察不拦截（agent 侧不清键）\n\
@@ -1738,16 +2405,19 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         Attach,
     }
 
-    /// 纯决策函数（自检覆盖）。`resident_token_ok` 表示"宿主里的 tap 用的是我们手上这个令牌"，
-    /// 它是**能否接管**的唯一判据；接不上就只剩"另起一代"或"人工清干净"两条路。
+    /// 纯决策函数（自检覆盖）。`token_assumed_reusable` 只表示"令牌文件在助手启动前就已存在"，
+    /// 即**假定**可复用——它证明不了"宿主里的 tap 用的就是手上这个令牌"。那只有**已鉴权握手**
+    /// 能证明（见 ATTACH_VERIFY_MS 的核验与升级注入；2026-10-08 现场教训：把"文件存在"
+    /// 当成"一致"，接管后静默跳过注入，三键与语音键全断，日志还写着"令牌一致"）。
+    /// 假定不成立时就只剩"另起一代"或"人工清干净"两条路。
     fn decide_plan(
         has_resident_tap: bool,
-        token_reusable: bool,
+        token_assumed_reusable: bool,
         attach_only: bool,
         new_generation: bool,
     ) -> Result<DllPlan, String> {
         if has_resident_tap {
-            if token_reusable {
+            if token_assumed_reusable {
                 return Ok(DllPlan::Attach);
             }
             if attach_only {
@@ -1904,7 +2574,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 加它的理由很直接：2026-09-23 那次故障，用户在**没有提权**的情况下无法预先知道
     /// "第二次运行必然会失败"，只能等提权跑完看报错。
     fn inspect_runtime_readonly(args: &Args, logger: &Logger) {
-        let dll = args.runtime_dir.join("frida-gadget.dll");
+        let dll = args.runtime_dir.join(RUNTIME_GADGET_NAME);
         let exists = dll.exists();
         let digest = if exists {
             fs::read(&dll).ok().map(|b| sha256_hex(&b))
@@ -2027,9 +2697,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let (target_dir, dll) = match plan {
             DllPlan::Generation(_) => {
                 let gd = dir.join(&gen_name);
-                (gd.clone(), gd.join("frida-gadget.dll"))
+                (gd.clone(), gd.join(RUNTIME_GADGET_NAME))
             }
-            _ => (dir.clone(), dir.join("frida-gadget.dll")),
+            _ => (dir.clone(), dir.join(RUNTIME_GADGET_NAME)),
         };
 
         let mut reused = false;
@@ -2105,11 +2775,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     }
                     s
                 })?;
+                // 复制之后**对副本重算摘要**，两个作用（2026-10-07 报障人实测后加）：
+                // ① 堵住"写下去之后、注入之前被换掉"的窗口；
+                // ② 让 [DLL] 的 sha256_verified 在 copied 路径上也有真实含义——此前 copied 路径
+                //    固定写 false，被读成"没校验就用了"（来源其实已在 [VERIFY] 校验过）。
+                verify_copied_gadget(&dll, GADGET_SHA256)?;
+                verified = true;
                 logger.kv(
                     "[PREP]",
                     &[
                         ("dll", normalize_display(&dll)),
                         ("action", "copied".into()),
+                        ("sha256_verified", "true".into()),
                         (
                             "bytes",
                             fs::metadata(&dll).map(|m| m.len()).unwrap_or(0).to_string(),
@@ -2219,6 +2896,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             .to_str()
             .ok_or_else(|| "Gadget 路径不是合法 UTF-8".to_string())?;
 
+        // **注入前**的架构闸门：助手 / 宿主 / Gadget 三者必须同架构。放在最前是有意的——
+        // 一旦走到 OpenProcess / CreateRemoteThread，失败就只剩一个 GetLastError，
+        // 会被读成"安全软件拦截注入"（Issue #206 现场就是这样被归因的）。
+        arch_preflight(pid, dll, logger)?;
+
         let mut inj = Injection {
             thread_handle: std::ptr::null_mut(),
             remote_buf: std::ptr::null_mut(),
@@ -2292,7 +2974,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 let err = lasts_error();
                 inj.cleanup();
                 return Err(format!(
-                    "CreateRemoteThread 失败，GetLastError={err}（安全软件拦截注入时常见）"
+                    "CreateRemoteThread 失败，GetLastError={err}。架构一致性已在注入前校验通过\
+                     （见上方 [ARCH] 行）；此处仍失败时，最常见的原因是安全软件拦截注入。"
                 ));
             }
             inj.thread_handle = thread;
@@ -3892,7 +4575,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let voice_gate_dirty = Arc::new(AtomicBool::new(false));
         let worker_gate = Arc::clone(&voice_gate);
         let worker_gate_dirty = Arc::clone(&voice_gate_dirty);
-        let worker_logger = Logger::with_shared(logger.fallback.clone(), logger.shared.clone());
+        let worker_logger = logger.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_stats = Arc::clone(&stats);
         // 首次未完成实际身份绑定时沿用同一宽限期，避免提权 Helper 长期遗留。
@@ -4033,9 +4716,16 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         run_task_command(task_delete_args(), "移除", logger)
     }
 
+    /// 子进程 `schtasks` 必须显式 **CREATE_NO_WINDOW**：助手自身是 GUI 子系统、
+    /// 没有可继承的控制台，不给这个标志时 Windows 会给这个控制台子进程新分配
+    /// 一个控制台（= 一个新的终端窗口）——正是本模块要消灭的那种闪现
+    /// （主程序侧的 `silent_command` 出于同一原因早就带上了该标志）。
     fn run_task_command(cmd_args: Vec<String>, label: &str, logger: &Logger) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         match std::process::Command::new("schtasks")
             .args(&cmd_args)
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(output) => {
@@ -4087,6 +4777,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         /// 接管后心跳一切正常、`edges` 却永远不会出现——最容易被误判成"注入没成功"。
         config_sent: bool,
         target_ack: Option<BridgeCaptureTargets>,
+        /// 上一次把心跳写进日志的时刻，以及当时的状态三元组（lease_ok / handshake /
+        /// disarmed）。心跳降噪（2026-10-08）：agent 的 hb 实测约 2 条/秒，逐条落盘会
+        /// 把日志刷爆；现在只在状态变化或每 `HB_LOG_EVERY` 记一条，
+        /// ownership 续约等协议动作不受影响。
+        last_hb_log: Option<(Instant, (bool, bool, bool))>,
     }
 
     fn now_ms() -> u128 {
@@ -4179,22 +4874,35 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 if !session.authenticated {
                     return false;
                 }
-                let stat = extract_substring(line, "\"stat\":").unwrap_or_default();
-                logger.kv(
-                    "[HB]",
-                    &[
-                        ("up", format!("{}s", extract_num(line, "up").unwrap_or(0))),
-                        ("lease_ok", extract_bool(line, "lease_ok").to_string()),
-                        ("handshake", extract_bool(line, "handshake").to_string()),
-                        ("disarmed", extract_bool(line, "disarmed").to_string()),
-                        (
-                            "renew_age_ms",
-                            extract_num(line, "since_renew_ms").unwrap_or(0).to_string(),
-                        ),
-                        ("stat", stat),
-                    ],
-                );
-                if extract_bool(line, "lease_ok") {
+                let lease_ok = extract_bool(line, "lease_ok");
+                let handshake = extract_bool(line, "handshake");
+                let disarmed = extract_bool(line, "disarmed");
+                // 心跳降噪：状态变化立即记，否则每 HB_LOG_EVERY 记一条（agent 的
+                // hb ≈2 条/秒；逐条落盘是 2026-10-08 日志膨胀的主因）。
+                let state = (lease_ok, handshake, disarmed);
+                let due = match session.last_hb_log {
+                    Some((at, previous)) => previous != state || at.elapsed() >= HB_LOG_EVERY,
+                    None => true,
+                };
+                if due {
+                    session.last_hb_log = Some((Instant::now(), state));
+                    let stat = extract_substring(line, "\"stat\":").unwrap_or_default();
+                    logger.kv(
+                        "[HB]",
+                        &[
+                            ("up", format!("{}s", extract_num(line, "up").unwrap_or(0))),
+                            ("lease_ok", lease_ok.to_string()),
+                            ("handshake", handshake.to_string()),
+                            ("disarmed", disarmed.to_string()),
+                            (
+                                "renew_age_ms",
+                                extract_num(line, "since_renew_ms").unwrap_or(0).to_string(),
+                            ),
+                            ("stat", stat),
+                        ],
+                    );
+                }
+                if lease_ok {
                     if let (Some(bridge), Some(ack)) = (bridge, session.target_ack.clone()) {
                         bridge.push_ownership(ack);
                     }
@@ -4426,6 +5134,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     // ============================================================ 主流程
 
     pub fn run() {
+        // 最先安顿 stdout/stderr（见 `bootstrap_console`）：必须早于任何打印，
+        // 包括参数错误时的 usage 输出。手动运行接父控制台；后台拉起接 NUL，
+        // 不分配控制台、也就没有任何窗口。
+        let console_state = bootstrap_console();
         let mut args = match parse_args() {
             Ok(a) => a,
             Err(e) if e == "HELP" => {
@@ -4447,11 +5159,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let _ = std::fs::create_dir_all(&args.runtime_dir);
             args.log = Some(args.runtime_dir.join("helper-task.log"));
         }
-        // 同理：后台拉起不该让用户看到一个黑框。放在最前，把窗口闪现的时间压到最短。
-        if args.follow_app || args.cleanup_only || args.hide_window {
-            hide_console_window();
-        }
-
         // ---- 日志落点：优先与主程序同一个文件（2026-10-01 Andy 要求）----
         // 描述文件 `log=` 是主程序写的真实路径；旧版主程序没有该字段时按约定回退
         // 到 `<描述文件目录>\Logs\sayall-diagnostic.log`；都拿不到才写自己的文件。
@@ -4505,6 +5212,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 ("pid", std::process::id().to_string()),
                 ("port", args.port.to_string()),
                 ("runtime_dir", args.runtime_dir.display().to_string()),
+                // 控制台引导结果：attached = 手动运行（父控制台可见输出）；
+                // nul = 后台拉起（无控制台，stdout/stderr 指向 NUL 设备）。
+                // 排查"为什么没有窗口/没有输出"时，这一条就是答案。
+                ("console", console_state.to_string()),
+                // 兼容参数 --hide-window（值不再影响行为：GUI 子系统没有窗口可
+                // 隐藏，见字段注释）；写进日志让"调用方还在传它"可见。
+                ("hide_window", args.hide_window.to_string()),
                 (
                     "target_pid",
                     args.target_pid
@@ -4517,7 +5231,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         );
 
         if args.selftest {
-            let ok = selftest(&logger);
+            let ok = selftest(&logger, console_state);
             std::process::exit(if ok { 0 } else { 1 });
         }
 
@@ -4661,23 +5375,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     ),
                 ],
             );
-            for m in &members {
-                logger.line(&format!(
-                    "    [{}] {}\\{}\\{}",
-                    if m.is_rc003 { "RC003" } else { "其它" },
-                    m.enumerator,
-                    mask_token(&m.device),
-                    mask_token(&m.instance)
-                ));
+            for (index, m) in members.iter().enumerate() {
+                logger.line(&member_line(index + 1, &m.enumerator, m.is_rc003));
             }
-            // 共享宿主**不再直接拒绝**（2026-09-25 产品决策：用户需要长期同时
-            // 连接另一个 BLE 键鼠设备）。原来的独占前提只是为了兜住"改写别的
-            // 设备报告"的风险；而 agent 的 `targetSetIn` 已经是**内容门禁**：
-            // 报告里不含目标 usage（0x00F1/0x0080/0x0081）就一个字节都不动，
-            // 普通键盘的按键报告天然不匹配——来源核验由报文内容成立。
-            // 残留前提（写进日志供验收核对）：同一宿主里没有**别的**设备会发出
-            // 这三个 usage（0xF1 为保留/厂商定义，0x80/0x81 是键盘页音量键，
-            // 通用键盘的音量走消费页 0xE9/0xEA）。
+            // 内容只决定映射范围，不能证明来源；共享宿主必须逐请求核验功能 PDO。
             if !(members.len() == 1 && rc003_members == 1) {
                 if args.require_exclusive_host || args.force {
                     // 旧行为（--require-exclusive-host；--force 保持同义）：
@@ -4688,25 +5389,56 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 logger.kv(
                     "[SHARED-HOST]",
                     &[
-                        ("decision", "continue_with_usage_gate".to_string()),
+                        ("decision", "require_request_source".to_string()),
                         ("members", members.len().to_string()),
                         ("rc003_members", rc003_members.to_string()),
                     ],
                 );
                 logger.line(
-                    "[INFO] 宿主同时承载其它 HID 设备：仅改写含目标 usage（F1/80/81）\
-                     的键盘报告，其它设备的报告不动；如需恢复旧行为加 --require-exclusive-host。",
+                    "[INFO] 宿主同时承载其它 HID 设备：先证明每个请求来自所选功能节点，再应用按键目标。",
                 );
             }
         }
+
+        // 固定来源适配仅在此前验证过的系统模块组合上运行；未知组合零注入。
+        let _source_module_locks = match verify_source_modules(target_pid) {
+            Ok(locks) => locks,
+            Err(reason) => {
+                logger.kv(
+                    "[SOURCE]",
+                    &[("result", "blocked".into()), ("reason", reason.into())],
+                );
+                std::process::exit(16);
+            }
+        };
+        logger.kv(
+            "[SOURCE]",
+            &[
+                ("result", "modules_verified".into()),
+                ("contract", "umdf_2_15".into()),
+            ],
+        );
+        let source_instance = entries
+            .iter()
+            .filter(|entry| entry.pid == target_pid && entry.is_rc003)
+            .map(|entry| entry.instance_id.clone())
+            .collect::<Vec<_>>();
+        if source_instance.len() != 1 || current_source_pdo(&source_instance[0]).is_none() {
+            logger.line("[SOURCE] result=blocked reason=selected_function_unproven");
+            std::process::exit(16);
+        }
+        let source_instance = source_instance[0].clone();
 
         // ---- Gadget 与 agent ----
         let gadget_src = match args.gadget.clone().or_else(default_gadget_path) {
             Some(p) => p,
             None => {
                 logger.line(
-                    "[STOP] 找不到 frida-gadget.dll。请用 --gadget 指定，或先运行 \
-                     vendor/fetch_frida_gadget.py 获取（版本与 SHA-256 见 vendor/frida-gadget.lock.json）。",
+                    &format!(
+                        "[STOP] 找不到本架构的 Gadget（{GADGET_FILE_NAME}）。请用 --gadget 指定，或先运行 \
+                         vendor/fetch_frida_gadget.py 获取（版本与 SHA-256 见 vendor/frida-gadget.lock.json；\
+                         锁定文件按架构各登记一条，本助手是 {ARCH_NAME}）。"
+                    ),
                 );
                 std::process::exit(4);
             }
@@ -4890,6 +5622,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             }
         };
 
+        // Start the diagnostic worker before any capture/control thread can log.
+        // If it cannot start, refuse capture rather than restoring synchronous I/O.
+        let logger = match logger.nonblocking() {
+            Ok(logger) => logger,
+            Err(_) => {
+                logger.line("[LOG-QUEUE] event=start_failed capture_authorized=false");
+                std::process::exit(17);
+            }
+        };
         // ---- 主程序桥接（捕获链第 ② 段）----
         // 刻意放在端口绑定之前：它只决定"边沿能不能送到主程序"，与"能不能捕获、
         // 能不能清键"完全解耦。主程序没运行时它会安静地每 2 秒重试（日志折叠成
@@ -4916,7 +5657,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     logger.line(
                         "[FOLLOW-APP] event=exit reason=startup_bridge_unavailable injected=false",
                     );
-                    std::process::exit(15);
+                    logger.exit(15);
                 }
                 logger.kv(
                     "[APP-BRIDGE]",
@@ -4945,14 +5686,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             logger.line(
                 "[STOP] result=blocked reason=prior_cleanup_unconfirmed receipt_preserved=true",
             );
-            std::process::exit(15);
+            logger.exit(15);
         }
 
         let prepared = match prepare_runtime(&args, &gadget_src, &logger, &plan) {
             Ok(f) => f,
             Err(e) => {
                 logger.line(&format!("[STOP] {e}"));
-                std::process::exit(7);
+                logger.exit(7);
             }
         };
         if matches!(plan, DllPlan::Generation(_)) {
@@ -4972,7 +5713,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         {
             let written = write_cleanup_state("not_started", true).is_ok();
             logger.line("[START-CANCELLED] stop_intent_observed injected=false");
-            std::process::exit(if written { 0 } else { 15 });
+            logger.exit(if written { 0 } else { 15 });
         }
 
         let mut injection: Option<Injection> = match plan {
@@ -4981,7 +5722,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     "[ATTACH]",
                     &[
                         ("action", "skip_injection".into()),
-                        ("reason", "宿主里已有我们那一代 tap（令牌一致）".into()),
+                        (
+                            "reason",
+                            "宿主里已有我们那一代 tap（按可复用令牌接管；一致性由握手核验）".into(),
+                        ),
                         ("path", normalize_display(&prepared.dll)),
                         (
                             "note",
@@ -4995,14 +5739,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             _ => {
                 if cleanup.begin_capture().is_err() {
                     logger.line("[STOP] cleanup_state_write_failed；未注入宿主");
-                    std::process::exit(15);
+                    logger.exit(15);
                 }
                 match inject_gadget(target_pid, &prepared.dll, &logger) {
                     Ok(i) => Some(i),
                     Err(e) => {
                         logger.line(&format!("[STOP] {e}"));
                         let _ = write_cleanup_state("unconfirmed", true);
-                        std::process::exit(9);
+                        logger.exit(9);
                     }
                 }
             }
@@ -5024,9 +5768,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let renew_counter = Arc::clone(&renew_count);
         let renew_stale = Arc::clone(&conn_stale);
         let renew_token = args.token.clone();
+        let renew_source_instance = source_instance;
         // 注意：这里是 `new` **不是** `open_round` —— 续约线程不是新一轮运行，
         // 它若写分隔线会让"每轮起点"的 grep 多算一次（2026-09-23 实测）。
-        let renew_logger = Logger::with_shared(args.log.clone(), shared_log.clone());
+        let renew_logger = logger.clone();
         let renew_handle = std::thread::spawn(move || {
             let mut tick: u64 = 0;
             while !renew_stop.load(Ordering::Relaxed) {
@@ -5040,7 +5785,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     Err(_) => break,
                 };
                 if let Some(stream) = guard.as_mut() {
-                    let line = format!("{{\"type\":\"renew\",\"token\":\"{renew_token}\"}}\n");
+                    let pdo = current_source_pdo(&renew_source_instance);
+                    let line = source_renewal(&renew_token, pdo.as_deref());
                     if stream.write_all(line.as_bytes()).is_err() {
                         renew_logger.kv("[RENEW]", &[("state", "write_failed".into())]);
                         *guard = None;
@@ -5077,7 +5823,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         );
         logger.line("未列入 report_usages 的按键保持 Windows 原生行为；语音键不参与本链路。");
         logger.line(&format!(
-            "每 2 秒会打印一次 [HB] 心跳；Ctrl+C 或直接关掉本窗口结束\
+            "心跳（[HB]）只在状态变化或每 30 秒记一条（避免把日志刷爆）；Ctrl+C 或直接关掉本窗口结束\
              （会先给 agent 发 disarm；即使来不及，agent 也会在 {LEASE_MS} ms 租约到期后自行停止清键）。\
              {}",
             if args.duration > 0 {
@@ -5106,6 +5852,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             authenticated: false,
             config_sent: false,
             target_ack: None,
+            last_hb_log: None,
         };
         let mut last_hb_warn = Instant::now();
         // 是否曾经接到过**已鉴权**的 agent。注意不能用 `session.authenticated`：
@@ -5158,6 +5905,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         authenticated: false,
                         config_sent: false,
                         target_ack: None,
+                        last_hb_log: None,
                     };
                     if let Ok(mut guard) = shared.lock() {
                         *guard = Some(stream.try_clone().expect("clone stream"));
@@ -5297,7 +6045,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         };
         if write_cleanup_state(cleanup_status, true).is_err() {
             logger.line("[CLEANUP] result=unconfirmed reason=state_write_failed");
-            std::process::exit(15);
+            logger.exit(15);
         }
         logger.kv(
             "[CLEANUP]",
@@ -5313,10 +6061,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
         if version_blocked {
             logger.line("[START-FAILED] reason=resident_agent_version_mismatch capture_acquired=false terminal_result=agent_version_blocked retryable=false");
-            std::process::exit(16);
+            logger.exit(16);
         }
         if cleanup_failed {
-            std::process::exit(15);
+            logger.exit(15);
         }
         if no_hello {
             logger.line(&format!(
@@ -5328,8 +6076,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                  \x20 4) 宿主进程被安全软件拦下了 CreateRemoteThread。",
                 args.await_hello
             ));
-            std::process::exit(12);
+            logger.exit(12);
         }
+        logger.shutdown();
     }
 
     /// 控制台事件处理器：只置位、不做事，把收尾留给主线程（那里才能安全地
@@ -5944,6 +6693,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 return;
                             }
                             AGENT_AUTHORIZED.store(true, Ordering::Relaxed);
+                            let pdo = source_pdo_for_host(cleanup.target_pid);
+                            if stream
+                                .write_all(source_renewal(token, pdo.as_deref()).as_bytes())
+                                .is_err()
+                            {
+                                return;
+                            }
                             session.config_sent = true;
                             let targets = bridge
                                 .map(|bridge| bridge.capture_targets())
@@ -6084,7 +6840,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// **注册表 HostPid 的读取宽度**。前三者出错的现象是"看起来正常但什么都没匹配到"；
     /// 第四者 2026-09-23 在真机上真的发生了（按 4 字节读 QWORD → 0 个实例 →
     /// 误报"设备未连接"），所以它的宽度契约必须留在这里做回归。
-    fn selftest(logger: &Logger) -> bool {
+    fn selftest(logger: &Logger, console_state: &str) -> bool {
         let mut all_ok = true;
         let mut check = |label: &str, ok: bool, detail: String| {
             all_ok = all_ok && ok;
@@ -6122,20 +6878,41 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             );
         }
 
-        // 2) mask_token：只脱敏紧跟在 `_` 之后的 12 位十六进制
-        //    注意：设备实例名里的厂商段是大写（`PID&32b8`），脱敏后必须原样保留，
-        //    断言须按实际大小写写，否则会误报（此前的 FAIL 就是这个测试自身的 bug）。
-        let device =
-            "{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_A1B2C3D4E5F6";
-        let masked = mask_token(device);
+        // 2) 宿主成员行：只报序号 + 枚举器 + 分类，不带设备接口路径
+        //    （LOGGING.md 隐私红线：不得记录 HID 路径。2026-10-08 现场发现该行含
+        //    `BTHLEDevice\{…}_Dev_VID&…\…`——地址已遮，但路径本体与实例序号仍在）
+        let line = member_line(1, "BTHLEDevice", true);
+        let other = member_line(2, "USB", false);
         check(
-            "mask_token 只打掉蓝牙地址",
-            masked == "{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&012717_PID&32b8_REV&00a4_<BT-ADDR>"
-                && masked.ends_with("_<BT-ADDR>")
-                && masked.contains("PID&32b8")
-                && masked.contains("00805f9b34fb")
-                && !masked.contains("A1B2C3D4E5F6"),
-            masked.clone(),
+            "宿主成员行不含设备接口路径",
+            line.contains("index=1")
+                && line.contains("enumerator=BTHLEDevice")
+                && line.contains("class=rc003_hid_service_match")
+                && other.contains("class=other_device")
+                && !line.contains('\\')
+                && !line.contains("Dev_VID"),
+            format!("{line} / {other}"),
+        );
+
+        // 2b) 令牌日志脱敏（2026-10-04 现场回归）：`[TOKEN]` 只允许写长度与脱敏标记。
+        //     此前 value 走 mask_token——它只认"下划线 + 12 位十六进制"的蓝牙
+        //     形态，对裸令牌是**空操作**，于是 32 位明文令牌进了诊断日志。
+        let sample_token = "0f5bc7ba950a257f62f4c99691e49280";
+        let token_line = token_log_fields(
+            "file",
+            Some(Path::new("C:\\x\\session.token")),
+            sample_token,
+        )
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+        check(
+            "令牌日志脱敏：只写长度与脱敏标记、不含明文",
+            !token_line.contains(sample_token)
+                && token_line.contains("token_redacted=true")
+                && token_line.contains("token_length=32"),
+            token_line,
         );
 
         // 3) 极简 JSON 取值器：协议实际会遇到的几类形态
@@ -6252,14 +7029,24 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
         // 6) 与锁定文件的一致性（编译期内联，确定性断言；不依赖运行时 CWD）
         check(
-            "Gadget 锁定文件与 GADGET_SHA256 / GADGET_VERSION 一致",
+            "Gadget 锁定文件与 GADGET_SHA256 / GADGET_VERSION 一致（本架构）",
             GADGET_LOCK_JSON.contains(GADGET_SHA256)
                 && GADGET_LOCK_JSON.contains(GADGET_VERSION)
-                && GADGET_LOCK_JSON.contains("windows-x86_64"),
+                && GADGET_LOCK_JSON.contains(GADGET_LOCK_ARCH_TOKEN),
             format!(
                 "常量 sha256={GADGET_SHA256} version={GADGET_VERSION}；锁定文件 {} 字节",
                 GADGET_LOCK_JSON.len()
             ),
+        );
+
+        // 6b) 双架构登记必须同时存在：只留一条时，另一架构的助手会拿着错值去校验，
+        //     表现为"Gadget SHA-256 不符"，而根因其实是登记缺失。
+        check(
+            "Gadget 锁定文件同时登记 x86_64 与 arm64 两份（按架构各一条）",
+            GADGET_LOCK_JSON.contains("windows-x86_64")
+                && GADGET_LOCK_JSON.contains("windows-arm64")
+                && GADGET_LOCK_JSON.contains("frida-gadget-arm64.dll"),
+            format!("本架构 token={GADGET_LOCK_ARCH_TOKEN}"),
         );
 
         // 7) HostPid 解码的宽度契约（2026-09-23 真机踩到的根因，回归测试）
@@ -6412,6 +7199,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         authenticated: false,
                         config_sent: false,
                         target_ack: None,
+                        last_hb_log: None,
                     };
                     let quiet = Logger::new(None);
                     let stop = Arc::new(AtomicBool::new(false));
@@ -6648,10 +7436,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let quiet = Logger::new(None);
         let token_detail = |t1: &str, from1: bool, t2: &str, from2: bool, t3: Option<&str>| {
             format!(
-                "1st(from_file={from1})={} 2nd(from_file={from2})={} new={} 文件已更新={}",
-                mask_token(t1),
-                mask_token(t2),
-                t3.map(mask_token).unwrap_or_else(|| "-".into()),
+                "1st(from_file={from1}) redacted={} 2nd(from_file={from2}) redacted={} new_redacted={} 文件已更新={}",
+                token_redacted(t1),
+                token_redacted(t2),
+                t3.map(token_redacted).unwrap_or_else(|| "-".into()),
                 t3.map(|t| fs::read_to_string(tmp.join(TOKEN_FILE))
                     .map(|s| s.trim() == t)
                     .unwrap_or(false))
@@ -7042,6 +7830,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 authenticated: false,
                                 config_sent: false,
                                 target_ack: None,
+                                last_hb_log: None,
                             };
                             let quiet = Logger::new(None);
                             let stop = Arc::new(AtomicBool::new(false));
@@ -7144,6 +7933,23 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             format!("first={first} second={second}"),
         );
 
+        // 控制台引导（2026-10-04）：stdout/stderr 必须可写。
+        // GUI 子系统 + 计划任务拉起时控制台状态是 `nul`（无窗口、输出进 NUL
+        // 设备）；手动运行是 `attached`（父控制台）。引导失效（句柄无效）时
+        // `Logger::line` 的 `println!` 会 panic，进程表现为"无声消失"——
+        // 这正是 2026-09-28 真机 run4/run5 那类事故的形状，必须可回归。
+        // 计划任务路径（探针 --selftest --hide-window）下执行的就是 nul 分支。
+        {
+            use std::io::Write;
+            let out_ok = std::io::stdout().write_all(b"\n").is_ok();
+            let err_ok = std::io::stderr().write_all(b"\n").is_ok();
+            check(
+                "控制台引导：stdout/stderr 可写（attached / nul 两条路径）",
+                out_ok && err_ok,
+                format!("console={console_state} stdout_ok={out_ok} stderr_ok={err_ok}"),
+            );
+        }
+
         let _ = fs::remove_dir_all(&tmp);
 
         logger.line("");
@@ -7169,32 +7975,46 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
     /// 默认 Gadget 位置：按顺序试若干候选，**并把选中的路径交给调用方记录**。
     /// 不打印路径的话，"找不到 / 找到的是另一个" 都会变成需要反查的谜题。
+    ///
+    /// 候选名按**本助手的架构**取（`GADGET_FILE_NAME`）：arm64 助手只看 arm64 那一份，
+    /// 避免在同一台机器上误取到另一架构的 Gadget（Issue #206 的根因之一）。
     fn default_gadget_path() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?;
         let mut candidates = vec![
-            dir.join("frida-gadget.dll"),
-            dir.join("vendor").join("frida-gadget.dll"),
-            // 开发布局：target/release/rc003-helper.exe → helper/vendor/frida-gadget.dll
+            dir.join(GADGET_FILE_NAME),
+            dir.join("vendor").join(GADGET_FILE_NAME),
+            // 开发布局：两种 target 目录深度都要覆盖
+            //   target/release/sayall-helper.exe            → helper/vendor/
+            //   target/aarch64-pc-windows-msvc/release/...  → helper/vendor/
             dir.join("..")
                 .join("..")
                 .join("vendor")
-                .join("frida-gadget.dll"),
+                .join(GADGET_FILE_NAME),
+            dir.join("..")
+                .join("..")
+                .join("..")
+                .join("vendor")
+                .join(GADGET_FILE_NAME),
         ];
         // 以当前工作目录为基准（从 helper/ 或仓库根直接调用 exe 时）
         if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join("vendor").join("frida-gadget.dll"));
-            candidates.push(cwd.join("frida-gadget.dll"));
+            candidates.push(cwd.join("vendor").join(GADGET_FILE_NAME));
+            candidates.push(cwd.join(GADGET_FILE_NAME));
         }
         candidates.into_iter().find(|p| p.exists())
     }
 
-    /// 校验 Gadget 的 SHA-256。锁定值来自 `vendor/frida-gadget.lock.json`，
+    /// 校验 Gadget 的 SHA-256 与**架构**。锁定值来自 `vendor/frida-gadget.lock.json`，
     /// 这里是编译期常量——改版本必须同时改锁定文件与本常量（见 ATTRIBUTION.md 登记）。
+    ///
+    /// 架构单列一项检查与一行日志：SHA 已经隐含锁定架构，但把 machine 打进日志才能一眼
+    /// 看出"手上这份是哪个架构"——Issue #206 的排查正是卡在缺这一行证据上。
     fn verify_gadget(path: &Path, logger: &Logger) -> Result<(), String> {
         let bytes =
             fs::read(path).map_err(|e| format!("读取 Gadget 失败 {}: {e}", path.display()))?;
         let digest = sha256_hex(&bytes);
+        let machine = pe_machine_from_bytes(&bytes);
         logger.kv(
             "[VERIFY]",
             &[
@@ -7202,12 +8022,48 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 ("size", bytes.len().to_string()),
                 ("sha256", digest.clone()),
                 ("expected", GADGET_SHA256.to_string()),
+                (
+                    "machine",
+                    machine
+                        .map(|m| format!("{} 0x{m:04X}", machine_name(m)))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                (
+                    "arch_expected",
+                    format!("{} 0x{:04X}", ARCH_NAME, INJECTOR_MACHINE),
+                ),
             ],
         );
+        if let Some(m) = machine {
+            if m != INJECTOR_MACHINE {
+                return Err(format!(
+                    "Gadget 架构不符：本助手是 {}（machine=0x{:04X}），Gadget 是 {}（machine=0x{m:04X}）。\
+                     请改用与系统架构匹配的安装包，或用 --gadget 指向本架构那一份。",
+                    ARCH_NAME,
+                    INJECTOR_MACHINE,
+                    machine_name(m)
+                ));
+            }
+        }
         if digest != GADGET_SHA256 {
             return Err(format!(
                 "Gadget SHA-256 不符：期望 {}，实际 {digest}。请重新运行 vendor/fetch_frida_gadget.py。",
                 GADGET_SHA256
+            ));
+        }
+        Ok(())
+    }
+
+    /// 复制之后对副本重算摘要（`expected` 作参数是为了让两个分支都能被单测直接覆盖）。
+    /// 摘要不符=硬失败：运行时目录里的那份马上要被注入，不能"记一条日志接着用"。
+    fn verify_copied_gadget(dll: &Path, expected: &str) -> Result<(), String> {
+        let digest = sha256_hex(
+            &fs::read(dll).map_err(|e| format!("复制后读回 Gadget 失败 {}: {e}", dll.display()))?,
+        );
+        if digest != expected {
+            return Err(format!(
+                "复制后的 Gadget 摘要不符：期望 {expected}，实际 {digest}（运行时目录 {}）",
+                dll.display()
             ));
         }
         Ok(())
@@ -7297,9 +8153,41 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         h.iter().map(|v| format!("{v:08x}")).collect()
     }
 
-    /// Gadget 的固定版本与 SHA-256（来自 vendor/frida-gadget.lock.json，2026-09-23 校验）。
+    /// Gadget 的固定版本与 SHA-256（来自 vendor/frida-gadget.lock.json，2026-10-07 起**按架构各一条**）。
+    ///
+    /// 为什么分两份：宿主（承载遥控器的 `WUDFHost.exe`）在 ARM64 系统上是原生 ARM64 进程，
+    /// 而 ARM64 进程不能加载 x64 镜像；因此"助手架构 == 宿主架构 == Gadget 架构"是硬前提，
+    /// 每个助手只认自己那一份（Issue #206 现场：x64 助手对 ARM64 宿主，注入必然失败）。
+    #[cfg(target_arch = "x86_64")]
     const GADGET_SHA256: &str = "350beb0e801dc7dc39d21512960d1048b9f21dc72c0ee5ced5cf5d9dc8ea6687";
-    /// Gadget 的固定版本号（与锁定文件 entries[0].version 必须一致）。
+    #[cfg(target_arch = "aarch64")]
+    const GADGET_SHA256: &str = "323a91b3842d31c324dafd5e3e504a06d3c8a82f849c05734838a38cb23b17ff";
+    /// 锁定文件里本架构条目的 `component` 后缀（自检第 6 项拿它做确定性断言）。
+    #[cfg(target_arch = "x86_64")]
+    const GADGET_LOCK_ARCH_TOKEN: &str = "windows-x86_64";
+    #[cfg(target_arch = "aarch64")]
+    const GADGET_LOCK_ARCH_TOKEN: &str = "windows-arm64";
+    /// 与助手同目录（及 vendor/、开发布局）里**本架构那一份** Gadget 的文件名。
+    /// x64 保持历史名不变；arm64 加后缀，两者可以在同一目录共存。
+    #[cfg(target_arch = "x86_64")]
+    const GADGET_FILE_NAME: &str = "frida-gadget.dll";
+    #[cfg(target_arch = "aarch64")]
+    const GADGET_FILE_NAME: &str = "frida-gadget-arm64.dll";
+    /// 注入进宿主后的**运行时**文件名。两种架构都用这个名字：同一台机器只会用到其中一种，
+    /// 而世代目录名（`frida-gadget.<hash>.dll`）、常驻 tap 识别（`is_gadget_module`）与
+    /// 既有验收脚本都按这个名字工作，改它会牵动整条接管/清键链路。
+    const RUNTIME_GADGET_NAME: &str = "frida-gadget.dll";
+    /// 本助手自身的 PE machine，用于注入前的架构比对（见 `arch_gate`）。x64 / ARM64。
+    #[cfg(target_arch = "x86_64")]
+    const INJECTOR_MACHINE: u16 = 0x8664;
+    #[cfg(target_arch = "aarch64")]
+    const INJECTOR_MACHINE: u16 = 0xAA64;
+    /// 本助手架构的短名，只用于日志与错误文案。
+    #[cfg(target_arch = "x86_64")]
+    const ARCH_NAME: &str = "x64";
+    #[cfg(target_arch = "aarch64")]
+    const ARCH_NAME: &str = "arm64";
+    /// Gadget 的固定版本号（与锁定文件 entries[*].version 必须一致）。
     const GADGET_VERSION: &str = "17.18.0";
     /// agent 脚本随二进制内嵌，保证"运行的就是校验过的那一份"，不受运行时目录被改动影响。
     /// （写入运行时目录是为了让 Gadget 能按相对路径加载它；内容以本常量为准。）
@@ -7315,7 +8203,154 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 有了代次，接管旧实例时日志会打 `[AGENT-STALE]`，让这件事一眼可见。
     ///
     /// 旧/未知代次不允许接管；本助手不结束共享宿主来替换 DLL。
-    const AGENT_BUILD: &str = "2026-10-03.cleanup-instance";
+    const AGENT_BUILD: &str = "2026-10-10.request-source";
+
+    fn decode_pdo_property(kind: u32, bytes: u32, buffer: &[u16]) -> Option<String> {
+        let count = (bytes / 2) as usize;
+        if kind != 1
+            || bytes < 4
+            || bytes & 1 != 0
+            || count > buffer.len()
+            || buffer[count - 1] != 0
+            || buffer[..count - 1].contains(&0)
+        {
+            return None;
+        }
+        String::from_utf16(&buffer[..count - 1]).ok()
+    }
+
+    // 每次租约都重新读取当前已启动的功能节点；不把旧 PDO 当作恢复依据。
+    fn current_source_pdo(instance: &str) -> Option<String> {
+        let id = to_wide(instance);
+        let (mut node, mut state, mut problem) = (0, 0, 0);
+        let (mut kind, mut bytes) = (0, 2048);
+        let mut buffer = [0u16; 1024];
+        unsafe {
+            if CM_Locate_DevNodeW(&mut node, id.as_ptr(), 0) != 0
+                || CM_Get_DevNode_Status(&mut state, &mut problem, node, 0) != 0
+                || state & 8 == 0
+                || CM_Get_DevNode_Registry_PropertyW(
+                    node,
+                    0x0f,
+                    &mut kind,
+                    buffer.as_mut_ptr().cast(),
+                    &mut bytes,
+                    0,
+                ) != 0
+            {
+                return None;
+            }
+        }
+        decode_pdo_property(kind, bytes, &buffer)
+    }
+
+    fn source_pdo_for_host(pid: u32) -> Option<String> {
+        let entries = enum_hosts().ok()?.entries;
+        let mut selected = entries
+            .iter()
+            .filter(|entry| entry.pid == pid && entry.is_rc003);
+        let instance = &selected.next()?.instance_id;
+        if selected.next().is_some() {
+            return None;
+        }
+        current_source_pdo(instance)
+    }
+
+    fn source_renewal(token: &str, pdo: Option<&str>) -> String {
+        // 仅写已鉴权的 loopback；包含身份的文本不得送入 Logger。
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "renew", "token": token, "source_pdo": pdo})
+        )
+    }
+
+    fn verify_source_modules(pid: u32) -> Result<Vec<fs::File>, &'static str> {
+        use std::os::windows::fs::OpenOptionsExt;
+        if !cfg!(target_arch = "x86_64") {
+            return Err("source_architecture_unverified");
+        }
+        let system = std::env::var_os("SystemRoot").ok_or("system_directory_unknown")?;
+        let system = PathBuf::from(system).join("System32");
+        let expected = [
+            (
+                "Microsoft.Bluetooth.Profiles.HidOverGatt.dll",
+                system
+                    .join("drivers")
+                    .join("UMDF")
+                    .join("Microsoft.Bluetooth.Profiles.HidOverGatt.dll"),
+                "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6",
+            ),
+            (
+                "WUDFx02000.dll",
+                system.join("WUDFx02000.dll"),
+                "e97a8bbbda4dd4989d9b3063cbfea05df9f60cdc7758fd21b163ebe3ce6786e0",
+            ),
+        ];
+        let modules = enum_modules(pid).map_err(|_| "source_modules_unknown")?;
+        let mut locks = Vec::new();
+        for (name, path, digest) in expected {
+            if !modules.iter().any(|module| {
+                module.name.eq_ignore_ascii_case(name)
+                    && Path::new(&module.path)
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&path.to_string_lossy())
+            }) {
+                return Err("source_module_path_unverified");
+            }
+            // 持有只共享读的句柄，防止核验后系统文件被替换；随 Helper 正常退出释放。
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&path)
+                .map_err(|_| "source_module_lock_failed")?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|_| "source_module_read_failed")?;
+            if sha256_hex(&bytes) != digest {
+                return Err("source_module_version_unverified");
+            }
+            locks.push(file);
+        }
+        Ok(locks)
+    }
+
+    #[cfg(test)]
+    mod request_source_binding_tests {
+        use super::*;
+
+        #[test]
+        fn pdo_property_requires_one_complete_string() {
+            let valid: Vec<u16> = "\\Device\\TestRemote\0".encode_utf16().collect();
+            assert_eq!(
+                decode_pdo_property(1, (valid.len() * 2) as u32, &valid),
+                Some("\\Device\\TestRemote".into())
+            );
+            assert_eq!(
+                decode_pdo_property(1, (valid.len() * 2 - 1) as u32, &valid),
+                None
+            );
+            assert_eq!(
+                decode_pdo_property(7, (valid.len() * 2) as u32, &valid),
+                None
+            );
+            assert_eq!(decode_pdo_property(1, 0, &valid), None);
+            assert_eq!(decode_pdo_property(1, 4, &[65, 66]), None);
+            assert_eq!(decode_pdo_property(1, 6, &[65, 0, 0]), None);
+        }
+
+        #[test]
+        fn source_renewal_uses_private_json_and_unknown_is_null() {
+            let line = source_renewal("token", Some("\\Device\\TestRemote"));
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["source_pdo"], "\\Device\\TestRemote");
+            assert_eq!(value["type"], "renew");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&source_renewal("token", None)).unwrap()
+                    ["source_pdo"]
+                    .is_null()
+            );
+        }
+    }
     /// 锁定文件在编译期内联。三重作用：
     /// 1) **缺失即编译失败**：锁定文件被删/路径写错，构建直接报错，不会产出"看起来正常、
     ///    实际没登记完整性"的二进制（本常量写错路径时已实测触发编译错误）；
@@ -7904,6 +8939,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 authenticated: false,
                 config_sent: false,
                 target_ack: None,
+                last_hb_log: None,
             }
         }
 
@@ -8424,7 +9460,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
             // 1) 共用日志可用：只写它，不再产生第二份文件。
             let logger = Logger::with_shared(Some(fallback.clone()), Some(shared.clone()));
+            let logger = logger.nonblocking().unwrap();
             logger.line("shared_sink_line");
+            assert!(logger.shutdown());
             let written = fs::read_to_string(&shared).expect("共用日志必须被写入");
             assert!(written.contains("shared_sink_line"), "{written}");
             assert!(written.contains("component=rc003-helper"), "{written}");
@@ -8434,7 +9472,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let blocked = dir.join("blocked");
             fs::write(&blocked, b"x").expect("prepare blocked path");
             let logger = Logger::with_shared(Some(fallback.clone()), Some(blocked.join("app.log")));
+            let logger = logger.nonblocking().unwrap();
             logger.line("fallback_sink_line");
+            assert!(logger.shutdown());
             let written = fs::read_to_string(&fallback).expect("回退文件必须被写入");
             assert!(written.contains("fallback_sink_line"), "{written}");
 
@@ -8553,6 +9593,147 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 ),
                 Some(Duration::from_millis(ACK_RESEND_SLOW_MS))
             );
+        }
+    }
+
+    /// 架构相关的不变量（Issue #206 回归）。
+    ///
+    /// 为什么用纯函数测：真机取证覆盖不到"x64 助手 + ARM64 宿主"这种组合（需要一台 ARM64
+    /// 机器），而这正是线上翻车的那一组；把判定抽成纯函数后，四种组合都能在 CI 里钉住。
+    #[cfg(test)]
+    mod arch_tests {
+        use super::*;
+
+        /// 造一份最小可解析的 PE 头（只到 FileHeader.Machine 为止）。
+        fn pe_bytes(machine: u16, e_lfanew: u32) -> Vec<u8> {
+            let mut b = vec![0u8; (e_lfanew as usize) + 8];
+            b[0] = b'M';
+            b[1] = b'Z';
+            b[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+            b[e_lfanew as usize..e_lfanew as usize + 4].copy_from_slice(b"PE\0\0");
+            b[e_lfanew as usize + 4..e_lfanew as usize + 6].copy_from_slice(&machine.to_le_bytes());
+            b
+        }
+
+        #[test]
+        fn pe_machine_reads_x64_and_arm64_headers() {
+            assert_eq!(pe_machine_from_bytes(&pe_bytes(0x8664, 0x80)), Some(0x8664));
+            assert_eq!(pe_machine_from_bytes(&pe_bytes(0xAA64, 0xF0)), Some(0xAA64));
+        }
+
+        /// 阴性对照：这些输入都不许被"猜"出架构——猜错的代价是把架构不匹配放过去。
+        #[test]
+        fn pe_machine_rejects_malformed_input() {
+            assert_eq!(pe_machine_from_bytes(b""), None);
+            assert_eq!(pe_machine_from_bytes(b"not a pe file at all........"), None);
+            // 只有 MZ、没有 PE 签名
+            let mut mz = vec![0u8; 0x100];
+            mz[0] = b'M';
+            mz[1] = b'Z';
+            assert_eq!(pe_machine_from_bytes(&mz), None);
+            // e_lfanew 越界：返回 None，不得 panic
+            let mut oob = pe_bytes(0x8664, 0x80);
+            oob[0x3C..0x40].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+            assert_eq!(pe_machine_from_bytes(&oob), None);
+            // 签名不对
+            let mut bad = pe_bytes(0x8664, 0x80);
+            bad[0x80] = b'X';
+            assert_eq!(pe_machine_from_bytes(&bad), None);
+        }
+
+        #[test]
+        fn arch_gate_accepts_only_matching_triples() {
+            // 本机：x64 助手 + x64 宿主 + x64 Gadget
+            assert!(arch_gate(0x8664, 0x8664, 0x8664).is_ok());
+            // ARM64 机器上的正确组合
+            assert!(arch_gate(0xAA64, 0xAA64, 0xAA64).is_ok());
+            // Issue #206 现场：x64 助手对 ARM64 宿主 —— 必须在闸门处拒绝
+            let cross = arch_gate(0x8664, 0xAA64, 0x8664).unwrap_err();
+            assert!(cross.contains("架构不一致"), "{cross}");
+            assert!(cross.contains("x64"), "{cross}");
+            assert!(cross.contains("arm64"), "{cross}");
+            // Gadget 与宿主不一致（例如 ARM64 宿主配了 x64 Gadget）
+            let bad_gadget = arch_gate(0xAA64, 0xAA64, 0x8664).unwrap_err();
+            assert!(bad_gadget.contains("Gadget 架构"), "{bad_gadget}");
+        }
+
+        /// 拒绝文案不得再把人引向"安全软件拦截注入"（Issue #206 的错误归因）。
+        #[test]
+        fn arch_gate_messages_do_not_blame_antivirus() {
+            let msg = arch_gate(0x8664, 0xAA64, 0x8664).unwrap_err();
+            assert!(!msg.contains("安全软件"), "{msg}");
+            assert!(!msg.contains("拦截"), "{msg}");
+        }
+
+        #[test]
+        fn per_arch_constants_are_self_consistent() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(INJECTOR_MACHINE, 0x8664);
+                assert_eq!(ARCH_NAME, "x64");
+                assert_eq!(GADGET_FILE_NAME, "frida-gadget.dll");
+                assert!(GADGET_LOCK_ARCH_TOKEN.ends_with("x86_64"));
+                assert_eq!(GADGET_SHA256.len(), 64);
+                assert!(GADGET_LOCK_JSON.contains(GADGET_SHA256));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert_eq!(INJECTOR_MACHINE, 0xAA64);
+                assert_eq!(ARCH_NAME, "arm64");
+                assert_eq!(GADGET_FILE_NAME, "frida-gadget-arm64.dll");
+                assert!(GADGET_LOCK_ARCH_TOKEN.ends_with("arm64"));
+                assert_eq!(GADGET_SHA256.len(), 64);
+                assert!(GADGET_LOCK_JSON.contains(GADGET_SHA256));
+            }
+            // 运行时名两种架构一致（世代目录名与常驻 tap 识别都按它工作）
+            assert_eq!(RUNTIME_GADGET_NAME, "frida-gadget.dll");
+        }
+
+        /// 两份 Gadget 的摘要必须不同：相同就意味着锁定文件抄错了一条。
+        #[test]
+        fn the_two_lock_entries_carry_different_hashes() {
+            let x64 = "350beb0e801dc7dc39d21512960d1048b9f21dc72c0ee5ced5cf5d9dc8ea6687";
+            let arm64 = "323a91b3842d31c324dafd5e3e504a06d3c8a82f849c05734838a38cb23b17ff";
+            assert_ne!(x64, arm64);
+            assert!(GADGET_LOCK_JSON.contains(x64), "锁定文件缺少 x64 摘要");
+            assert!(GADGET_LOCK_JSON.contains(arm64), "锁定文件缺少 arm64 摘要");
+        }
+
+        /// 打包后的 arm64 文件名也必须被"常驻 tap 识别"认出来，否则会漏报 module_present。
+        #[test]
+        fn bundled_arm64_name_is_recognized_as_a_gadget_module() {
+            assert!(is_gadget_module("frida-gadget-arm64.dll"));
+            assert!(is_gadget_module("FRIDA-GADGET.DLL"));
+            assert!(!is_gadget_module("frida-gadget.dll.bak"));
+        }
+    }
+
+    /// 复制后的摘要复核（2026-10-07 报障人实测后加：copied 路径原先固定报 sha256_verified=false，
+    /// 被读成"没校验就用了"）。
+    #[cfg(test)]
+    mod copied_gadget_verify_tests {
+        use super::*;
+
+        #[test]
+        fn copied_gadget_must_match_the_expected_digest() {
+            let dir =
+                std::env::temp_dir().join(format!("sayall-copy-verify-{}", std::process::id()));
+            let _ = fs::create_dir_all(&dir);
+            let path = dir.join("frida-gadget.dll");
+            fs::write(&path, b"payload").unwrap();
+            let digest = sha256_hex(b"payload");
+
+            // 摘要一致 → 通过（真实运行里 expected 恒为 GADGET_SHA256）
+            assert!(verify_copied_gadget(&path, &digest).is_ok());
+
+            // 摘要不一致（"写下去之后被换掉"的窗口）→ 必须报错，不得只记日志接着注入
+            let error = verify_copied_gadget(&path, GADGET_SHA256).unwrap_err();
+            assert!(error.contains("摘要不符"), "{error}");
+
+            // 读不到也要报错（不是静默通过）
+            assert!(verify_copied_gadget(&dir.join("missing.dll"), &digest).is_err());
+
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 }

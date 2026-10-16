@@ -1,20 +1,21 @@
+﻿param([string]$InstallerPath, [string]$ArtifactDirectory)
 $ErrorActionPreference = "Stop"
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repositoryRoot "src-tauri/tauri.conf.json"
 $compatibilitySourcePath = Join-Path $repositoryRoot "crates/sayall-windows/src/compatibility.rs"
 $bundleDirectory = Join-Path $repositoryRoot "target/release/bundle/nsis"
-$artifactDirectory = Join-Path $repositoryRoot "artifacts/windows-preview"
+if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { $ArtifactDirectory = Join-Path $repositoryRoot "artifacts/windows-preview" }
 $applicationPath = Join-Path $repositoryRoot "target/release/sayall-windows-app.exe"
 
 $config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
-if ($config.productName -ne "无线麦 SayAll") {
+if ($config.productName -ne "无线麦") {
     throw "Unexpected productName: $($config.productName)"
 }
 if ($config.identifier -ne "app.getsayall.remote-mic.windows") {
     throw "Unexpected application identifier: $($config.identifier)"
 }
-if ($config.bundle.publisher -ne "GetSayAll") {
+if ($config.bundle.publisher -ne "luck-gh") {
     throw "Unexpected publisher: $($config.bundle.publisher)"
 }
 if ($config.bundle.windows.nsis.installMode -ne "currentUser") {
@@ -66,6 +67,50 @@ if ($compatibilitySource -notmatch 'WindowsVersion::new\(10, 0, 17_763\)') {
     throw "Runtime and NSIS minimum Windows versions must both remain Windows 10 build 17763"
 }
 
+# ── 载荷集合一致性（2026-10-07 issue206，arm64 双载荷）──────────────────
+# 判据：出包时**暂存到 src-tauri/ 的载荷集合**就是安装包实际携带的集合——资源条目
+# 写的是裸文件名，落盘路径即安装根目录（见 stage-bundle-inputs.cjs 顶部）。
+# arm64 两件是可选的：本机/部分环境没有 VS ARM64 工具集时暂存不到，不得因此误报
+# 失败；但只要暂存到了，构建就必须用 arm64 覆盖配置声明它们，否则安装包会静默地
+# 只带 x64——那正是 issue206 要消除的失败模式。
+$srcTauriDir = Split-Path -Parent $configPath
+$receiptPath = Join-Path $repositoryRoot 'target/dev/bundle-staging/payloads.json'
+$receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+$payloadNames = @($receipt.resources | ForEach-Object { $_.name })
+foreach ($resource in $receipt.resources) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $srcTauriDir $resource.name) -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $resource.sha256) { throw "Staged resource changed: $($resource.name)" }
+}
+$stagedPayloads = @($payloadNames | Where-Object { Test-Path -LiteralPath (Join-Path $srcTauriDir $_) -PathType Leaf })
+if ($stagedPayloads -notcontains "sayall-helper.exe" -or $stagedPayloads -notcontains "frida-gadget.dll") {
+    throw "x64 bundle resources were not staged in src-tauri: $srcTauriDir"
+}
+$arm64PayloadNames = @("sayall-helper-arm64.exe", "frida-gadget-arm64.dll")
+$stagedArm64 = @($arm64PayloadNames | Where-Object { $payloadNames -contains $_ })
+if ($stagedArm64.Count -ne 0 -and $stagedArm64.Count -ne $arm64PayloadNames.Count) {
+    throw "Incomplete arm64 payload staging: $($stagedArm64 -join ', ')"
+}
+$arm64PayloadConfigPath = Join-Path $srcTauriDir "tauri.arm64-payload.conf.json"
+if ($stagedArm64.Count -eq $arm64PayloadNames.Count) {
+    if (-not (Test-Path -LiteralPath $arm64PayloadConfigPath -PathType Leaf)) {
+        throw "arm64 payloads are staged but tauri.arm64-payload.conf.json is missing: the installer would silently omit them"
+    }
+    $arm64PayloadConfig = Get-Content -Raw -Encoding UTF8 $arm64PayloadConfigPath | ConvertFrom-Json
+    $declaredPayloads = @($arm64PayloadConfig.bundle.resources)
+    foreach ($name in $payloadNames) {
+        if ($declaredPayloads -notcontains $name) {
+            throw "arm64 payload override must declare $name"
+        }
+    }
+    if ($declaredPayloads.Count -ne $payloadNames.Count) {
+        throw "arm64 payload override must declare exactly $($payloadNames.Count) payloads, observed $($declaredPayloads.Count)"
+    }
+}
+if ($env:SAYALL_REQUIRE_ARM64_PAYLOAD -eq "1" -and $stagedArm64.Count -ne $arm64PayloadNames.Count) {
+    throw "SAYALL_REQUIRE_ARM64_PAYLOAD=1 but arm64 payloads were not staged: the published installer must carry them"
+}
+Write-Host "Verified bundle payload set ($($stagedPayloads.Count)): $($stagedPayloads -join ', ')"
+
 if (-not (Test-Path -LiteralPath $applicationPath -PathType Leaf)) {
     throw "Release application executable is missing: $applicationPath"
 }
@@ -87,7 +132,11 @@ if ($subsystem -ne 2) {
 }
 Write-Host "Verified Windows GUI subsystem for $([System.IO.Path]::GetFileName($applicationPath))"
 
-$installers = @(Get-ChildItem -Path $bundleDirectory -Filter "*-setup.exe" -File)
+$explicitInstaller = -not [string]::IsNullOrWhiteSpace($InstallerPath)
+$installers = if ($explicitInstaller) {
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw 'Selected installer does not exist' }
+    @(Get-Item -LiteralPath $InstallerPath)
+} else { @(Get-ChildItem -Path $bundleDirectory -Filter "*-setup.exe" -File) }
 if ($installers.Count -ne 1) {
     throw "Expected exactly one NSIS installer, found $($installers.Count)"
 }
@@ -101,9 +150,24 @@ if ($signature.Status -ne "NotSigned") {
     throw "CI preview must be explicitly unsigned; observed signature status $($signature.Status)"
 }
 
+$identityScript = Join-Path $PSScriptRoot 'build-identity.ps1'
+$identityJson = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $identityScript -RepositoryRoot $repositoryRoot -IncludePayloads
+if ($LASTEXITCODE -ne 0 -or @($identityJson).Count -ne 1) { throw 'Could not recompute build input identity' }
+$identity = $identityJson | ConvertFrom-Json
+$identityManifestPath = Join-Path $repositoryRoot 'target/dev/foreground-input/build-identity-current.json'
+if (-not (Test-Path -LiteralPath $identityManifestPath -PathType Leaf)) { throw 'Build input identity manifest is missing' }
+$builtIdentity = Get-Content -LiteralPath $identityManifestPath -Raw | ConvertFrom-Json
+foreach ($field in @('sourceCommit', 'sourceBaseCommit', 'sourceState', 'sourceFingerprint', 'payloadInputs')) {
+    if ($identity.$field -ne $builtIdentity.$field) { throw "Build input identity changed after compilation ($field)" }
+}
+if ($builtIdentity.payloadInputs -ne 'included') { throw 'Runtime identity was built without current staged payload inputs' }
+
 New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
-$copiedInstaller = Join-Path $artifactDirectory $installer.Name
-Copy-Item -LiteralPath $installer.FullName -Destination $copiedInstaller -Force
+$copiedInstaller = $installer.FullName
+if (-not $explicitInstaller) {
+    $copiedInstaller = Join-Path $artifactDirectory $installer.Name
+    Copy-Item -LiteralPath $installer.FullName -Destination $copiedInstaller -Force
+}
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $copiedInstaller).Hash.ToLowerInvariant()
 $checksumPath = Join-Path $artifactDirectory "SHA256SUMS.txt"
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
@@ -117,7 +181,12 @@ $metadata = [ordered]@{
     installer = $installer.Name
     sha256 = $hash
     signatureStatus = $signature.Status.ToString()
-    sourceCommit = $env:GITHUB_SHA
+    sourceCommit = $identity.sourceCommit
+    sourceBaseCommit = $identity.sourceBaseCommit
+    sourceState = $identity.sourceState
+    sourceFingerprint = $identity.sourceFingerprint
+    buildChannel = $builtIdentity.buildChannel
+    payloadInputs = $identity.payloadInputs
     distributionStatus = "unsigned-ci-preview-not-for-public-release"
 }
 $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $artifactDirectory "build-metadata.json")

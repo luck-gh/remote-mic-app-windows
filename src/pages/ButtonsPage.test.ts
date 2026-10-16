@@ -23,7 +23,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   });
   return {
     ...actual,
-    getSceneSnapshot: vi.fn(async () => ({ templateId: "preset-agent", mappingNotice: { kind: "template", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 })),
+    getSceneSnapshot: vi.fn(async () => ({ templateId: "preset-agent", mappingNotice: { kind: "direct", templateId: "preset-agent", name: "Agent", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 })),
     selectCurrentTemplate: vi.fn(),
     subscribeSceneEvents: vi.fn(async (handler: SceneHandler) => { sceneHandler = handler; return () => { sceneHandler = null; }; }),
     getMappingConfiguration: vi.fn(async () => ({
@@ -94,6 +94,8 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       return () => {};
     }),
     startShortcutCapture: vi.fn(async () => undefined),
+    learnFocusTarget: vi.fn(async () => ({ controlType: "edit", automationId: "compose" })),
+    testAppFocus: vi.fn(async () => undefined),
     stopShortcutCapture: vi.fn(async () => undefined),
     subscribeShortcutCaptureEdges: vi.fn(async (handler: ShortcutCaptureHandler) => {
       shortcutCaptureHandler = handler;
@@ -117,8 +119,23 @@ import {
   updateButtonMappingTemplate,
   startShortcutCapture,
   stopShortcutCapture,
+  learnFocusTarget,
+  testAppFocus,
 } from "../lib/bridge";
-import type { ButtonMappings, RuntimeSnapshot } from "../lib/bridge";
+import type { ButtonMappings, RuntimeSnapshot, SceneSnapshot } from "../lib/bridge";
+
+function voiceSnapshot(pressed: boolean): SceneSnapshot {
+  return { mappingNoticeEnabled: true, mappingNotice: null, mappingNoticeRevision: 1,
+    enabled: true, generation: 1, foregroundGeneration: 1, applicationId: null,
+    templateId: null, panel: null, updateDefault: false, selectedIndex: null,
+    menuItems: [], waitingForRelease: false, voiceActive: false,
+    voiceButtonPressed: pressed, status: null };
+}
+
+function voiceRuntime(overrides: Partial<RuntimeSnapshot["platform"]["connection"]>): RuntimeSnapshot {
+  return { ...runtime, platform: { ...runtime.platform,
+    connection: { ...runtime.platform.connection, ...overrides } } };
+}
 
 const runtime: RuntimeSnapshot = {
   appVersion: "0.1.0",
@@ -207,6 +224,7 @@ beforeEach(() => {
   gestureHandler = null;
   vi.mocked(getMappingConfiguration).mockClear();
   vi.mocked(getTemplateCatalog).mockClear();
+  vi.mocked(selectCurrentTemplate).mockReset();
   vi.mocked(saveMappingConfiguration).mockClear();
   vi.mocked(setMenuTemplateSwitchEnabled).mockReset();
   vi.mocked(subscribeButtonEdges).mockClear();
@@ -217,18 +235,96 @@ beforeEach(() => {
 });
 
 describe("buttons mapping page", () => {
+  it("shows a received voice key before audio is ready and retains the failure after release", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
+    await flushPromises();
+    expect(wrapper.get('.voice-card').classes()).toContain('active');
+    expect(wrapper.get('.anchor-dot.voice').classes()).toContain('visible');
+    expect(wrapper.get('.voice-feedback').text()).toContain('已收到语音键');
+    expect(wrapper.get('.voice-feedback').element.closest('header')).not.toBeNull();
+    expect(wrapper.get('.voice-badge').text()).not.toContain('语音进行中');
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ lastError: 'select an output endpoint before starting voice' }) });
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.voice-feedback').text()).toContain('声音通道尚未就绪');
+    expect(wrapper.get('.voice-feedback').text()).toContain('连接与语音');
+    expect(wrapper.get('.voice-feedback').text()).not.toContain('select an output');
+    wrapper.unmount();
+  });
+
+  it("keeps evidence of a quick voice press without extending the pressed state", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(false) });
+    await flushPromises();
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.voice-feedback').text()).toContain('已收到语音键');
+    wrapper.unmount();
+  });
+
+  it("does not turn streaming or a stale error into an observed voice key", async () => {
+    const wrapper = await mountPage();
+    await wrapper.setProps({ runtime: voiceRuntime({ lastError: '旧的声音通道错误' }) });
+    expect(wrapper.find('.voice-feedback').exists()).toBe(false);
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'streaming', lastError: null }) });
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.voice-badge').text()).toBe('语音进行中');
+    wrapper.unmount();
+  });
+
+  it("clears voice observation on a cancelled or disconnected scene", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
+    await flushPromises();
+    expect(wrapper.get('.voice-card').classes()).toContain('active');
+    sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ phase: 'disconnected', voiceState: 'idle' }) });
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    expect(wrapper.get('.anchor-dot.voice').classes()).not.toContain('visible');
+    wrapper.unmount();
+  });
+
+  it("replaces the previous failure with the next observed streaming session", async () => {
+    const wrapper = await mountPage();
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(true) });
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ lastError: '声音通道暂不可用' }) });
+    expect(wrapper.get('.voice-feedback').text()).toContain('声音通道暂不可用');
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(true) });
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'streaming', lastError: null }) });
+    expect(wrapper.get('.voice-feedback').text()).toBe('已收到语音键，语音进行中。');
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime });
+    expect(wrapper.get('.voice-feedback').text()).toBe('已收到语音键，语音已结束。');
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    wrapper.unmount();
+  });
+
+  it("shows an idle voice failure even when the preceding runtime snapshot was streaming", async () => {
+    const wrapper = await mountPage();
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'streaming', lastError: null }) });
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(true) });
+    sceneHandler?.({ type: 'snapshot', snapshot: voiceSnapshot(false) });
+    await wrapper.setProps({ runtime: voiceRuntime({ voiceState: 'idle', lastError: 'select an output endpoint before starting voice' }) });
+    expect(wrapper.get('.voice-feedback').text()).toContain('连接与语音');
+    expect(wrapper.get('.voice-feedback').text()).not.toContain('语音已结束');
+    expect(wrapper.get('.voice-card').classes()).not.toContain('active');
+    wrapper.unmount();
+  });
+
   it("shows the applied template separately from the editing draft and follows runtime changes", async () => {
     const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
-    const current = wrapper.get('output[aria-label="当前使用的按键模板"]');
-    expect(current.text()).toBe("Agent");
-    expect(wrapper.find('.current-template-display select, .current-template-display button, .current-template-display input').exists()).toBe(false);
+    const current = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    expect((current.element as HTMLSelectElement).value).toBe("preset-agent");
+    expect(current.text()).toContain("Agent");
     const editor = wrapper.get('.editing-source-picker select');
     await editor.setValue("template:profile-a"); await flushPromises();
-    expect(current.text()).toBe("Agent");
+    expect((current.element as HTMLSelectElement).value).toBe("preset-agent");
     expect(selectCurrentTemplate).not.toHaveBeenCalled();
-    sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "template", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
+    sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "direct", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
     await flushPromises();
-    expect(current.text()).toBe("模板 A");
+    expect((current.element as HTMLSelectElement).value).toBe("profile-a");
     expect((editor.element as HTMLSelectElement).value).toBe("template:profile-a");
     wrapper.unmount();
   });
@@ -236,15 +332,60 @@ describe("buttons mapping page", () => {
   it("shows an unconfirmed state on read failure and updates to common only after application", async () => {
     vi.mocked(getSceneSnapshot).mockRejectedValueOnce(new Error("读取失败"));
     const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
-    const current = wrapper.get('output[aria-label="当前使用的按键模板"]');
-    expect(current.text()).toBe("正在确认当前模板…");
+    const current = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    expect((current.element as HTMLSelectElement).value).toBe("");
+    expect(current.text()).toContain("正在确认当前模板…");
     expect(wrapper.text()).toContain("读取失败");
     sceneHandler?.({ type: "mapping_applied", revision: 2, notice: { kind: "common", templateId: null, name: null, actionsAvailable: true } });
     await flushPromises();
-    expect(current.text()).toBe("通用配置");
+    expect((current.element as HTMLSelectElement).value).toBe("common");
     expect(selectCurrentTemplate).not.toHaveBeenCalled();
     wrapper.unmount();
   });
+
+  it("applies the selected runtime template without changing the separate editor target", async () => {
+    vi.mocked(selectCurrentTemplate).mockImplementationOnce(async templateId => ({
+      ...voiceSnapshot(false),
+      templateId,
+      mappingNotice: { kind: templateId ? "direct" : "common", templateId, name: templateId ? "模板 A" : null, actionsAvailable: true },
+      mappingNoticeRevision: 2,
+    }));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const active = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    await active.setValue("profile-a"); await flushPromises();
+    expect(selectCurrentTemplate).toHaveBeenCalledExactlyOnceWith("profile-a");
+    expect((active.element as HTMLSelectElement).value).toBe("profile-a");
+    expect((wrapper.get(".editing-source-picker select").element as HTMLSelectElement).value).toBe("common");
+    expect(wrapper.text()).toContain("模板 A");
+    wrapper.unmount();
+  });
+
+  it("keeps the confirmed active template on application failure", async () => {
+    vi.mocked(selectCurrentTemplate).mockRejectedValueOnce(new Error("映射应用失败"));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const active = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    await active.setValue("profile-a"); await flushPromises();
+    expect((active.element as HTMLSelectElement).value).toBe("preset-agent");
+    expect(wrapper.text()).toContain("映射应用失败");
+    wrapper.unmount();
+  });
+
+  it("blocks repeated active-template changes while the engine confirmation is pending", async () => {
+    let resolve!: (snapshot: SceneSnapshot) => void;
+    vi.mocked(selectCurrentTemplate).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = mount(ButtonsPage, { props: { runtime } }); await flushPromises();
+    const active = wrapper.get('select[aria-label="当前使用的按键模板"]');
+    await active.setValue("profile-a");
+    expect((active.element as HTMLSelectElement).disabled).toBe(true);
+    (active.element as HTMLSelectElement).value = "scene-copy";
+    await active.trigger("change");
+    expect(selectCurrentTemplate).toHaveBeenCalledExactlyOnceWith("profile-a");
+    resolve({ ...voiceSnapshot(false), templateId: "profile-a", mappingNotice: { kind: "direct", templateId: "profile-a", name: "模板 A", actionsAvailable: true }, mappingNoticeRevision: 2 });
+    await flushPromises();
+    expect((active.element as HTMLSelectElement).value).toBe("profile-a");
+    wrapper.unmount();
+  });
+
   it("saves Menu mode through the shared narrow command without changing drafts or confirming pending state", async () => {
     const base = await getMappingConfiguration();
     const wrapper = await mountPage();
@@ -607,7 +748,8 @@ describe("buttons mapping page", () => {
     expect(voiceCard.text()).toContain("按住说话");
     expect(wrapper.text()).not.toContain("静音（设备支持时）");
     const selectors = wrapper.findAll(".mapping-header-controls select");
-    expect(selectors).toHaveLength(1);
+    expect(selectors).toHaveLength(2);
+    expect(selectors.map(selector => selector.attributes("aria-label"))).toEqual(["当前使用的按键模板", undefined]);
   });
 
   it("does not register listeners or polling after unmounting during initial load", async () => {
@@ -1180,5 +1322,248 @@ describe("buttons mapping page", () => {
     expect(page.find(".device-chip").text()).toContain("小米蓝牙语音遥控器");
     expect(page.find(".device-chip").text()).not.toContain("连接后显示");
     page.unmount();
+  });
+});
+
+
+describe("hold repeat and OK click in local editing drafts", () => {
+  it("reads a saved explicit off without treating it as the automatic default", async () => {
+    const base = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({ ...base, commonMappings: {
+      ...base.commonMappings, schemaVersion: 2, actions: { up: {
+        single: { type: 'shortcut', chord: { keys: ['up'] } },
+        double: { type: 'disabled' }, long: { type: 'disabled' }, holdRepeat: 'off',
+      } },
+    } });
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      expect(wrapper.find('.repeat-auto-hint').exists()).toBe(false);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("explains why automatic mode does not repeat a combination shortcut or an unset action", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('未设置单击动作');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['control', 'c'] } });
+      await flushPromises();
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('只执行一次');
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!.classes()).toContain('selected');
+      const menu = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '菜单')!;
+      await menu.findAll('.mapping-cell')[0]!.trigger('click');
+      expect(wrapper.find('.repeat-group').exists()).toBe(false);
+      expect(wrapper.get('.voice-card').find('.repeat-group').exists()).toBe(false);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("defaults to automatic repeat and follows long-action edits without changing the saved configuration", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      const auto = () => wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!;
+      expect(auto().classes()).toContain('selected');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['up'] } });
+      await flushPromises();
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('连续执行单击动作');
+      await up.findAll('.mapping-cell')[2]!.trigger('click');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['left'] } });
+      await flushPromises();
+      expect(auto().classes()).toContain('selected');
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('长按动作一次');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'disabled' });
+      await flushPromises();
+      expect(wrapper.get('.repeat-auto-hint').text()).toContain('连续执行单击动作');
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0];
+      expect(saved.schemaVersion).toBe(2);
+      expect(saved.actions.up).not.toHaveProperty('holdRepeat');
+    } finally { wrapper.unmount(); }
+  });
+
+  it("persists an explicit off and removes it only when automatic is selected", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['up'] } });
+      await flushPromises();
+      await wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.trigger('click');
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[0]![0]).toMatchObject({ schemaVersion: 2, actions: { up: { holdRepeat: 'off' } } });
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      await wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!.trigger('click');
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[1]![0].actions.up).not.toHaveProperty('holdRepeat');
+    } finally { wrapper.unmount(); }
+  });
+
+  it("keeps an explicit off in the draft after a save failure and subsequent action edits", async () => {
+    const wrapper = await mountPage();
+    try {
+      const up = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '上')!;
+      await up.findAll('.mapping-cell')[0]!.trigger('click');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['up'] } });
+      await flushPromises();
+      await wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.trigger('click');
+      vi.mocked(saveButtonMappings).mockRejectedValueOnce(new Error('写入失败'));
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(wrapper.text()).toContain('写入失败');
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      wrapper.findComponent({ name: 'ButtonActionEditor' }).vm.$emit('update', { type: 'shortcut', chord: { keys: ['down'] } });
+      await flushPromises();
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[1]![0].actions.up).toMatchObject({ holdRepeat: 'off', single: { chord: { keys: ['down'] } } });
+      expect(selectCurrentTemplate).not.toHaveBeenCalled();
+    } finally { wrapper.unmount(); }
+  });
+
+  it("keeps explicit app focus settings in the common draft until saved", async () => {
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      expect(wrapper.get('[aria-label="应用聚焦方式"]').element).toHaveProperty("value", "open_only");
+      expect(learnFocusTarget).not.toHaveBeenCalled();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("recorded_element");
+      await wrapper.get('[data-testid="learn-app-focus"]').trigger("click");
+      await flushPromises();
+      expect(learnFocusTarget).toHaveBeenCalledOnce();
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(wrapper.get('[data-testid="test-app-focus"]').attributes("disabled")).toBeDefined();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenCalledWith(expect.objectContaining({ focusProfiles: { wechat: { strategy: "recorded_element", recorded: { controlType: "edit", automationId: "compose" } } } }));
+      await wrapper.get('[data-testid="test-app-focus"]').trigger("click");
+      await flushPromises();
+      expect(testAppFocus).toHaveBeenCalledWith("wechat");
+      expect(wrapper.text()).toContain("已提交测试");
+      await wrapper.get(".editing-source-picker select").setValue("template:profile-a");
+      await flushPromises();
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      expect(wrapper.find('[aria-label="应用聚焦方式"]').exists()).toBe(false);
+    } finally { wrapper.unmount(); }
+  });
+
+  it("records an app focus shortcut without replacing the open-app action", async () => {
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("app_shortcut");
+      await wrapper.get('[data-testid="capture-app-focus"]').trigger("click");
+      await flushPromises();
+      shortcutCaptureHandler?.({ key: "left_control", isPressed: true });
+      shortcutCaptureHandler?.({ key: "l", isPressed: true });
+      shortcutCaptureHandler?.({ key: "l", isPressed: false });
+      shortcutCaptureHandler?.({ key: "left_control", isPressed: false });
+      await flushPromises();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenCalledWith(expect.objectContaining({ actions: expect.objectContaining({ ok: expect.objectContaining({ single: { type: "open_app", target: "wechat" } }) }), focusProfiles: { wechat: { strategy: "app_shortcut", shortcut: { keys: ["left_control", "l"] } } } }));
+    } finally { wrapper.unmount(); }
+  });
+
+  it("ignores a learned target returned after the edited app changes", async () => {
+    let resolve!: (value: { controlType: string; automationId: string }) => void;
+    vi.mocked(learnFocusTarget).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      const editor = wrapper.findComponent({ name: "ButtonActionEditor" });
+      editor.vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("recorded_element");
+      await wrapper.get('[data-testid="learn-app-focus"]').trigger("click");
+      editor.vm.$emit("update", { type: "open_app", target: "doubao" });
+      await flushPromises();
+      resolve({ controlType: "edit", automationId: "late" });
+      await flushPromises();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls[0]![0].focusProfiles).toEqual({ wechat: { strategy: "recorded_element" } });
+    } finally { wrapper.unmount(); }
+  });
+
+  it("shows a failed recording without saving or claiming a target was recorded", async () => {
+    vi.mocked(learnFocusTarget).mockRejectedValueOnce(new Error("no_editable_target"));
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "open_app", target: "wechat" });
+      await flushPromises();
+      await wrapper.get('[aria-label="应用聚焦方式"]').setValue("recorded_element");
+      await wrapper.get('[data-testid="learn-app-focus"]').trigger("click");
+      await flushPromises();
+      expect(wrapper.text()).toContain("记录输入框失败");
+      expect(wrapper.text()).toContain("尚未记录输入框");
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(wrapper.get('[data-testid="test-app-focus"]').attributes("disabled")).toBeDefined();
+    } finally { wrapper.unmount(); }
+  });
+  it("saves repeat only to the explicitly edited template and reconciles an incompatible long action", async () => {
+    const wrapper = await mountPage();
+    try {
+      await wrapper.get(".editing-source-picker select").setValue("template:profile-a");
+      await flushPromises();
+      const up = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "上")!;
+      await up.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "shortcut", chord: { keys: ["up"] } });
+      await flushPromises();
+      await wrapper.findAll(".repeat-group button").find(button => button.text() === "重复单击动作")!.trigger("click");
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+    expect((wrapper.get('[aria-label="当前使用的按键模板"]').element as HTMLSelectElement).value).toBe("preset-agent");
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(updateButtonMappingTemplate).toHaveBeenCalledWith("profile-a", expect.objectContaining({ actions: expect.objectContaining({ up: expect.objectContaining({ holdRepeat: "single" }) }) }));
+      await up.findAll(".mapping-cell")[2]!.trigger("click");
+      wrapper.findComponent({ name: "ButtonActionEditor" }).vm.$emit("update", { type: "shortcut", chord: { keys: ["control", "c"] } });
+      await flushPromises();
+      expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '关闭')!.classes()).toContain('selected');
+      expect(wrapper.text()).toContain("连续执行”已关闭");
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      await wrapper.findAll('.mapping-actions button').find(button => button.text() === '保存当前配置')!.trigger('click');
+      await flushPromises();
+      expect(vi.mocked(updateButtonMappingTemplate).mock.calls[1]![1].actions.up).toMatchObject({ holdRepeat: 'off' });
+    } finally { wrapper.unmount(); }
+  });
+
+  it("keeps contextual OK clicks in a common draft and never exposes them for a template", async () => {
+    const wrapper = await mountPage();
+    try {
+      const ok = wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "确定")!;
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      await wrapper.get(".ok-click-toggle input").setValue(true);
+      expect(saveButtonMappings).not.toHaveBeenCalled();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenCalledWith(expect.objectContaining({ actions: expect.objectContaining({ ok: expect.objectContaining({ okContextClick: true }) }) }));
+      await wrapper.get(".editing-source-picker select").setValue("template:profile-a");
+      await flushPromises();
+      await ok.findAll(".mapping-cell")[0]!.trigger("click");
+      expect(wrapper.find(".ok-click-toggle").exists()).toBe(false);
+      expect(wrapper.get(".voice-card").find(".repeat-group").exists()).toBe(false);
+    } finally { wrapper.unmount(); }
   });
 });

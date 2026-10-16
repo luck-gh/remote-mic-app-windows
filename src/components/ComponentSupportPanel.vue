@@ -4,8 +4,8 @@ import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import EnhancedCaptureConfirmDialog from "./EnhancedCaptureConfirmDialog.vue";
 import {
   getComponentStatus, performComponentAction, getRc003BridgeSnapshot, getRc003TaskStatus,
-  enableRc003Capture, disableRc003Capture,
-  type ComponentOperation, type ComponentStatus, type Rc003BridgeSnapshot, type Rc003TaskStatus,
+  enableRc003Capture, disableRc003Capture, getCaptureSupport,
+  type CaptureSupport, type ComponentOperation, type ComponentStatus, type Rc003BridgeSnapshot, type Rc003TaskStatus,
 } from "../lib/bridge";
 
 const vb = ref<ComponentStatus | null>(null);
@@ -18,9 +18,10 @@ const captureBusy = ref(false);
 const captureAction = ref<"enable" | "disable" | null>(null);
 const captureError = ref<{ action: "enable" | "disable"; message: string } | null>(null);
 const captureReadError = ref(false);
+const captureSupport = ref<CaptureSupport | null>(null);
 const confirmCapture = ref(false);
 const cleanupPending = computed(() => captureTask.value?.cleanupPending === true);
-const captureCanEnable = computed(() => Boolean(captureTask.value) && !captureBusy.value && !captureReadError.value && !cleanupPending.value);
+const captureCanEnable = computed(() => Boolean(captureTask.value) && captureSupport.value?.available !== false && !captureBusy.value && !captureReadError.value && !cleanupPending.value);
 const captureNeedsRestart = computed(() => captureTask.value?.enabled && (captureBridge.value?.phase === "failed" || Boolean(captureTask.value.lastError)));
 const capturePresentation = computed(() => {
   if (captureBusy.value) {
@@ -33,6 +34,7 @@ const capturePresentation = computed(() => {
     ? { state: "cleanup_pending", text: "关闭待完成", tone: "warning", icon: "◷", detail: "上一次关闭尚未完成。重试关闭会自动恢复残留的按键状态，完成后可再次开启。" }
     : { state: "cleanup_blocked", text: "按键支持暂不可用", tone: "error", icon: "!", detail: "上一次关闭的完成状态尚未确认，当前无法继续开启。请刷新状态查看恢复结果。" };
   if (captureReadError.value) return { state: "read_failed", text: "状态读取失败", tone: "error", icon: "!", detail: "暂时无法确认当前状态，请刷新后再操作。" };
+  if (captureSupport.value?.available === false) return { state: "unsupported", text: "暂不可用", tone: "warning", icon: "!", detail: "这台电脑暂不支持全按键支持，其他按键不受影响。" };
   const task = captureTask.value;
   if (!task) return { state: "unknown", text: "正在读取状态", tone: "pending", icon: "◷", detail: "正在检查全按键支持。" };
   if (captureError.value?.action === "disable") return { state: "failed", text: "关闭未完成", tone: "error", icon: "!", detail: task.lastError || "尚未确认关闭结果，请刷新状态。" };
@@ -61,10 +63,11 @@ async function readCaptureState(force = false) {
   const generation = captureGeneration;
   const readGeneration = ++captureReadGeneration;
   try {
-    const [task, bridge] = await Promise.all([getRc003TaskStatus(), getRc003BridgeSnapshot()]);
+    const [task, bridge, support] = await Promise.all([getRc003TaskStatus(), getRc003BridgeSnapshot(), getCaptureSupport().catch(() => null)]);
     if (!disposed && generation === captureGeneration && readGeneration === captureReadGeneration) {
       captureTask.value = task;
       captureBridge.value = bridge;
+      if (support) captureSupport.value = support;
       captureReadError.value = false;
       if (captureError.value?.action === "disable" && !task.enabled && !task.cleanupPending && !task.lastError) captureError.value = null;
     }

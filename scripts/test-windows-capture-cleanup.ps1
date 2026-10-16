@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $source = [IO.File]::ReadAllText((Join-Path $root 'src-tauri/windows/verify-capture-cleanup.ps1'))
 $tokens = $null; $parseErrors = $null
@@ -11,6 +11,12 @@ foreach ($declaration in $ast.EndBlock.Statements | Where-Object { $_ -is [Manag
 }
 $checks = 0
 function Assert-Cleanup($condition, [string]$message) { if (-not $condition) { throw $message }; $script:checks++ }
+foreach ($name in @('sayall-helper', 'sayall-helper-arm64', 'SAYALL-HELPER-ARM64')) {
+    Assert-Cleanup (Test-CurrentCaptureHelperImage $name) 'Current architecture Helper treated as legacy'
+}
+foreach ($name in @('sayall-hid-host-helper', 'sayall-component-helper', 'other')) {
+    Assert-Cleanup (-not (Test-CurrentCaptureHelperImage $name)) 'Retired or unrelated Helper treated as current'
+}
 function New-State([string]$status = 'passed', [long]$id = 10, [long]$start = 100) {
     [pscustomobject]@{ helper_pid=$id; started_unix_ms=$start; completed_unix_ms=200; status=$status; host_pid=20; host_created=400; agent_instance='instance' }
 }

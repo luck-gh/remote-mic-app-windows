@@ -198,12 +198,32 @@ pub fn resolve_capture_pair(
     preferred_render: Option<(&str, &str)>,
 ) -> Result<AudioEndpoint, AudioRouteReason> {
     let started = std::time::Instant::now();
+    let mut capture_present = false;
+    let mut capture_metadata_complete = false;
+    let mut capture_family_known = false;
+    let mut known_capture_count = 0;
+    let mut known_render_count = 0;
     let result = inventory().and_then(|endpoints| {
+        if let Some(capture) = endpoints.iter().find(|endpoint| {
+            endpoint.direction == Direction::Capture && endpoint.endpoint.id == capture_id
+        }) {
+            capture_present = true;
+            capture_metadata_complete = capture.metadata_complete;
+            capture_family_known = capture.cable.is_some();
+        }
+        for endpoint in &endpoints {
+            if endpoint.cable.is_some() {
+                match endpoint.direction {
+                    Direction::Capture => known_capture_count += 1,
+                    Direction::Render => known_render_count += 1,
+                }
+            }
+        }
         resolve_pair(&endpoints, capture_id, expected_name, preferred_render)
             .map(|endpoint| endpoint.endpoint.clone())
     });
     crate::gatt_note(format!(
-        "audio_route action=pair result={} reason={} saved_writer_retained={} elapsed_ms={}",
+        "audio_route action=pair result={} reason={} saved_writer_retained={} capture_present={capture_present} capture_metadata_complete={capture_metadata_complete} capture_family_known={capture_family_known} known_capture_count={known_capture_count} known_render_count={known_render_count} elapsed_ms={}",
         if result.is_ok() { "passed" } else { "failed" },
         result
             .as_ref()
@@ -313,7 +333,14 @@ fn snapshot_from(
 }
 
 fn cable_from_adapter(name: &str) -> Option<Cable> {
-    match name.to_ascii_lowercase().as_str() {
+    let normalized = name.to_ascii_lowercase();
+    // Windows adds a numeric instance prefix to the adapter label. It is not
+    // device identity: resolve_pair still requires the exact PnP adapter node.
+    let label = normalized
+        .split_once("- ")
+        .filter(|(number, _)| !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit()))
+        .map_or(normalized.as_str(), |(_, label)| label);
+    match label {
         "vb-audio virtual cable" => Some(Cable::Base),
         "vb-audio cable a" => Some(Cable::A),
         "vb-audio cable b" => Some(Cable::B),
@@ -335,7 +362,12 @@ fn pin_from_description(cable: Cable, description: &str, direction: Direction) -
     match direction {
         Direction::Capture if description == format!("{prefix} output") => Pin::Capture,
         Direction::Render if description == format!("{prefix} input") => Pin::Render,
-        Direction::Render if description == format!("{prefix} in 16ch") => Pin::Render16,
+        Direction::Render
+            if description == format!("{prefix} in 16ch")
+                || description == format!("{prefix} in 16 ch") =>
+        {
+            Pin::Render16
+        }
         _ => Pin::Other,
     }
 }
@@ -748,6 +780,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn windows_numbered_adapter_labels_keep_the_exact_known_cable_family() {
+        for (name, cable) in [
+            ("2- VB-Audio Virtual Cable", Cable::Base),
+            ("12- VB-Audio Cable A", Cable::A),
+            ("2- VB-Audio Cable B", Cable::B),
+            ("3- VB-Audio Cable C", Cable::C),
+            ("4- VB-Audio Cable D", Cable::D),
+        ] {
+            assert_eq!(cable_from_adapter(name), Some(cable));
+        }
+        for name in [
+            "other- VB-Audio Virtual Cable",
+            "2-VB-Audio Virtual Cable",
+            "2-  VB-Audio Virtual Cable",
+            "2- Speakers (VB-Audio Virtual Cable)",
+            "2- 3- VB-Audio Virtual Cable",
+            "2- VB-Audio Virtual Cable extra",
+        ] {
+            assert_eq!(cable_from_adapter(name), None);
+        }
+    }
+
+    #[test]
+    fn current_pack45_spaced_16_channel_pin_is_recognized_without_guessing_family() {
+        assert_eq!(
+            pin_from_description(Cable::Base, "CABLE In 16 Ch", Direction::Render),
+            Pin::Render16
+        );
+        assert_eq!(
+            pin_from_description(Cable::Base, "CABLE In 16 Ch", Direction::Capture),
+            Pin::Other
+        );
+        assert_eq!(
+            pin_from_description(Cable::A, "CABLE In 16 Ch", Direction::Render),
+            Pin::Other
+        );
+        assert_eq!(
+            pin_from_description(Cable::Base, "My CABLE In 16 Ch", Direction::Render),
+            Pin::Other
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "read-only Windows audio topology observation; requires exactly one active standard VB-CABLE"]
@@ -782,5 +857,47 @@ mod tests {
             })
             .count();
         println!("audio_route_observation result=passed same_pnp_adapter=true selected_pin=standard same_line_render_count={same_line_render_count} system_default_writes=0 audio_streams_opened=0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "read-only Windows audio topology observation; requires one active VB-CABLE capture with one 16-channel writer"]
+    fn actual_vb_cable_topology_resolves_explicit_16ch_without_changing_audio() {
+        let endpoints = inventory().expect("read active public endpoint properties");
+        let captures: Vec<_> = endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.direction == Direction::Capture && endpoint.cable == Some(Cable::Base)
+            })
+            .collect();
+        assert_eq!(
+            captures.len(),
+            1,
+            "explicit base-cable observation requires one capture"
+        );
+        let capture = captures[0];
+        assert!(capture.adapter_instance.is_some());
+        let same_line_16ch: Vec<_> = endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.direction == Direction::Render
+                    && endpoint.pin == Pin::Render16
+                    && endpoint.adapter_instance == capture.adapter_instance
+            })
+            .collect();
+        assert_eq!(
+            same_line_16ch.len(),
+            1,
+            "requires one exact same-line 16-channel writer"
+        );
+        let preferred = same_line_16ch[0];
+        let explicit = resolve_capture_pair(
+            &capture.endpoint.id,
+            &capture.endpoint.name,
+            Some((&preferred.endpoint.id, &preferred.endpoint.name)),
+        )
+        .expect("explicit same-line 16-channel writer");
+        assert_eq!(explicit.id, preferred.endpoint.id);
+        println!("audio_route_observation result=passed same_pnp_adapter=true selected_pin=explicit_16ch system_default_writes=0 audio_streams_opened=0");
     }
 }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import SettingsDialog from "./SettingsDialog.vue";
-import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+import { reportFrontendEvent, reasonToken } from "../lib/frontend-diagnostics";
 import { useUiPreference } from "../lib/ui-preferences";
 import {
   listRunningApps, pickCustomApp,
@@ -108,7 +108,7 @@ async function loadChoices(): Promise<void> {
       id: app.applicationId, name: app.name, source: "running" as const,
     }));
     choices.value = next;
-    reportFrontendEvent({ event: "template_app_discovery", phase: "completed", result: "passed", reason: `choices_${next.length}`, elapsedMs: Math.round(performance.now() - started) });
+    reportFrontendEvent({ event: "template_app_discovery", phase: "completed", result: "passed", reason: reasonToken("choices", next.length), elapsedMs: Math.round(performance.now() - started) });
   } catch (reason) {
     loadError.value = reason instanceof Error ? reason.message : String(reason);
     reportFrontendEvent({ event: "template_app_discovery", phase: "completed", result: "failed", reason: "public_app_sources_unavailable", elapsedMs: Math.round(performance.now() - started) });

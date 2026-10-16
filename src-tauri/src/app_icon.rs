@@ -1,19 +1,5 @@
-//! 应用图标：把用户选择的应用图标应用到所有显示它的地方（2026-10-02）。
-//!
-//! 对齐 Mac main 的 `Sources/RemoteMic/AppIconController.swift`：
-//!
-//! - 稳定语义 ID + 目录解析：`standard` 是内置应用图标，`faceted-duck`（几何鸭）
-//!   来自 Mac `Resources/AppIcons/faceted-duck.png`，由
-//!   `scripts/generate-app-icons.py` 派生为 Windows 用的尺寸档；认不出的 ID 一律
-//!   回落 `standard`（Mac `AppIconCatalog.resolvedIdentifier(for:)` 同款语义）；
-//! - 落日志 `app_icon action=apply phase=... result=applied|fallback reason=...`
-//!   （对应 Mac 的 `APP_ICON CHANGE`）；
-//! - Mac 换的是 `NSApplication.applicationIconImage`（Dock / 应用切换器 / 设置窗口）；
-//!   Windows 上等价的"各个地方" = **主窗口图标（任务栏 + Alt-Tab + 标题栏）与通知
-//!   区域托盘图标**，设置页顶部标识由前端按同一选择实时渲染。安装包、开始菜单快捷
-//!   方式与可执行文件自身的图标属于安装产物，运行期不可改（Mac 的 bundle 图标同样不变）。
+//! 个人修改版固定应用图标（2026-10-06）；窗口与托盘按 DPI 使用同源资产。
 
-use sayall_core::AppIconIdentifier;
 use tauri::image::Image;
 use tauri::AppHandle;
 use tauri::Manager;
@@ -34,32 +20,25 @@ pub fn nearest_icon_size(dpi: u32) -> u32 {
         .unwrap_or(32)
 }
 
-fn faceted_duck_tray_bytes(size: u32) -> &'static [u8] {
+fn personal_tray_bytes(size: u32) -> &'static [u8] {
     match size {
-        16 => include_bytes!("../icons/app-icons/faceted-duck-16.png"),
-        20 => include_bytes!("../icons/app-icons/faceted-duck-20.png"),
-        24 => include_bytes!("../icons/app-icons/faceted-duck-24.png"),
-        _ => include_bytes!("../icons/app-icons/faceted-duck-32.png"),
+        16 => include_bytes!("../icons/app-icons/personal-16.png"),
+        20 => include_bytes!("../icons/app-icons/personal-20.png"),
+        24 => include_bytes!("../icons/app-icons/personal-24.png"),
+        _ => include_bytes!("../icons/app-icons/personal-32.png"),
     }
 }
 
-/// 托盘尺寸的几何鸭图标；`standard` 由 `default_window_icon` 提供，不走这里。
-pub fn faceted_duck_tray_image(size: u32) -> Result<Image<'static>, String> {
-    Image::from_bytes(faceted_duck_tray_bytes(size))
-        .map_err(|error| format!("解码内置几何鸭托盘图标失败：{error}"))
+/// 托盘尺寸的固定个人版图标。
+pub fn personal_tray_image(size: u32) -> Result<Image<'static>, String> {
+    Image::from_bytes(personal_tray_bytes(size))
+        .map_err(|error| format!("解码内置个人版托盘图标失败：{error}"))
 }
 
-/// 窗口（任务栏 / Alt-Tab）尺寸的几何鸭图标。
-pub fn faceted_duck_window_image() -> Result<Image<'static>, String> {
-    Image::from_bytes(include_bytes!("../icons/app-icons/faceted-duck-256.png"))
-        .map_err(|error| format!("解码内置几何鸭窗口图标失败：{error}"))
-}
-
-pub fn style_label(identifier: AppIconIdentifier) -> &'static str {
-    match identifier {
-        AppIconIdentifier::Standard => "standard",
-        AppIconIdentifier::FacetedDuck => "faceted-duck",
-    }
+/// 窗口（任务栏 / Alt-Tab）尺寸的个人版图标。
+pub fn personal_window_image() -> Result<Image<'static>, String> {
+    Image::from_bytes(include_bytes!("../icons/app-icons/personal-256.png"))
+        .map_err(|error| format!("解码内置个人版窗口图标失败：{error}"))
 }
 
 /// 任务栏 / Alt-Tab 用的是 `ICON_BIG`，标题栏用的是 `ICON_SMALL`。
@@ -246,31 +225,117 @@ fn window_dpi(app: &AppHandle) -> u32 {
         .unwrap_or(96)
 }
 
-/// 把选择的应用图标应用到主窗口与托盘；返回真正生效的 ID（回落时 ≠ 请求值）。
+#[cfg(windows)]
+fn refresh_shell_icon(executable: &std::path::Path) -> Result<i32, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        IExtractIconW, ILFree, IShellFolder, SHBindToParent, SHGetFileInfoW, SHParseDisplayName,
+        SHUpdateImageW, SHFILEINFOW, SHGFI_SYSICONINDEX,
+    };
+
+    if !executable.is_file() {
+        return Err("executable_missing".to_owned());
+    }
+    struct Apartment(bool);
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+    struct ItemId(*mut ITEMIDLIST);
+    impl Drop for ItemId {
+        fn drop(&mut self) {
+            unsafe { ILFree(Some(self.0)) };
+        }
+    }
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
+        return Err("com_initialize_failed".to_owned());
+    }
+    let _apartment = Apartment(initialized.is_ok());
+    let path: Vec<u16> = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        let mut parsed = std::ptr::null_mut();
+        SHParseDisplayName(
+            PCWSTR(path.as_ptr()),
+            None::<&IBindCtx>,
+            &mut parsed,
+            0,
+            None,
+        )
+        .map_err(|_| "shell_parse_failed".to_owned())?;
+        let item_id = ItemId(parsed);
+        let mut child = std::ptr::null_mut();
+        let folder: IShellFolder = SHBindToParent(item_id.0, Some(&mut child))
+            .map_err(|_| "shell_parent_failed".to_owned())?;
+        let extractor: IExtractIconW = folder
+            .GetUIObjectOf(HWND::default(), &[child.cast_const()], None)
+            .map_err(|_| "shell_icon_handler_failed".to_owned())?;
+        let mut location = vec![0u16; 32768];
+        let (mut resource_index, mut flags) = (0, 0);
+        extractor
+            .GetIconLocation(0, &mut location, &mut resource_index, &mut flags)
+            .map_err(|_| "shell_icon_location_failed".to_owned())?;
+        let mut info = SHFILEINFOW::default();
+        let list = SHGetFileInfoW(
+            PCWSTR(path.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        );
+        if list == 0 || info.iIcon < 0 || location[0] == 0 {
+            return Err("shell_image_index_failed".to_owned());
+        }
+        // Microsoft requires the existing handler's exact location/index/flags.
+        // Only this executable's image entry is notified; AppID and pins stay intact.
+        SHUpdateImageW(PCWSTR(location.as_ptr()), resource_index, flags, info.iIcon);
+        Ok(info.iIcon)
+    }
+}
+
+/// 将固定个人图标应用到主窗口与托盘，并通知 Shell 当前 EXE 图像项变化。
 ///
 /// 任何一步失败都只记录并继续：图标属于表现层，绝不影响语音与按键主路径。
-pub fn apply(app: &AppHandle, requested: AppIconIdentifier) -> AppIconIdentifier {
-    let applied = resolve(requested);
-    sayall_windows::gatt_note(format!(
-        "app_icon action=apply phase=requested requested={} source=preference",
-        style_label(requested)
-    ));
-
-    let window_icon = match applied {
-        AppIconIdentifier::Standard => app
-            .default_window_icon()
-            .cloned()
-            .map(|icon| icon.to_owned()),
-        AppIconIdentifier::FacetedDuck => faceted_duck_window_image().ok(),
-    };
+pub fn apply(app: &AppHandle) {
+    sayall_windows::gatt_note(
+        "app_icon action=apply phase=requested source=personal_bundle".to_owned(),
+    );
+    let window_icon = personal_window_image().ok();
     let dpi = window_dpi(app);
-    let tray_icon = match applied {
-        AppIconIdentifier::Standard => app
-            .default_window_icon()
-            .cloned()
-            .map(|icon| icon.to_owned()),
-        AppIconIdentifier::FacetedDuck => faceted_duck_tray_image(nearest_icon_size(dpi)).ok(),
-    };
+    let tray_icon = personal_tray_image(nearest_icon_size(dpi)).ok();
+
+    #[cfg(windows)]
+    tauri::async_runtime::spawn_blocking(|| {
+        sayall_windows::gatt_note(
+            "app_icon action=refresh target=shell_image phase=requested source=current_executable"
+                .to_owned(),
+        );
+        let result = std::env::current_exe()
+            .map_err(|_| "executable_resolve_failed".to_owned())
+            .and_then(|executable| refresh_shell_icon(&executable));
+        match result {
+            Ok(index) => sayall_windows::gatt_note(format!(
+                "app_icon action=refresh target=shell_image phase=submitted image_index={index} display_result=unknown"
+            )),
+            Err(code) => sayall_windows::gatt_note(format!(
+                "app_icon action=refresh target=shell_image phase=completed terminal_result=failed error_domain=shell error_code={code} retryable=false"
+            )),
+        }
+    });
 
     match (&window_icon, app.get_webview_window("main")) {
         (Some(icon), Some(window)) => {
@@ -294,13 +359,13 @@ pub fn apply(app: &AppHandle, requested: AppIconIdentifier) -> AppIconIdentifier
                         if let Err(error) = window_icons::apply(hwnd.0 as isize, &big, &small) {
                             sayall_windows::gatt_note(format!(
                                 "app_icon action=apply target=taskbar phase=completed terminal_result=failed applied={} error_domain=windows error_code=set_icon_failed retryable=true",
-                                style_label(applied)
+                                "personal"
                             ));
                             eprintln!("更新任务栏图标失败：{error}");
                         } else {
                             sayall_windows::gatt_note(format!(
                                 "app_icon action=apply target=taskbar phase=completed terminal_result=passed applied={} big={}x{} small={}x{}",
-                                style_label(applied),
+                                "personal",
                                 big.width,
                                 big.height,
                                 small.width,
@@ -331,54 +396,46 @@ pub fn apply(app: &AppHandle, requested: AppIconIdentifier) -> AppIconIdentifier
             Some(icon) => match tray.set_icon(Some(icon)) {
                 Ok(()) => sayall_windows::gatt_note(format!(
                     "app_icon action=apply target=tray phase=completed terminal_result=passed applied={} dpi={dpi}",
-                    style_label(applied)
+                    "personal"
                 )),
                 Err(error) => {
                     sayall_windows::gatt_note(format!(
                         "app_icon action=apply target=tray phase=completed terminal_result=failed applied={} error_domain=tray error_code=set_icon_failed retryable=true",
-                        style_label(applied)
+                        "personal"
                     ));
                     eprintln!("更新托盘图标失败：{error}");
                 }
             },
             None => sayall_windows::gatt_note(format!(
                 "app_icon action=apply target=tray phase=completed terminal_result=failed applied={} error_domain=icon error_code=resolve_failed retryable=true",
-                style_label(applied)
+                "personal"
             )),
         },
         // 仿真构建不建托盘；真机上托盘创建失败也走这里。只记日志，不报错。
         None => sayall_windows::gatt_note(format!(
             "app_icon action=apply target=tray phase=completed terminal_result=skipped applied={} reason=tray_unavailable",
-            style_label(applied)
+            "personal"
         )),
-    }
-
-    if applied == requested {
-        sayall_windows::gatt_note(format!(
-            "app_icon action=apply phase=completed terminal_result=passed requested={} applied={} result=applied reason=selection_available",
-            style_label(requested),
-            style_label(applied)
-        ));
-    } else {
-        sayall_windows::gatt_note(format!(
-            "app_icon action=apply phase=completed terminal_result=passed requested={} applied={} result=fallback reason=resource_unavailable",
-            style_label(requested),
-            style_label(applied)
-        ));
-    }
-    applied
-}
-
-/// 目录解析：目前两个 ID 的内置资产都在仓库里，未知 ID 不在枚举内（反序列化时
-/// 已回落 `standard`）；这里保留 Mac 同款入口，供后续新增图标时集中处理。
-fn resolve(requested: AppIconIdentifier) -> AppIconIdentifier {
-    match requested {
-        AppIconIdentifier::Standard | AppIconIdentifier::FacetedDuck => requested,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn shell_refresh_for_current_executable_is_repeatable() {
+        let executable = std::env::current_exe().expect("test executable");
+        assert!(super::refresh_shell_icon(&executable).expect("first refresh") >= 0);
+        assert!(super::refresh_shell_icon(&executable).expect("repeat refresh") >= 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_refresh_rejects_missing_executable() {
+        let missing = std::env::temp_dir().join("sayall-personal-icon-missing.exe");
+        assert!(!missing.exists());
+        assert!(super::refresh_shell_icon(&missing).is_err());
+    }
     use super::*;
 
     #[test]
@@ -393,32 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn style_labels_match_persisted_identifiers() {
-        assert_eq!(style_label(AppIconIdentifier::Standard), "standard");
-        assert_eq!(style_label(AppIconIdentifier::FacetedDuck), "faceted-duck");
-    }
-
-    #[test]
-    fn every_embedded_faceted_duck_size_decodes() {
+    fn every_embedded_personal_size_decodes() {
         for size in TRAY_ICON_SIZES {
-            let image = faceted_duck_tray_image(size)
-                .unwrap_or_else(|error| panic!("{size}px 内置几何鸭图标解码失败：{error}"));
+            let image = personal_tray_image(size)
+                .unwrap_or_else(|error| panic!("{size}px 内置个人版图标解码失败：{error}"));
             assert_eq!((image.width(), image.height()), (size, size));
         }
-        let window_icon = faceted_duck_window_image().expect("窗口尺寸的几何鸭图标必须可解码");
+        let window_icon = personal_window_image().expect("窗口尺寸的个人版图标必须可解码");
         assert_eq!((window_icon.width(), window_icon.height()), (256, 256));
-    }
-
-    #[test]
-    fn resolution_keeps_known_identifiers() {
-        assert_eq!(
-            resolve(AppIconIdentifier::FacetedDuck),
-            AppIconIdentifier::FacetedDuck
-        );
-        assert_eq!(
-            resolve(AppIconIdentifier::Standard),
-            AppIconIdentifier::Standard
-        );
     }
 
     /// 回归测试（2026-10-02 用户现场："任务栏没有跟随切换图标"）：

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import RegisteredAppsDialog from "./RegisteredAppsDialog.vue";
+import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import {
   actionSummary,
   mouseClickLabels, mouseMoveLabels, registerPresetAppNames,
@@ -14,6 +15,8 @@ import {
   type KeyCode,
   type PresetAppInfo,
   type RemoteButton,
+  learnFocusTarget, testAppFocus,
+  type AppFocusProfile, type FocusStrategy,
 } from "../lib/bridge";
 
 const props = defineProps<{
@@ -23,11 +26,14 @@ const props = defineProps<{
   presetApps: PresetAppInfo[];
   capabilityNote?: string | null;
   shortcutsOnly?: boolean;
+  savedMappings?: ButtonMappings;
+  busy?: boolean;
 }>();
 const emit = defineEmits<{
   update: [action: ButtonAction];
   status: [message: string];
   applications: [apps: AppLibraryEntry[]];
+  focusProfile: [target: string, profile: AppFocusProfile];
 }>();
 
 const capturingShortcut = ref(false);
@@ -38,16 +44,83 @@ const capturePressedKeys = new Set<KeyCode>();
 let capturedChord: KeyCode[] | null = null;
 let captureTimeout: number | null = null;
 let captureRequestId = 0;
+let capturePurpose: "action" | "focus_shortcut" = "action";
+let captureFocusTarget: string | null = null;
 let unmounted = false;
 let unlistenCapture: (() => void) | null = null;
 const statusMessage = ref<string | null>(null);
 watch(statusMessage, message => { if (message) emit("status", message); });
 const action = computed<ButtonAction>(() => props.mappings.actions[props.button]?.[props.trigger] ?? { type: "disabled" });
+const focusTarget = computed(() => !props.shortcutsOnly && action.value.type === "open_app" ? action.value.target : null);
+const focusProfile = computed(() => focusTarget.value ? props.mappings.focusProfiles?.[focusTarget.value] : undefined);
+const focusStrategy = computed(() => focusProfile.value?.strategy ?? "open_only");
+const learningFocus = ref(false);
+const testingFocus = ref(false);
+let focusRequest = 0;
+const focusDraftSaved = computed(() => {
+  const savedAction = props.savedMappings?.actions[props.button]?.[props.trigger];
+  return !!focusTarget.value && savedAction?.type === "open_app" && savedAction.target === focusTarget.value
+    && JSON.stringify(focusProfile.value) === JSON.stringify(props.savedMappings?.focusProfiles?.[focusTarget.value]);
+});
+const focusProfileComplete = computed(() => focusStrategy.value === "open_only"
+  || (focusStrategy.value === "app_shortcut" ? !!focusProfile.value?.shortcut?.keys.length : !!focusProfile.value?.recorded));
+function updateFocusProfile(profile: AppFocusProfile): void {
+  if (!focusTarget.value || props.busy) return;
+  emit("focusProfile", focusTarget.value, profile);
+  reportFrontendEvent({ event: "app_focus_profile", phase: "draft_changed", result: "passed", reason: profile.strategy });
+  statusMessage.value = "应用聚焦设置已修改；保存当前配置后生效";
+}
+function changeFocusStrategy(event: Event): void {
+  const strategy = (event.target as HTMLSelectElement).value as FocusStrategy;
+  const previous = focusProfile.value;
+  updateFocusProfile(strategy === "app_shortcut" && previous?.shortcut ? { strategy, shortcut: previous.shortcut }
+    : strategy === "recorded_element" && previous?.recorded ? { strategy, recorded: previous.recorded } : { strategy });
+}
+async function learnAppFocus(): Promise<void> {
+  const target = focusTarget.value;
+  if (!target || learningFocus.value || props.busy) return;
+  const request = ++focusRequest;
+  learningFocus.value = true;
+  statusMessage.value = "请在三秒内点击目标应用的输入框；只记录当前焦点的特征，不读取输入内容";
+  reportFrontendEvent({ event: "app_focus_learn", phase: "started", result: "unknown", reason: "explicit_request" });
+  try {
+    const recorded = await learnFocusTarget();
+    if (unmounted || request !== focusRequest || target !== focusTarget.value || focusStrategy.value !== "recorded_element") {
+      reportFrontendEvent({ event: "app_focus_learn", phase: "completed", result: "unknown", reason: "stale_result" });
+      return;
+    }
+    updateFocusProfile({ strategy: "recorded_element", recorded });
+    reportFrontendEvent({ event: "app_focus_learn", phase: "completed", result: "passed", reason: "target_recorded" });
+  } catch (error) {
+    if (!unmounted && request === focusRequest) statusMessage.value = `记录输入框失败：${String(error)}`;
+    reportFrontendEvent({ event: "app_focus_learn", phase: "completed", result: "failed", reason: "learning_failed" });
+  } finally { if (request === focusRequest) learningFocus.value = false; }
+}
+async function testSelectedAppFocus(): Promise<void> {
+  const target = focusTarget.value;
+  if (!target || !focusDraftSaved.value || !focusProfileComplete.value || props.busy || testingFocus.value) return;
+  const request = focusRequest;
+  testingFocus.value = true;
+  try {
+    await testAppFocus(target);
+    if (!unmounted && request === focusRequest) statusMessage.value = "已提交测试，请在目标应用确认效果";
+    reportFrontendEvent({ event: "app_focus_test", phase: "submitted", result: "unknown", reason: "explicit_request" });
+  } catch (error) {
+    if (!unmounted && request === focusRequest) statusMessage.value = `测试应用聚焦失败：${String(error)}`;
+    reportFrontendEvent({ event: "app_focus_test", phase: "completed", result: "failed", reason: "submission_failed" });
+  } finally { if (request === focusRequest) testingFocus.value = false; }
+}
+watch([focusTarget, focusStrategy], () => {
+  focusRequest += 1;
+  learningFocus.value = false;
+  testingFocus.value = false;
+  if (capturePurpose === "focus_shortcut" && (capturingShortcut.value || captureStarting.value)) void finishShortcutCapture("聚焦设置已切换，已取消录入");
+});
 const presetIds = computed(() => new Set(props.presetApps.map((app) => app.id)));
 const customApps = computed(() => {
   const found = new Map<string, string>((props.mappings.applications ?? []).map(app => [app.path, app.name]));
   for (const actions of Object.values(props.mappings.actions)) {
-    for (const mapped of Object.values(actions)) {
+    for (const mapped of [actions.single, actions.double, actions.long]) {
       if (mapped.type === "open_app" && !presetIds.value.has(mapped.target)) {
         const base = mapped.target.split(/[\\/]/).pop() ?? mapped.target;
         found.set(mapped.target, base.replace(/\.(exe|lnk)$/i, "") || base);
@@ -164,8 +237,11 @@ function toggleCaptureModifier(key: KeyCode): void {
   captureDisplay.value = [...selectedCaptureModifiers];
 }
 
-async function beginShortcutCapture(): Promise<void> {
+async function beginShortcutCapture(purpose: "action" | "focus_shortcut" = "action"): Promise<void> {
   if (capturingShortcut.value || captureStarting.value) return;
+  if (purpose === "focus_shortcut" && (!focusTarget.value || props.busy)) return;
+  capturePurpose = purpose;
+  captureFocusTarget = focusTarget.value;
   const requestId = ++captureRequestId;
   captureStarting.value = true;
   statusMessage.value = null;
@@ -256,7 +332,13 @@ function acceptCapturedKey(code: KeyCode, isPressed: boolean, repeat = false): v
   const keys = [...modifiers, code];
   capturedChord = keys;
   captureDisplay.value = keys;
-  apply({ type: "shortcut", chord: { keys } });
+  if (capturePurpose === "focus_shortcut") {
+    if (focusTarget.value !== captureFocusTarget || focusStrategy.value !== "app_shortcut") {
+      void finishShortcutCapture("聚焦设置已切换，已取消录入");
+      return;
+    }
+    updateFocusProfile({ strategy: "app_shortcut", shortcut: { keys } });
+  } else apply({ type: "shortcut", chord: { keys } });
   statusMessage.value = `已录入 ${chordLabel({ keys })}，松开全部按键后完成`;
 }
 
@@ -332,6 +414,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   unmounted = true;
+  focusRequest += 1;
   window.removeEventListener("keydown", handleCaptureKeydown, true);
   window.removeEventListener("keyup", handleCaptureKeyup, true);
   window.removeEventListener("blur", handleCaptureBlur);
@@ -440,6 +523,26 @@ onUnmounted(() => {
               :class="{ selected: (action.type === 'open_app' ? action.target : null) === app.path }"
               :title="app.name" @click="apply({ type: 'open_app', target: app.path })">{{ app.name }}</button>
           </div>
+          <div v-if="focusTarget" class="app-focus-editor">
+            <label>打开应用后
+              <select aria-label="应用聚焦方式" :value="focusStrategy" :disabled="busy || learningFocus || capturingShortcut || captureStarting" @change="changeFocusStrategy">
+                <option value="open_only">只打开应用</option>
+                <option value="app_shortcut">用应用快捷键聚焦</option>
+                <option value="recorded_element">聚焦已记录的输入框</option>
+              </select>
+            </label>
+            <template v-if="focusStrategy === 'app_shortcut'">
+              <p class="muted editor-note">{{ focusProfile?.shortcut ? chordLabel(focusProfile.shortcut) : '尚未录入应用的聚焦快捷键' }}</p>
+              <button class="chip" type="button" data-testid="capture-app-focus" :disabled="busy || captureStarting || capturingShortcut" @click="beginShortcutCapture('focus_shortcut')">录入应用聚焦快捷键</button>
+            </template>
+            <template v-if="focusStrategy === 'recorded_element'">
+              <p class="muted editor-note">{{ focusProfile?.recorded ? '已记录输入框特征' : '尚未记录输入框' }}；仅在执行此按键动作时定位，不持续扫描应用。</p>
+              <button class="chip" type="button" data-testid="learn-app-focus" :disabled="busy || learningFocus || capturingShortcut || captureStarting" @click="learnAppFocus">{{ learningFocus ? '请点击目标输入框…' : '记录输入框' }}</button>
+              <button v-if="focusProfile?.recorded" class="chip" type="button" :disabled="busy || learningFocus" @click="updateFocusProfile({ strategy: 'open_only' })">清除记录并只打开应用</button>
+            </template>
+            <button class="chip" type="button" data-testid="test-app-focus" :disabled="busy || !focusDraftSaved || !focusProfileComplete || learningFocus || testingFocus || capturingShortcut || captureStarting" @click="testSelectedAppFocus">测试已保存的应用聚焦设置</button>
+            <p v-if="!focusDraftSaved" class="muted editor-note">保存当前配置后可测试。</p>
+          </div>
         </section>
 
         <section class="action-section">
@@ -507,6 +610,8 @@ onUnmounted(() => {
 .app-library-search { max-width: 280px; margin: 8px 0; }
 .action-section { display: grid; gap: 8px; }
 .action-section h4 { margin: 0; }
+.app-focus-editor { display: grid; gap: 8px; margin-top: 8px; }
+.app-focus-editor label { display: flex; gap: 8px; align-items: center; }
 .preset-grid { display: flex; flex-wrap: wrap; gap: 8px; }
 .capture-display { margin-left: 10px; color: var(--text-secondary); }
 </style>

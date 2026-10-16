@@ -50,7 +50,9 @@
  *
  * 安全感（任何一条不满足就绝不写目标缓冲区）
  * ----------------------------------------
- *   1. IoControlCode == 0x80018483
+ *   1. 当前 WDF 请求的功能 PDO == Helper 从当前已启动节点读出的所选 PDO
+ *      （嵌套作用域与来源代次一致，来源不明绝不读取/改写报告）
+ *   2. IoControlCode == 0x80018483
  *   2. InBufferLength == 8 且 out 长度 >= 9
  *   3. OutputBuffer 非空 且 out[0] == 0x01（键盘报告）
  *   4. in[4] == 0x02 且 in[5] == 0x01（operation / selector）
@@ -91,7 +93,7 @@
    [AGENT-STALE]。没有它，"改了 agent 但宿主里跑的还是上一代"是完全静默的——
    握手正常、命令照发、日志漂亮，只有按键行为是旧的（2026-09-26 哨兵键那次
    就是这样白跑了一轮：以为在验新逻辑，其实接管的是旧实例）。 */
-var AGENT_BUILD = '2026-10-03.cleanup-instance';
+var AGENT_BUILD = '2026-10-10.request-source';
 
 var TARGET_IOCTL = 0x80018483;
 var TARGET_USAGES = [
@@ -156,6 +158,10 @@ var synthFrom = 0;
 var synthTo = 0;
 var gateDelayMs = 0;          /* 0 = 门未开启；>0 = 按下帧改写前先睡这么久 */
 var hookListener = null;
+var sourceListeners = [];
+var sourceContexts = {};
+var sourcePdo = '';
+var sourceGeneration = 0;
 var observedUsages = [];
 var physicalUsages = [];
 var blockedUsages = [];
@@ -234,6 +240,9 @@ var stat = {
   auth_rejected: 0,
   errors: 0
 };
+stat.source_selected = 0;
+stat.source_other = 0;
+stat.source_unknown = 0;
 
 var pressed = {};             /* 当前按下的目标 usage（绝对状态） */
 
@@ -392,6 +401,7 @@ function synthTrace(msg) {
 /* 清键许可：助手在 LEASE_MS 内续过约，且未被显式解除。 */
 function leaseOk() {
   if (disarmed || !connected) return false;
+  if (!sourcePdo || hookListener === null) return false;
   if (lastRenewAt === 0) return false;   /* 还没收到第一次续约 ⇒ 从未武装 */
   return (Date.now() - lastRenewAt) <= LEASE_MS;
 }
@@ -437,15 +447,16 @@ function handleCommand(line) {
   try { cmd = JSON.parse(line); } catch (e) {
     /* 2026-09-29 run7 观察：targets/synth 的 ack 四轮全缺而 renew 正常——
        必须区分「字节没到 / 到了但损坏 / 处理了但 ack 没回」。parse 失败不再静默。 */
-    logLine('cmd:parse_failed len=' + line.length + ' head=' + line.slice(0, 32));
+    logLine('cmd:parse_failed len=' + line.length);
     return;
   }
   if (!cmd || typeof cmd.type !== 'string') {
-    logLine('cmd:bad_shape head=' + String(line).slice(0, 32));
+    logLine('cmd:bad_shape');
     return;
   }
   /* 每条非 renew 下行都留痕：renew 500ms 一条太多，其余命令频次极低。 */
-  if (cmd.type !== 'renew') logLine('cmd:' + cmd.type);
+  if (cmd.type !== 'renew') logLine('cmd:' +
+    (['arm', 'disarm', 'bye', 'mode', 'restore', 'targets', 'gate', 'synth'].indexOf(cmd.type) >= 0 ? cmd.type : 'unknown'));
 
   /* 令牌校验：助手监听在 loopback，本地任意进程都能连上来冒充助手。
      带令牌时不匹配的命令一律忽略（尤其不能让伪造的 renew 把 agent 武装起来）。 */
@@ -455,6 +466,15 @@ function handleCommand(line) {
 
   if (cmd.type === 'renew') {
     if (stopPending) return;
+    // 身份只走已鉴权的私有通道，绝不进入日志。每次续约必须重新证明当前设备。
+    var pdo = typeof cmd.source_pdo === 'string' && cmd.source_pdo.length > 0
+      && cmd.source_pdo.length < 1024 && cmd.source_pdo.indexOf('\0') < 0 ? cmd.source_pdo : '';
+    if (pdo !== sourcePdo) {
+      sourcePdo = pdo; sourceGeneration++;
+      releaseEdges('source_changed'); emitObservation([]);
+      physicalUsages = []; blockedUsages = [];
+      logLine('source:binding generation=' + sourceGeneration + ' present=' + (pdo ? 1 : 0));
+    }
     if (lastRenewAt === 0) logLine('renew:first');           /* 首次续约 = 武装时刻 */
     lastRenewAt = Date.now();
     if (handshakeDone === false) handshakeDone = true;
@@ -576,8 +596,10 @@ function completeStop() {
     if (hookListener !== null) {
       hookListener.detach();
       hookListener = null;
-      Interceptor.flush();
     }
+    while (sourceListeners.length) { sourceListeners[0].detach(); sourceListeners.shift(); }
+    sourceContexts = {};
+    Interceptor.flush();
     detached = true;
   } catch (e) { logLine('stop:detach_failed'); }
   sendLine({ type: 'stopped', instance: agentInstance, stop_id: stopRequestId,
@@ -845,8 +867,72 @@ function writeReport(ptr, bytes) {
   }
 }
 
+/* 固定、已核验的 HidOverGatt / UMDF 2.15 绑定。Helper 先核对模块路径及散列。
+   每个完成请求同步读取 queue -> device -> PDO；不跨回调保留 WDF 对象/报告指针。
+   完成函数调用复制 IOCTL 时，仅此线程、此嵌套作用域携带来源证明。 */
+function installSourceHooks() {
+  if (sourceListeners.length === 2) return true;
+  try {
+    if (Process.arch !== 'x64' || Process.pointerSize !== 8) throw Error('architecture');
+    var host = Process.getModuleByName('Microsoft.Bluetooth.Profiles.HidOverGatt.dll');
+    var framework = Process.getModuleByName('WUDFx02000.dll');
+    var table = host.base.add(0x32dc0).readPointer();
+    var globals = host.base.add(0x32dc8).readPointer();
+    if (table.isNull() || globals.isNull()) throw Error('binding');
+    function address(slot) {
+      var p = table.add(slot * 8).readPointer();
+      var range = Process.findRangeByAddress(p);
+      if (p.compare(framework.base) < 0 || p.compare(framework.base.add(framework.size)) >= 0
+          || !range || range.protection.indexOf('x') < 0) throw Error('binding');
+      return p;
+    }
+    var queueOf = new NativeFunction(address(175), 'pointer', ['pointer', 'pointer']);
+    var deviceOf = new NativeFunction(address(90), 'pointer', ['pointer', 'pointer']);
+    var parameters = new NativeFunction(address(165), 'void', ['pointer', 'pointer', 'pointer']);
+    var property = new NativeFunction(address(31), 'int', ['pointer', 'pointer', 'uint', 'uint', 'pointer', 'pointer']);
+    function hooks() { return {
+      onEnter: function (args) {
+        this.parent = sourceContexts[this.threadId];
+        // 嵌套的其他请求必须遮住外层来源，属性查询中的 IOCTL 也没有报告来源。
+        sourceContexts[this.threadId] = null;
+        try {
+          if (!args[0].equals(globals) || args[2].toInt32() < 0) return;
+          var requestParams = Memory.alloc(40);
+          requestParams.writeByteArray(new Uint8Array(40)); requestParams.writeU16(40);
+          parameters(globals, args[1], requestParams);
+          var type = requestParams.add(4).readU32();
+          if ((type !== 14 && type !== 15) || requestParams.add(24).readU32() !== 0xb000b) return;
+          var queue = queueOf(globals, args[1]); if (queue.isNull()) return;
+          var device = deviceOf(globals, queue); if (device.isNull()) return;
+          var value = Memory.alloc(2048), required = Memory.alloc(4); required.writeU32(0);
+          if (property(globals, device, 11, 2048, value, required) !== 0) return;
+          var bytes = required.readU32();
+          if (bytes < 4 || bytes > 2048 || (bytes & 1)) return;
+          var chars = bytes / 2;
+          if (value.add((chars - 1) * 2).readU16() !== 0) return;
+          var pdo = value.readUtf16String(chars - 1);
+          if (!pdo || pdo.indexOf('\0') >= 0) return;
+          sourceContexts[this.threadId] = { pdo: pdo, generation: sourceGeneration };
+        } catch (_) { /* 不读、不改来源不明的报告。 */ }
+      },
+      onLeave: function () {
+        if (this.parent === undefined) delete sourceContexts[this.threadId];
+        else sourceContexts[this.threadId] = this.parent;
+      }
+    }; }
+    sourceListeners.push(Interceptor.attach(address(163), hooks()));
+    sourceListeners.push(Interceptor.attach(address(164), hooks()));
+    logLine('source:hooks_bound contract=umdf_2_15');
+    return true;
+  } catch (_) {
+    while (sourceListeners.length) { sourceListeners.pop().detach(); }
+    logLine('source:hooks_rejected'); return false;
+  }
+}
+
 function installHook() {
   if (hookListener !== null) return true;
+  if (!installSourceHooks()) return false;
   var ntdll = Process.getModuleByName('ntdll.dll');
   var fn = ntdll.getExportByName('NtDeviceIoControlFile');
   if (fn === null || fn.isNull()) {
@@ -860,6 +946,12 @@ function installHook() {
       try {
         stat.ioctl_calls++;
         if (args[5].toUInt32() !== TARGET_IOCTL) return;
+        var source = sourceContexts[this.threadId];
+        if (!source || !sourcePdo || source.generation !== sourceGeneration) {
+          stat.source_unknown++; return;
+        }
+        if (source.pdo !== sourcePdo) { stat.source_other++; return; }
+        stat.source_selected++;
 
         var inLen = args[7].toUInt32();
         var outLen = args[9].toUInt32();
@@ -926,7 +1018,8 @@ function installHook() {
           try {
             Thread.sleep(gateDelayMs / 1000);
             // 延迟期间配置/租约可能被撤销；迟到报告不得重新呈现合成按下。
-            if (!leaseOk() || synthFrom === 0) return;
+            if (!leaseOk() || synthFrom === 0 || source.generation !== sourceGeneration
+                || source.pdo !== sourcePdo) return;
             stat.gate_delays++;
             logLine('synth:gate delay_ms=' + gateDelayMs);
           } catch (e) {
@@ -1115,7 +1208,9 @@ function heartbeat() {
       lease_expired: stat.lease_expired,
       rx_timeouts: stat.rx_timeouts,
       auth_rejected: stat.auth_rejected,
-      errors: stat.errors
+      errors: stat.errors,
+      source_selected: stat.source_selected, source_other: stat.source_other,
+      source_unknown: stat.source_unknown
     }
   });
 }
@@ -1132,6 +1227,7 @@ rpc.exports = {
 
   logLine('agent:load build=' + AGENT_BUILD);
     var hookOk = installHook();
+    disarmed = !hookOk;
 
     var connectAttempt = connectOnce().then(function () { return 'connected'; })
       .catch(function (e) { return 'connect_failed:' + String(e).slice(0, 80); });

@@ -20,7 +20,7 @@ describe("driver guide", () => {
     expect(wrapper.text()).toContain("菜单和主页");
     await wrapper.findAll("button").find(button => button.text() === "扫描已配对遥控器")!.trigger("click");
     await flushPromises();
-    expect(wrapper.text()).toContain("Windows 已配对并被 SayAll 发现");
+    expect(wrapper.text()).toContain("Windows 已配对并被无线麦发现");
     expect(wrapper.text()).not.toContain("已完成连接");
   });
   it("keeps pairing guidance and Windows settings available after connection", async () => {

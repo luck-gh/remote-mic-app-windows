@@ -4,7 +4,7 @@ use sayall_windows::send_input::{
     ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, SendInputSnapshot,
 };
 use sayall_windows::{
-    AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformSnapshot,
+    AudioEndpoint, AudioSnapshot, ConnectionSnapshot, ImeStatus, PairedRemote, PlatformSnapshot,
     WindowsPlatform,
 };
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use tauri::{Emitter, Manager};
 mod accent;
 mod app_icon;
 mod diagnostics;
+mod onboarding;
 mod platform;
 mod rc003_task;
 mod settings;
@@ -24,7 +25,7 @@ mod updater;
 
 use diagnostics::DiagnosticReport;
 use platform::PlatformRuntime;
-use sayall_core::{AppIconIdentifier, ThemePreference, VoiceInputTool};
+use sayall_core::{ThemePreference, VoiceInputTool};
 use updater::{
     check_app_update, get_app_update_preferences, install_app_update, set_app_update_preferences,
 };
@@ -32,7 +33,7 @@ use updater::{
 #[derive(Default)]
 struct WebviewFailureState {
     reloaded: bool,
-    notified: bool,
+    gave_up: bool,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum WebviewFailureAction {
@@ -45,37 +46,86 @@ impl WebviewFailureState {
         if closing || !matches!(kind, 0..=2) {
             return WebviewFailureAction::Ignore;
         }
+        if self.gave_up {
+            return WebviewFailureAction::Ignore;
+        }
         if kind == 1 && !self.reloaded {
             self.reloaded = true;
             return WebviewFailureAction::Reload;
         }
-        if self.notified {
-            return WebviewFailureAction::Ignore;
-        }
-        self.notified = true;
+        self.gave_up = true;
         WebviewFailureAction::Notify
     }
 }
 
-#[cfg(windows)]
-fn report_webview_unavailable(app: &tauri::AppHandle) {
-    static NOTIFIED: AtomicBool = AtomicBool::new(false);
-    if NOTIFIED.swap(true, Ordering::AcqRel) {
-        return;
+/// 终止原因：记入日志，区分"哪一类失败导致不再重试"。
+fn terminal_reason(kind: i32) -> &'static str {
+    match kind {
+        0 => "browser_process_exited",
+        1 => "renderer_exited_after_reload",
+        2 => "renderer_unresponsive",
+        _ => "other",
     }
-    // Native window/tray and a separate native dialog remain usable after the
-    // browser process dies. No JS/IPC or audio worker is needed for this hint.
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_title("无线麦 — 界面已停止，请通过托盘正常退出后重开");
+}
+
+/// 界面提示（窗口标题）的判定结果。
+#[derive(Debug, PartialEq, Eq)]
+enum UiHintDecision {
+    /// 宽限期内页面没有报到：界面确实没有回来，写提示。
+    Show,
+    /// 页面报到过：界面已经回来，不写。
+    SkipPageAlive,
+    /// 应用已在退出收尾：不写。
+    SkipExiting,
+}
+
+/// 是否该把"界面未能正常显示"写进窗口标题（2026-10-07）。
+///
+/// 判据是**页面是否报到**——前端每秒一次 `get_runtime_snapshot` 轮询就是心跳，
+/// 不是 `Reload` 的返回值：WebView2 对渲染进程失败会自行尝试恢复，
+/// 接口报错时页面可能已经好了，接口被接受时页面也可能再没回来。
+fn ui_hint_decision(baseline_ms: u64, latest_ms: u64, closing: bool) -> UiHintDecision {
+    if latest_ms > baseline_ms {
+        return UiHintDecision::SkipPageAlive;
     }
-    if let Some(tray) = app.tray_by_id("sayall-tray") {
-        let _ = tray.set_tooltip(Some("无线麦界面已停止；请通过托盘退出后重新打开"));
+    if closing {
+        return UiHintDecision::SkipExiting;
     }
-    let _ = std::thread::Builder::new().name("sayall-webview-error".into()).spawn(|| unsafe {
-        use windows::core::w;
-        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONERROR};
-        MessageBoxW(None, w!("无线麦的界面进程已停止，当前无法恢复显示。请通过系统托盘正常退出无线麦，再重新打开。后台语音状态不由此消息判定；请勿强行结束进程。"), w!("无线麦界面异常"), MB_OK | MB_ICONERROR);
-    });
+    UiHintDecision::Show
+}
+
+/// 界面提示状态：只排定一次判定；写入时记住原标题，供页面回来时恢复。
+#[derive(Debug, Default)]
+struct WebviewUiHintState {
+    scheduled: bool,
+    showing: Option<String>,
+}
+
+impl WebviewUiHintState {
+    /// 排定一次判定；已排定或已在显示时返回 false（幂等）。
+    fn schedule(&mut self) -> bool {
+        if self.scheduled || self.showing.is_some() {
+            return false;
+        }
+        self.scheduled = true;
+        true
+    }
+
+    /// 记下"提示已写入"并保存原标题；重复调用返回 false。
+    fn mark_showing(&mut self, previous_title: String) -> bool {
+        if self.showing.is_some() {
+            return false;
+        }
+        self.scheduled = false;
+        self.showing = Some(previous_title);
+        true
+    }
+
+    /// 取出要恢复的标题并收起提示；没有提示时返回 None。
+    fn take_for_restore(&mut self) -> Option<String> {
+        self.scheduled = false;
+        self.showing.take()
+    }
 }
 
 #[cfg(windows)]
@@ -119,10 +169,21 @@ fn observe_webview_failure(window: &tauri::WebviewWindow) {
                         let result = core.Reload();
                         let code = result.as_ref().err().map(|e| e.code().0).unwrap_or(0);
                         sayall_windows::gatt_note(format!("webview event=recovery role={role} phase=submitted action=reload result={} code={code} attempt=1", if result.is_ok() { "accepted" } else { "failed" }));
-                        if result.is_err() { failures.notified = true; report_webview_unavailable(&app); }
+                        // 重载失败即进入终态：等待下一次事件只会得到同样的结果，
+                        // 反复重试在界面已经停止时没有收益。
+                        if result.is_err() { failures.gave_up = true; }
+                        // 提交过重载也要判定页面是否真的回来：接口被接受而页面
+                        // 再没回来时不会有第二次事件，只看终态会漏掉这种静默失败。
+                        schedule_ui_hint(&app, if result.is_ok() { "reload_submitted" } else { "reload_failed" });
+                    } else {
+                        sayall_windows::gatt_note(format!("webview event=recovery role={role} phase=completed action=reload result=failed reason=missing_sender attempt=1"));
+                        failures.gave_up = true;
+                        schedule_ui_hint(&app, "reload_missing_sender");
                     }
                 }
-                WebviewFailureAction::Notify => report_webview_unavailable(&app),
+                // 终止决策本身（action=Notify）已随上面的 process_failed 行落盘；
+                // 这里只排定"界面是否真的回来"的判定（页面报到就不写提示）。
+                WebviewFailureAction::Notify => schedule_ui_hint(&app, terminal_reason(kind.0)),
                 WebviewFailureAction::Ignore => {}
             }
             Ok(())
@@ -158,6 +219,187 @@ fn application_startup_settings(
                 rc003_capture_enabled: false,
                 ..Default::default()
             }
+        }
+    }
+}
+
+/// 界面未能正常显示时写进窗口标题的文案（2026-10-07 定稿，见 docs/product-copy.md）。
+/// 放在 Rust 是因为界面已经不工作时它也必须能显示，与托盘菜单文案同理。
+#[cfg(windows)]
+const WEBVIEW_UNAVAILABLE_TITLE: &str = "无线麦 · 个人版界面未能正常显示，请从托盘退出后重开";
+
+/// 判定宽限期：前端每秒报到一次，连续 5 秒没有信号才认定界面没有回来。
+/// 窗口收进托盘时 WebView 会把定时器节流，可能误判为"没回来"；页面一旦恢复
+/// 报到（窗口重新显示后最多一个轮询周期）就恢复原标题并落 `result=cleared`。
+#[cfg(windows)]
+const UI_HINT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 前端最后一次报到的时刻（毫秒）；0 表示本次进程内还没有过报到。
+#[cfg(windows)]
+static LAST_FRONTEND_SIGNAL_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
+static WEBVIEW_UI_HINT: std::sync::Mutex<WebviewUiHintState> =
+    std::sync::Mutex::new(WebviewUiHintState {
+        scheduled: false,
+        showing: None,
+    });
+
+#[cfg(windows)]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn with_ui_hint<R>(apply: impl FnOnce(&mut WebviewUiHintState) -> R) -> R {
+    let mut state = WEBVIEW_UI_HINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    apply(&mut state)
+}
+
+#[cfg(windows)]
+fn signal_age_field(baseline: u64) -> String {
+    if baseline == 0 {
+        "none".to_owned()
+    } else {
+        now_ms().saturating_sub(baseline).to_string()
+    }
+}
+
+/// 页面报到（每次 `get_runtime_snapshot` 调用）：刷新"页面还活着"的时间戳，
+/// 并把已写出的界面提示恢复成原标题。
+#[cfg(windows)]
+fn note_frontend_signal(app: &tauri::AppHandle) {
+    LAST_FRONTEND_SIGNAL_MS.store(now_ms(), Ordering::Release);
+    let Some(previous) = with_ui_hint(WebviewUiHintState::take_for_restore) else {
+        return;
+    };
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(window) = handle.get_webview_window("main") else {
+            sayall_windows::gatt_note(
+                "webview event=ui_hint phase=completed action=title result=restore_skipped reason=window_missing".to_owned(),
+            );
+            return;
+        };
+        match window.set_title(&previous) {
+            Ok(()) => sayall_windows::gatt_note(
+                "webview event=ui_hint phase=completed action=title result=cleared reason=page_alive".to_owned(),
+            ),
+            Err(_) => sayall_windows::gatt_note(
+                "webview event=ui_hint phase=completed action=title result=restore_failed reason=set_title_rejected".to_owned(),
+            ),
+        }
+    });
+}
+
+/// 排定一次界面提示判定（幂等）。`reason` 记入日志，便于定位是哪类失败触发的。
+#[cfg(windows)]
+fn schedule_ui_hint(app: &tauri::AppHandle, reason: &'static str) {
+    if !with_ui_hint(WebviewUiHintState::schedule) {
+        sayall_windows::gatt_note(format!(
+            "webview event=ui_hint phase=completed action=title result=skipped reason=already_scheduled reason_detail={reason}"
+        ));
+        return;
+    }
+    let baseline = LAST_FRONTEND_SIGNAL_MS.load(Ordering::Acquire);
+    sayall_windows::gatt_note(format!(
+        "webview event=ui_hint phase=started action=title reason={reason} grace_ms={} signal_age_ms={}",
+        UI_HINT_GRACE.as_millis(),
+        signal_age_field(baseline)
+    ));
+    let handle = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("sayall-webview-hint".into())
+        .spawn(move || {
+            std::thread::sleep(UI_HINT_GRACE);
+            resolve_ui_hint(&handle, baseline, reason);
+        });
+    if spawned.is_err() {
+        with_ui_hint(WebviewUiHintState::take_for_restore);
+        sayall_windows::gatt_note(
+            "webview event=ui_hint phase=completed action=title result=failed reason=thread_spawn_failed"
+                .to_owned(),
+        );
+    }
+}
+
+/// 宽限期结束后的判定：页面报到过就不写、退出收尾中不写，否则把提示写进窗口标题。
+#[cfg(windows)]
+fn resolve_ui_hint(app: &tauri::AppHandle, baseline: u64, reason: &'static str) {
+    let latest = LAST_FRONTEND_SIGNAL_MS.load(Ordering::Acquire);
+    let closing = app
+        .try_state::<AppState>()
+        .is_some_and(|s| s.exit_cleanup.0.exit_attempt.load(Ordering::Acquire) != 0);
+    match ui_hint_decision(baseline, latest, closing) {
+        UiHintDecision::SkipPageAlive => {
+            with_ui_hint(WebviewUiHintState::take_for_restore);
+            sayall_windows::gatt_note(format!(
+                "webview event=ui_hint phase=completed action=title result=skipped reason=page_alive reason_detail={reason} signal_delta_ms={}",
+                latest.saturating_sub(baseline)
+            ));
+        }
+        UiHintDecision::SkipExiting => {
+            with_ui_hint(WebviewUiHintState::take_for_restore);
+            sayall_windows::gatt_note(format!(
+                "webview event=ui_hint phase=completed action=title result=skipped reason=app_exiting reason_detail={reason}"
+            ));
+        }
+        UiHintDecision::Show => {
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                // 主线程上再判一次：宽限期内到达、尚未被消费的信号不能漏判。
+                let latest = LAST_FRONTEND_SIGNAL_MS.load(Ordering::Acquire);
+                if latest > baseline {
+                    with_ui_hint(WebviewUiHintState::take_for_restore);
+                    sayall_windows::gatt_note(format!(
+                        "webview event=ui_hint phase=completed action=title result=skipped reason=page_alive_at_write reason_detail={reason}"
+                    ));
+                    return;
+                }
+                if handle.try_state::<AppState>().is_some_and(|s| s.exit_cleanup.0.exit_attempt.load(Ordering::Acquire) != 0) {
+                    with_ui_hint(WebviewUiHintState::take_for_restore);
+                    sayall_windows::gatt_note(format!(
+                        "webview event=ui_hint phase=completed action=title result=skipped reason=app_exiting_at_write reason_detail={reason}"
+                    ));
+                    return;
+                }
+                let Some(window) = handle.get_webview_window("main") else {
+                    with_ui_hint(WebviewUiHintState::take_for_restore);
+                    sayall_windows::gatt_note(format!(
+                        "webview event=ui_hint phase=completed action=title result=skipped reason=window_missing reason_detail={reason}"
+                    ));
+                    return;
+                };
+                let previous_title = window.title().unwrap_or_default();
+                let window_visible = window.is_visible().unwrap_or(true);
+                // 读不到原标题就不写：宁可没有提示，也不能写下一个无法恢复的标题。
+                if previous_title.is_empty() {
+                    with_ui_hint(WebviewUiHintState::take_for_restore);
+                    sayall_windows::gatt_note(format!(
+                        "webview event=ui_hint phase=completed action=title result=skipped reason=title_unreadable reason_detail={reason}"
+                    ));
+                    return;
+                }
+                if !with_ui_hint(|state| state.mark_showing(previous_title)) {
+                    return;
+                }
+                match window.set_title(WEBVIEW_UNAVAILABLE_TITLE) {
+                    Ok(()) => sayall_windows::gatt_note(format!(
+                        "webview event=ui_hint phase=completed action=title result=written reason={reason} window_visible={window_visible} signal_age_ms={}",
+                        signal_age_field(baseline)
+                    )),
+                    Err(_) => {
+                        with_ui_hint(WebviewUiHintState::take_for_restore);
+                        sayall_windows::gatt_note(format!(
+                            "webview event=ui_hint phase=completed action=title result=failed reason=set_title_rejected reason_detail={reason}"
+                        ));
+                    }
+                }
+            });
         }
     }
 }
@@ -199,42 +441,87 @@ async fn list_capture_inputs(
 async fn set_capture_input(
     state: tauri::State<'_, AppState>,
     config: sayall_core::CaptureInputSettings,
+    writer_endpoint_id: Option<String>,
 ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
     let platform = state.platform.clone();
     let settings = state.settings.clone();
     let operation = state.capture_config_operation.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        capture_config_transaction(&operation, platform.as_ref(), config, |value, audio| {
-            settings.save_capture_audio(value, audio)
-        })
+        capture_audio_config_transaction(
+            &operation,
+            platform.as_ref(),
+            config,
+            writer_endpoint_id,
+            |value, audio| settings.save_capture_audio(value, audio),
+        )
     })
     .await
     .map_err(|_| "输入设备设置任务失败".to_owned())?
 }
+#[cfg(test)]
 fn capture_config_transaction(
     operation: &Mutex<()>,
     platform: &dyn PlatformRuntime,
     config: sayall_core::CaptureInputSettings,
     persist: impl FnOnce(sayall_core::CaptureInputSettings, AudioSnapshot) -> Result<(), String>,
 ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+    capture_audio_config_transaction(operation, platform, config, None, persist)
+}
+
+fn capture_audio_config_transaction(
+    operation: &Mutex<()>,
+    platform: &dyn PlatformRuntime,
+    config: sayall_core::CaptureInputSettings,
+    writer_endpoint_id: Option<String>,
+    persist: impl FnOnce(sayall_core::CaptureInputSettings, AudioSnapshot) -> Result<(), String>,
+) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
     let _operation = operation.lock().unwrap_or_else(|e| e.into_inner());
     let previous = platform.capture_input_snapshot().settings;
     let previous_audio = platform.audio_snapshot();
+    let explicit_writer = writer_endpoint_id
+        .map(|id| {
+            platform
+                .list_audio_endpoints()
+                .map_err(|_| "无法读取声音写入设备".to_owned())?
+                .into_iter()
+                .find(|endpoint| endpoint.id == id)
+                .ok_or_else(|| "所选声音写入设备当前不可用".to_owned())
+        })
+        .transpose()?;
+    let preferred = explicit_writer
+        .as_ref()
+        .map(|endpoint| AudioSnapshot {
+            selected_endpoint_id: Some(endpoint.id.clone()),
+            selected_endpoint_name: Some(endpoint.name.clone()),
+            ..Default::default()
+        })
+        .unwrap_or_else(|| previous_audio.clone());
     // Pair from a fresh inventory before changing either side. The toggle controls
     // default-microphone switching only; a selected cable still needs its write end.
     let disable_only = previous.enabled
         && !config.enabled
         && config.endpoint_id == previous.endpoint_id
         && config.endpoint_name == previous.endpoint_name;
-    let paired = if disable_only {
+    let paired = if disable_only && explicit_writer.is_none() {
         None
     } else {
-        platform.resolve_audio_pair(&config, &previous_audio)?
+        platform.resolve_audio_pair(&config, &preferred)?
     };
+    if let Some(writer) = explicit_writer {
+        if paired
+            .as_ref()
+            .is_none_or(|endpoint| endpoint.id != writer.id || endpoint.name != writer.name)
+        {
+            sayall_windows::gatt_note(
+                "audio_route action=config_pair result=failed reason=render_mismatch".into(),
+            );
+            return Err("所选写入端与目标麦克风不属于同一条音频线".into());
+        }
+    }
     match platform.configure_capture_input(config.clone()) {
         Ok(_) => {}
         Err(error) => {
-            let rollback = platform.configure_capture_input(previous);
+            let rollback = platform.restore_capture_input_configuration(previous);
             sayall_windows::gatt_note(format!(
                 "capture_input action=config_apply result=failed rollback_ok={}",
                 rollback.is_ok()
@@ -244,7 +531,7 @@ fn capture_config_transaction(
     };
     if let Some(endpoint) = paired {
         if let Err(error) = apply_audio_endpoint(platform, endpoint) {
-            let rollback_capture = platform.configure_capture_input(previous);
+            let rollback_capture = platform.restore_capture_input_configuration(previous);
             let rollback_audio = restore_audio_selection(platform, previous_audio);
             sayall_windows::gatt_note(format!(
                 "audio_route action=apply result=failed rollback_capture_ok={} rollback_audio_ok={}",
@@ -254,7 +541,7 @@ fn capture_config_transaction(
         }
     }
     if persist(config, platform.audio_snapshot()).is_err() {
-        let rollback = platform.configure_capture_input(previous);
+        let rollback = platform.restore_capture_input_configuration(previous);
         let rollback_audio = restore_audio_selection(platform, previous_audio);
         sayall_windows::gatt_note(format!(
             "capture_input action=config_persist result=failed rollback_ok={} rollback_audio_ok={}",
@@ -263,6 +550,7 @@ fn capture_config_transaction(
         ));
         return Err("保存输入设备设置失败，请重新检查设置".to_owned());
     }
+    sayall_windows::gatt_note("audio_route action=config_persist result=passed".into());
     Ok(platform.capture_input_snapshot())
 }
 
@@ -350,6 +638,7 @@ async fn resolve_capture_recovery(
 
 struct AppState {
     capture_config_operation: Arc<Mutex<()>>,
+    onboarding_operation: Arc<Mutex<()>>,
     platform: Arc<dyn PlatformRuntime>,
     exit_cleanup: ExitCleanup,
     settings: SettingsStore,
@@ -554,6 +843,7 @@ impl ExitCleanup {
             "app_shutdown stage=input_quiesce phase=started terminal_result=pending".to_owned(),
         );
         let input_result = self.0.platform.quiesce_input();
+        sayall_windows::key_host::shutdown_global();
         failures += u8::from(input_result.is_err());
         sayall_windows::gatt_note(format!(
             "app_shutdown stage=input_quiesce phase=completed terminal_result={} error_code={} took_ms={}",
@@ -712,9 +1002,16 @@ async fn get_system_accent_color() -> Option<accent::AccentColor> {
 
 #[tauri::command]
 fn get_runtime_snapshot(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> RuntimeSnapshot {
+    // 前端每秒轮询一次：这是"页面还活着"的唯一权威信号，
+    // 也是界面提示（窗口标题）写出与恢复的判据。
+    #[cfg(windows)]
+    if window.label() == "main" {
+        note_frontend_signal(&app);
+    }
     RuntimeSnapshot {
         // 版本统一取 package_info（tauri.conf.json 的 version，与安装包/更新器
         // 比较同源）。此前用编译期 CARGO_PKG_VERSION（Cargo.toml），两者在
@@ -726,24 +1023,45 @@ fn get_runtime_snapshot(
 }
 
 #[tauri::command]
-fn get_diagnostic_report(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> DiagnosticReport {
-    let platform = state.platform.snapshot();
-    let send_input = state.platform.send_input_snapshot();
-    DiagnosticReport::capture(
-        &app.package_info().version.to_string(),
-        &platform,
-        &send_input,
-    )
+async fn get_diagnostic_report(app: tauri::AppHandle) -> DiagnosticReport {
+    // 参数只留 `AppHandle`（owned）：Tauri 的 async 命令若含引用参数必须返回
+    // `Result`，而这份报告的 IPC 形状要保持"直接是报告对象"（前端 `invoke<T>`）。
+    let (platform, send_input, settings) = {
+        let state = app.state::<AppState>();
+        (
+            state.platform.snapshot(),
+            state.platform.send_input_snapshot(),
+            state.settings.clone(),
+        )
+    };
+    let app_version = app.package_info().version.to_string();
+    // 输入法状态是实时读回（TSF 查询有界但最坏 500ms）：整份报告放阻塞线程池，
+    // 不占主线程（Tauri 的同步命令跑在主线程）。
+    let platform_for_task = platform.clone();
+    let send_input_for_task = send_input.clone();
+    let app_version_for_task = app_version.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let tool = load_voice_input_tool(&settings);
+        DiagnosticReport::capture(
+            &app_version_for_task,
+            &platform_for_task,
+            &send_input_for_task,
+            tool,
+        )
+    })
+    .await
+    {
+        Ok(report) => report,
+        // 任务失败（线程池/panic）不能吞掉整份诊断：退回"输入法不可用"的一次采集。
+        Err(_) => DiagnosticReport::capture(&app_version, &platform, &send_input, None),
+    }
 }
 
 /// 在系统文件资源管理器里打开诊断日志目录（关于页"打开日志目录"入口）。
 ///
 /// 路径来自日志初始化的**实际**落盘路径，不接受前端传入：否则等于把"用
 /// ShellExecuteW 打开任意路径"的能力交给 WebView，与本仓库 capabilities 的
-/// 最小权限设计（opener 只放行 VB-CABLE 官网、产品官网与源码仓库三个固定
+/// 最小权限设计（opener 只放行仍需使用的第三方工具公开入口，固定
 /// URL，见 capabilities/default.json）直接冲突。
 ///
 /// 目录不存在时先创建：日志初始化理论上已建好父目录（`create_dir_all`），
@@ -771,6 +1089,81 @@ fn open_log_directory() -> Result<String, String> {
             );
             Err(format!("无法打开日志目录：{error}"))
         }
+    }
+}
+
+/// 向导入口用到的固定 Windows 设置页（2026-10-04，设计稿 §4.2）。
+///
+/// URI 全部在本仓库代码里固定映射；前端只能传枚举值，不接受任意 URI。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WindowsSettingsSection {
+    Bluetooth,
+    Sound,
+    Microphone,
+}
+
+fn windows_settings_uri(section: WindowsSettingsSection) -> &'static str {
+    match section {
+        WindowsSettingsSection::Bluetooth => "ms-settings:bluetooth",
+        WindowsSettingsSection::Sound => "ms-settings:sound",
+        WindowsSettingsSection::Microphone => "ms-settings:privacy-microphone",
+    }
+}
+
+fn windows_settings_section_name(section: WindowsSettingsSection) -> &'static str {
+    match section {
+        WindowsSettingsSection::Bluetooth => "bluetooth",
+        WindowsSettingsSection::Sound => "sound",
+        WindowsSettingsSection::Microphone => "microphone",
+    }
+}
+
+/// 打开固定的 Windows 设置页（向导第②步「打开蓝牙设置」等入口）。
+#[tauri::command]
+fn open_windows_settings(section: WindowsSettingsSection) -> Result<(), String> {
+    let name = windows_settings_section_name(section);
+    match sayall_windows::app_launcher::open_uri(windows_settings_uri(section)) {
+        Ok(()) => {
+            sayall_windows::gatt_note(format!(
+                "system_settings action=open phase=completed terminal_result=passed section={name}"
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            sayall_windows::gatt_note(format!(
+                "system_settings action=open phase=completed terminal_result=failed section={name} error_domain=shell error_code=open_failed retryable=true"
+            ));
+            Err(format!("无法打开系统设置：{error}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod windows_settings_tests {
+    use super::*;
+
+    #[test]
+    fn maps_sections_to_fixed_ms_settings_uris() {
+        assert_eq!(
+            windows_settings_uri(WindowsSettingsSection::Bluetooth),
+            "ms-settings:bluetooth"
+        );
+        assert_eq!(
+            windows_settings_uri(WindowsSettingsSection::Sound),
+            "ms-settings:sound"
+        );
+        assert_eq!(
+            windows_settings_uri(WindowsSettingsSection::Microphone),
+            "ms-settings:privacy-microphone"
+        );
+    }
+
+    #[test]
+    fn deserializes_only_known_sections() {
+        let bluetooth: WindowsSettingsSection = serde_json::from_str("\"bluetooth\"").unwrap();
+        assert_eq!(bluetooth, WindowsSettingsSection::Bluetooth);
+        assert!(serde_json::from_str::<WindowsSettingsSection>("\"camera\"").is_err());
     }
 }
 
@@ -805,25 +1198,6 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
         started.elapsed().as_millis()
     ));
     result
-}
-
-/// 设置页「应用图标」的当前选择（默认内置应用图标）。
-#[tauri::command]
-fn get_app_icon(state: tauri::State<'_, AppState>) -> Result<AppIconIdentifier, String> {
-    state.settings.load().map(|settings| settings.app_icon)
-}
-
-/// 切换应用图标：先落盘，再应用到主窗口（任务栏 / Alt-Tab）与托盘图标；
-/// 认不出的 ID 与资产缺失都在应用层回落 `standard` 并落日志。
-#[tauri::command]
-fn set_app_icon(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    identifier: AppIconIdentifier,
-) -> Result<AppIconIdentifier, String> {
-    state.settings.save_app_icon(identifier)?;
-    let applied = app_icon::apply(&app, identifier);
-    Ok(applied)
 }
 
 #[tauri::command]
@@ -1284,6 +1658,40 @@ impl Drop for Rc003ControlOperation<'_> {
     }
 }
 
+/// 全按键支持在本机的可用性：原生架构（x64 / arm64）与对应载荷是否存在。
+///
+/// 界面据此在"本机根本用不了"时置灰开关并说明原因，而不是让用户打开后永远停在
+/// 「正在启动」（Issue #206：ARM64 上的 x64 助手必然注入失败）。
+///
+/// 仿真构建恒返回"可用"：仿真跑在开发机 / CI 上，那里未必有助手的 release 产物，
+/// 若按真实探测置灰，会把既有的全按键支持界面回归流程一起锁死。可用性判定本身
+/// （两种不可用原因）由 `rc003_task` 的纯函数单测覆盖。
+#[tauri::command]
+fn get_capture_support() -> rc003_task::CaptureSupport {
+    #[cfg(feature = "runtime-simulation")]
+    {
+        rc003_task::CaptureSupport {
+            native_arch: "x64".to_string(),
+            helper_expected: "sayall-helper.exe".to_string(),
+            available: true,
+            reason: None,
+        }
+    }
+    #[cfg(not(feature = "runtime-simulation"))]
+    {
+        rc003_task::capture_support()
+    }
+}
+
+/// 助手经计划任务拉起时会在用户会话里短暂创建窗口（旧版：控制台黑框），
+/// 这个创建动作会把前台焦点从主程序抢走——窗口随即消失，焦点落在「无」上，
+/// 用户感觉"程序没反应了"。延迟把焦点还给主窗口即可；延迟要留足助手启动时间。
+///
+/// 2026-10-04 起助手是 **GUI 子系统**程序（计划任务 / 提权拉起都不创建任何窗口，
+/// 见 `hardware/RC003/helper/src/main.rs` 的 `bootstrap_console`），本兜底理论上
+/// 已无对象可还——保留是因为：升级过渡期可能仍拉起旧版控制台助手，且"抢焦点"
+/// 若来自其它环节，这里是廉价保险。真实机器验证「打开开关全程无焦点扰动」后
+/// 可以连同本注释一起删除。
 fn refocus_main_window_soon(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(900));
@@ -1299,6 +1707,117 @@ fn refocus_main_window_soon(app: tauri::AppHandle) {
     });
 }
 
+/// 把主窗口从「最小化 / 收进托盘」恢复到可见并尝试置前（2026-10-03 用户报障：
+/// 「主窗口最小化到任务栏后，点击托盘图标或者双击快捷键（快捷方式）无法打开」）。
+/// 托盘点击 / 托盘菜单 / 第二个实例的显示请求共用这一个入口。
+///
+/// 为什么不能只调 `show()` + `set_focus()`（tao 0.35.3 源码 + 本机最小实验）：
+/// - `show()` 只改 tao 的可见性 flag，且仅在 flag 有差异时才动 Win32
+///   （`window_state.rs` 的 `apply_diff` 在 diff 为空时直接返回）；最小化窗口
+///   仍处于「可见」状态、没有 diff，因此这个调用是空操作；
+/// - `set_focus()` 要求缓存 `!MINIMIZED`（`window.rs::set_focus` 只在
+///   `is_visible && !is_minimized` 时置前），最小化时被整个跳过。
+///   于是「最小化后点托盘」整条链没有任何一次调用真正到达 Win32。
+/// 恢复最小化必须走 `unminimize()`（tao → `ShowWindow(SW_RESTORE)`）；本机实测
+/// `SW_SHOW` 不能恢复最小化窗口（iconic 保持 true），`SW_RESTORE` 可以。
+///
+/// `trigger` 只用于日志（tray_click / tray_menu / second_instance）。结束时用
+/// Win32 读回真实状态落日志：后台线程调用时 unminimize/show 的消息要经事件
+/// 循环落地，读回给 6 × 100 ms 有界复核（已就绪时首轮直接返回，不等待）。
+/// 前台是否抢到单独记 `foreground_after`（tao 的 set_focus 已含 Alt 边沿解锁
+/// 重试），它不影响可见性判定。
+#[cfg(windows)]
+fn show_main_window(app: &tauri::AppHandle, trigger: &str) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, IsIconic, IsWindowVisible, ShowWindow, SW_RESTORE,
+    };
+
+    let Some(window) = app.get_webview_window("main") else {
+        sayall_windows::gatt_note(format!(
+            "app_lifecycle event=show_main_window trigger={trigger} phase=completed terminal_result=failed reason=window_missing retryable=false"
+        ));
+        return;
+    };
+    // Tauri 自带的是 windows 0.61 的 HWND（tao 依赖），本 crate 用 0.62；
+    // 跨版本只传裸句柄值（与 `app_icon::window_icons` 相同做法）。
+    let hwnd = window
+        .hwnd()
+        .ok()
+        .map(|hwnd| HWND(hwnd.0 as *mut core::ffi::c_void));
+    let minimized_before = window.is_minimized().unwrap_or(false);
+    let iconic_before = hwnd.map(|hwnd| unsafe { IsIconic(hwnd).as_bool() });
+    let visible_before = hwnd.map(|hwnd| unsafe { IsWindowVisible(hwnd).as_bool() });
+    sayall_windows::gatt_note(format!(
+        "app_lifecycle event=show_main_window trigger={trigger} phase=requested actual_foreground={}",
+        overlay_is_foreground(&window)
+    ));
+
+    if minimized_before || iconic_before == Some(true) {
+        let _ = window.unminimize();
+    }
+    // tao 只在 flag 有差异时动作：缓存与实际漂移（缓存报"未最小化"、实际仍
+    // iconic）时上一步是空操作，这里按 Win32 真实状态补一次恢复。
+    if let Some(hwnd) = hwnd {
+        if unsafe { IsIconic(hwnd).as_bool() } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    // 有界复核：读回 Win32 真实状态（恢复可见是功能判据；前台只是诊断字段）。
+    // 前台切换可能异步完成（app_launcher 的同款已知现象）：窗口已恢复可见后，
+    // 再给前台最多约 2 × 100 ms 的观察窗口；前台一直没来也照常结束，不阻塞。
+    let mut iconic_after = None;
+    let mut visible_after = None;
+    let mut foreground_after = None;
+    if let Some(hwnd) = hwnd {
+        for attempt in 0..6u8 {
+            iconic_after = Some(unsafe { IsIconic(hwnd).as_bool() });
+            visible_after = Some(unsafe { IsWindowVisible(hwnd).as_bool() });
+            foreground_after = Some(unsafe { GetForegroundWindow() == hwnd });
+            let restored = iconic_after == Some(false) && visible_after == Some(true);
+            if restored && (foreground_after == Some(true) || attempt >= 2) {
+                break;
+            }
+            if attempt < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    } else {
+        iconic_after = Some(window.is_minimized().unwrap_or(false));
+        visible_after = Some(window.is_visible().unwrap_or(true));
+    }
+
+    let minimized_after = iconic_after.unwrap_or(minimized_before);
+    let visible_after_value = visible_after.unwrap_or(!minimized_after);
+    let (terminal_result, reason) = if minimized_after {
+        ("failed", "still_minimized")
+    } else if !visible_after_value {
+        ("failed", "still_hidden")
+    } else {
+        ("passed", "none")
+    };
+    let flag = |value: Option<bool>| match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    sayall_windows::gatt_note(format!(
+        "app_lifecycle event=show_main_window trigger={trigger} phase=completed terminal_result={terminal_result} reason={reason} minimized_before={minimized_before} iconic_before={} visible_before={} iconic_after={} visible_after={} foreground_after={}",
+        flag(iconic_before),
+        flag(visible_before),
+        flag(iconic_after),
+        flag(visible_after),
+        flag(foreground_after),
+    ));
+}
+
+/// 开关打开：**每次都重新授权**（弹一次 UAC 重新注册任务），然后触发助手。
+/// 2026-10-03 Andy 定稿：每次开启都重新弹窗 + 重新授权（见 rc003_task）。
 #[tauri::command]
 async fn enable_rc003_capture(
     state: tauri::State<'_, AppState>,
@@ -1354,6 +1873,12 @@ async fn enable_rc003_capture(
         "rc003 feature=enhanced-capture action=enable phase=completed terminal_result=passed"
             .to_owned(),
     );
+    #[cfg(all(windows, not(feature = "runtime-simulation")))]
+    {
+        let platform = Arc::clone(&state.platform);
+        let settings = state.settings.clone();
+        std::thread::spawn(move || rc003_auto_trigger_reconcile(platform, settings, capture_epoch));
+    }
     refocus_main_window_soon(app);
     Ok(rc003_task::status(true))
 }
@@ -1434,71 +1959,245 @@ fn rc003_startup_reconcile(
     }
 }
 
+fn capture_inactive_due_to_missing_ownership(
+    target_usages: usize,
+    owned_usages: usize,
+    connected_ms: u64,
+    grace_ms: u64,
+) -> bool {
+    target_usages > 0 && owned_usages == 0 && connected_ms >= grace_ms
+}
+
+/// 常驻对账的节奏参数（纯常量，测试钉住）。
+///
+/// 2026-10-04 用户要求「重启后自动恢复全按键支持」。旧实现是**一次性**的：
+/// 4 轮 × 5s + 兜底一次，约 25s 后放弃并把结果交给按键页。结构上必然失败的
+/// 场景：电脑重启后应用随登录自启，此刻 RC003 往往还没被 Windows 枚举
+/// （遥控器未唤醒/未连接）——助手会以退出码 11 直接退出（[STOP] 读到 WUDF
+/// 宿主但都不是承载 RC003 的实例，见 helper 的 `resolve_target`）。一次性
+/// 重试全部落空后**不再拉起**：开关开着、界面永远停在「正在启动」，用户
+/// 只能手动关开一次（还要再弹一次 UAC）。产品规则是「用户侧零介入」，
+/// 恢复必须由应用在设备晚到、助手崩溃、宿主重启等场景下自己完成。
+const AUTO_TRIGGER_RAPID_MS: u64 = 5_000;
+/// 稳态重试间隔：设备晚到时最迟一个间隔内自动恢复，又不会把日志刷爆。
+const AUTO_TRIGGER_STEADY_MS: u64 = 30_000;
+/// 已连接后的观察间隔：助手掉线（崩溃 / 宿主重启）要能被发现并重新拉起。
+const AUTO_TRIGGER_WATCH_MS: u64 = 15_000;
+/// 「桥连上了」到「捕获真的在生效」之间允许的宽限。
+///
+/// 桥连接只说明助手进程活着；捕获要生效还需要 agent 拿到所有权（ACK）。
+/// 2026-10-08 现场：卸载残留的旧世代 tap 让 agent 永远握不上手，三键与语音键
+/// 全断，而当时日志里只有一条 `reason=helper_connected` 的"成功"——界面于是
+/// 显示"已开启"却按不动。超过本宽限仍没有所有权就落一条可分流的
+/// `capture_inactive`，恢复时再落一条 `capture_resumed`。
+const AUTO_TRIGGER_CAPTURE_GRACE_MS: u64 = 20_000;
+/// 开关关闭 / 桥不在监听时的复查间隔（不触发，只等待状态变化）。
+const AUTO_TRIGGER_IDLE_MS: u64 = 30_000;
+/// 前几轮快速重试的轮数。
+const AUTO_TRIGGER_RAPID_ATTEMPTS: u32 = 4;
+/// 连续失败时的日志折叠：前 3 轮与每 10 轮各留一条。
+const AUTO_TRIGGER_LOG_EVERY: u32 = 10;
+
+/// 第 `consecutive` 轮失败后的等待时长（纯函数）。
+///
+/// 前四轮快速重试，此后进入稳态；不终止既有任务或设备宿主。
+fn auto_trigger_retry_delay_ms(consecutive: u32) -> u64 {
+    if consecutive <= AUTO_TRIGGER_RAPID_ATTEMPTS {
+        AUTO_TRIGGER_RAPID_MS
+    } else {
+        AUTO_TRIGGER_STEADY_MS
+    }
+}
+
+/// 这一轮是否值得写一条触发日志（前 3 轮 + 每 10 轮）：
+/// 稳态每 30 秒一轮，逐轮写会把诊断日志刷满；而 `attempt=` 字段保证
+/// 任何时刻都能从日志恢复出「已经连续重试了多少轮」。
+fn auto_trigger_attempt_should_log(consecutive: u32) -> bool {
+    consecutive <= 3 || consecutive % AUTO_TRIGGER_LOG_EVERY == 0
+}
+
+/// 常驻对账的单轮动作（纯函数输出，测试钉住）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileAction {
+    /// 开关未开：不触发，按空闲节奏复查（绝不顶掉用户的「关闭」意图）。
+    Standby,
+    /// 桥不在监听（failed/stopped）：触发无意义，按空闲节奏复查。
+    WaitBridge,
+    /// 助手已连接：转入观察。
+    Connected,
+    /// 桥在监听但助手未连上：触发助手。
+    Trigger,
+}
+
+/// 开关与桥接快照 → 本轮动作。
+fn decide_reconcile_round(enabled: bool, check: AutoTriggerCheck) -> ReconcileAction {
+    if !enabled {
+        return ReconcileAction::Standby;
+    }
+    match check {
+        AutoTriggerCheck::Connected => ReconcileAction::Connected,
+        AutoTriggerCheck::Abort => ReconcileAction::WaitBridge,
+        AutoTriggerCheck::Retry => ReconcileAction::Trigger,
+    }
+}
+
+fn capture_reconcile_generation_is_current(expected_epoch: u64) -> bool {
+    rc003_task::capture_epoch() == expected_epoch && !rc003_task::start_was_rejected()
+}
+
 fn rc003_auto_trigger_reconcile(
     platform: Arc<dyn PlatformRuntime>,
     settings: SettingsStore,
     expected_epoch: u64,
 ) {
-    const MAX_AUTO_TRIGGER_ATTEMPTS: u32 = 4;
-    const AUTO_TRIGGER_RETRY_MS: u64 = 5_000;
+    // 本机没有对应架构的载荷时，重试多少次也连不上（Issue #206：x64 助手对 ARM64 宿主）。
+    // 启动对账已把开关回落，这里再兜一次：将来若有人从别处调用本函数，也不会空转——
+    // 常驻对账尤其不能每 30 秒去撞一条必然连不上的路径。
+    let support = rc003_task::capture_support();
+    if !support.available {
+        sayall_windows::gatt_note(format!(
+            "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=skipped \
+             reason={} native_arch={} helper_expected={} retryable=false",
+            support.reason.as_deref().unwrap_or("unavailable"),
+            support.native_arch,
+            support.helper_expected
+        ));
+        return;
+    }
     sayall_windows::gatt_note(
         "rc003 feature=enhanced-capture action=auto_trigger phase=started reason=app_startup"
             .to_owned(),
     );
-    for attempt in 1..=MAX_AUTO_TRIGGER_ATTEMPTS {
-        if rc003_task::capture_epoch() != expected_epoch {
+    // 连续「开关开着、桥在监听、但助手没连上」的轮数；连上或用户关闭即清零。
+    let mut consecutive: u32 = 0;
+    let mut was_connected = false;
+    // 以下标志只控制「状态刚变化时记一条」，避免空闲期重复刷屏。
+    let mut bridge_unavailable_logged = false;
+    let mut active_seen = false;
+    // 捕获是否真的在生效：桥连上 ≠ 捕获生效（见 AUTO_TRIGGER_CAPTURE_GRACE_MS）。
+    let mut connected_since: Option<std::time::Instant> = None;
+    let mut capture_inactive_logged = false;
+    loop {
+        if !capture_reconcile_generation_is_current(expected_epoch) {
             return;
         }
-        if rc003_task::start_was_rejected() {
-            sayall_windows::gatt_note("rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=failed reason=agent_version_blocked retryable=false".into());
-            return;
-        }
-        match classify_auto_trigger(&platform.rc003_bridge_snapshot()) {
-            AutoTriggerCheck::Connected => {
-                sayall_windows::gatt_note(
-                    "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=passed reason=helper_connected".to_owned(),
-                );
-                return;
-            }
-            AutoTriggerCheck::Abort => {
-                sayall_windows::gatt_note(
-                    "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=failed reason=bridge_not_listening retryable=false".to_owned(),
-                );
-                return;
-            }
-            AutoTriggerCheck::Retry => {}
-        }
-        let enabled_now = settings
+        let enabled = settings
             .load()
             .map(|settings| settings.rc003_capture_enabled)
             .unwrap_or(false);
-        if !enabled_now {
-            sayall_windows::gatt_note(
-                "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=passed reason=disabled_by_user_during_retry".to_owned(),
-            );
+        if !enabled {
             return;
         }
-        sayall_windows::gatt_note(format!(
-            "rc003 feature=enhanced-capture action=auto_trigger phase=trigger attempt={attempt}"
-        ));
-        match rc003_task::task_trigger(expected_epoch) {
-            Ok(()) => sayall_windows::gatt_note(format!(
-                "rc003 feature=enhanced-capture action=auto_trigger phase=triggered terminal_result=passed attempt={attempt}"
-            )),
-            Err(error) => sayall_windows::gatt_note(format!(
-                "rc003 feature=enhanced-capture action=auto_trigger phase=triggered terminal_result=failed attempt={attempt} detail={error}"
-            )),
+        let snapshot = platform.rc003_bridge_snapshot();
+        match decide_reconcile_round(enabled, classify_auto_trigger(&snapshot)) {
+            ReconcileAction::Standby => {
+                if active_seen {
+                    // 用户关闭开关（关闭动作自己已有日志）：对账转入等待，
+                    // 用户之后再次打开时由这里或 enable 命令重新拉起。
+                    sayall_windows::gatt_note(
+                        "rc003 feature=enhanced-capture action=auto_trigger phase=standby reason=disabled_by_user"
+                            .to_owned(),
+                    );
+                    active_seen = false;
+                }
+                consecutive = 0;
+                was_connected = false;
+                bridge_unavailable_logged = false;
+                connected_since = None;
+                capture_inactive_logged = false;
+                std::thread::sleep(std::time::Duration::from_millis(AUTO_TRIGGER_IDLE_MS));
+            }
+            ReconcileAction::WaitBridge => {
+                if !bridge_unavailable_logged {
+                    sayall_windows::gatt_note(format!(
+                        "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=failed reason=bridge_not_listening retryable=true {}",
+                        bridge_health_summary(&snapshot)
+                    ));
+                    bridge_unavailable_logged = true;
+                }
+                active_seen = true;
+                was_connected = false;
+                consecutive = 0;
+                connected_since = None;
+                capture_inactive_logged = false;
+                std::thread::sleep(std::time::Duration::from_millis(AUTO_TRIGGER_IDLE_MS));
+            }
+            ReconcileAction::Connected => {
+                if !was_connected {
+                    sayall_windows::gatt_note(format!(
+                        "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=passed reason=helper_connected trigger_attempts={consecutive}"
+                    ));
+                    connected_since = Some(std::time::Instant::now());
+                    capture_inactive_logged = false;
+                }
+                // 「助手连上」不等于「捕获生效」：agent 没拿到所有权时按键一条都不过桥。
+                // 超过宽限仍未接管就落一条可分流的失败日志（含去向提示），恢复时补一条
+                // 成功——不让「显示已开启、实际按不动」成为静默状态（2026-10-08 现场）。
+                let connected_ms = connected_since
+                    .map(|since| since.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                if capture_inactive_due_to_missing_ownership(
+                    snapshot.target_usages.len(),
+                    snapshot.owned_usages.len(),
+                    connected_ms,
+                    AUTO_TRIGGER_CAPTURE_GRACE_MS,
+                ) {
+                    if !capture_inactive_logged {
+                        sayall_windows::gatt_note(format!(
+                            "rc003 feature=enhanced-capture action=capture_inactive phase=completed \
+                             terminal_result=failed reason=agent_never_acked retryable=true \
+                             elapsed_ms={connected_ms} recovery=ownership_observation {}",
+                            bridge_health_summary(&snapshot)
+                        ));
+                        capture_inactive_logged = true;
+                    }
+                } else if capture_inactive_logged && !snapshot.owned_usages.is_empty() {
+                    // 只有真的拿回所有权才算恢复。若此时恰好是"用户把增强键全部取消映射"
+                    // （target 清空、owned 也为空），记 capture_resumed 同样是假阳性——
+                    // 与 0.8.1 的教训同型：判据必须是"确实生效"，不是"失败条件消失"。
+                    sayall_windows::gatt_note(format!(
+                        "rc003 feature=enhanced-capture action=capture_resumed phase=completed \
+                         terminal_result=passed owned_usages={} elapsed_ms={connected_ms}",
+                        snapshot.owned_usages.len()
+                    ));
+                    capture_inactive_logged = false;
+                }
+                active_seen = true;
+                was_connected = true;
+                consecutive = 0;
+                bridge_unavailable_logged = false;
+                std::thread::sleep(std::time::Duration::from_millis(AUTO_TRIGGER_WATCH_MS));
+            }
+            ReconcileAction::Trigger => {
+                bridge_unavailable_logged = false;
+                if was_connected {
+                    // 助手掉线（崩溃 / 宿主重启 / 被系统回收）：重新进入恢复，
+                    // 先来一轮快速期。
+                    sayall_windows::gatt_note(
+                        "rc003 feature=enhanced-capture action=auto_trigger phase=started reason=helper_disconnected"
+                            .to_owned(),
+                    );
+                    was_connected = false;
+                    consecutive = 0;
+                    connected_since = None;
+                    capture_inactive_logged = false;
+                }
+                active_seen = true;
+                consecutive = consecutive.saturating_add(1);
+                let loggable = auto_trigger_attempt_should_log(consecutive);
+                let result = rc003_task::task_trigger(expected_epoch);
+                if loggable || result.is_err() {
+                    sayall_windows::gatt_note(format!(
+                        "rc003 feature=enhanced-capture action=auto_trigger phase=triggered terminal_result={} attempt={consecutive} {}",
+                        if result.is_ok() { "submitted" } else { "failed" },
+                        bridge_health_summary(&snapshot)
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    auto_trigger_retry_delay_ms(consecutive),
+                ));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(AUTO_TRIGGER_RETRY_MS));
-    }
-    match classify_auto_trigger(&platform.rc003_bridge_snapshot()) {
-        AutoTriggerCheck::Connected => sayall_windows::gatt_note(
-            "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=passed reason=helper_connected".to_owned(),
-        ),
-        _ => sayall_windows::gatt_note(format!(
-            "rc003 feature=enhanced-capture action=auto_trigger phase=completed terminal_result=failed reason=helper_not_connected retryable=true {}",
-            bridge_health_summary(&platform.rc003_bridge_snapshot())
-        )),
     }
 }
 
@@ -1565,6 +2264,55 @@ async fn copy_template_catalog_entry(
         started.elapsed().as_millis()
     ));
     result
+}
+
+/// 向导第⑥步：按键映射临时暂挂（只观察、不注入；内存态、不改用户配置）。
+#[tauri::command]
+fn set_mapping_suspension(suspended: bool, state: tauri::State<'_, AppState>) -> bool {
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=mapping_suspension action=set phase=completed terminal_result=passed suspended={suspended}"
+    ));
+    state.platform.set_mapping_suspension(suspended);
+    suspended
+}
+
+/// 向导第⑤步前置（探针④）：打开物理键观察窗口。
+///
+/// `exclude_vks` 排除「按住说话」和弦等由报告层合成以非注入形态送进 OS 的键
+/// （它们必须到达输入法，不属于手动输入）。返回窗口 id；0 = 不可用（钩子未
+/// 运行/仿真平台），调用方按未知处理。
+#[tauri::command]
+fn begin_key_observation(exclude_vks: Vec<u32>, state: tauri::State<'_, AppState>) -> u64 {
+    let exclude_count = exclude_vks.len();
+    let window = state.platform.begin_key_observation(exclude_vks);
+    if window > 0 {
+        sayall_windows::gatt_note(format!(
+            "input_observation feature=physical_keys action=begin window={window} exclude_count={exclude_count} phase=completed terminal_result=passed"
+        ));
+    } else {
+        sayall_windows::gatt_note(
+            "input_observation feature=physical_keys action=begin phase=completed terminal_result=failed error_domain=hook error_code=gate_inactive retryable=true"
+                .to_owned(),
+        );
+    }
+    window
+}
+
+/// 向导第⑤步前置（探针④）：关闭物理键观察窗口并取回计数。
+/// None = 计量不可靠（窗口过期/钩子停止）——调用方 fail-open。
+/// 日志只保留计数，不记录具体键码或可还原输入的序列。
+#[tauri::command]
+fn end_key_observation(window_id: u64, state: tauri::State<'_, AppState>) -> Option<u64> {
+    let count = state.platform.end_key_observation(window_id);
+    match count {
+        Some(count) => sayall_windows::gatt_note(format!(
+            "input_observation feature=physical_keys action=end window={window_id} count={count} phase=completed terminal_result=passed"
+        )),
+        None => sayall_windows::gatt_note(format!(
+            "input_observation feature=physical_keys action=end window={window_id} phase=completed terminal_result=failed error_domain=hook error_code=window_unreliable retryable=true"
+        )),
+    }
+    count
 }
 
 #[tauri::command]
@@ -1968,6 +2716,7 @@ async fn reset_button_mappings(
 fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut shortcut_count = 0_usize;
     let mut open_app_count = 0_usize;
+    let mut focus_input_count = 0_usize;
     let mut scroll_count = 0_usize;
     let mut mouse_count = 0_usize;
     let mut task_switch_count = 0_usize;
@@ -1978,6 +2727,7 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
                 ButtonAction::Shortcut { .. } => shortcut_count += 1,
                 ButtonAction::TaskSwitch { .. } => task_switch_count += 1,
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
+                ButtonAction::FocusInput => focus_input_count += 1,
                 ButtonAction::Scroll { .. } => scroll_count += 1,
                 ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
                     mouse_count += 1
@@ -1987,7 +2737,7 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} scroll_count={scroll_count} mouse_count={mouse_count} task_switch_count={task_switch_count} disabled_cell_count={disabled_count}",
+        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} scroll_count={scroll_count} mouse_count={mouse_count} task_switch_count={task_switch_count} disabled_cell_count={disabled_count}",
         mappings.enabled,
         mappings.actions.len()
     )
@@ -2031,6 +2781,16 @@ async fn test_button_mapping(
         ButtonAction::TaskSwitch { .. } => {
             Err("请在目标程序中使用遥控器触发任务切换，以校验系统窗口和取消边界".to_owned())
         }
+        ButtonAction::FocusInput => tauri::async_runtime::spawn_blocking(move || {
+            // 受理后返回平台的 SendInput 快照（与快捷键/滚轮测试同口径），
+            // 便于 UI 与仿真断言「动作确实走到了聚焦受理路径」。
+            platform
+                .test_focus_input()
+                .map(|_| platform.send_input_snapshot())
+        })
+        .await
+        .map_err(|error| format!("测试聚焦输入框任务失败：{error}"))?
+        .map_err(|error| error.to_string()),
         ButtonAction::Disabled => Err("该触发方式当前未配置动作".to_owned()),
     }
 }
@@ -2045,6 +2805,30 @@ fn list_preset_apps(
 #[tauri::command]
 fn list_running_apps() -> Vec<sayall_windows::app_launcher::RunningAppInfo> {
     sayall_windows::app_launcher::list_running_apps()
+}
+
+/// 「学习输入框」：3 秒窗口内轮询系统焦点，返回捕获到的可编辑目标特征。
+///
+/// 阻塞式（窗口期内），放在阻塞线程池执行；UI 负责把它写进对应目标的聚焦档案。
+#[tauri::command]
+async fn learn_focus_target(
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::focus::RecordedFocusTarget, String> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || platform.learn_focus_target())
+        .await
+        .map_err(|error| format!("学习输入框任务失败：{error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// 「测试打开与聚焦」：按目标与其聚焦档案走一次生产路径（异步受理）。
+#[tauri::command]
+async fn test_app_focus(target: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || platform.test_app_focus(target))
+        .await
+        .map_err(|error| format!("测试打开与聚焦任务失败：{error}"))?
+        .map_err(|error| error.to_string())
 }
 
 /// 原生文件选择器：选择自定义应用（.exe/.lnk）。用户取消返回 null。
@@ -2263,8 +3047,9 @@ async fn set_voice_input_tool(
     ));
     let result = match tauri::async_runtime::spawn_blocking(move || {
         settings.save_voice_input_tool(tool)?;
-        // 推给平台：BLE 工作线程在**按住语音键**的那一刻按它决定切哪个输入法
-        //（唯一切换时机；不做聚焦/离开窗口时的预切，2026-10-01 Andy 要求）。
+        // 推给平台：BLE 工作线程在按下语音键的那一刻按它决定切哪个输入法（按下时兜底切换），
+        // 并且在**选中的当下就尝试对齐**系统输入法（自身窗口在前台时改为布防，等失焦后切；
+        // 见 `sayall_windows::WindowsPlatform::set_voice_input_tool`，2026-10-03 Andy 要求）。
         platform.set_voice_input_tool(tool);
         Ok(tool)
     })
@@ -2288,6 +3073,297 @@ async fn set_voice_input_tool(
     result
 }
 
+/// 「用户选的输入工具」的唯一来源（`settings.json`，与 `get_voice_input_tool` 同源）。
+///
+/// 为什么不问平台：`PlatformRuntime` 只有 setter（`set_voice_input_tool`），没有
+/// getter；平台侧持有的那份本身也始终由 `settings.json` 写入（启动装载 + 每次保存），
+/// 读设置文件不会引入第二份真值。
+fn load_voice_input_tool(settings: &SettingsStore) -> Option<VoiceInputTool> {
+    settings
+        .load()
+        .ok()
+        .and_then(|settings| settings.voice_input_tool)
+}
+
+/// 输入法状态日志（`ime_status`，AGENTS.md「功能点自带日志」口径）：格式与字段
+/// 由 `sayall_windows::ime_status_log_line` 单一来源（含单测），这里只负责落盘。
+fn log_ime_status(
+    action: &str,
+    tool: Option<VoiceInputTool>,
+    status: &ImeStatus,
+    started: std::time::Instant,
+) {
+    sayall_windows::gatt_note(sayall_windows::ime_status_log_line(
+        action,
+        tool,
+        status,
+        started.elapsed().as_millis(),
+    ));
+}
+
+/// 两个输入法状态命令共用的执行体：读工具 → 在阻塞线程池里取状态 → 落结构化日志。
+///
+/// 放阻塞线程池而不是主线程：TSF 查询有界但最坏 500ms（查询本身还要
+/// 叠加会话切换的重绑等待），Tauri 的同步命令跑在主线程，会卡住 WebView。
+/// 任何失败都降级成 `ImeStatus::unavailable()`，命令不报错（界面 fail-open）。
+async fn ime_status_command(
+    settings: SettingsStore,
+    action: &'static str,
+    query: fn(Option<VoiceInputTool>) -> ImeStatus,
+) -> ImeStatus {
+    let started = std::time::Instant::now();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let tool = load_voice_input_tool(&settings);
+        (tool, query(tool))
+    })
+    .await;
+    match outcome {
+        Ok((tool, status)) => {
+            log_ime_status(action, tool, &status, started);
+            status
+        }
+        Err(_) => {
+            sayall_windows::gatt_note(format!(
+                "ime_status action={action} phase=completed terminal_result=failed tool=unknown detected=false matches_expected=unknown installed_count=0 error_domain=task error_code=join_failed retryable=true elapsed_ms={}",
+                started.elapsed().as_millis(),
+            ));
+            ImeStatus::unavailable()
+        }
+    }
+}
+
+/// 试一下页 / 诊断：当前输入法状态（**只读**，不切换任何输入法）。
+///
+/// 返回形状（camelCase）：`{ detected, active, installed, expected, matchesExpected }`；
+/// `matchesExpected = null` 表示判定不出来（界面不要提示），查询不可用则
+/// `detected = false`。
+#[tauri::command]
+async fn get_ime_status(state: tauri::State<'_, AppState>) -> Result<ImeStatus, String> {
+    Ok(ime_status_command(
+        state.settings.clone(),
+        "queried",
+        sayall_windows::ime_status_for,
+    )
+    .await)
+}
+
+/// 首次使用向导（Onboarding）状态与进度。落点是 `onboarding.json`（与 settings.json
+/// 同目录），迁移与失败日志在 `SettingsStore` 内完成；这里只做 IPC 校验与任务调度。
+#[tauri::command]
+async fn get_onboarding_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let settings = state.settings.clone();
+    match tauri::async_runtime::spawn_blocking(move || settings.ensure_onboarding_state()).await {
+        Ok(Ok(value)) => Ok(value.view()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(onboarding_blocking_failure("state_read")),
+    }
+}
+
+#[tauri::command]
+async fn save_onboarding_step(
+    step: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let Some(step) = onboarding::parse_step(&step) else {
+        sayall_windows::gatt_note(
+            "onboarding event=step_save phase=completed terminal_result=failed error_domain=validation error_code=unknown_step retryable=true".to_owned(),
+        );
+        return Err("未知向导步骤".to_owned());
+    };
+    let settings = state.settings.clone();
+    match tauri::async_runtime::spawn_blocking(move || settings.save_onboarding_step(step)).await {
+        Ok(Ok(value)) => Ok(value.view()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(onboarding_blocking_failure("step_save")),
+    }
+}
+
+/// 设置页「重新运行设置向导」：只重置向导进度，不清除设备/映射/音频/其他设置。
+#[tauri::command]
+async fn restart_onboarding(
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let settings = state.settings.clone();
+    let platform = state.platform.clone();
+    let operation = state.onboarding_operation.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let restarted = settings.restart_onboarding()?;
+        platform.set_voice_input_tool(settings.load()?.voice_input_tool);
+        platform.set_voice_hold_hotkey(settings.load_voice_hold_hotkey()?);
+        Ok::<_, String>(restarted)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Ok(value.view()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(onboarding_blocking_failure("restart")),
+    }
+}
+
+#[tauri::command]
+async fn complete_onboarding(
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let settings = state.settings.clone();
+    let operation = state.onboarding_operation.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        settings.complete_onboarding()
+    })
+    .await
+    {
+        Ok(Ok(value)) => Ok(value.view()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(onboarding_blocking_failure("complete")),
+    }
+}
+
+#[tauri::command]
+async fn cancel_voice_test(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let platform = state.platform.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        platform
+            .cancel_voice_test()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| onboarding_blocking_failure("voice_cancel"))?
+}
+
+#[tauri::command]
+async fn dismiss_onboarding(
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let settings = state.settings.clone();
+    let platform = state.platform.clone();
+    let operation = state.onboarding_operation.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cancelled = platform
+            .cancel_voice_test()
+            .map_err(|_| "voice_cleanup_failed".to_owned());
+        let dismissed = settings
+            .dismiss_onboarding()
+            .map_err(|_| "settings_restore_failed".to_owned())?;
+        platform.set_voice_input_tool(
+            settings
+                .load()
+                .map_err(|_| "settings_restore_failed".to_owned())?
+                .voice_input_tool,
+        );
+        platform.set_voice_hold_hotkey(
+            settings
+                .load_voice_hold_hotkey()
+                .map_err(|_| "settings_restore_failed".to_owned())?,
+        );
+        cancelled?;
+        Ok(dismissed.view())
+    })
+    .await
+    .map_err(|_| onboarding_blocking_failure("dismiss"))?
+}
+
+/// 第④步暂存语音绑定：落回滚快照 + 应用正式配置，并把工具/快捷键推给平台。
+///
+/// 平台应用与 `set_voice_input_tool` / `set_voice_hold_hotkey` 同一条链路：
+/// 保证第⑤步真实验证时按下语音键就能按 staged 组合触发。
+#[tauri::command]
+async fn stage_onboarding_voice_binding(
+    tool: VoiceInputTool,
+    hotkey: Option<KeyChord>,
+    state: tauri::State<'_, AppState>,
+) -> Result<onboarding::OnboardingStateView, String> {
+    let settings = state.settings.clone();
+    let platform = state.platform.clone();
+    let operation = state.onboarding_operation.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _guard = operation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let staged = settings.stage_onboarding_voice_binding(tool, hotkey.clone())?;
+        platform.set_voice_input_tool(Some(tool));
+        platform.set_voice_hold_hotkey(hotkey);
+        Ok::<_, String>(staged)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Ok(value.view()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(onboarding_blocking_failure("binding_stage")),
+    }
+}
+
+fn onboarding_blocking_failure(event: &str) -> String {
+    sayall_windows::gatt_note(format!(
+        "onboarding event={event} phase=completed terminal_result=failed error_domain=task error_code=join_failed retryable=true"
+    ));
+    format!("向导任务失败（{event}）")
+}
+
+/// 语音增益（dB，0–24；对齐 Mac 设置页「增益」滑块：0 = 原始音量）。
+///
+/// 返回的是持久化值（唯一事实来源）；平台运行态由写入路径与启动恢复保持同步。
+#[tauri::command]
+async fn get_gain_db(state: tauri::State<'_, AppState>) -> Result<f32, String> {
+    let settings = state.settings.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        settings.load().map(|settings| settings.gain_db)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("读取增益设置任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(gain_db) => format!(
+            "audio_settings feature=gain action=load phase=completed terminal_result=passed gain_db={gain_db}"
+        ),
+        Err(_) => "audio_settings feature=gain action=load phase=completed terminal_result=failed error_domain=settings error_code=load_failed reason=settings_load_failed retryable=true".to_owned(),
+    });
+    result
+}
+
+#[tauri::command]
+async fn set_gain_db(gain_db: f32, state: tauri::State<'_, AppState>) -> Result<f32, String> {
+    let started = std::time::Instant::now();
+    let settings = state.settings.clone();
+    let platform = state.platform.clone();
+    sayall_windows::gatt_note(format!(
+        "audio_settings feature=gain action=save phase=requested gain_db={gain_db}"
+    ));
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        let saved = settings.save_gain_db(gain_db)?;
+        // 推给平台：BLE 工作线程每批音频前读取，改动从下一批音频生效。
+        platform.set_gain_db(saved);
+        Ok(saved)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("保存增益设置任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(saved) => format!(
+            "audio_settings feature=gain action=save phase=completed terminal_result=passed gain_db={saved} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "audio_settings feature=gain action=save phase=completed terminal_result=failed gain_db={gain_db} error_domain=settings error_code=save_failed reason=settings_save_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
 /// Vokie 安装检测的返回体（连接页用它决定显示官网入口还是“没有运行”提示）。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2296,7 +3372,7 @@ struct VokieInstallationSnapshot {
     running: bool,
 }
 
-fn voice_input_tool_name(tool: Option<VoiceInputTool>) -> &'static str {
+pub(crate) fn voice_input_tool_name(tool: Option<VoiceInputTool>) -> &'static str {
     match tool {
         Some(VoiceInputTool::Wechat) => "wechat",
         Some(VoiceInputTool::Doubao) => "doubao",
@@ -2416,13 +3492,33 @@ struct FrontendDiagnosticEvent {
     phase: String,
     result: String,
     reason: String,
+    /// 稳定 token 字段（向导等结构式日志用）：逐字校验，非法值记为 invalid。
+    #[serde(default)]
+    step: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
     elapsed_ms: u64,
 }
 
 #[tauri::command]
 fn report_frontend_event(report: FrontendDiagnosticEvent) {
+    let mut tokens = String::new();
+    for (name, value) in [
+        ("step", report.step.as_deref()),
+        ("code", report.code.as_deref()),
+        ("detail", report.detail.as_deref()),
+    ] {
+        if let Some(value) = value {
+            tokens.push(' ');
+            tokens.push_str(name);
+            tokens.push('=');
+            tokens.push_str(diagnostic_token(value));
+        }
+    }
     sayall_windows::gatt_note(format!(
-        "frontend event={} phase={} result={} reason={} elapsed_ms={}",
+        "frontend event={} phase={} result={} reason={}{tokens} elapsed_ms={}",
         diagnostic_token(&report.event),
         diagnostic_token(&report.phase),
         diagnostic_token(&report.result),
@@ -2682,6 +3778,15 @@ fn run_runtime_simulation_voice_session(
         .map_err(|error| error.to_string())
 }
 
+/// 仿真旅程选项：本机跑时不弹系统浏览器（CI 或显式指定时执行外部入口）。
+#[cfg(feature = "runtime-simulation")]
+#[tauri::command]
+fn get_runtime_simulation_options(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    serde_json::json!({
+        "skipExternalEntries": state.platform.simulation_skip_external_entries(),
+    })
+}
+
 #[cfg(feature = "runtime-simulation")]
 #[tauri::command]
 fn complete_runtime_simulation_smoke(
@@ -2733,6 +3838,7 @@ const SCENE_OVERLAY_LABEL: &str = "scene-overlay";
 struct SceneOverlayState {
     panel_open: bool,
     interactive: bool,
+    foreground_verified: bool,
     menu_generation: Option<u64>,
     exit_after_release: Option<i32>,
     notices_enabled: bool,
@@ -2746,9 +3852,32 @@ impl SceneOverlayState {
             || self.interactive != interactive;
         self.panel_open = true;
         self.interactive = interactive;
+        if layout_required {
+            self.foreground_verified = false;
+        }
         self.menu_generation = Some(generation);
         self.visible_notice_revision = None;
         layout_required
+    }
+
+    fn record_native_menu_focus(
+        &mut self,
+        focused: bool,
+        actual_foreground: bool,
+    ) -> Option<(bool, u64)> {
+        let generation = self.menu_generation?;
+        if !self.panel_open || !self.interactive {
+            return None;
+        }
+        if focused && actual_foreground {
+            self.foreground_verified = true;
+            Some((true, generation))
+        } else if !focused && !actual_foreground && self.foreground_verified {
+            self.foreground_verified = false;
+            Some((false, generation))
+        } else {
+            None
+        }
     }
 }
 
@@ -2800,17 +3929,30 @@ fn create_scene_overlay(app: &tauri::App) -> tauri::Result<()> {
                 }
             });
         }
-        if matches!(event, tauri::WindowEvent::Focused(false)) {
-            let interactive = {
+        if let tauri::WindowEvent::Focused(focused) = event {
+            let Some(window) = handle.get_webview_window(SCENE_OVERLAY_LABEL) else {
+                return;
+            };
+            let actual_foreground = overlay_is_foreground(&window);
+            let (transition, observed_menu_generation) = {
                 let overlay = handle.state::<Mutex<SceneOverlayState>>();
                 let mut overlay = overlay.lock().unwrap_or_else(|p| p.into_inner());
-                std::mem::take(&mut overlay.interactive)
+                let generation = overlay.menu_generation;
+                let transition = overlay.record_native_menu_focus(*focused, actual_foreground);
+                (transition, generation)
             };
-            if interactive {
-                handle
-                    .state::<AppState>()
-                    .platform
-                    .set_template_menu_focus(false);
+            log_template_menu_window_state(&window, "native_focus", observed_menu_generation);
+            sayall_windows::gatt_note(format!(
+                "template_menu phase=native_focus focused={focused} observed_menu_generation={} actual_foreground={actual_foreground} cleanup_requested={}",
+                menu_generation_field(observed_menu_generation), matches!(transition, Some((false, _)))
+            ));
+            if let Some((verified, generation)) = transition {
+                handle.state::<AppState>().platform.set_template_menu_focus(
+                    verified,
+                    if verified { "native_focus_verified" } else { "native_focus_lost" },
+                    Some(generation),
+                    verified.then(|| overlay_window_id(&window)).flatten(),
+                );
             }
         }
     });
@@ -2866,6 +4008,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
         SceneEvent::Snapshot { .. } if state.panel_open => {
             state.panel_open = false;
             state.interactive = false;
+            state.foreground_verified = false;
             state.menu_generation = None;
             "hide"
         }
@@ -2895,6 +4038,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
         return;
     };
     let interactive = state.interactive;
+    let observed_menu_generation = state.menu_generation;
     let restore_target = mode == "hide" && was_interactive && overlay_is_foreground(&window);
     let deferred_exit = if mode == "hide" {
         state.exit_after_release.take()
@@ -2968,19 +4112,51 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
     if mode == "hide" && result.is_ok() {
         // A nonforeground hide need not raise a native focus event. Complete
         // the return-target lifecycle explicitly once the window is hidden.
-        app.state::<AppState>()
-            .platform
-            .set_template_menu_focus(false);
+        app.state::<AppState>().platform.set_template_menu_focus(
+            false,
+            "hide_completed",
+            previous_menu_generation,
+            None,
+        );
     }
     if interactive && !was_interactive {
-        let requested = result.is_ok() && activate_template_menu(&window);
-        let verified = requested && overlay_is_foreground(&window);
-        app.state::<AppState>()
-            .platform
-            .set_template_menu_focus(verified);
+        let window_operation_passed = result.is_ok();
+        let (activation_api_result, verified, actual_foreground) =
+            template_menu_foreground_readback(
+                window_operation_passed,
+                || activate_template_menu(&window),
+                || overlay_is_foreground(&window),
+            );
+        {
+            let overlay = app.state::<Mutex<SceneOverlayState>>();
+            let mut overlay = overlay.lock().unwrap_or_else(|p| p.into_inner());
+            if overlay.menu_generation == observed_menu_generation && overlay.interactive {
+                overlay.foreground_verified = verified;
+            }
+        }
+        let requested = activation_api_result == Some(true);
+        let activation_attempted = activation_api_result.is_some();
+        let activation_api_result = match activation_api_result {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "not_attempted",
+        };
+        log_template_menu_window_state(&window, "activation_result", observed_menu_generation);
+        // Record the request and observation before focus cleanup emits another snapshot.
         sayall_windows::gatt_note(format!(
-            "template_menu phase=foreground_verified requested={requested} result={verified} before={role_before} after={} request_count={}", scene_foreground_role(app), usize::from(result.is_ok())
+            "template_menu phase=foreground_verified observed_menu_generation={} window_operation_passed={window_operation_passed} activation_attempted={activation_attempted} activation_api_result={activation_api_result} requested={requested} actual_foreground={actual_foreground} result={verified} before={role_before} after={} request_count={}",
+            menu_generation_field(observed_menu_generation), scene_foreground_role(app), usize::from(activation_attempted)
         ));
+        app.state::<AppState>().platform.set_template_menu_focus(
+            verified,
+            if window_operation_passed {
+                "activation_result"
+            } else {
+                "window_operation_failed"
+            },
+            observed_menu_generation,
+            verified.then(|| overlay_window_id(&window)).flatten(),
+        );
     }
     sayall_windows::gatt_note(format!(
         "scene_overlay action={} terminal_result={} reason={}",
@@ -3008,10 +4184,70 @@ fn restore_before_hide(
     }
 }
 
-fn activate_template_menu(window: &tauri::WebviewWindow) -> bool {
+fn template_menu_foreground_readback(
+    window_operation_passed: bool,
+    activate: impl FnOnce() -> Option<bool>,
+    readback: impl FnOnce() -> bool,
+) -> (Option<bool>, bool, bool) {
+    let activation_api_result = if window_operation_passed {
+        activate()
+    } else {
+        None
+    };
+    let observed = readback();
+    (
+        activation_api_result,
+        window_operation_passed && observed,
+        observed,
+    )
+}
+
+fn menu_generation_field(generation: Option<u64>) -> String {
+    generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn log_template_menu_window_state(
+    window: &tauri::WebviewWindow,
+    reason: &'static str,
+    observed_menu_generation: Option<u64>,
+) {
     #[cfg(windows)]
     {
-        window.hwnd().is_ok_and(|hwnd| unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE,
+            WS_EX_NOACTIVATE,
+        };
+        if let Ok(hwnd) = window.hwnd() {
+            let hwnd = HWND(hwnd.0);
+            let (visible, minimized, no_activate, caller_is_window_thread) = unsafe {
+                (
+                    IsWindowVisible(hwnd).as_bool(),
+                    IsIconic(hwnd).as_bool(),
+                    GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0 != 0,
+                    GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, None),
+                )
+            };
+            sayall_windows::gatt_note(format!(
+                "template_menu phase=window_readback reason={reason} observed_menu_generation={} window_available=true visible={visible} minimized={minimized} no_activate={no_activate} caller_is_window_thread={caller_is_window_thread}",
+                menu_generation_field(observed_menu_generation)
+            ));
+        } else {
+            sayall_windows::gatt_note(format!(
+                "template_menu phase=window_readback reason={reason} observed_menu_generation={} window_available=false",
+                menu_generation_field(observed_menu_generation)
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (window, reason, observed_menu_generation);
+}
+
+fn activate_template_menu(window: &tauri::WebviewWindow) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        window.hwnd().ok().map(|hwnd| unsafe {
             windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(
                 windows::Win32::Foundation::HWND(hwnd.0),
             )
@@ -3021,7 +4257,7 @@ fn activate_template_menu(window: &tauri::WebviewWindow) -> bool {
     #[cfg(not(windows))]
     {
         let _ = window;
-        false
+        None
     }
 }
 
@@ -3057,6 +4293,18 @@ fn overlay_is_foreground(window: &tauri::WebviewWindow) -> bool {
     {
         let _ = window;
         false
+    }
+}
+
+fn overlay_window_id(window: &tauri::WebviewWindow) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        window.hwnd().ok().map(|hwnd| hwnd.0 as usize as u64)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
     }
 }
 
@@ -3200,6 +4448,24 @@ fn register_scene_events(
         .name("sayall-scene-settings".to_owned())
         .spawn(move || {
             while let Ok(event) = receiver.recv() {
+                if let SceneEvent::ManualTemplatePersistenceRequested {
+                    request_id,
+                    template_id,
+                } = &event
+                {
+                    let result = settings.save_remembered_template(
+                        *request_id,
+                        template_id.as_deref(),
+                        || {
+                            runtime.manual_template_save_is_current(
+                                *request_id,
+                                template_id.as_deref(),
+                            )
+                        },
+                    );
+                    runtime.complete_manual_template_save(*request_id, matches!(result, Ok(true)));
+                    continue;
+                }
                 if let SceneEvent::MenuPreferencePersistenceRequested {
                     request_id,
                     enabled,
@@ -3266,6 +4532,11 @@ fn register_scene_events(
         if let SceneEvent::MenuPreferencePersistenceRequested { request_id, .. } = &event {
             if sender.send(event.clone()).is_err() { platform_for_failure.complete_menu_preference_save(*request_id, false); }
         }
+        if let SceneEvent::ManualTemplatePersistenceRequested { request_id, .. } = &event {
+            if sender.send(event.clone()).is_err() {
+                platform_for_failure.complete_manual_template_save(*request_id, false);
+            }
+        }
         if let SceneEvent::DefaultTemplatePersistenceRequested { request_id, .. } = &event {
             if sender.send(event.clone()).is_err() {
                 platform_for_failure.complete_template_default_save(*request_id, false);
@@ -3296,13 +4567,20 @@ fn register_shortcut_capture_events(app: tauri::AppHandle) {
             }
         })
         .ok();
-    // 10s 诊断心跳（临时排查设施，PR 前移除）：把钩子健康度基线（calls_total /
-    // capture_active 等）周期落盘，便于在无需界面交互的情况下用外部注入对照，
-    // 区分"钩子没被系统调用"与"钩子被调用但事件被上层吞掉/过滤"。只读原子。
+    // 诊断心跳：把钩子健康度基线（calls_total / capture_active 等）周期落盘，便于在
+    // 无需界面交互的情况下用外部注入对照，区分"钩子没被系统调用"与"钩子被调用但事件
+    // 被上层吞掉/过滤"。只读原子。
+    //
+    // 2026-10-08 用户要求：**只在无线麦窗口处于前台时**记录，10 秒一条——后台时整条
+    // 不打，避免空闲驻留把日志写满。代价（已与用户确认）：应用在后台时没有周期状态行，
+    // 后台静默停摆要靠其它事件行判断；需要"后台也留一条"时把下面的门去掉或改成低频即可。
     std::thread::Builder::new()
         .name("sayall-shortcut-capture-diag".to_owned())
         .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(10));
+            if !sayall_windows::foreground::own_process_is_foreground() {
+                continue;
+            }
             sayall_windows::gatt_note(format!(
                 "shortcut_capture action=diag phase=heartbeat {}",
                 sayall_windows::key_gate::capture_diagnostics_summary()
@@ -3505,6 +4783,55 @@ fn spawn_installer_graceful_exit_watcher(app: tauri::AppHandle) {
     }
 }
 
+/// 监听第二个实例发出的"请显示主窗口"请求（2026-10-03 用户报障）。
+///
+/// 为什么需要：单实例守卫让第二个进程直接退出——「应用已在运行、主窗口最小化
+/// 或收进托盘」时，双击快捷方式 / 再点启动图标没有任何可见反应。第二个实例
+/// 改为在退出前置位命名事件（`instance_signal`），本线程收到后用统一的
+/// `show_main_window` 恢复并置前。
+///
+/// 线程按进程存活设计（阻塞在 wait()）；Tauri 的退出路径是
+/// `std::process::exit`、不执行析构，线程不做（也无法做）退场处理。
+fn spawn_second_instance_listener(app: tauri::AppHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("sayall-second-instance".to_owned())
+        .spawn(move || {
+            let signal = match sayall_windows::instance_signal::ShowMainWindowSignal::create() {
+                Ok(signal) => signal,
+                Err(error) => {
+                    sayall_windows::gatt_note(format!(
+                        "app_lifecycle event=second_instance_listener phase=completed terminal_result=failed error_domain=windows error_code=create_event_failed retryable=true detail_hresult=0x{:08x}",
+                        error.code().0 as u32
+                    ));
+                    return;
+                }
+            };
+            sayall_windows::gatt_note(
+                "app_lifecycle event=second_instance_listener phase=completed terminal_result=passed reason=listening"
+                    .to_owned(),
+            );
+            loop {
+                if !signal.wait() {
+                    sayall_windows::gatt_note(
+                        "app_lifecycle event=second_instance_listener phase=completed terminal_result=failed error_domain=windows error_code=wait_failed retryable=false"
+                            .to_owned(),
+                    );
+                    return;
+                }
+                sayall_windows::gatt_note(
+                    "app_lifecycle event=second_instance_listener phase=observed terminal_result=passed reason=show_requested"
+                        .to_owned(),
+                );
+                show_main_window(&app, "second_instance");
+            }
+        });
+    if let Err(error) = spawned {
+        sayall_windows::gatt_note(format!(
+            "app_lifecycle event=second_instance_listener phase=completed terminal_result=failed error_domain=process error_code=thread_spawn_failed retryable=true detail={error}"
+        ));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let log_path = std::env::var_os("LOCALAPPDATA")
@@ -3526,6 +4853,15 @@ pub fn run() {
                 .unwrap_or("unknown")
                 .to_owned(),
             source_revision: env!("SAYALL_SOURCE_REVISION").to_owned(),
+            source_fingerprint: option_env!("SAYALL_SOURCE_FINGERPRINT")
+                .unwrap_or("unknown")
+                .to_owned(),
+            source_state: option_env!("SAYALL_SOURCE_STATE")
+                .unwrap_or("unknown")
+                .to_owned(),
+            payload_inputs: option_env!("SAYALL_PAYLOAD_INPUTS")
+                .unwrap_or("unknown")
+                .to_owned(),
             build_channel: option_env!("SAYALL_BUILD_CHANNEL")
                 .unwrap_or("unknown")
                 .to_owned(),
@@ -3534,10 +4870,20 @@ pub fn run() {
                 .to_owned(),
         },
     );
+    #[cfg(windows)]
+    let (windows_version, windows_build) = {
+        let current = sayall_windows::compatibility::current_windows_version();
+        (current.to_string(), current.build.to_string())
+    };
+    #[cfg(not(windows))]
+    let (windows_version, windows_build) = ("unknown".to_owned(), "unknown".to_owned());
     sayall_windows::gatt_note(format!(
-        "app_lifecycle event=process_start phase=started result={} diagnostic_schema=1 process_architecture={} windows_version=unknown windows_build=unknown",
+        "app_lifecycle event=process_start phase=started result={} diagnostic_schema=2 process_architecture={} native_arch={} windows_version={} windows_build={}",
         if log_ready { "passed" } else { "failed" },
-        std::env::consts::ARCH
+        std::env::consts::ARCH,
+        sayall_windows::os_arch::native_arch(),
+        windows_version,
+        windows_build
     ));
     #[cfg(windows)]
     if let Err(error) = sayall_windows::compatibility::check_current_windows() {
@@ -3550,7 +4896,9 @@ pub fn run() {
     }
     // 单实例守卫（2026-09-05 实证：双实例并存——开发构建与已部署版抢遥控器
     // 连接、抑制器互扰、抢不到连接的实例还会周期性无线电重启杀掉对方的
-    // 连接）。命名互斥体跨进程互斥；已存在实例时本次启动直接退出。
+    // 连接）。命名互斥体跨进程互斥；已存在实例时本次启动**请求它显示主窗口
+    // 后**退出（2026-10-03：此前直接退出，「应用在运行、窗口最小化/收进托盘」
+    // 时双击快捷方式没有任何可见反应）。
     // 注意：互斥体名不得含反斜杠——对象管理器会把名字按路径解析，要求
     // 父对象目录存在（"SayAll\Windows\…" 直接 ERROR_PATH_NOT_FOUND，
     // 2026-09-05 探针实证）；创建失败按 fail-closed 处理（退出）——
@@ -3566,10 +4914,20 @@ pub fn run() {
                 // CreateMutexW 对"已存在"返回有效句柄 + GetLastError=
                 // ERROR_ALREADY_EXISTS（不是失败）；其余残留错误值无意义。
                 if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                    sayall_windows::gatt_note(
-                        "app_lifecycle event=single_instance phase=completed terminal_result=failed error_domain=process error_code=already_running reason=existing_instance retryable=false".to_owned(),
-                    );
-                    eprintln!("SayAll 已在运行：单实例守卫阻止了第二个实例启动");
+                    // 请求已运行实例把主窗口显示出来（命名事件由对端的
+                    // `spawn_second_instance_listener` 等待；对端是未带此功能的
+                    // 旧版本时请求失败，如实记录但按原样退出）。
+                    let show_request = sayall_windows::instance_signal::request_show_main_window();
+                    let (request_result, request_error) = match &show_request {
+                        Ok(()) => ("passed", "none".to_owned()),
+                        Err(error) => {
+                            ("failed", format!("hresult=0x{:08x}", error.code().0 as u32))
+                        }
+                    };
+                    sayall_windows::gatt_note(format!(
+                        "app_lifecycle event=single_instance phase=completed terminal_result=failed error_domain=process error_code=already_running reason=existing_instance retryable=false show_request_result={request_result} show_request_error={request_error}"
+                    ));
+                    eprintln!("SayAll 已在运行：已请求显示主窗口，第二个实例退出");
                     unsafe {
                         let _ = CloseHandle(handle);
                     }
@@ -3627,14 +4985,9 @@ pub fn run() {
                     .icon(icon)
                     .menu(&menu)
                     .show_menu_on_left_click(false)
-                    .tooltip("无线麦 SayAll")
+                    .tooltip("无线麦 · 个人版")
                     .on_menu_event(|app, event| match event.id.as_ref() {
-                        "tray-show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
+                        "tray-show" => show_main_window(app, "tray_menu"),
                         "tray-quit" => request_clean_exit(app.clone(), 0),
                         _ => {}
                     })
@@ -3645,10 +4998,7 @@ pub fn run() {
                             ..
                         } = event
                         {
-                            if let Some(window) = tray.app_handle().get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
+                            show_main_window(tray.app_handle(), "tray_click");
                         }
                     })
                     .build(app)?;
@@ -3670,11 +5020,21 @@ pub fn run() {
             #[cfg(not(feature = "runtime-simulation"))]
             let settings_path = app.path().app_config_dir()?.join("settings.json");
             let settings = SettingsStore::new(settings_path);
+            // 向导迁移判定：必须在任何设置写入之前执行（首次引入时的老用户直接标记
+            // 完成，全新安装从欢迎开始；设计稿 §6.2）。失败不阻断启动，命令层会重试。
+            if let Err(error) = settings.ensure_onboarding_state() {
+                eprintln!("{error}");
+            }
+            // 未完成向导里残留的 staged 语音绑定：启动时回滚正式配置（设计稿 §5.4：
+            // 退出未完成流程必须恢复进入向导前的配置）。无事务时是空操作、不落日志。
+            if let Err(error) = settings.restore_onboarding_staged_binding("startup_recovery") {
+                eprintln!("{error}");
+            }
             let saved_settings = application_startup_settings(settings.load());
             // 应用图标（2026-10-02）：托盘刚用内置图标建成，这里按持久化选择把
             // 主窗口（任务栏 / Alt-Tab）与托盘图标一起换成用户选的那一个。
             #[cfg(windows)]
-            app_icon::apply(app.handle(), saved_settings.app_icon);
+            app_icon::apply(app.handle());
             // 启动时把持久化偏好同步到 Windows 当前用户登录启动项；失败只记录，
             // 不阻断主程序启动，用户可在“关于”页重试。
             #[cfg(all(windows, not(feature = "runtime-simulation")))]
@@ -3689,18 +5049,26 @@ pub fn run() {
                     saved_settings.launch_at_login
                 ));
             }
-            // Radio::RequestAccessAsync 可能显示系统授权，微软要求从可交互的 UI
-            // 上下文调用。setup 线程在创建 BLE 后台线程前预热并缓存 Radio，
-            // 使蓝牙栈资源耗尽时仍能自动关开无线电，而不是再依赖失败的枚举。
-            #[cfg(all(windows, not(feature = "runtime-simulation")))]
-            sayall_windows::prepare_bluetooth_radio_recovery();
             let platform = create_platform();
             #[cfg(all(windows, not(feature = "runtime-simulation")))]
             let rc003_auto_trigger_allowed = {
                 let enabled = saved_settings.rc003_capture_enabled;
-                let authorized = enabled && !rc003_task::reauth_required() && rc003_task::task_installed();
+                let support = rc003_task::capture_support();
+                let target_matches = rc003_task::task_target_matches(&support.helper_expected);
+                let reason = if !support.available {
+                    support.reason.as_deref().unwrap_or("helper_unavailable")
+                } else if target_matches == Some(false) {
+                    "task_target_mismatch"
+                } else if rc003_task::reauth_required() {
+                    "reauth_marker_present"
+                } else if !rc003_task::task_installed() {
+                    "task_missing"
+                } else {
+                    "authorized"
+                };
+                let authorized = enabled && reason == "authorized";
                 if enabled && !authorized {
-                    sayall_windows::gatt_note("rc003 feature=enhanced-capture action=reconcile terminal_result=revoked reason=authorization_missing".to_owned());
+                    sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=reconcile terminal_result=revoked reason={reason} native_arch={} helper_expected={}", support.native_arch, support.helper_expected));
                     if let Err(error) = settings.save_rc003_capture_enabled(false) {
                         sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=reconcile terminal_result=failed reason=settings_write_failed detail={error}"));
                     }
@@ -3787,8 +5155,9 @@ pub fn run() {
             }
 
             // 选的输入工具同样要推给平台（2026-10-01）：语音会话开始前决定把哪个
-            // 输入法切进当前会话。启动只推状态、不主动切——避免应用一启动就改用户
-            // 当前的输入法；真正切换发生在"选中工具"与"按下语音键"两个时机。
+            // 输入法切进当前会话。启动恢复同样走"选中即对齐"（2026-10-03 Andy：
+            // 保证重启/冷启动后的第一按也能拉起）：自身在前台先布防、失焦后切一次；
+            // 否则立即切。基准确认见 Bugs/2026-10-03-ime-switch-lags-tool-selection.md。
             match settings.load() {
                 Ok(loaded) => {
                     sayall_windows::gatt_note(format!(
@@ -3805,6 +5174,14 @@ pub fn run() {
                 }
             }
 
+            // 增益（对齐 Mac：0 dB = 原始音量）。启动即把持久化值推给平台，
+            // 否则重启后管道会退回 0 dB，直到用户再碰一次滑块。
+            platform.set_gain_db(saved_settings.gain_db);
+            sayall_windows::gatt_note(format!(
+                "audio_settings feature=gain action=restore phase=completed terminal_result=passed gain_db={}",
+                saved_settings.gain_db
+            ));
+
             #[cfg(not(windows))]
             let _ = saved_settings;
 
@@ -3814,6 +5191,7 @@ pub fn run() {
             let exit_cleanup = ExitCleanup::new(Arc::clone(&platform), supervisor);
             app.manage(AppState {
                 capture_config_operation: platform.capture_config_gate(),
+                onboarding_operation: Arc::new(Mutex::new(())),
                 platform: Arc::clone(&platform),
                 exit_cleanup,
                 settings: settings.clone(),
@@ -3850,9 +5228,22 @@ pub fn run() {
                 ));
             }
 
+
+            // 仿真构建 + 指定脚本（`SAYALL_HARDWARE_SIGNAL_SCRIPT`）：回放硬件信号
+            // （按键边沿、ATVV 语音帧），事件走生产解析链路 —— 没有物理遥控器也能
+            // 覆盖 onboarding 向导与按键链路（见 hardware-simulation 仓库）。
+            #[cfg(feature = "runtime-simulation")]
+            if let Some(script_path) = std::env::var_os("SAYALL_HARDWARE_SIGNAL_SCRIPT") {
+                Arc::clone(&platform)
+                    .start_hardware_script_replay(std::path::PathBuf::from(script_path));
+            }
+
+            let _ = sayall_windows::key_host::start_global();
             // 安装/升级前的优雅退出监听（2026-09-16）：安装器会先请求退出、
             // 若清理未完成则安装器中止，不允许强杀。
             spawn_installer_graceful_exit_watcher(app.handle().clone());
+            // 二次启动（双击快捷方式 / 再点启动图标）→ 显示主窗口的监听端。
+            spawn_second_instance_listener(app.handle().clone());
             // "打开无线麦"（自身窗口）后的 tao 可见性缓存同步：`app_launcher` 用
             // Win32 `ShowWindow` 显示已隐藏的自身主窗口（同步生效，其后抢前台才有
             // 意义），但那会绕过 tao 的 `WindowFlags::VISIBLE` 缓存，使随后点 X 的
@@ -3863,7 +5254,19 @@ pub fn run() {
                 let handle = app.handle().clone();
                 sayall_windows::app_launcher::set_self_show_sync(move || {
                     if let Some(window) = handle.get_webview_window("main") {
-                        let _ = window.show();
+                        let visible_before = window.is_visible().ok();
+                        let result = window.show();
+                        sayall_windows::gatt_note(format!(
+                            "app_lifecycle event=self_show_sync trigger=app_launcher_self window_available=true result={} tauri_visible_before={} tauri_visible_after={} actual_foreground={}",
+                            if result.is_ok() { "submitted" } else { "failed" },
+                            visible_before.map_or("unknown", |visible| if visible { "true" } else { "false" }),
+                            window.is_visible().ok().map_or("unknown", |visible| if visible { "true" } else { "false" }),
+                            overlay_is_foreground(&window)
+                        ));
+                    } else {
+                        sayall_windows::gatt_note(
+                            "app_lifecycle event=self_show_sync trigger=app_launcher_self window_available=false result=failed reason=main_window_missing".to_owned()
+                        );
                     }
                 });
             }
@@ -3902,6 +5305,16 @@ pub fn run() {
                     ));
                     api.prevent_close();
                 }
+            } else if let tauri::WindowEvent::Focused(false) = event {
+                // 工具选择后的一次性输入法对齐（2026-10-03）：用户刚在连接页选过工具、
+                // 且当时前台是自身窗口（不能立即切——TSF 会话切换曾致 WebView 整页重载，
+                // Bugs/2026-09-12）时，这里在焦点离开后再切一次，让后续语音键按下时
+                // 系统输入法已对齐。未布防时是 no-op。
+                if window.label() == "main" {
+                    if let Some(state) = window.app_handle().try_state::<AppState>() {
+                        state.platform.align_ime_after_tool_selection();
+                    }
+                }
             }
         });
 
@@ -3916,6 +5329,7 @@ pub fn run() {
         get_system_accent_color,
         get_diagnostic_report,
         open_log_directory,
+        open_windows_settings,
         hide_main_window,
         scan_paired_remotes,
         get_connection_snapshot,
@@ -3944,6 +5358,7 @@ pub fn run() {
         perform_component_action,
         get_rc003_bridge_snapshot,
         get_rc003_task_status,
+        get_capture_support,
         enable_rc003_capture,
         disable_rc003_capture,
         copy_template_catalog_entry,
@@ -3965,9 +5380,14 @@ pub fn run() {
         upsert_application_binding,
         remove_application_binding,
         reorder_application_associations,
+        set_mapping_suspension,
+        begin_key_observation,
+        end_key_observation,
         save_button_mappings,
         reset_button_mappings,
         test_button_mapping,
+        learn_focus_target,
+        test_app_focus,
         list_preset_apps,
         list_running_apps,
         pick_custom_app,
@@ -3980,23 +5400,32 @@ pub fn run() {
         set_voice_hold_hotkey,
         get_voice_input_tool,
         set_voice_input_tool,
+        get_ime_status,
+        get_gain_db,
+        set_gain_db,
         get_vokie_installation,
         launch_vokie,
         get_other_voice_hotkey,
         set_other_voice_hotkey,
+        get_onboarding_state,
+        save_onboarding_step,
+        restart_onboarding,
+        complete_onboarding,
+        dismiss_onboarding,
+        cancel_voice_test,
+        stage_onboarding_voice_binding,
         get_theme_preference,
         set_theme_preference,
         get_launch_at_login,
         set_launch_at_login,
         report_theme_result,
-        get_app_icon,
-        set_app_icon,
         get_app_update_preferences,
         set_app_update_preferences,
         check_app_update,
         install_app_update,
         report_frontend_event,
         run_runtime_simulation_voice_session,
+        get_runtime_simulation_options,
         complete_runtime_simulation_smoke
     ]);
     #[cfg(not(feature = "runtime-simulation"))]
@@ -4010,6 +5439,7 @@ pub fn run() {
         get_system_accent_color,
         get_diagnostic_report,
         open_log_directory,
+        open_windows_settings,
         hide_main_window,
         scan_paired_remotes,
         get_connection_snapshot,
@@ -4038,6 +5468,7 @@ pub fn run() {
         perform_component_action,
         get_rc003_bridge_snapshot,
         get_rc003_task_status,
+        get_capture_support,
         enable_rc003_capture,
         disable_rc003_capture,
         copy_template_catalog_entry,
@@ -4059,9 +5490,14 @@ pub fn run() {
         upsert_application_binding,
         remove_application_binding,
         reorder_application_associations,
+        set_mapping_suspension,
+        begin_key_observation,
+        end_key_observation,
         save_button_mappings,
         reset_button_mappings,
         test_button_mapping,
+        learn_focus_target,
+        test_app_focus,
         list_preset_apps,
         list_running_apps,
         pick_custom_app,
@@ -4074,17 +5510,25 @@ pub fn run() {
         set_voice_hold_hotkey,
         get_voice_input_tool,
         set_voice_input_tool,
+        get_ime_status,
+        get_gain_db,
+        set_gain_db,
         get_vokie_installation,
         launch_vokie,
         get_other_voice_hotkey,
         set_other_voice_hotkey,
+        get_onboarding_state,
+        save_onboarding_step,
+        restart_onboarding,
+        complete_onboarding,
+        dismiss_onboarding,
+        cancel_voice_test,
+        stage_onboarding_voice_binding,
         get_theme_preference,
         set_theme_preference,
         get_launch_at_login,
         set_launch_at_login,
         report_theme_result,
-        get_app_icon,
-        set_app_icon,
         get_app_update_preferences,
         set_app_update_preferences,
         check_app_update,
@@ -4195,6 +5639,84 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn menu_activation_uses_actual_foreground_when_the_window_is_prepared() {
+        for (requested, actual_foreground) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let reads = std::cell::Cell::new(0);
+            let (api_result, verified, observed) = template_menu_foreground_readback(
+                true,
+                || Some(requested),
+                || {
+                    reads.set(reads.get() + 1);
+                    actual_foreground
+                },
+            );
+            assert_eq!(api_result, Some(requested));
+            assert_eq!(
+                reads.get(),
+                1,
+                "API denial must not skip actual foreground observation"
+            );
+            assert_eq!(observed, actual_foreground);
+            assert_eq!(
+                verified, actual_foreground,
+                "the observed foreground window determines keyboard ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_only_menu_ignores_native_focus_noise_and_new_menu_ignores_old_loss() {
+        let mut state = SceneOverlayState::default();
+        assert!(state.update_menu(8, true));
+        assert_eq!(state.record_native_menu_focus(false, false), None);
+        assert_eq!(state.record_native_menu_focus(true, false), None);
+        assert_eq!(state.record_native_menu_focus(true, true), Some((true, 8)));
+        assert_eq!(state.record_native_menu_focus(false, true), None);
+        assert!(state.update_menu(9, true));
+        assert_eq!(state.record_native_menu_focus(false, false), None);
+        assert_eq!(state.record_native_menu_focus(true, true), Some((true, 9)));
+        assert_eq!(
+            state.record_native_menu_focus(false, false),
+            Some((false, 9))
+        );
+    }
+
+    #[test]
+    fn unprepared_menu_skips_activation_but_still_reads_actual_foreground() {
+        for actual_foreground in [false, true] {
+            let activations = std::cell::Cell::new(0);
+            let reads = std::cell::Cell::new(0);
+            let (api_result, verified, observed) = template_menu_foreground_readback(
+                false,
+                || {
+                    activations.set(activations.get() + 1);
+                    Some(true)
+                },
+                || {
+                    reads.set(reads.get() + 1);
+                    actual_foreground
+                },
+            );
+            assert_eq!(activations.get(), 0);
+            assert_eq!(reads.get(), 1);
+            assert_eq!(observed, actual_foreground);
+            assert!(!verified);
+            assert_eq!(
+                api_result, None,
+                "unattempted API must be distinct from denial"
+            );
+        }
+        // API delivery is recorded separately from the actual HWND observation.
+        let (api_result, verified, observed) =
+            template_menu_foreground_readback(true, || None, || true);
+        assert_eq!(api_result, None);
+        assert!(verified);
+        assert!(observed);
+    }
+
+    #[test]
     fn same_menu_receipts_do_not_repeat_window_layout_but_new_open_and_dpi_do() {
         let mut state = SceneOverlayState::default();
         state.visible_notice_revision = Some(1);
@@ -4301,10 +5823,20 @@ mod lifecycle_tests {
         fn resolve_audio_pair(
             &self,
             settings: &sayall_core::CaptureInputSettings,
-            _preferred: &AudioSnapshot,
+            preferred: &AudioSnapshot,
         ) -> Result<Option<AudioEndpoint>, String> {
             match settings.endpoint_id.as_deref() {
                 Some("capture-missing") => Err("capture_missing".into()),
+                Some("capture-explicit")
+                    if preferred.selected_endpoint_id.as_deref() == Some("render-explicit") =>
+                {
+                    Ok(Some(AudioEndpoint {
+                        id: "render-explicit".into(),
+                        name: "CABLE In 16 Ch".into(),
+                        is_virtual_cable_candidate: true,
+                    }))
+                }
+                Some("capture-explicit") => Err("render_missing".into()),
                 Some("capture-cable") => Ok(Some(AudioEndpoint {
                     id: "render-cable".into(),
                     name: "CABLE Input".into(),
@@ -4329,6 +5861,16 @@ mod lifecycle_tests {
             }
         }
         fn configure_capture_input(
+            &self,
+            settings: sayall_core::CaptureInputSettings,
+        ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
+            if settings.enabled && settings.endpoint_id.as_deref() == Some("capture-missing") {
+                return Err("capture_target_unavailable".into());
+            }
+            *self.capture.lock().unwrap() = settings;
+            Ok(self.capture_input_snapshot())
+        }
+        fn restore_capture_input_configuration(
             &self,
             settings: sayall_core::CaptureInputSettings,
         ) -> Result<sayall_windows::capture_input::CaptureInputSnapshot, String> {
@@ -4375,7 +5917,11 @@ mod lifecycle_tests {
         }
 
         fn list_audio_endpoints(&self) -> Result<Vec<AudioEndpoint>, PlatformError> {
-            Ok(Vec::new())
+            Ok(vec![AudioEndpoint {
+                id: "render-explicit".into(),
+                name: "CABLE In 16 Ch".into(),
+                is_virtual_cable_candidate: true,
+            }])
         }
 
         fn select_audio_endpoint(
@@ -4391,7 +5937,7 @@ mod lifecycle_tests {
             expected_name: String,
         ) -> Result<AudioSnapshot, PlatformError> {
             *self.audio.lock().unwrap() = AudioSnapshot {
-                phase: if endpoint_id == "render-unready" {
+                phase: if matches!(endpoint_id.as_str(), "render-unready" | "render-missing") {
                     sayall_windows::AudioPhase::Failed
                 } else {
                     sayall_windows::AudioPhase::Ready
@@ -4454,6 +6000,20 @@ mod lifecycle_tests {
 
         fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
             Vec::new()
+        }
+
+        fn test_focus_input(&self) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn test_app_focus(&self, _target: String) -> Result<(), PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn learn_focus_target(
+            &self,
+        ) -> Result<sayall_windows::focus::RecordedFocusTarget, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
         }
 
         fn launch_app(&self, _target: &str) -> Result<(), PlatformError> {
@@ -4525,6 +6085,140 @@ mod lifecycle_tests {
             worker: Mutex::new(None),
             spawn_failed: false,
         }
+    }
+
+    #[test]
+    fn capture_missing_old_pair_writer_failure_restores_old_identities_as_unavailable() {
+        let platform = TestPlatform::default();
+        let previous = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-missing".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        *platform.capture.lock().unwrap() = previous.clone();
+        platform
+            .restore_audio_endpoint("render-missing".into(), "missing writer".into())
+            .unwrap();
+        assert!(capture_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            sayall_core::CaptureInputSettings {
+                enabled: true,
+                endpoint_id: Some("capture-unready".into()),
+                endpoint_name: Some("new".into())
+            },
+            |_, _| panic!("unready must not persist")
+        )
+        .is_err());
+        assert_eq!(platform.capture_input_snapshot().settings, previous);
+        assert_eq!(
+            platform.audio_snapshot().selected_endpoint_id.as_deref(),
+            Some("render-missing")
+        );
+        assert_eq!(
+            platform.audio_snapshot().phase,
+            sayall_windows::AudioPhase::Failed
+        );
+    }
+
+    #[test]
+    fn capture_explicit_writer_cannot_override_resolved_other_line() {
+        let platform = TestPlatform::default();
+        assert!(capture_audio_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            sayall_core::CaptureInputSettings {
+                endpoint_id: Some("capture-cable".into()),
+                ..Default::default()
+            },
+            Some("render-explicit".into()),
+            |_, _| panic!("cross-line must not persist")
+        )
+        .is_err());
+        assert_eq!(
+            platform.capture_input_snapshot().settings,
+            Default::default()
+        );
+        assert_eq!(platform.audio_snapshot(), AudioSnapshot::default());
+    }
+
+    #[test]
+    fn capture_explicit_pair_repeated_save_holds_gate_until_persisted() {
+        let platform = TestPlatform::default();
+        let gate = Mutex::new(());
+        for _ in 0..2 {
+            capture_audio_config_transaction(
+                &gate,
+                &platform,
+                sayall_core::CaptureInputSettings {
+                    enabled: true,
+                    endpoint_id: Some("capture-explicit".into()),
+                    endpoint_name: Some("CABLE Output".into()),
+                },
+                Some("render-explicit".into()),
+                |_, audio| {
+                    assert!(gate.try_lock().is_err());
+                    assert_eq!(audio.phase, sayall_windows::AudioPhase::Ready);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_explicit_two_end_recovery_retains_default_switch_authorization() {
+        let platform = TestPlatform::default();
+        *platform.capture.lock().unwrap() = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-missing".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        let next = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-explicit".into()),
+            endpoint_name: Some("CABLE Output".into()),
+        };
+        capture_audio_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            next.clone(),
+            Some("render-explicit".into()),
+            |config, audio| {
+                assert_eq!(config, next);
+                assert_eq!(
+                    audio.selected_endpoint_id.as_deref(),
+                    Some("render-explicit")
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(platform.capture_input_snapshot().settings, next);
+    }
+
+    #[test]
+    fn capture_missing_old_target_save_failure_restores_settings_without_enabling_new_target() {
+        let platform = TestPlatform::default();
+        let previous = sayall_core::CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("capture-missing".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        *platform.capture.lock().unwrap() = previous.clone();
+        assert!(capture_config_transaction(
+            &Mutex::new(()),
+            &platform,
+            sayall_core::CaptureInputSettings {
+                enabled: true,
+                endpoint_id: Some("capture-cable".into()),
+                endpoint_name: Some("CABLE Output".into()),
+            },
+            |_, _| Err("disk_failed".into())
+        )
+        .is_err());
+        assert_eq!(platform.capture_input_snapshot().settings, previous);
+        assert_eq!(platform.audio_snapshot(), AudioSnapshot::default());
     }
 
     #[test]
@@ -4807,6 +6501,37 @@ mod lifecycle_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn personal_branding_keeps_install_identity() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["productName"], "无线麦");
+        assert_eq!(config["bundle"]["publisher"], "luck-gh");
+        assert_eq!(config["identifier"], "app.getsayall.remote-mic.windows");
+        assert_eq!(
+            config["bundle"]["windows"]["nsis"]["startMenuFolder"],
+            "无线麦"
+        );
+        let installer = include_str!("../windows/installer.nsi");
+        assert!(installer.contains("!define INSTALLIDENTITY \"无线麦 SayAll\""));
+        assert!(installer.contains("!define MANUKEY \"Software\\GetSayAll\""));
+        assert!(installer.contains("Uninstall\\${INSTALLIDENTITY}"));
+        assert!(installer.contains("$LOCALAPPDATA\\${INSTALLIDENTITY}"));
+    }
+    #[test]
+    fn personal_installer_preserves_shortcut_choices_and_updates_existing_links() {
+        let installer = include_str!("../windows/installer.nsi");
+        let hooks = include_str!("../windows/installer-hooks.nsh");
+        assert!(!installer.contains("StrCpy $AppStartMenuFolder \"${STARTMENUFOLDER}\""));
+        assert!(installer.contains("${AndIf} $SayAllRestoreStartMenuShortcut = 0"));
+        assert!(installer.contains("${AndIf} $SayAllRestoreDesktopShortcut = 0"));
+        for line in hooks
+            .lines()
+            .filter(|line| line.contains("MessageBox") || line.trim_start().starts_with("Abort"))
+        {
+            assert!(!line.contains("SayAll"), "old display branding: {line}");
+        }
+    }
+    #[test]
     fn startup_settings_never_restore_enhancement_after_load_failure() {
         let failure = super::application_startup_settings(Err("invalid settings".to_owned()));
         assert!(!failure.rc003_capture_enabled);
@@ -4999,5 +6724,211 @@ mod tests {
                 "安装器钩子出现强杀 `{token}`：强杀会留下未关闭的 GATT 会话并楔死系统蓝牙栈"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod webview_failure_tests {
+    use super::*;
+    #[test]
+    fn webview_failure_reloads_only_renderer_once_and_never_reopens_during_close() {
+        let mut state = WebviewFailureState::default();
+        assert_eq!(state.failed(1, false), WebviewFailureAction::Reload);
+        assert_eq!(state.failed(1, false), WebviewFailureAction::Notify);
+        assert_eq!(state.failed(1, false), WebviewFailureAction::Ignore);
+        assert_eq!(
+            WebviewFailureState::default().failed(0, false),
+            WebviewFailureAction::Notify
+        );
+        assert_eq!(
+            WebviewFailureState::default().failed(1, true),
+            WebviewFailureAction::Ignore
+        );
+        assert_eq!(
+            WebviewFailureState::default().failed(3, false),
+            WebviewFailureAction::Ignore
+        );
+    }
+
+    #[test]
+    fn unknown_webview_failure_does_not_consume_recovery_budget() {
+        let mut state = WebviewFailureState::default();
+        assert_eq!(state.failed(-1, false), WebviewFailureAction::Ignore);
+        assert_eq!(state.failed(99, false), WebviewFailureAction::Ignore);
+        assert_eq!(state.failed(1, false), WebviewFailureAction::Reload);
+    }
+
+    #[test]
+    fn closing_webview_failure_does_not_schedule_recovery_or_notification() {
+        let mut state = WebviewFailureState::default();
+        for kind in [0, 1, 2] {
+            assert_eq!(state.failed(kind, true), WebviewFailureAction::Ignore);
+        }
+        assert_eq!(state.failed(1, false), WebviewFailureAction::Reload);
+    }
+    #[test]
+    fn terminal_webview_failure_stays_terminal_even_if_renderer_exits_later() {
+        for first_kind in [0, 2] {
+            let mut state = WebviewFailureState::default();
+            assert_eq!(
+                state.failed(first_kind, false),
+                WebviewFailureAction::Notify
+            );
+            assert_eq!(
+                state.failed(1, false),
+                WebviewFailureAction::Ignore,
+                "browser exit or unresponsive state must prevent a later reload"
+            );
+            assert_eq!(
+                state.failed(first_kind, false),
+                WebviewFailureAction::Ignore
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ui_hint_tests {
+    use super::*;
+
+    #[test]
+    fn ui_hint_is_written_only_when_the_page_never_reports_after_the_failure() {
+        assert_eq!(ui_hint_decision(1_000, 1_000, false), UiHintDecision::Show);
+        assert_eq!(
+            ui_hint_decision(1_000, 1_001, false),
+            UiHintDecision::SkipPageAlive,
+            "故障后排定、宽限期内页面报到过 => 界面已恢复，不写提示"
+        );
+        assert_eq!(
+            ui_hint_decision(0, 5, false),
+            UiHintDecision::SkipPageAlive,
+            "进程内已有过报到即视为界面正常"
+        );
+    }
+
+    #[test]
+    fn ui_hint_is_never_written_while_the_app_is_shutting_down() {
+        assert_eq!(
+            ui_hint_decision(1_000, 1_000, true),
+            UiHintDecision::SkipExiting
+        );
+        assert_eq!(
+            ui_hint_decision(1_000, 1_500, true),
+            UiHintDecision::SkipPageAlive,
+            "两个理由同时成立时先记页面活着，日志才能解释为什么没写"
+        );
+    }
+
+    #[test]
+    fn ui_hint_state_schedules_once_shows_once_and_restores_once() {
+        let mut state = WebviewUiHintState::default();
+        assert!(state.schedule());
+        assert!(!state.schedule(), "重复排定必须被忽略");
+        assert!(state.mark_showing("无线麦 SayAll".to_owned()));
+        assert!(
+            !state.mark_showing("无线麦 SayAll".to_owned()),
+            "已在显示时不重复写"
+        );
+        assert!(!state.schedule(), "已在显示时不再排定");
+        assert_eq!(state.take_for_restore().as_deref(), Some("无线麦 SayAll"));
+        assert_eq!(state.take_for_restore(), None, "恢复只发生一次");
+        assert!(state.schedule(), "收起后可以再次排定");
+    }
+
+    #[test]
+    fn ui_hint_state_cancels_a_pending_schedule_without_touching_the_title() {
+        let mut state = WebviewUiHintState::default();
+        assert!(state.schedule());
+        assert_eq!(state.take_for_restore(), None, "还没写入时没有标题要恢复");
+        assert!(state.schedule(), "取消后可以重新排定");
+    }
+
+    #[test]
+    fn terminal_reason_distinguishes_the_failure_kinds() {
+        assert_eq!(terminal_reason(0), "browser_process_exited");
+        assert_eq!(terminal_reason(1), "renderer_exited_after_reload");
+        assert_eq!(terminal_reason(2), "renderer_unresponsive");
+        assert_eq!(terminal_reason(-1), "other");
+        assert_eq!(terminal_reason(9), "other");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ui_hint_copy_follows_the_product_naming_rules() {
+        assert_eq!(
+            WEBVIEW_UNAVAILABLE_TITLE,
+            "无线麦 · 个人版界面未能正常显示，请从托盘退出后重开"
+        );
+        for banned in ["注入", "进程", "重载", "钩子", "提权", "端口"] {
+            assert!(
+                !WEBVIEW_UNAVAILABLE_TITLE.contains(banned),
+                "用户可见文案不得含内部术语：{banned}"
+            );
+        }
+        assert!(
+            WEBVIEW_UNAVAILABLE_TITLE.contains("无线麦 · 个人版"),
+            "产品名必须明确个人版身份"
+        );
+    }
+    #[test]
+    fn capture_inactive_needs_targets_without_ownership_after_grace() {
+        assert!(capture_inactive_due_to_missing_ownership(
+            3, 0, 20_000, 20_000
+        ));
+        assert!(capture_inactive_due_to_missing_ownership(
+            3, 0, 60_000, 20_000
+        ));
+        // 宽限内不算：助手刚连上、agent 还在握手。
+        assert!(!capture_inactive_due_to_missing_ownership(
+            3, 0, 19_999, 20_000
+        ));
+        // agent 已接管 ⇒ 正常，不报。
+        assert!(!capture_inactive_due_to_missing_ownership(
+            3, 3, 60_000, 20_000
+        ));
+        // 没有下发目标（用户没映射增强键）⇒ 不适用，不许误报。
+        assert!(!capture_inactive_due_to_missing_ownership(
+            0, 0, 60_000, 20_000
+        ));
+    }
+
+    #[test]
+    fn reconcile_round_requires_enabled_switch_and_listening_bridge() {
+        assert_eq!(
+            decide_reconcile_round(false, AutoTriggerCheck::Retry),
+            ReconcileAction::Standby
+        );
+        assert_eq!(
+            decide_reconcile_round(false, AutoTriggerCheck::Connected),
+            ReconcileAction::Standby
+        );
+        assert_eq!(
+            decide_reconcile_round(false, AutoTriggerCheck::Abort),
+            ReconcileAction::Standby
+        );
+        assert_eq!(
+            decide_reconcile_round(true, AutoTriggerCheck::Retry),
+            ReconcileAction::Trigger
+        );
+        assert_eq!(
+            decide_reconcile_round(true, AutoTriggerCheck::Connected),
+            ReconcileAction::Connected
+        );
+        assert_eq!(
+            decide_reconcile_round(true, AutoTriggerCheck::Abort),
+            ReconcileAction::WaitBridge
+        );
+    }
+
+    #[test]
+    fn auto_trigger_logging_folds_but_stays_auditable() {
+        assert!(auto_trigger_attempt_should_log(1));
+        assert!(auto_trigger_attempt_should_log(2));
+        assert!(auto_trigger_attempt_should_log(3));
+        for folded in 4..AUTO_TRIGGER_LOG_EVERY {
+            assert!(!auto_trigger_attempt_should_log(folded), "attempt={folded}");
+        }
+        assert!(auto_trigger_attempt_should_log(AUTO_TRIGGER_LOG_EVERY));
+        assert!(auto_trigger_attempt_should_log(AUTO_TRIGGER_LOG_EVERY * 3));
     }
 }

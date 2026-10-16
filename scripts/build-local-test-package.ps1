@@ -1,0 +1,149 @@
+﻿# 本地测试包：构建（助手 + 前端 + NSIS + updater 签名）并跑嵌入校验。
+#
+# 背景与坑（2026-10-03 全量实证；每一条都曾让出包静默出错）：
+# 1) `--config '{...}'` 内联 JSON 在 PowerShell → pnpm shim 之间会被剥掉引号，
+#    tauri 报 "key must be a string" ⇒ 统一走 src-tauri/tauri.local-build.conf.json 文件形态；
+# 2) frontendDist 只能写相对 src-tauri 的路径；Windows 绝对路径会被 url crate 解析成
+#    单字母 scheme（d:）→ 前端不嵌入、界面变目录列表，而哈希与签名全部正常；
+# 3) staging 脚本按 hardware/RC003/helper/target/release 取助手 ⇒ 跑 staging 时不要设
+#    CARGO_TARGET_DIR；应用构建可用 -CargoTargetDir 指向已有缓存的 target 目录；
+# 4) TAURI_CONFIG 不进 cargo 指纹 ⇒ 构建前 touch src-tauri/src/lib.rs，避免复用旧内嵌；
+# 5) 嵌入校验对象必须是**裸构建 exe**（NSIS setup 是压缩包装，明文路径查不到、否则必误报）；
+# 6) 双载荷（2026-10-07）：arm64 两件**只有 staging 真落地**时才用 `--config
+#    src-tauri/tauri.arm64-payload.conf.json` 覆盖式声明；`--config` 可重复，按
+#    RFC 7396 顺序合并（数组整体覆盖），因此两份配置叠加是安全的。默认
+#    src-tauri/tauri.conf.json 必须保持 x64 单载荷，理由见 RELEASING.md。
+#
+# 签名：默认读取仓库外的个人密钥 %LOCALAPPDATA%\SayAll\personal-updater.key；
+# 口令取参数或环境变量，未提供时使用空口令。公私钥必须通过实际产物验签。
+# 本地产物身份仍为 local/dirty，不因使用个人密钥而获得发布授权。
+#
+# 用法：
+#   powershell -File scripts\build-local-test-package.ps1
+#   powershell -File scripts\build-local-test-package.ps1 -CargoTargetDir D:\...\target
+param(
+    [string]$CargoTargetDir = "",
+    [string]$SigningKeyPath = "",
+    [string]$SigningKeyPassword = ""
+)
+
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+
+$repo = Split-Path -Parent $PSScriptRoot
+Set-Location $repo
+
+# ---- pnpm 解析（与 ci-preflight 同款）：PATH 上的 pnpm 优先，其次 corepack pnpm ----
+$script:UseCorepack = $false
+function Test-PnpmAvailable {
+    if (Get-Command pnpm -ErrorAction SilentlyContinue) { return $true }
+    if (Get-Command corepack -ErrorAction SilentlyContinue) {
+        $script:UseCorepack = $true
+        return $true
+    }
+    return $false
+}
+function Invoke-Pnpm {
+    param([string[]]$PnpmArgs)
+    if ($script:UseCorepack) { & corepack pnpm @PnpmArgs } else { & pnpm @PnpmArgs }
+}
+if (-not (Test-PnpmAvailable)) { throw "缺少 pnpm：请安装 pnpm 或启用 corepack（corepack enable）" }
+
+# ---- MSVC 环境：link.exe 不在 PATH 时用 vswhere 找 VS 并导入 vcvars64 ----
+function Import-MsvcEnvironment {
+    if (Get-Command link.exe -ErrorAction SilentlyContinue) { return }
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($vsPath) {
+            $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+            if (Test-Path $vcvars) {
+                $dump = cmd /c "`"$vcvars`" >nul 2>&1 && set"
+                foreach ($line in $dump) {
+                    if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+                }
+                return
+            }
+        }
+    }
+    throw "找不到 link.exe，且无法通过 vswhere 导入 VS 构建环境：请改用 VS Developer PowerShell 运行本脚本"
+}
+Import-MsvcEnvironment
+Write-Host ("[env] link.exe = " + (Get-Command link.exe).Source)
+
+# ---- 1/6 依赖（锁文件为准） ----
+Write-Host "[1/6] pnpm install --frozen-lockfile"
+Invoke-Pnpm @("install", "--frozen-lockfile")
+if ($LASTEXITCODE -ne 0) { throw "pnpm install 失败" }
+
+# ---- 2/6 frida-gadget：按锁定文件校验（缺失则下载），绝不落未校验的 DLL ----
+Write-Host "[2/6] 校验 frida-gadget（vendor 锁定文件）"
+& python (Join-Path $repo "hardware\RC003\helper\vendor\fetch_frida_gadget.py")
+if ($LASTEXITCODE -ne 0) { throw "frida-gadget 校验失败" }
+
+# ---- 3/6 staging：构建助手并落地 src-tauri（注意：本步不要设 CARGO_TARGET_DIR） ----
+Write-Host "[3/6] stage-bundle-inputs（助手 release + gadget 落地；arm64 载荷视本机工具链而定）"
+Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+& node (Join-Path $repo "scripts\stage-bundle-inputs.cjs")
+if ($LASTEXITCODE -ne 0) { throw "staging 失败" }
+
+# ---- 4/6 标准前端构建：类型检查和 Vite 共同产出唯一 dist ----
+Write-Host "[4/6] pnpm build -> dist"
+Remove-Item Env:VITE_SAYALL_RUNTIME_SIMULATION -ErrorAction SilentlyContinue
+Remove-Item Env:SAYALL_WINDOWS_RUNTIME_SIMULATION -ErrorAction SilentlyContinue
+Invoke-Pnpm @("build")
+if ($LASTEXITCODE -ne 0) { throw "前端构建失败" }
+
+# ---- 5/6 tauri build（NSIS；配置覆盖走文件，见头部坑 1/2/4） ----
+Write-Host "[5/6] tauri build --bundles nsis"
+(Get-Item (Join-Path $repo "src-tauri\src\lib.rs")).LastWriteTime = Get-Date
+if ($CargoTargetDir) { $env:CARGO_TARGET_DIR = $CargoTargetDir }
+if (-not $SigningKeyPath) { $SigningKeyPath = Join-Path $env:LOCALAPPDATA "SayAll\personal-updater.key" }
+if (Test-Path $SigningKeyPath) {
+    if (-not $SigningKeyPassword) {
+        $SigningKeyPassword = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { "" }
+    }
+    $env:TAURI_SIGNING_PRIVATE_KEY = ((Get-Content $SigningKeyPath -Raw) -replace "`r", "").TrimEnd("`n")
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $SigningKeyPassword
+    Write-Host "[5/6] 使用个人更新密钥签名；稍后验证配置公钥与实际产物匹配"
+} else {
+    throw "缺少个人更新签名密钥；本地包必须与配置公钥匹配"
+}
+# arm64 双载荷：只有 staging 真的把两件都落到 src-tauri 之后，才用 --config 覆盖式
+# 声明它们（默认 src-tauri/tauri.conf.json 必须保持 x64 单载荷：tauri-build 在编译期
+# 校验资源存在，而 arm64 助手在本机缺 VS ARM64 工具集时根本构建不出来——写进默认
+# 配置会让全仓库的 cargo check / cargo test 直接失败）。理由与接口见 RELEASING.md。
+$receipt = Get-Content -LiteralPath (Join-Path $repo 'target/dev/bundle-staging/payloads.json') -Raw | ConvertFrom-Json
+foreach ($resource in $receipt.resources) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $repo ('src-tauri/' + $resource.name)) -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $resource.sha256) { throw "Staged payload changed after staging: $($resource.name)" }
+}
+$tauriArgs = @("tauri", "build", "--bundles", "nsis", "--ci", "--config", "src-tauri/tauri.local-build.conf.json")
+if ($receipt.arm64) {
+    $tauriArgs += @("--config", "src-tauri/tauri.arm64-payload.conf.json")
+    Write-Host '[5/6] 本包含本次暂存并读回校验的 ARM64 载荷'
+} else {
+    Write-Host '[5/6] 本包仅含 x64 载荷；ARM64 增强未覆盖'
+}
+Invoke-Pnpm $tauriArgs
+if ($LASTEXITCODE -ne 0) { throw "tauri build 失败" }
+
+# ---- 6/6 嵌入校验（裸 exe！）与产物报告 ----
+Write-Host "[6/6] 嵌入校验 + 产物报告"
+$targetRoot = if ($CargoTargetDir) { $CargoTargetDir } else { Join-Path $repo "target" }
+$rawExe = Join-Path $targetRoot "release\sayall-windows-app.exe"
+if (-not (Test-Path $rawExe)) { throw "找不到裸构建产物：$rawExe" }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo "scripts\verify-frontend-embedded.ps1") -Executable $rawExe -FrontendDirectory (Join-Path $repo "dist")
+if ($LASTEXITCODE -ne 0) { throw "前端嵌入校验失败" }
+$setup = Get-ChildItem (Join-Path $targetRoot "release\bundle\nsis") -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $setup) { throw "找不到 NSIS 产物" }
+$sha = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+$sig = Join-Path $setup.DirectoryName ($setup.Name + ".sig")
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts/verify-updater-signing.ps1') -Installer $setup.FullName
+if ($LASTEXITCODE -ne 0) { throw '个人更新签名核验失败' }
+Write-Host ""
+Write-Host ("SETUP       : " + $setup.FullName)
+Write-Host ("SETUP_SHA256: " + $sha)
+Write-Host ("SIGNATURE   : " + $(if (Test-Path $sig) { $sig } else { "(无)" }))
+Write-Host ""
+Write-Host "OK：本地测试包已生成（安装与静态校验：scripts\verify-local-test-install.ps1）"

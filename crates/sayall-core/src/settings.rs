@@ -39,30 +39,6 @@ pub enum VoiceInputTool {
     Other,
 }
 
-/// 应用图标（设置页「应用图标」，2026-10-02 用户指定）。
-///
-/// 对齐 Mac main `Sources/RemoteMic/AppIconController.swift` 的 `AppIconIdentifier`：
-/// 稳定语义 ID（`standard` 是内置应用图标，`faceted-duck` 来自 Mac
-/// `Resources/AppIcons/faceted-duck.png`），未知 ID 一律回落到 `standard`
-/// （Mac `AppIconCatalog.resolvedIdentifier(for:)` 同款语义）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum AppIconIdentifier {
-    #[default]
-    Standard,
-    FacetedDuck,
-}
-
-impl AppIconIdentifier {
-    /// 用户可见名称（对齐 Mac `about.preferences.app_icon_*` 文案）。
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Standard => "默认",
-            Self::FacetedDuck => "几何鸭",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -81,19 +57,7 @@ pub struct AppSettings {
     pub rc003_capture_enabled: bool,
     pub check_prerelease_updates: bool,
     pub theme_preference: ThemePreference,
-    /// 应用图标；老配置没有这个字段时落回内置默认图标。
-    #[serde(default, deserialize_with = "deserialize_app_icon")]
-    pub app_icon: AppIconIdentifier,
     pub usage_statistics: UsageStatistics,
-}
-
-/// 认不出的应用图标 ID（更早/更新版本写下的值）回落 `standard`，不让一个
-/// 图标名把整份设置打成默认值（Mac `AppIconCatalog.resolvedIdentifier` 同款语义）。
-fn deserialize_app_icon<'de, D>(deserializer: D) -> Result<AppIconIdentifier, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(AppIconIdentifier::deserialize(deserializer).unwrap_or_default())
 }
 
 impl Default for AppSettings {
@@ -113,7 +77,6 @@ impl Default for AppSettings {
             rc003_capture_enabled: false,
             check_prerelease_updates: false,
             theme_preference: ThemePreference::System,
-            app_icon: AppIconIdentifier::Standard,
             usage_statistics: UsageStatistics::default(),
         }
     }
@@ -155,11 +118,7 @@ impl UiPreferences {
 impl AppSettings {
     pub fn normalized(mut self) -> Self {
         self.schema_version = Self::default().schema_version;
-        self.gain_db = if self.gain_db.is_finite() {
-            self.gain_db.clamp(0.0, 24.0)
-        } else {
-            0.0
-        };
+        self.gain_db = crate::normalize_gain_db(self.gain_db);
         self.usage_statistics = self.usage_statistics.normalized();
         self
     }
@@ -239,48 +198,34 @@ mod tests {
             assert_eq!(decoded.voice_input_tool, Some(tool));
         }
     }
-
-    #[test]
-    fn app_icon_defaults_to_standard_and_round_trips() {
-        // 老配置 / 新装：没有这个字段时落回内置默认图标（Mac 的 standard）。
-        let settings: AppSettings = serde_json::from_str(
-            r#"{"schema_version":3,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
-        )
-        .unwrap();
-        assert_eq!(settings.app_icon, AppIconIdentifier::Standard);
-
-        for icon in [AppIconIdentifier::Standard, AppIconIdentifier::FacetedDuck] {
-            let settings = AppSettings {
-                app_icon: icon,
-                ..AppSettings::default()
-            };
-            let encoded = serde_json::to_string(&settings).unwrap();
-            assert!(encoded.contains("\"app_icon\""));
-            let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
-            assert_eq!(decoded.normalized().app_icon, icon);
-        }
-
-        // 磁盘上的原始值是 Mac 同源的稳定语义 ID。
-        let encoded = serde_json::to_string(&AppSettings::default()).unwrap();
-        assert!(encoded.contains("\"app_icon\":\"standard\""));
-        assert_eq!(AppIconIdentifier::FacetedDuck.display_name(), "几何鸭");
-    }
-
-    #[test]
-    fn unknown_app_icon_identifier_falls_back_to_standard() {
-        // 更早/更新版本写下的图标 ID：只回落图标选择，不把整份设置打成默认值。
-        let settings: AppSettings = serde_json::from_str(
-            r#"{"schema_version":3,"gain_db":12.0,"voice_trigger_mode":"hold","app_icon":"neon-duck"}"#,
-        )
-        .unwrap();
-        assert_eq!(settings.app_icon, AppIconIdentifier::Standard);
-        assert_eq!(settings.gain_db, 12.0);
-    }
 }
 
 #[cfg(test)]
 mod enhancement_default_tests {
     use super::AppSettings;
+    #[test]
+    fn retired_app_icon_is_ignored_without_resetting_preferences() {
+        for icon in [
+            serde_json::json!("faceted-duck"),
+            serde_json::json!("standard"),
+            serde_json::json!({"unknown": true}),
+        ] {
+            let loaded: AppSettings = serde_json::from_value(serde_json::json!({
+                "app_icon": icon,
+                "gain_db": 12.0,
+                "launch_at_login": true,
+                "theme_preference": "dark",
+                "capture_input": {"enabled": true, "endpointId": "capture-test"}
+            }))
+            .unwrap();
+            let encoded = serde_json::to_value(loaded).unwrap();
+            assert!(encoded.get("app_icon").is_none());
+            assert_eq!(encoded["gain_db"], 12.0);
+            assert_eq!(encoded["launch_at_login"], true);
+            assert_eq!(encoded["theme_preference"], "dark");
+            assert_eq!(encoded["capture_input"]["endpointId"], "capture-test");
+        }
+    }
     #[test]
     fn legacy_helper_opt_in_does_not_authorize_unified_capture() {
         let loaded: AppSettings = serde_json::from_str(

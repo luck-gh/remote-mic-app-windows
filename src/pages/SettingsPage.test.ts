@@ -7,6 +7,7 @@ import { ref } from "vue";
 import type { RuntimeSnapshot } from "../lib/bridge";
 import { useAppUpdate, type AppUpdatePhase } from "../lib/app-update";
 import SettingsPage from "./SettingsPage.vue";
+import tauriConfig from "../../src-tauri/tauri.conf.json";
 
 const phase: Ref<AppUpdatePhase> = ref("idle");
 const info = ref<Awaited<ReturnType<typeof useAppUpdate>>["info"]["value"]>(null);
@@ -27,8 +28,7 @@ const setThemePreference = vi.fn<(value: "system" | "light" | "dark") => Promise
 const bridge = vi.hoisted(() => ({
   getLaunchAtLogin: vi.fn<() => Promise<boolean>>(),
   setLaunchAtLogin: vi.fn<(enabled: boolean) => Promise<boolean>>(),
-  getAppIcon: vi.fn<() => Promise<"standard" | "faceted-duck">>(),
-  setAppIcon: vi.fn<(identifier: "standard" | "faceted-duck") => Promise<"standard" | "faceted-duck">>(),
+  restartOnboarding: vi.fn<() => Promise<{ flowVersion: number; completedVersion: number; step: string; isActive: boolean }>>(),
 }));
 
 vi.mock("../lib/app-update", async (importOriginal) => {
@@ -140,8 +140,9 @@ describe("settings page", () => {
     setThemePreference.mockReset();
     bridge.getLaunchAtLogin.mockReset().mockResolvedValue(false);
     bridge.setLaunchAtLogin.mockReset();
-    bridge.getAppIcon.mockReset().mockResolvedValue("standard");
-    bridge.setAppIcon.mockReset();
+    bridge.restartOnboarding
+      .mockReset()
+      .mockResolvedValue({ flowVersion: 1, completedVersion: 0, step: "welcome", isActive: true });
   });
 
   it("页面标题为「设置」，顶部显示应用标识、标语与当前版本", async () => {
@@ -149,7 +150,13 @@ describe("settings page", () => {
     await flushPromises();
 
     expect(wrapper.get("h1").text()).toBe("设置");
-    expect(wrapper.text()).toContain("无线麦 SayAll");
+    expect(wrapper.text()).toContain("无线麦");
+    expect(wrapper.get(".personal-build").text()).toBe("个人版");
+    expect(wrapper.text()).not.toContain("非官方");
+    expect(tauriConfig.app.windows[0].title).toBe("无线麦 · 个人版");
+    expect(tauriConfig.bundle.longDescription).not.toContain("个人修改版");
+    expect(tauriConfig.bundle.longDescription).not.toContain("非官方");
+    expect(wrapper.text()).not.toContain("SayAll");
     expect(wrapper.text()).toContain("让语音触手可及");
     expect(wrapper.text()).toContain("当前版本");
     expect(wrapper.text()).toContain("0.5.0");
@@ -192,6 +199,27 @@ describe("settings page", () => {
     expect(setIncludePrereleases).toHaveBeenCalledWith(true);
   });
 
+  it("设置页的 Switch 开关都在对应文字右侧（2026-10-03 用户要求）", async () => {
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    // 顶部「检查预览版更新」：文字在前、开关在后（标签行内顺序即视觉顺序）。
+    const prerelease = wrapper.get("label.prerelease-toggle");
+    expect((prerelease.element.firstElementChild as HTMLElement).textContent).toContain(
+      "检查预览版更新",
+    );
+    expect(prerelease.element.lastElementChild).toBe(prerelease.find("input").element);
+
+    // 通用「登录时自动启动」：同样文字在前、开关在后。
+    const launch = wrapper.get('label[title*="Windows 登录启动项"]');
+    expect((launch.element.firstElementChild as HTMLElement).textContent).toContain(
+      "登录时自动启动",
+    );
+    expect(launch.element.lastElementChild).toBe(
+      launch.find('input[name="launch-at-login"]').element,
+    );
+  });
+
   it("初始状态显示手动检查入口", () => {
     const wrapper = mount(SettingsPage, { props: { runtime } });
     expect(wrapper.text()).toContain("手动检查是否有新版本");
@@ -201,84 +229,17 @@ describe("settings page", () => {
     expect(button).toBeDefined();
   });
 
-  it("问题反馈模块提供官网与 GitHub 入口，官网带 Windows 来源标记", async () => {
-    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+  it("隐藏反馈区和可切换图标，同时保留固定品牌图标", async () => {
     const wrapper = mount(SettingsPage, { props: { runtime } });
     await flushPromises();
 
-    const buttons = wrapper
-      .findAll("button")
-      .filter((button) => ["官网", "GitHub"].includes(button.text()));
-    expect(buttons.map((button) => button.text())).toEqual(["官网", "GitHub"]);
-
-    await buttons[0].trigger("click");
-    await buttons[1].trigger("click");
-    await flushPromises();
-
-    expect(open.mock.calls.map(([url]) => url)).toEqual([
-      "https://sayall.app/?from=win",
-      "https://github.com/GetSayAll/remote-mic-app-windows",
-    ]);
-    // 2026-10-02 用户指定：成功不再显示“已在系统默认浏览器打开…”这类提示。
-    expect(wrapper.find(".link-message").exists()).toBe(false);
-    open.mockRestore();
-  });
-
-  it("入口打开失败时就地显示原因而不是静默", async () => {
-    const open = vi
-      .spyOn(window, "open")
-      .mockImplementation(() => {
-        throw new Error("Not allowed to open url https://sayall.app/?from=win");
-      });
-    const wrapper = mount(SettingsPage, { props: { runtime } });
-    await flushPromises();
-
-    const website = wrapper.findAll("button").find((button) => button.text() === "官网");
-    await website!.trigger("click");
-    await flushPromises();
-
-    expect(wrapper.text()).toContain("Not allowed to open url");
-    open.mockRestore();
-  });
-
-  it("应用图标默认内置图标，切换后保存并立即生效，顶部标识同步换图", async () => {
-    bridge.setAppIcon.mockImplementation(async (identifier) => identifier);
-    const wrapper = mount(SettingsPage, { props: { runtime } });
-    await flushPromises();
-
-    expect(bridge.getAppIcon).toHaveBeenCalledTimes(1);
-    const radios = wrapper.findAll<HTMLInputElement>('input[name="app-icon"]');
-    expect(radios.map((radio) => radio.attributes("value"))).toEqual([
-      "standard",
-      "faceted-duck",
-    ]);
-    expect(radios[0].element.checked).toBe(true);
-    expect(wrapper.text()).toContain("应用图标");
-    expect(wrapper.text()).toContain("默认");
-    expect(wrapper.text()).toContain("几何鸭");
+    expect(wrapper.text()).not.toContain("问题反馈");
+    expect(wrapper.text()).not.toContain("官网");
+    expect(wrapper.text()).not.toContain("GitHub");
+    expect(wrapper.text()).not.toContain("应用图标");
+    expect(wrapper.text()).not.toContain("几何鸭");
+    expect(wrapper.find('input[name="app-icon"]').exists()).toBe(false);
     expect(wrapper.get("img.app-logo").attributes("src")).toBe("/app-logo.png");
-
-    await radios[1].setValue(true);
-    expect(bridge.setAppIcon).toHaveBeenCalledWith("faceted-duck");
-    expect(radios[1].element.checked).toBe(true);
-    // 顶部标识与窗口/托盘用同一个选择：切换后立即换成几何鸭。
-    expect(wrapper.get("img.app-logo").attributes("src")).toBe(
-      "/app-icon-faceted-duck.png",
-    );
-  });
-
-  it("应用图标保存失败时就地报错并回到实际生效的图标", async () => {
-    bridge.setAppIcon.mockRejectedValue(new Error("保存应用图标设置失败"));
-    bridge.getAppIcon.mockResolvedValue("standard");
-    const wrapper = mount(SettingsPage, { props: { runtime } });
-    await flushPromises();
-
-    const radios = wrapper.findAll<HTMLInputElement>('input[name="app-icon"]');
-    await radios[1].setValue(true);
-    await flushPromises();
-
-    expect(wrapper.get('[role="alert"]').text()).toContain("保存应用图标设置失败");
-    expect(radios[0].element.checked).toBe(true);
   });
 
   it("发现新版本时展示版本、说明与安装入口", async () => {
@@ -353,5 +314,50 @@ describe("settings page", () => {
       .findAll("button")
       .find((b) => b.text().includes("下载并安装"));
     expect(installButton).toBeUndefined();
+  });
+
+  it("首次设置：重新运行向导重置进度并通知宿主进入向导", async () => {
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    await wrapper
+      .findAll("button")
+      .find((button) => button.text() === "重新运行向导")!
+      .trigger("click");
+    await flushPromises();
+
+    expect(bridge.restartOnboarding).toHaveBeenCalledTimes(1);
+    expect(wrapper.emitted("restart-onboarding")).toHaveLength(1);
+  });
+
+  it("首次设置：重置失败时就地报错，不发进入向导事件", async () => {
+    bridge.restartOnboarding.mockRejectedValueOnce(new Error("ipc failed"));
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    await wrapper
+      .findAll("button")
+      .find((button) => button.text() === "重新运行向导")!
+      .trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get('[role="alert"]').text()).toContain("无法开始设置向导");
+    expect(wrapper.emitted("restart-onboarding")).toBeUndefined();
+  });
+
+  it("首次设置：系统授权未结束时明确提示限制，并允许结束后重试", async () => {
+    bridge.restartOnboarding.mockRejectedValueOnce(new Error("Windows 授权或增强设置仍在处理中；操作结束后可以重新运行向导。"));
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+    const rerun = wrapper.findAll("button").find(button => button.text() === "重新运行向导")!;
+    await rerun.trigger("click");
+    await flushPromises();
+    expect(wrapper.get('[role="alert"]').text()).toContain("Windows 授权或增强设置仍在处理中");
+    expect(rerun.attributes("disabled")).toBeUndefined();
+    expect(wrapper.emitted("restart-onboarding")).toBeUndefined();
+    await rerun.trigger("click");
+    await flushPromises();
+    expect(wrapper.emitted("restart-onboarding")).toHaveLength(1);
+    wrapper.unmount();
   });
 });

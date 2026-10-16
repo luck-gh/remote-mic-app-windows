@@ -1,21 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import { assertOnboardingCanRestart, onboardingExternalState, waitForOnboardingCleanup } from "../onboarding/lifecycle";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
-
-/**
- * 设置页“问题反馈”的外部入口（2026-10-01 用户指定，2026-10-02 官网地址改为
- * 带 `?from=win` 的来源标记，便于官网区分 Windows 版来客）：官网首页与 Windows
- * 版源码仓库。
- *
- * 这两个字符串同时是 `src-tauri/capabilities/default.json` 里 opener 白名单的
- * 键——改这里必须同步改那里，否则真机上点击会被插件判为 ForbiddenUrl
- * （`bridge.test.ts` 逐字锁定了这份契约，runtime simulation 另行断言不在真机
- * 上被拒绝）。
- */
-export const OFFICIAL_WEBSITE_URL = "https://sayall.app/?from=win";
-export const GITHUB_REPOSITORY_URL = "https://github.com/GetSayAll/remote-mic-app-windows";
 
 /**
  * Vokie 官网（2026-10-01 Andy 提供）。
@@ -57,17 +45,26 @@ export interface AudioEndpoint {
 }
 
 /**
- * 界面上的“推荐”判据：只有 VB-CABLE 标准包提供的 CABLE Input
- * （渲染端点友好名 `CABLE Input (VB-Audio Virtual Cable)`）值得推荐给
- * 微信输入法等语音工具作麦克风来源。
+ * 界面上的“推荐”判据：值得推荐给输入法当麦克风来源的 VB-CABLE 渲染端点。
+ *
+ * 渲染端点的名字跨 VB-CABLE 驱动版本变化（2026-10-02 现场）：
+ *   经典 2 通道：`CABLE Input (VB-Audio Virtual Cable)`
+ *   新版 16 通道：`CABLE In 16 Ch (2- VB-Audio Virtual Cable)`
+ * 两者都能把声音送回录音端 `CABLE Output`（`examples/cable_loopback_probe.rs`
+ * 实测两个端点回环 peak 均 ≈11k），因此都推荐；VB-CABLE A/B 的
+ * `CABLE-A/B Input` 不带 "VB-Audio Virtual Cable"，不推荐（它们的录音端不是
+ * 输入法默认监听的 CABLE Output）。
  *
  * 后端的 `isVirtualCableCandidate` 是更宽的候选判定（含 VB-CABLE A/B 的
  * CABLE-A/B Input 与 CI 仿真端点），只用于自动选择与安装检测，不足以
- * 决定推荐标记；两者刻意分开，避免给非标准端点打上推荐。
+ * 决定推荐标记；两者刻意分开。
  */
 export function isRecommendedVoiceEndpoint(endpoint: AudioEndpoint): boolean {
   const name = endpoint.name.trim().toLowerCase();
-  return name.includes("cable input") && name.includes("vb-audio");
+  if (!name.includes("vb-audio virtual cable")) {
+    return false;
+  }
+  return name.includes("cable input") || name.includes("cable in");
 }
 
 export interface AudioSnapshot {
@@ -142,7 +139,8 @@ export type ButtonAction =
   | { type: "scroll"; direction: "up" | "down"; steps?: number }
   | { type: "mouse_click"; kind: MouseClickKind }
   | { type: "mouse_move"; direction: MoveDirection; distance: number }
-  | { type: "open_app"; target: string };
+  | { type: "open_app"; target: string }
+  | { type: "focus_input" };
 
 /** 预设应用条目（list_preset_apps 返回；对齐 Mac PresetApplication）。 */
 export interface PresetAppInfo {
@@ -151,17 +149,65 @@ export interface PresetAppInfo {
   installed: boolean;
 }
 
+/** 打开应用后的聚焦方式（对齐 Rust `FocusStrategy`）。 */
+export type FocusStrategy = "open_only" | "app_shortcut" | "recorded_element";
+
+/** 相对目标顶层窗口的归一化矩形（物理像素换算成比例）。 */
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * 用户记录的输入框语义特征（不含任何输入内容）。
+ *
+ * `name` / `windowTitle` 属本地配置数据（可能含文档名等个人化信息），只存本地
+ * 配置文件，不进日志、不随诊断上传。
+ */
+export interface RecordedFocusTarget {
+  controlType: string;
+  automationId: string;
+  className?: string;
+  name?: string;
+  windowTitle?: string;
+  normalizedRect?: NormalizedRect;
+  contextTokens?: string[];
+}
+
+/** 「打开应用」目标的聚焦档案（键 = open_app 的 target）。 */
+export interface AppFocusProfile {
+  strategy: FocusStrategy;
+  shortcut?: KeyChord;
+  recorded?: RecordedFocusTarget;
+}
+
 /** 每键三列（单击/双击/长按），对齐 Mac 原版 ButtonTrigger。 */
 export interface ButtonActions {
   single: ButtonAction;
   double: ButtonAction;
   long: ButtonAction;
+  /**
+   * 「按住连续触发」策略；缺省 = 自动（无长按时连续执行可重复的单击）。
+   * off 显式关闭，single / long 显式指定连续执行的槽位。
+   * 每键至多一个槽位，互斥由界面与 Rust `normalized()` 强制。
+   */
+  holdRepeat?: "off" | "single" | "long";
+  /**
+   * OK 键：用遥控器移动过光标后的 5 秒内，按 OK 直接点击光标位置
+   * （缺省 = 关闭；只对 OK 键生效）。
+   */
+  okContextClick?: boolean;
 }
 
 export interface ButtonMappings {
+  /** 配置结构版本（当前为 2：缺省自动，off 显式关闭；保存时由 Rust 校验）。 */
+  schemaVersion?: number;
   enabled: boolean;
   actions: Partial<Record<RemoteButton, ButtonActions>>;
   applications?: AppLibraryEntry[];
+  focusProfiles?: Record<string, AppFocusProfile>;
 }
 
 export interface CaptureInputSettings {
@@ -177,6 +223,21 @@ export interface AudioRouteSnapshot {
   renderEndpointId: string | null;
   renderEndpointName: string | null;
 }
+/** Read-back identity proof: ready render alone cannot establish the selected capture route. */
+export function isPairedAudioRoute(
+  route: AudioRouteSnapshot | null,
+  capture: CaptureInputSnapshot | null,
+  audio: AudioSnapshot | null,
+): boolean {
+  return route?.phase === "paired"
+    && !!capture?.settings.endpointId
+    && !capture.recoveryPending
+    && !capture.lastError
+    && route.captureEndpointId === capture.settings.endpointId
+    && !!route.renderEndpointId
+    && route.renderEndpointId === audio?.selectedEndpointId;
+}
+
 export async function getAudioRouteSnapshot(): Promise<AudioRouteSnapshot> {
   if (!isTauriRuntime()) return { phase: "unavailable", reason: "unsupported", captureEndpointId: null, captureEndpointName: null, renderEndpointId: null, renderEndpointName: null };
   return invoke<AudioRouteSnapshot>("get_audio_route_snapshot");
@@ -195,9 +256,9 @@ export async function listCaptureInputs(): Promise<AudioEndpoint[]> {
   if (!isTauriRuntime()) return [];
   return invoke<AudioEndpoint[]>("list_capture_inputs");
 }
-export async function setCaptureInput(config: CaptureInputSettings): Promise<CaptureInputSnapshot> {
+export async function setCaptureInput(config: CaptureInputSettings, writerEndpointId?: string): Promise<CaptureInputSnapshot> {
   if (!isTauriRuntime()) throw new Error("请在 Windows 应用中设置会话输入设备");
-  return invoke<CaptureInputSnapshot>("set_capture_input", { config });
+  return invoke<CaptureInputSnapshot>("set_capture_input", { config, ...(writerEndpointId ? { writerEndpointId } : {}) });
 }
 export async function resolveCaptureRecovery(restore: boolean): Promise<CaptureInputSnapshot> {
   if (!isTauriRuntime()) throw new Error("请在 Windows 应用中恢复输入设备");
@@ -217,15 +278,17 @@ export interface MappingConfiguration {
   templates: MappingTemplate[];
   applicationBindings: ApplicationBinding[];
   buttonMappingFollowEnabled: boolean;
+  rememberedTemplateId?: string | null;
 }
 export interface MappingConfigurationImportPreview { token: string; sourceToken: string | null; formatVersion: number; configuration: MappingConfiguration; builtinTemplateIds: string[]; templateNameConflicts: string[]; unresolvedApplicationIds: string[]; }
 export interface SceneMenuItem { applicationId:string|null; templateId:string; label:string; running:boolean; }
-export interface MappingNotice { kind:string; templateId:string|null; name:string|null; actionsAvailable:boolean; defaultSaveStatus?:string|null; }
-export interface SceneSnapshot { mappingNoticeEnabled:boolean; mappingNotice:MappingNotice|null; mappingNoticeRevision:number; enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; panel:"template"|null; updateDefault:boolean; preferencePending?:boolean; preferenceError?:boolean; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; status:string|null; }
+export interface MappingNotice { kind:string; templateId:string|null; name:string|null; actionsAvailable:boolean; defaultSaveStatus?:string|null; manualSaveStatus?:"saving"|"saved"|"failed"|null; }
+export interface SceneSnapshot { mappingNoticeEnabled:boolean; mappingNotice:MappingNotice|null; mappingNoticeRevision:number; enabled:boolean; generation:number; foregroundGeneration:number; applicationId:string|null; templateId:string|null; panel:"template"|null; updateDefault:boolean; preferencePending?:boolean; preferenceError?:boolean; selectedIndex:number|null; menuItems:SceneMenuItem[]; waitingForRelease:boolean; voiceActive:boolean; voiceButtonPressed:boolean; status:string|null; }
 export type SceneEvent =
   | { type:"mapping_notice_enabled"; enabled:boolean }
   | { type:"snapshot"; snapshot:SceneSnapshot }
   | { type:"mapping_applied"; notice:MappingNotice; revision:number }
+  | { type:"manual_template_persistence_requested"; request_id:number; template_id:string|null }
   | { type:"default_template_persistence_requested"; requestId:number; applicationId:string; templateId:string };
 export interface TemplateImportRequest { templateIds: string[]; resolvedNames: Record<string,string>; replaceApplicationBindings: boolean; }
 export interface TemplateImportPreview { token:string; templates:Array<{sourceTemplateId:string;template:MappingTemplate}>; addedApplicationBindings:ApplicationBinding[]; replacedApplicationIds:string[]; skippedApplicationIds:string[]; unresolvedApplicationIds:string[]; }
@@ -258,6 +321,16 @@ export interface FiredGesture {
   trigger: ButtonTrigger;
 }
 
+/** 「聚焦输入框」最近一次结果（focus_service::FocusReport；reason 见 FocusFailure 标识）。 */
+export interface FocusReport {
+  requestId: number;
+  kind: string;
+  focused: boolean;
+  reason?: string;
+  attempts: number;
+  elapsedMs: number;
+}
+
 export interface ButtonMappingSnapshot {
   observedButtons: RemoteButton[];
   enabled: boolean;
@@ -268,6 +341,7 @@ export interface ButtonMappingSnapshot {
   firedGestures: number;
   lastFired: FiredGesture | null;
   lastError: string | null;
+  lastFocus?: FocusReport;
 }
 
 export interface SendInputSnapshot {
@@ -291,6 +365,8 @@ export interface ConnectionSnapshot {
   batteryLevel?: number | null;
   remoteName: string | null;
   remoteModel: RemoteModel;
+  /** 当前连接设备的稳定令牌（Rust `device_token`，与扫描列表同一套算法）；老快照没有此字段。 */
+  remoteToken?: string | null;
   capabilities: AtvvCapabilities | null;
   voiceState: VoiceSessionState;
   decodedSamples: number;
@@ -323,6 +399,16 @@ export interface RuntimeSnapshot {
 export interface DiagnosticReport {
   schemaVersion: number;
   appVersion: string;
+  /** 构建号（CI / 本地构建注入；取不到为 "unknown"）。 */
+  appBuild: string;
+  /** 源码修订（40 位 git SHA；取不到为 "unknown"）。 */
+  sourceRevision: string;
+  /** 发布通道（取不到为 "unknown"）。 */
+  buildChannel: string;
+  /** 运行机器的 Windows 版本（major.minor.build，如 "10.0.26100"）。 */
+  windowsVersion: string;
+  /** 进程架构（x86_64 等）。 */
+  processArchitecture: string;
   platform: string;
   verificationStatus: string;
   capabilities: {
@@ -376,6 +462,14 @@ export interface DiagnosticReport {
     firedGestures: number;
     errorPresent: boolean;
   };
+  /** 输入法（2026-10-13 现场，schemaVersion 3）：诊断"语音没出字是不是没切输入法"。 */
+  ime: {
+    detected: boolean;
+    activeName: string | null;
+    installedNames: string[];
+    expectedName: string | null;
+    matchesExpected: boolean | null;
+  };
 }
 
 export interface PairedRemote {
@@ -383,6 +477,8 @@ export interface PairedRemote {
   name: string;
   model: RemoteModel;
   isSupportedCandidate: boolean;
+  /** 设备稳定令牌（Rust `device_token`）：把扫描行与"当前连着的设备"对上；老快照没有此字段。 */
+  token?: string;
 }
 
 /** 应用内更新（Rust updater command 契约，camelCase 对齐 src-tauri/src/updater.rs）。 */
@@ -446,7 +542,7 @@ export interface AppUpdateProgress {
 const browserSnapshot: RuntimeSnapshot = {
   // 浏览器预览没有安装包可读，这里跟随当前应用版本：它是预览里"设置页版本号"
   // 与侧栏底部的唯一来源，写死旧值会让预览显示一个不存在的版本。
-  appVersion: "0.5.0",
+  appVersion: "0.8.2",
   platform: {
     platform: "browser-preview",
     windowsApiAvailable: false,
@@ -516,8 +612,13 @@ export async function getRuntimeSnapshot(): Promise<RuntimeSnapshot> {
 export async function getDiagnosticReport(): Promise<DiagnosticReport> {
   if (!isTauriRuntime()) {
     return {
-      schemaVersion: 1,
+      schemaVersion: 3,
       appVersion: browserSnapshot.appVersion,
+      appBuild: "unknown",
+      sourceRevision: "unknown",
+      buildChannel: "unknown",
+      windowsVersion: "unknown",
+      processArchitecture: "browser-preview",
       platform: browserSnapshot.platform.platform,
       verificationStatus: browserSnapshot.platform.verificationStatus,
       capabilities: {
@@ -571,6 +672,13 @@ export async function getDiagnosticReport(): Promise<DiagnosticReport> {
         firedGestures: 0,
         errorPresent: false,
       },
+      ime: {
+        detected: false,
+        activeName: null,
+        installedNames: [],
+        expectedName: null,
+        matchesExpected: null,
+      },
     };
   }
   return invoke<DiagnosticReport>("get_diagnostic_report");
@@ -586,9 +694,7 @@ export function formatDiagnosticReport(
 /**
  * 打开诊断日志目录（关于页入口）。返回实际打开的目录供界面显示。
  *
- * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径——
- * 保留 capabilities 的最小权限边界（opener 只放行 VB-CABLE 官网、产品官网与
- * 源码仓库三个固定 URL）。
+ * 目录由 Rust 侧从日志初始化的落盘路径推导，前端不拼接、也不传路径。
  */
 export async function openLogDirectory(): Promise<string> {
   if (!isTauriRuntime()) throw new Error("当前是浏览器预览，无法打开日志目录");
@@ -657,6 +763,36 @@ export async function selectAudioEndpoint(endpointId: string): Promise<AudioSnap
   return invoke<AudioSnapshot>("select_audio_endpoint", { endpointId });
 }
 
+/** 向导入口用到的固定 Windows 设置页（不接收任意 URI；Rust 侧另有 ms-settings 前缀校验）。 */
+export type WindowsSettingsSection = "bluetooth" | "sound" | "microphone";
+
+export async function openWindowsSettings(section: WindowsSettingsSection): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  return invoke<void>("open_windows_settings", { section });
+}
+
+/**
+ * 语音增益（dB，0–24；对齐 Mac 设置页「增益」滑块，0 = 原始音量）。
+ *
+ * 读取走持久化值；写入返回实际保存值（越界会被钳制），界面用它回显——
+ * 不假设"写进去什么就存什么"。
+ */
+export async function getGainDb(): Promise<number> {
+  if (!isTauriRuntime()) {
+    return 0;
+  }
+  return invoke<number>("get_gain_db");
+}
+
+export async function setGainDb(gainDb: number): Promise<number> {
+  if (!isTauriRuntime()) {
+    return gainDb;
+  }
+  return invoke<number>("set_gain_db", { gainDb });
+}
+
 export async function openVbCableDownloadPage(): Promise<void> {
   if (!isTauriRuntime()) {
     window.open(VB_CABLE_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
@@ -675,16 +811,6 @@ async function openExternalUrl(url: string): Promise<void> {
     return;
   }
   await openUrl(url);
-}
-
-/** 设置页顶部“官网”入口。 */
-export async function openOfficialWebsite(): Promise<void> {
-  await openExternalUrl(OFFICIAL_WEBSITE_URL);
-}
-
-/** 设置页“问题反馈”里的“GitHub”入口。 */
-export async function openGitHubRepository(): Promise<void> {
-  await openExternalUrl(GITHUB_REPOSITORY_URL);
 }
 
 /** 连接页“Vokie 未安装”提示里的官网入口（2026-10-01）。 */
@@ -732,6 +858,90 @@ export async function setOtherVoiceHotkey(keys: KeyCode[]): Promise<KeyCode[] | 
     return keys;
   }
   return invoke<KeyCode[] | null>("set_other_voice_hotkey", { keys });
+}
+
+/**
+ * 首次使用向导状态（Rust `onboarding.json`，设计稿 §6）。
+ *
+ * `isActive` = 当前流程版本尚未处理（验证完成或用户主动稍后设置都会关闭自动展示）。步骤 token 由
+ * `src/onboarding/flow.ts` 的 `normalizeStep` 归一化（未知值 → welcome）。
+ */
+export interface OnboardingState {
+  flowVersion: number;
+  completedVersion: number;
+  step: string;
+  isActive: boolean;
+}
+
+/**
+ * 浏览器预览（`pnpm dev`）兜底：默认「已完成」，预览环境用于页面开发，
+ * 不把开发者锁进向导；真机/仿真环境始终走 Rust 状态文件。
+ */
+const BROWSER_ONBOARDING_STATE: OnboardingState = {
+  flowVersion: 1,
+  completedVersion: 1,
+  step: "complete",
+  isActive: false,
+};
+
+export async function getOnboardingState(): Promise<OnboardingState> {
+  if (!isTauriRuntime()) {
+    return { ...BROWSER_ONBOARDING_STATE };
+  }
+  return invoke<OnboardingState>("get_onboarding_state");
+}
+
+export async function saveOnboardingStep(step: string): Promise<OnboardingState> {
+  if (!isTauriRuntime()) {
+    return { ...BROWSER_ONBOARDING_STATE };
+  }
+  return invoke<OnboardingState>("save_onboarding_step", { step });
+}
+
+/** 设置页「重新运行设置向导」：只重置向导进度，不清除设备/映射/音频/其他设置。 */
+export async function restartOnboarding(): Promise<OnboardingState> {
+  assertOnboardingCanRestart();
+  await waitForOnboardingCleanup();
+  assertOnboardingCanRestart();
+  if (!isTauriRuntime()) {
+    return { ...BROWSER_ONBOARDING_STATE };
+  }
+  const state = await invoke<OnboardingState>("restart_onboarding");
+  onboardingExternalState.value = null;
+  return state;
+}
+
+export async function completeOnboarding(): Promise<OnboardingState> {
+  if (!isTauriRuntime()) {
+    return { ...BROWSER_ONBOARDING_STATE };
+  }
+  return invoke<OnboardingState>("complete_onboarding");
+}
+
+/** 退出/跳过结束不提交未验证绑定；保留进入向导前的有效工具与快捷键。 */
+export async function dismissOnboarding(): Promise<OnboardingState> {
+  if (!isTauriRuntime()) return { ...BROWSER_ONBOARDING_STATE };
+  return invoke<OnboardingState>("dismiss_onboarding");
+}
+
+/** 停止本轮实际语音测试，释放注入按键与临时音频会话。 */
+export async function cancelVoiceTest(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  return invoke<void>("cancel_voice_test");
+}
+
+/**
+ * 第④步暂存语音绑定：落回滚快照 + 应用正式配置与运行时（设计稿 §5.4）。
+ * 只有向导进行中可调用；退出未完成流程/重跑向导会回滚到进入向导前的配置。
+ */
+export async function stageOnboardingVoiceBinding(
+  tool: VoiceInputTool,
+  hotkey: KeyChord | null,
+): Promise<OnboardingState> {
+  if (!isTauriRuntime()) {
+    return { ...BROWSER_ONBOARDING_STATE };
+  }
+  return invoke<OnboardingState>("stage_onboarding_voice_binding", { tool, hotkey });
 }
 
 export async function getRawInputSnapshot(): Promise<RawInputSnapshot> {
@@ -834,6 +1044,44 @@ export interface Rc003BridgeSnapshot {
 /** `stopped` = 该平台没有这个机制（非 Windows），或桥接未启用。 */
 export type Rc003BridgePhase = "stopped" | "listening" | "connected" | "failed";
 
+/**
+ * 向导第⑥步：按键映射临时暂挂（只观察、不注入；内存态、不改用户配置）。
+ * 进入「普通按键体验」时暂挂，离开时恢复；进程退出后自然复位。
+ */
+export async function setMappingSuspension(suspended: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return suspended;
+  }
+  return invoke<boolean>("set_mapping_suspension", { suspended });
+}
+
+/**
+ * 向导第⑤步前置（探针④）：打开物理键观察窗口。
+ * 返回窗口 id；0 = 当前环境不可用（仿真/钩子未运行），调用方按未知处理。
+ * excludeVks：不计入的虚拟键码——「按住说话」和弦由报告层以非注入形态
+ * 送进 OS（必须到达输入法），不属于手动输入。
+ */
+export async function beginKeyObservation(excludeVks: number[]): Promise<number> {
+  if (!isTauriRuntime()) {
+    return 0;
+  }
+  return invoke<number>("begin_key_observation", { excludeVks });
+}
+
+/**
+ * 向导第⑤步前置（探针④）：关闭物理键观察窗口并取回计数。
+ * 计数 = 窗口内「可能进入 OS 的物理按下沿」（非注入、未被门控吞下、不在
+ * 排除集内）。返回 null = 计量不可靠（窗口过期/钩子停止）——fail-open，
+ * 不得据此判定手动输入。
+ */
+export async function endKeyObservation(windowId: number): Promise<number | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<number | null>("end_key_observation", { windowId });
+}
+
+/** 浏览器 / 仿真环境没有这个机制：恒为 "不存在"，前端据此不显示这一条目。 */
 const BROWSER_RC003_BRIDGE: Rc003BridgeSnapshot = {
   phase: "stopped",
   port: 0,
@@ -906,6 +1154,49 @@ export async function disableRc003Capture(): Promise<Rc003TaskStatus> {
   return invoke<Rc003TaskStatus>("disable_rc003_capture");
 }
 
+/** 本机无法使用「全按键支持」的原因（`available` 为 false 时一定有值）。 */
+export type CaptureUnsupportedReason = "arch_unsupported" | "helper_missing";
+
+/**
+ * 「全按键支持」在这台电脑上是否可用（2026-10-07 issue #206）。
+ *
+ * 背景：Windows 11 ARM64 上增强捕获起不来（产品只提供 x64 载荷，ARM64 上加载
+ * 不了），后端因此在启动时把已持久化的开启意图回落为关闭、并停止重试空转；
+ * 界面据此把开关与三键卡片置灰、说明原因与恢复方式，不再让页面永久停在
+ * 「正在启动」。`available=false` 时桥接相位是 `stopped`（状态点不显示）。
+ */
+export interface CaptureSupport {
+  /** 本机原生架构。 */
+  nativeArch: "x64" | "arm64" | "unknown";
+  /** 本机架构对应的载荷文件名（诊断信息，不进用户可见文案）。 */
+  helperExpected: string;
+  /** false = 本机无法使用「全按键支持」：界面必须置灰入口并说明原因。 */
+  available: boolean;
+  reason: CaptureUnsupportedReason | null;
+}
+
+/** 浏览器预览没有真实平台：按「可用」渲染，保证界面能完整走查。 */
+const BROWSER_CAPTURE_SUPPORT: CaptureSupport = {
+  nativeArch: "unknown",
+  helperExpected: "sayall-helper.exe",
+  available: true,
+  reason: null,
+};
+
+/**
+ * 读取本机的支持情况（挂载时一次 + 随页面既有轮询刷新）。
+ *
+ * 与 `getRc003TaskStatus` 同口径：非 Tauri 环境返回浏览器预览值，Tauri 环境
+ * IPC 失败时抛错，由调用方 `.catch` 后保持上一次的值（读不到就不置灰，
+ * 不因为一次 IPC 失败把功能锁死）。
+ */
+export async function getCaptureSupport(): Promise<CaptureSupport> {
+  if (typeof window === "undefined" || !isTauriRuntime()) {
+    return BROWSER_CAPTURE_SUPPORT;
+  }
+  return invoke<CaptureSupport>("get_capture_support");
+}
+
 
 
 export async function saveButtonMappings(mappings: ButtonMappings): Promise<ButtonMappings> {
@@ -965,6 +1256,26 @@ export async function listRunningApps(): Promise<RunningAppInfo[]> {
     { applicationId: "c:\\tools\\reader.exe", name: "Reader", preset: false },
   ];
   return invoke<RunningAppInfo[]>("list_running_apps");
+}
+
+/**
+ * 「学习输入框」：3 秒窗口内轮询系统焦点，返回捕获到的可编辑目标特征。
+ *
+ * 调用方需先让目标应用成为前台（本命令不会切换窗口）。
+ */
+export async function learnFocusTarget(): Promise<RecordedFocusTarget> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法学习输入框");
+  }
+  return invoke<RecordedFocusTarget>("learn_focus_target");
+}
+
+/** 「测试打开与聚焦」：按目标与聚焦档案走一次生产路径（异步受理）。 */
+export async function testAppFocus(target: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法测试打开与聚焦");
+  }
+  return invoke<void>("test_app_focus", { target });
 }
 
 export async function getButtonMappingSnapshot(): Promise<ButtonMappingSnapshot> {
@@ -1095,6 +1406,33 @@ export async function setVoiceInputTool(tool: VoiceInputTool): Promise<VoiceInpu
   return saved ?? tool;
 }
 
+/**
+ * 输入法状态（2026-10-13 现场）：诊断"语音没出字是不是因为没切输入法"。
+ *
+ * - `detected=false`：读不到输入法状态——界面**不提示**（fail-open，宁可不说也不能瞎说）；
+ * - `expected=null`：当前的输入工具不需要切输入法（如 Vokie / 其他工具）；
+ * - `matchesExpected`：`null` = 判定不出来，同样是"不提示"。
+ */
+export interface ImeStatus {
+  detected: boolean;
+  active: string | null;
+  installed: string[];
+  expected: string | null;
+  matchesExpected: boolean | null;
+}
+
+
+/**
+ * **只读**查询输入法状态（不切输入法）。复制诊断信息时用它，避免"复制一下顺手改了
+ * 用户输入法"。浏览器预览下返回"读不到"。
+ */
+export async function getImeStatus(): Promise<ImeStatus> {
+  if (!isTauriRuntime()) {
+    return { detected: false, active: null, installed: [], expected: null, matchesExpected: null };
+  }
+  return invoke<ImeStatus>("get_ime_status");
+}
+
 /** 检查应用更新；浏览器预览下返回"无更新"占位（不发起网络请求）。 */
 export async function checkAppUpdate(): Promise<AppUpdateInfo> {
   if (!isTauriRuntime()) {
@@ -1159,28 +1497,6 @@ export interface ThemeResultReport {
 export async function reportThemeResult(report: ThemeResultReport): Promise<void> {
   if (!isTauriRuntime()) return;
   await invoke("report_theme_result", { report });
-}
-
-/**
- * 应用图标（2026-10-02 用户指定；对齐 Mac main `AppIconController`/`AppIconCatalog`）：
- *
- * - `standard`：内置应用图标（默认，也是老配置的落点）；
- * - `faceted-duck`：来自 Mac `Resources/AppIcons/faceted-duck.png` 的「几何鸭」。
- *
- * 切换后由 Rust 同时更换**主窗口图标（任务栏 / Alt-Tab / 标题栏）与托盘图标**；
- * 设置页顶部标识与选项预览用同一 ID 实时渲染。安装包与开始菜单快捷方式的图标
- * 属于安装产物，运行期不变（Mac 的 bundle 图标同样不变）。
- */
-export type AppIconIdentifier = "standard" | "faceted-duck";
-
-export async function getAppIcon(): Promise<AppIconIdentifier> {
-  if (!isTauriRuntime()) return "standard";
-  return invoke<AppIconIdentifier>("get_app_icon");
-}
-
-export async function setAppIcon(identifier: AppIconIdentifier): Promise<AppIconIdentifier> {
-  if (!isTauriRuntime()) return identifier;
-  return invoke<AppIconIdentifier>("set_app_icon", { identifier });
 }
 
 /** 下载并安装已检查到的更新（Windows 上安装成功时应用会退出并由安装器重启）。 */
@@ -1361,6 +1677,7 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
   if (action.type === "task_switch") return action.view === "applications" ? "任务切换" : "任务视图";
+  if (action.type === "focus_input") return "聚焦输入框";
   if (action.type === "scroll") {
     const label = action.direction === "up" ? "滚轮向上" : "滚轮向下";
     return (action.steps ?? 1) === 1 ? label : `${label} ${action.steps} 格`;

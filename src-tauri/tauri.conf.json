@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "无线麦 SayAll",
-  "version": "0.5.0",
+  "productName": "无线麦",
+  "version": "1.0.0",
   "identifier": "app.getsayall.remote-mic.windows",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -12,11 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "无线麦 SayAll",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 1100,
-        "minHeight": 720,
+        "title": "无线麦 · 个人版",
+        "width": 1066.67,
+        "height": 800,
+        "minWidth": 1066.67,
+        "minHeight": 800,
         "decorations": true,
         "resizable": true,
         "dragDropEnabled": false,
@@ -33,7 +33,7 @@
       "nsis"
     ],
     "createUpdaterArtifacts": true,
-    "publisher": "GetSayAll",
+    "publisher": "luck-gh",
     "resources": [
       "sayall-helper.exe",
       "frida-gadget.dll",
@@ -42,7 +42,7 @@
     ],
     "category": "Productivity",
     "shortDescription": "把 RC001/RC003 遥控器的语音和按键桥接到 Windows",
-    "longDescription": "无线麦 SayAll Windows 版通过公开 Windows API 接收 RC001 和 RC003 遥控器的语音和普通按键。",
+    "longDescription": "无线麦个人版；基于 GetSayAll Windows 项目，2026-10-06 修改。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -66,15 +66,16 @@
         "installerHooks": "windows/installer-hooks.nsh",
         "template": "windows/installer.nsi",
         "uninstallerIcon": "icons/icon.ico",
-        "startMenuFolder": "无线麦 SayAll"
+        "startMenuFolder": "无线麦"
       }
-    }
+    },
+    "license": "GPL-3.0-only"
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcyRUY0RDUwOEQ1ODAyNDgKUldSSUFsaU5VRTN2Y3ZleWlGT3AzSHpNZk5ka09TZFZRUHRsci9BVXJacmU0QTljSElnd0RydTQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1NDg0MTUwODU3N0UyNUMKUldSYzRuZUZVRUZJOVhpWXJYNzVHdDZ6UVlUZm4wWk5JWTZ2Sm1XL0lmOWJnbThQWDM2dzAyMmkK",
       "endpoints": [
-        "https://github.com/GetSayAll/remote-mic-app-windows/releases/latest/download/latest.json"
+        "https://github.com/luck-gh/remote-mic-app-windows/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

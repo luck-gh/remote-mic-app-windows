@@ -85,7 +85,7 @@ fn run_json_dialog(kind: DialogKind) -> Result<Option<PathBuf>, String> {
             DialogKind::Save => "导出按键映射配置",
         };
         let title = wide(title_text);
-        let filter_name = wide("SayAll 按键映射配置 (*.json)");
+        let filter_name = wide("无线麦 按键映射配置 (*.json)");
         let filter_spec = wide("*.json");
         let filters = [COMDLG_FILTERSPEC {
             pszName: PCWSTR(filter_name.as_ptr()),
@@ -106,7 +106,7 @@ fn run_json_dialog(kind: DialogKind) -> Result<Option<PathBuf>, String> {
                 | FOS_STRICTFILETYPES;
             if matches!(kind, DialogKind::Save) {
                 options |= FOS_OVERWRITEPROMPT;
-                let default_name = wide("SayAll-按键映射.json");
+                let default_name = wide("无线麦-按键映射.json");
                 dialog
                     .SetFileName(PCWSTR(default_name.as_ptr()))
                     .map_err(|_| "设置导出文件名失败".to_owned())?;

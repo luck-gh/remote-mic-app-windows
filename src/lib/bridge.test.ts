@@ -7,15 +7,14 @@ import {
   chordLabel,
   connectionPhaseLabel,
   formatDiagnosticReport,
-  GITHUB_REPOSITORY_URL,
   isRecommendedVoiceEndpoint,
-  OFFICIAL_WEBSITE_URL,
-  openGitHubRepository,
   openLogDirectory,
-  openOfficialWebsite,
+  setCaptureInput,
+  openVokieHomepage,
   openVbCableDownloadPage,
   remoteModelLabel,
   VB_CABLE_DOWNLOAD_URL,
+  VOKIE_HOMEPAGE_URL,
   type AudioPhase,
   type ConnectionPhase,
   type DiagnosticReport,
@@ -29,6 +28,11 @@ describe("mouse actions", () => {
     expect(actionSummary({ type: "scroll", direction: "down", steps: 5 })).toBe("滚轮向下 5 格");
     expect(actionSummary({ type: "mouse_move", direction: "left", distance: 75 })).toBe("鼠标向左 75 px");
     expect(actionSummary({ type: "mouse_click", kind: "double_left" })).toBe("左键双击");
+  });
+
+  it("summarizes the focus-input action", () => {
+    // 动作摘要会显示在按键格子上，文案即用户可见串（product-copy 口径）。
+    expect(actionSummary({ type: "focus_input" })).toBe("聚焦输入框");
   });
 });
 
@@ -118,8 +122,13 @@ describe("connection phase presentation", () => {
 describe("diagnostic report presentation", () => {
   it("adds an explicit generation time without changing the captured report", () => {
     const report: DiagnosticReport = {
-      schemaVersion: 1,
+      schemaVersion: 3,
       appVersion: "0.1.0",
+      appBuild: "1001",
+      sourceRevision: "0123456789012345678901234567890123456789",
+      buildChannel: "local-test",
+      windowsVersion: "10.0.26100",
+      processArchitecture: "x86_64",
       platform: "windows",
       verificationStatus: "待真机验证",
       capabilities: {
@@ -173,6 +182,13 @@ describe("diagnostic report presentation", () => {
         firedGestures: 0,
         errorPresent: false,
       },
+  ime: {
+    detected: false,
+    activeName: null,
+    installedNames: [],
+    expectedName: null,
+    matchesExpected: null,
+  },
     };
 
     const formatted = JSON.parse(formatDiagnosticReport(report, "2026-09-01T00:00:00.000Z"));
@@ -194,44 +210,26 @@ describe("VB-CABLE download guidance", () => {
   });
 });
 
-describe("设置页外部入口（官网 / GitHub）", () => {
+describe("设置页移除普通官方入口，同时保留必要第三方链接", () => {
   afterEach(() => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.mocked(openUrl).mockReset();
   });
 
-  it("指向已确认的官网与 Windows 仓库地址", () => {
-    // 2026-10-02 用户指定：官网入口带 `?from=win` 来源标记，便于官网区分来客。
-    expect(OFFICIAL_WEBSITE_URL).toBe("https://sayall.app/?from=win");
-    expect(GITHUB_REPOSITORY_URL).toBe("https://github.com/GetSayAll/remote-mic-app-windows");
-  });
-
-  it("浏览器预览下用新标签打开，不调用 Tauri opener", async () => {
+  it("保留 VB-CABLE 与 Vokie 的公开入口", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
 
-    await openOfficialWebsite();
-    await openGitHubRepository();
+    await openVbCableDownloadPage();
+    await openVokieHomepage();
 
-    expect(open).toHaveBeenNthCalledWith(1, OFFICIAL_WEBSITE_URL, "_blank", "noopener,noreferrer");
-    expect(open).toHaveBeenNthCalledWith(2, GITHUB_REPOSITORY_URL, "_blank", "noopener,noreferrer");
+    expect(VB_CABLE_DOWNLOAD_URL).toBe("https://vb-audio.com/Cable/");
+    expect(VOKIE_HOMEPAGE_URL).toBe("https://vokie.com/");
+    expect(open).toHaveBeenNthCalledWith(1, VB_CABLE_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
+    expect(open).toHaveBeenNthCalledWith(2, VOKIE_HOMEPAGE_URL, "_blank", "noopener,noreferrer");
     expect(openUrl).not.toHaveBeenCalled();
     open.mockRestore();
   });
 
-  it("Tauri 运行时交给 opener 插件，地址必须与 capability 白名单逐字一致", async () => {
-    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-    vi.mocked(openUrl).mockResolvedValue(undefined);
-
-    await openOfficialWebsite();
-    await openGitHubRepository();
-
-    // 传出的字符串与 src-tauri/capabilities/default.json 的 allow 列表是同一份
-    // 契约：多一个字符、少一个尾斜杠都会被插件判为 ForbiddenUrl。
-    expect(vi.mocked(openUrl).mock.calls.map(([url]) => url)).toEqual([
-      OFFICIAL_WEBSITE_URL,
-      GITHUB_REPOSITORY_URL,
-    ]);
-  });
 });
 
 describe("诊断日志目录入口", () => {
@@ -254,5 +252,18 @@ describe("诊断日志目录入口", () => {
   it("浏览器预览下明确不可用而不是静默失败", async () => {
     await expect(openLogDirectory()).rejects.toThrow("当前是浏览器预览，无法打开日志目录");
     expect(invoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("explicit capture and writer transaction", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(invoke).mockReset();
+  });
+  it("submits both explicit endpoint choices in one IPC request", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const config = { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' };
+    await setCaptureInput(config, 'render-16');
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('set_capture_input', { config, writerEndpointId: 'render-16' });
   });
 });

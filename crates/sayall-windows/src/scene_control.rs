@@ -7,7 +7,8 @@ use crate::application_control::{
 use crate::button_mapping::{FiredGesture, GestureDisposition, RoutedGesture};
 use crate::raw_input::{ButtonEdge, RemoteButton};
 use crate::send_input::{
-    ButtonAction, ButtonActions, ButtonMappings, ButtonTrigger, KeyChord, KeyCode, TaskSwitchView,
+    ButtonAction, ButtonActions, ButtonMappings, ButtonTrigger, HoldRepeat, KeyChord, KeyCode,
+    TaskSwitchView,
 };
 use crate::templates::MappingConfiguration;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,20 @@ pub(crate) fn notify_voice_activity(active: bool) {
     let scene = VOICE_SCENE.get().and_then(|slot| lock(slot).upgrade());
     if let Some(scene) = scene {
         scene.notify_voice_active(active);
+    }
+}
+
+pub(crate) fn observe_voice_control(bytes: &[u8]) {
+    let scene = VOICE_SCENE.get().and_then(|slot| lock(slot).upgrade());
+    if let Some(scene) = scene {
+        scene.observe_voice_control(bytes);
+    }
+}
+
+pub(crate) fn clear_voice_button(reason: &'static str) {
+    let scene = VOICE_SCENE.get().and_then(|slot| lock(slot).upgrade());
+    if let Some(scene) = scene {
+        scene.set_voice_button_pressed(false, reason);
     }
 }
 
@@ -67,6 +82,8 @@ pub struct SceneSnapshot {
     pub menu_items: Vec<SceneMenuItem>,
     pub waiting_for_release: bool,
     pub voice_active: bool,
+    /// ATVV start/stop observation, independent of successful audio preparation.
+    pub voice_button_pressed: bool,
     pub status: Option<String>,
 }
 
@@ -92,6 +109,10 @@ pub enum SceneEvent {
         request_id: u64,
         enabled: bool,
     },
+    ManualTemplatePersistenceRequested {
+        request_id: u64,
+        template_id: Option<String>,
+    },
 }
 
 pub type SceneEventCallback = Arc<dyn Fn(SceneEvent) + Send + Sync>;
@@ -105,6 +126,7 @@ pub struct MappingNotice {
     pub name: Option<String>,
     pub actions_available: bool,
     pub default_save_status: Option<String>,
+    pub manual_save_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +150,8 @@ struct ManualTemplateSelection {
     template_id: Option<String>,
     application_id: Option<String>,
     source: &'static str,
+    generation: u64,
+    save_status: Option<String>,
 }
 
 struct PendingTemplateSelection {
@@ -152,9 +176,12 @@ struct State {
     token: Option<WindowToken>,
     // The actual window that opened the menu is independent of template selection.
     menu_return_target: Option<WindowToken>,
+    menu_open_generation: Option<u64>,
     closing_panel: Option<PanelState>,
     panel: Option<PanelState>,
     template_menu_focused: bool,
+    menu_focused_window_id: Option<u64>,
+    template_menu_remote_only: bool,
     menu_application_id: Option<String>,
     update_default: bool,
     preference_request: Option<(u64, u64, bool)>,
@@ -171,6 +198,7 @@ struct State {
     handled_in_cycle: BTreeSet<RemoteButton>,
     waiting_for_release: bool,
     voice_active: bool,
+    voice_button_pressed: bool,
     status: Option<String>,
 }
 
@@ -189,9 +217,12 @@ impl Default for State {
             foreground_generation: 0,
             token: None,
             menu_return_target: None,
+            menu_open_generation: None,
             closing_panel: None,
             panel: None,
             template_menu_focused: false,
+            menu_focused_window_id: None,
+            template_menu_remote_only: false,
             menu_application_id: None,
             update_default: false,
             preference_request: None,
@@ -208,6 +239,7 @@ impl Default for State {
             handled_in_cycle: BTreeSet::new(),
             waiting_for_release: false,
             voice_active: false,
+            voice_button_pressed: false,
             status: None,
         }
     }
@@ -290,15 +322,18 @@ impl SceneController {
         {
             let mut state = lock(&self.state);
             cancel_state(&mut state, "configuration_changed");
-            let follow_reenabled = !state.configuration.button_mapping_follow_enabled
-                && configuration.button_mapping_follow_enabled;
+            let follow_changed = state.configuration.button_mapping_follow_enabled
+                != configuration.button_mapping_follow_enabled;
             state.configuration = configuration;
+            if follow_changed {
+                state.configuration.remembered_template_id = None;
+            }
             if state
                 .manual_selection
                 .as_ref()
                 .and_then(|selection| selection.template_id.as_deref())
                 .is_some_and(|id| !template_exists(&state.configuration, id))
-                || (follow_reenabled && !manual_selection_matches_application(&state))
+                || follow_changed
             {
                 state.manual_selection = None;
             }
@@ -421,7 +456,7 @@ impl SceneController {
         mut notice: MappingNotice,
         available: bool,
     ) {
-        let (event, source, selection_confirmed) = {
+        let (event, source, selection_confirmed, persistence) = {
             let mut state = lock(&self.state);
             if state.generation != generation || state.foreground_generation != foreground {
                 return;
@@ -436,6 +471,24 @@ impl SceneController {
             }
             notice.actions_available =
                 available && !matches!(notice.kind.as_str(), "disabled" | "unconfigured");
+            let persistence = if !state.configuration.button_mapping_follow_enabled {
+                state.manual_selection.as_mut().and_then(|selection| {
+                    if selection.save_status.is_some() {
+                        return None;
+                    }
+                    selection.save_status = Some("saving".into());
+                    Some(SceneEvent::ManualTemplatePersistenceRequested {
+                        request_id: selection.generation,
+                        template_id: selection.template_id.clone(),
+                    })
+                })
+            } else {
+                None
+            };
+            notice.manual_save_status = state
+                .manual_selection
+                .as_ref()
+                .and_then(|selection| selection.save_status.clone());
             let event = if state.mapping_notice.as_ref() != Some(&notice) {
                 state.mapping_notice_revision = state.mapping_notice_revision.saturating_add(1);
                 state.mapping_notice = Some(notice.clone());
@@ -454,7 +507,12 @@ impl SceneController {
                     let _ = pending.reply.try_send(Ok(snapshot_from(&state)));
                 }
             }
-            (event, selection_source(&state), selection_confirmed)
+            (
+                event,
+                selection_source(&state),
+                selection_confirmed,
+                persistence,
+            )
         };
         if event.is_none() && !selection_confirmed {
             return;
@@ -464,6 +522,78 @@ impl SceneController {
         if let Some(event) = event {
             emit(&self.callbacks, event);
         }
+        if let Some(event) = persistence {
+            emit(&self.callbacks, event);
+        }
+    }
+
+    /// Called under the settings transaction lock before saving only the memory field.
+    pub fn manual_template_save_is_current(
+        &self,
+        request_id: u64,
+        template_id: Option<&str>,
+    ) -> bool {
+        let state = lock(&self.state);
+        !state.configuration.button_mapping_follow_enabled
+            && state
+                .manual_selection
+                .as_ref()
+                .into_iter()
+                .chain(
+                    state
+                        .pending_selection
+                        .as_ref()
+                        .and_then(|pending| pending.previous.as_ref()),
+                )
+                .any(|selection| {
+                    selection.generation == request_id
+                        && selection.template_id.as_deref() == template_id
+                        && selection.save_status.as_deref() == Some("saving")
+                })
+    }
+
+    pub fn complete_manual_template_save(&self, request_id: u64, saved: bool) {
+        let event = {
+            let mut state = lock(&self.state);
+            if state.configuration.button_mapping_follow_enabled {
+                return;
+            }
+            let selection = if state
+                .manual_selection
+                .as_ref()
+                .is_some_and(|selection| selection.generation == request_id)
+            {
+                state.manual_selection.as_mut()
+            } else {
+                state
+                    .pending_selection
+                    .as_mut()
+                    .and_then(|pending| pending.previous.as_mut())
+            };
+            let Some(selection) = selection.filter(|selection| {
+                selection.generation == request_id
+                    && selection.save_status.as_deref() == Some("saving")
+            }) else {
+                return;
+            };
+            selection.save_status = Some(if saved { "saved" } else { "failed" }.into());
+            let remembered = selection.template_id.clone();
+            if saved {
+                state.configuration.remembered_template_id = remembered;
+            }
+            let Some(mut notice) = state.mapping_notice.clone() else {
+                return;
+            };
+            notice.manual_save_status = Some(if saved { "saved" } else { "failed" }.into());
+            state.mapping_notice_revision = state.mapping_notice_revision.saturating_add(1);
+            state.mapping_notice = Some(notice.clone());
+            SceneEvent::MappingApplied {
+                notice,
+                revision: state.mapping_notice_revision,
+            }
+        };
+        crate::gatt_note(format!("manual_template_memory phase=persisted request_id={request_id} terminal_result={} current_mapping_retained=true", if saved { "passed" } else { "failed" }));
+        emit(&self.callbacks, event);
     }
 
     /// Returns the ordinary-key profile selected by the current foreground
@@ -521,10 +651,26 @@ impl SceneController {
             crate::gatt_note(format!("template_menu phase=restore_completed generation={generation} terminal_result=failed reason=return_target_unavailable elapsed_ms=0"));
             return Err(ApplicationControlError::NoForegroundWindow);
         };
+        let already_foreground = self
+            .application
+            .identify_foreground()
+            .is_ok_and(|current| token.same_window(&current));
         // The host calls this from its UI thread. Returning to our own main
         // window must stay on that thread; waiting on a worker would prevent
         // the target input queue from processing its foreground activation.
-        let result = if token.process_id() == std::process::id() {
+        let result = if already_foreground {
+            let state = lock(&self.state);
+            if state.generation == generation
+                && state
+                    .menu_return_target
+                    .as_ref()
+                    .is_some_and(|target| target.same_window(&token))
+            {
+                Ok(())
+            } else {
+                Err(ApplicationControlError::StaleToken)
+            }
+        } else if token.process_id() == std::process::id() {
             self.application.restore_foreground(&token)
         } else {
             let (reply, receiver) = mpsc::sync_channel(1);
@@ -549,17 +695,45 @@ impl SceneController {
                 }
             }
         };
-        crate::gatt_note(format!("template_menu phase=restore_completed generation={generation} terminal_result={} reason={} elapsed_ms={}", if result.is_ok() { "passed" } else { "failed" }, result.as_ref().err().map(application_error_reason).unwrap_or("foreground_verified"), started.elapsed().as_millis()));
+        crate::gatt_note(format!("template_menu phase=restore_completed generation={generation} terminal_result={} reason={} elapsed_ms={}", if result.is_ok() { "passed" } else { "failed" }, result.as_ref().err().map(application_error_reason).unwrap_or(if already_foreground { "already_foreground" } else { "foreground_verified" }), started.elapsed().as_millis()));
         if result.is_ok() {
             let mut state = lock(&self.state);
             if state.generation == generation {
                 state.menu_return_target = None;
+                state.menu_open_generation = None;
                 state.closing_panel = None;
             }
             drop(state);
             self.refresh_foreground();
         }
         result
+    }
+
+    fn observe_voice_control(&self, bytes: &[u8]) {
+        use sayall_core::AtvvControlEvent;
+        match AtvvControlEvent::parse(bytes) {
+            Ok(AtvvControlEvent::StreamStarted { .. }) => {
+                self.set_voice_button_pressed(true, "atvv_start");
+            }
+            Ok(AtvvControlEvent::StreamStopped) => {
+                self.set_voice_button_pressed(false, "atvv_stop");
+            }
+            _ => {}
+        }
+    }
+
+    fn set_voice_button_pressed(&self, pressed: bool, reason: &'static str) {
+        {
+            let mut state = lock(&self.state);
+            if state.voice_button_pressed == pressed {
+                return;
+            }
+            state.voice_button_pressed = pressed;
+        }
+        crate::gatt_note(format!(
+            "voice_button_observation pressed={pressed} reason={reason} result=observed"
+        ));
+        self.emit_snapshot();
     }
 
     pub fn notify_voice_active(&self, active: bool) {
@@ -585,9 +759,48 @@ impl SceneController {
     }
 
     pub fn handle_edge(&self, edge: ButtonEdge) {
+        let stale_menu_generation = if !edge.is_pressed {
+            let menu_target = {
+                let state = lock(&self.state);
+                is_template_menu(&state).then(|| {
+                    (
+                        state.generation,
+                        state
+                            .template_menu_remote_only
+                            .then(|| state.menu_return_target.clone())
+                            .flatten(),
+                        state
+                            .template_menu_focused
+                            .then_some(state.menu_focused_window_id)
+                            .flatten(),
+                    )
+                })
+            };
+            menu_target.and_then(|(generation, original_target, focused_window_id)| {
+                let still_foreground =
+                    self.application.identify_foreground().is_ok_and(|current| {
+                        original_target
+                            .as_ref()
+                            .is_some_and(|target| target.same_window(&current))
+                            || focused_window_id == Some(current.window_id())
+                    });
+                (!still_foreground).then_some(generation)
+            })
+        } else {
+            None
+        };
         let mut emit = false;
         {
             let mut state = lock(&self.state);
+            if stale_menu_generation.is_some_and(|generation| {
+                state.generation == generation
+                    && (state.template_menu_remote_only || state.template_menu_focused)
+            }) {
+                state.panel = None;
+                cancel_state(&mut state, "menu_focus_lost");
+                crate::gatt_note(format!("template_menu phase=release_foreground_check generation={} menu_mode_foreground=false cancelled=true", stale_menu_generation.unwrap()));
+                emit = true;
+            }
             if edge.is_pressed {
                 if state.held.insert(edge.button) {
                     // Keep canceled-cycle gestures drained through their UP; only a
@@ -627,33 +840,137 @@ impl SceneController {
     }
 
     /// Called only by the host after checking this menu's actual foreground HWND.
-    pub fn set_template_menu_focus(&self, focused: bool) {
-        {
+    pub fn set_template_menu_focus(
+        &self,
+        focused: bool,
+        reason: &'static str,
+        observed_menu_generation: Option<u64>,
+        menu_window_id: Option<u64>,
+    ) {
+        let foreground = (focused || reason == "activation_result")
+            .then(|| self.application.identify_foreground().ok())
+            .flatten();
+        let verified_focus = focused
+            && menu_window_id.is_some_and(|id| {
+                foreground
+                    .as_ref()
+                    .is_some_and(|current| current.window_id() == id)
+            });
+        let original_still_foreground = if !focused && reason == "activation_result" {
+            let target = {
+                let state = lock(&self.state);
+                state.menu_return_target.clone()
+            };
+            target.is_some_and(|target| {
+                foreground
+                    .as_ref()
+                    .is_some_and(|current| target.same_window(current))
+            })
+        } else {
+            false
+        };
+        let (
+            generation,
+            panel_before,
+            panel_after,
+            held_count,
+            native_held_before,
+            native_held_after,
+            waiting_before,
+            waiting_after,
+            return_target_before,
+            return_target_after,
+        ) = {
             let mut state = lock(&self.state);
-            if !focused {
-                state.menu_return_target = None;
-                state.closing_panel = None;
-            }
-            if !is_template_menu(&state) {
+            if observed_menu_generation
+                .is_some_and(|observed| Some(observed) != state.menu_open_generation)
+            {
+                crate::gatt_note(format!("template_menu phase=focus_ignored reason={reason} observed_menu_generation={} current_menu_generation={} current_generation={} cause=stale_generation", observed_menu_generation.unwrap(), state.menu_open_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string()), state.generation));
                 return;
             }
-            state.template_menu_focused = focused;
-            if !focused {
-                state.menu_press_generation = None;
-                state.menu_native_held.clear();
-                state.menu_native_routed.clear();
-                state.menu_close_after_release = None;
-                state.panel = None;
-                state.status = Some("template_menu_focus_lost".to_owned());
-                state.waiting_for_release = !state.held.is_empty();
+            let panel_before = is_template_menu(&state);
+            let native_held_before = state.menu_native_held.len();
+            let waiting_before = state.waiting_for_release;
+            let return_target_before = state.menu_return_target.is_some();
+            let remote_only = !focused
+                && reason == "activation_result"
+                && panel_before
+                && original_still_foreground;
+            if !verified_focus && !remote_only {
+                state.menu_return_target = None;
+                state.menu_open_generation = None;
+                state.closing_panel = None;
             }
+            if panel_before {
+                state.template_menu_focused = verified_focus;
+                state.menu_focused_window_id = if verified_focus { menu_window_id } else { None };
+                state.template_menu_remote_only = remote_only;
+                if !verified_focus && !remote_only {
+                    state.menu_press_generation = None;
+                    state.menu_native_held.clear();
+                    state.menu_native_routed.clear();
+                    state.menu_close_after_release = None;
+                    state.panel = None;
+                    state.status = Some("template_menu_focus_lost".to_owned());
+                    state.waiting_for_release = !state.held.is_empty();
+                }
+            }
+            if reason == "activation_result" && !verified_focus {
+                crate::gatt_note(format!("template_menu phase=activation_denied_policy generation={} original_still_foreground={original_still_foreground} remote_only={remote_only}", state.generation));
+            }
+            (
+                state.generation,
+                panel_before,
+                is_template_menu(&state),
+                state.held.len(),
+                native_held_before,
+                state.menu_native_held.len(),
+                waiting_before,
+                state.waiting_for_release,
+                return_target_before,
+                state.menu_return_target.is_some(),
+            )
+        };
+        let observed_generation = observed_menu_generation
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+        crate::ble::gatt_note(format!("template_menu phase=focus reason={reason} observed_menu_generation={observed_generation} current_generation={generation} verified={verified_focus} panel_before={panel_before} panel_after={panel_after} held_count={held_count} native_held_before={native_held_before} native_held_after={native_held_after} waiting_before={waiting_before} waiting_after={waiting_after} return_target_before={return_target_before} return_target_after={return_target_after}"));
+        if !panel_before {
+            return;
         }
-        crate::ble::gatt_note(format!("template_menu phase=focus verified={focused}"));
         self.emit_snapshot();
     }
 
     /// Native keys belong to our focused menu, not to an inferred remote device.
     pub fn template_menu_key(&self, generation: u64, button: RemoteButton, down: bool) -> bool {
+        let focused_window = {
+            let state = lock(&self.state);
+            (is_template_menu(&state) && state.template_menu_focused)
+                .then_some((state.generation, state.menu_focused_window_id))
+        };
+        if let Some((current_generation, expected_window_id)) = focused_window {
+            let still_foreground = expected_window_id.is_some_and(|expected| {
+                self.application
+                    .identify_foreground()
+                    .is_ok_and(|current| current.window_id() == expected)
+            });
+            if !still_foreground {
+                let cancelled = {
+                    let mut state = lock(&self.state);
+                    if state.generation == current_generation && state.template_menu_focused {
+                        state.panel = None;
+                        cancel_state(&mut state, "menu_focus_lost");
+                        true
+                    } else {
+                        false
+                    }
+                };
+                crate::gatt_note(format!("template_menu phase=native_key_foreground_check generation={current_generation} verified=false cancelled={cancelled}"));
+                if cancelled {
+                    self.emit_snapshot();
+                }
+                return false;
+            }
+        }
         {
             let mut state = lock(&self.state);
             let draining_up = !down && state.menu_native_held.contains(&button);
@@ -1050,6 +1367,52 @@ impl SceneController {
         if let Some(disposition) = self.handle_task_gesture(routed) {
             return disposition;
         }
+        let menu_target = {
+            let state = lock(&self.state);
+            if is_template_menu(&state) && state.template_menu_remote_only {
+                Some((
+                    state.generation,
+                    true,
+                    state.menu_return_target.clone(),
+                    None,
+                ))
+            } else if is_template_menu(&state) && state.template_menu_focused {
+                Some((state.generation, false, None, state.menu_focused_window_id))
+            } else {
+                None
+            }
+        };
+        if let Some((generation, remote_only, original_target, focused_window_id)) = &menu_target {
+            let still_foreground = self.application.identify_foreground().is_ok_and(|current| {
+                original_target
+                    .as_ref()
+                    .is_some_and(|target| target.same_window(&current))
+                    || *focused_window_id == Some(current.window_id())
+            });
+            if !still_foreground {
+                let cancelled = {
+                    let mut state = lock(&self.state);
+                    if state.generation == *generation
+                        && if *remote_only {
+                            state.template_menu_remote_only
+                        } else {
+                            state.template_menu_focused
+                        }
+                    {
+                        state.panel = None;
+                        cancel_state(&mut state, "menu_focus_lost");
+                        true
+                    } else {
+                        false
+                    }
+                };
+                crate::gatt_note(format!("template_menu phase=gesture_foreground_check generation={generation} mode={} verified=false cancelled={cancelled}", if *remote_only { "remote_only" } else { "focused" }));
+                if cancelled {
+                    self.emit_snapshot();
+                }
+                return GestureDisposition::Blocked;
+            }
+        }
         let opening_generation = {
             let state = lock(&self.state);
             (routed.gesture.button == RemoteButton::Menu
@@ -1068,6 +1431,19 @@ impl SceneController {
             .map(|generation| (generation, self.application.identify_foreground()));
         let disposition = {
             let mut state = lock(&self.state);
+            if menu_target
+                .as_ref()
+                .is_some_and(|(generation, remote_only, _, _)| {
+                    state.generation != *generation
+                        || if *remote_only {
+                            !state.template_menu_remote_only
+                        } else {
+                            !state.template_menu_focused
+                        }
+                })
+            {
+                return GestureDisposition::Blocked;
+            }
             let menu_key = state.configuration.menu_template_switch_enabled
                 && routed.gesture.button == RemoteButton::Menu;
             if state.panel.is_none() && !menu_key {
@@ -1082,7 +1458,7 @@ impl SceneController {
                 }
                 GestureDisposition::Blocked
             } else if is_template_menu(&state) {
-                if !state.template_menu_focused
+                if !menu_accepts_remote_input(&state)
                     || state.menu_native_routed.contains(&routed.gesture.button)
                     || state.menu_native_held.contains(&routed.gesture.button)
                 {
@@ -1105,6 +1481,12 @@ impl SceneController {
                 match target {
                     Ok(target) => {
                         let own = target.process_id() == std::process::id();
+                        if !own {
+                            // The foreground capture is newer than the watcher snapshot.
+                            // The menu and any saved default belong to this actual program.
+                            state.foreground_generation = target.generation();
+                            state.token = Some(target.clone());
+                        }
                         open_panel(&mut state, ScenePanel::Template);
                         state.menu_return_target = Some(target);
                         crate::gatt_note(format!("template_menu phase=return_target_captured generation={} role={} terminal_result=passed", state.generation, if own { "own_window" } else { "external_window" }));
@@ -1223,8 +1605,11 @@ fn open_panel(state: &mut State, kind: ScenePanel) {
         state.menu_return_target = None;
         state.closing_panel = None;
         state.generation = state.generation.saturating_add(1);
+        state.menu_open_generation = Some(state.generation);
         state.menu_press_generation = None;
         state.template_menu_focused = false;
+        state.menu_focused_window_id = None;
+        state.template_menu_remote_only = false;
         state.menu_native_held.clear();
         state.menu_native_routed.clear();
         state.menu_close_after_release = None;
@@ -1391,40 +1776,67 @@ fn apply_foreground_observation(
                 if token.process_id() == std::process::id() {
                     return;
                 }
-                let program_changed = state.token.as_ref().is_none_or(|current| {
-                    !current
-                        .application_id()
-                        .eq_ignore_ascii_case(token.application_id())
-                });
-                let window_changed = state
-                    .token
-                    .as_ref()
-                    .is_none_or(|current| current.generation() != token.generation());
-                if program_changed {
-                    cancel_state(&mut state, "program_changed");
-                    if state.configuration.button_mapping_follow_enabled {
-                        state.manual_selection = None;
+                let tracked_menu = is_template_menu(&state) && state.menu_return_target.is_some();
+                let original_still_foreground = tracked_menu
+                    && state
+                        .menu_return_target
+                        .as_ref()
+                        .is_some_and(|target| target.same_window(&token));
+                if original_still_foreground {
+                    crate::gatt_note(format!("template_menu phase=foreground_refresh generation={} original_still_foreground=true target_preserved=true", state.generation));
+                    changed |= state.token.as_ref() != Some(&token);
+                    state.foreground_generation = token.generation();
+                    state.token = Some(token);
+                } else {
+                    if tracked_menu {
+                        state.panel = None;
+                        cancel_state(&mut state, "menu_focus_lost");
+                        changed = true;
                     }
-                    state.default_save_status = None;
-                    changed = true;
-                } else if window_changed && state.panel.is_some() {
-                    // External focus loss cancels our menu; no foreground restoration.
-                    state.panel = None;
-                    state.template_menu_focused = false;
-                    cancel_state(&mut state, "menu_focus_lost");
-                    changed = true;
-                } else if window_changed && state.pending_selection.is_some() {
-                    cancel_state(&mut state, "foreground_changed");
-                    changed = true;
+                    let program_changed = state.token.as_ref().is_none_or(|current| {
+                        !current
+                            .application_id()
+                            .eq_ignore_ascii_case(token.application_id())
+                    });
+                    let window_changed = state
+                        .token
+                        .as_ref()
+                        .is_none_or(|current| current.generation() != token.generation());
+                    if program_changed {
+                        if !tracked_menu {
+                            cancel_state(&mut state, "program_changed");
+                        }
+                        if state.configuration.button_mapping_follow_enabled {
+                            state.manual_selection = None;
+                        }
+                        state.default_save_status = None;
+                        changed = true;
+                    } else if window_changed && state.panel.is_some() {
+                        // External focus loss cancels our menu; no foreground restoration.
+                        state.panel = None;
+                        state.template_menu_focused = false;
+                        state.template_menu_remote_only = false;
+                        cancel_state(&mut state, "menu_focus_lost");
+                        changed = true;
+                    } else if window_changed && state.pending_selection.is_some() {
+                        cancel_state(&mut state, "foreground_changed");
+                        changed = true;
+                    }
+                    state.foreground_generation = token.generation();
+                    state.token = Some(token);
+                    state.menu_return_target = None;
+                    state.menu_open_generation = None;
+                    state.closing_panel = None;
                 }
-                state.foreground_generation = token.generation();
-                state.token = Some(token);
-                state.menu_return_target = None;
-                state.closing_panel = None;
             }
             Err(_) => {
                 changed |= clear_task_switch(&mut state, "foreground_unavailable");
-                if state.token.take().is_some() {
+                let had_token = state.token.take().is_some();
+                let menu_open = is_template_menu(&state);
+                if had_token || menu_open {
+                    if menu_open {
+                        state.panel = None;
+                    }
                     cancel_state(&mut state, "foreground_unavailable");
                     if state.configuration.button_mapping_follow_enabled {
                         state.manual_selection = None;
@@ -1432,6 +1844,7 @@ fn apply_foreground_observation(
                     changed = true;
                 }
                 state.menu_return_target = None;
+                state.menu_open_generation = None;
                 state.closing_panel = None;
             }
         }
@@ -1500,6 +1913,7 @@ fn clear_task_switch(state: &mut State, reason: &str) -> bool {
 }
 
 fn cancel_state(state: &mut State, reason: &str) {
+    let cancelled_menu_press = state.held.contains(&RemoteButton::Menu);
     if let Some(pending) = state.pending_selection.take() {
         state.manual_selection = pending.previous;
         let _ = pending.reply.try_send(Err("state_changed"));
@@ -1508,7 +1922,7 @@ fn cancel_state(state: &mut State, reason: &str) {
     // A configuration/voice cancellation may not send a held native Enter back
     // to the target window. Drain the focused menu first; focus loss is separate.
     let drain_menu = is_template_menu(state)
-        && state.template_menu_focused
+        && menu_accepts_remote_input(state)
         && (!state.held.is_empty() || !state.menu_native_held.is_empty());
     state.generation = state.generation.saturating_add(1).max(1);
     state.menu_press_generation = None;
@@ -1518,13 +1932,21 @@ fn cancel_state(state: &mut State, reason: &str) {
         state.closing_panel = state.panel.take();
         if state.closing_panel.is_none() {
             state.menu_return_target = None;
+            state.menu_open_generation = None;
         }
         state.template_menu_focused = false;
+        state.menu_focused_window_id = None;
+        state.template_menu_remote_only = false;
         state.menu_native_held.clear();
         state.menu_native_routed.clear();
         state.menu_close_after_release = None;
     }
     state.handled_in_cycle.clear();
+    if cancelled_menu_press {
+        // The recognizer dispatches Single after UP. Do not reopen a menu from
+        // the same physical press that was canceled while it was held.
+        state.handled_in_cycle.insert(RemoteButton::Menu);
+    }
     if !state.held.is_empty() {
         state.waiting_for_release = true;
     }
@@ -1538,10 +1960,14 @@ fn is_template_menu(state: &State) -> bool {
         .is_some_and(|p| p.kind == ScenePanel::Template)
 }
 
+fn menu_accepts_remote_input(state: &State) -> bool {
+    state.template_menu_focused || state.template_menu_remote_only
+}
+
 fn default_intent_available(state: &State) -> bool {
     is_template_menu(state)
         && state.configuration.menu_template_switch_enabled
-        && state.template_menu_focused
+        && menu_accepts_remote_input(state)
         && !state.voice_active
         && !state.waiting_for_release
         && state.menu_close_after_release.is_none()
@@ -1578,7 +2004,10 @@ fn finish_template_menu(state: &mut State) -> bool {
         return false;
     };
     let selected = state.panel.as_ref().unwrap().selected;
-    if confirm && state.template_menu_focused && state.configuration.menu_template_switch_enabled {
+    if confirm
+        && menu_accepts_remote_input(state)
+        && state.configuration.menu_template_switch_enabled
+    {
         if let Some(item) = menu_items(state, ScenePanel::Template).get(selected) {
             let selected = item.template_id.clone();
             // A notice queued while navigating describes the previous profile.
@@ -1609,8 +2038,14 @@ fn finish_template_menu(state: &mut State) -> bool {
     }
     state.closing_panel = state.panel.take();
     state.template_menu_focused = false;
+    state.menu_focused_window_id = None;
+    state.template_menu_remote_only = false;
     state.menu_press_generation = None;
+    let cancelled_menu_press = state.handled_in_cycle.contains(&RemoteButton::Menu);
     state.handled_in_cycle.clear();
+    if cancelled_menu_press {
+        state.handled_in_cycle.insert(RemoteButton::Menu);
+    }
     state.menu_native_routed.clear();
     state.status = Some(
         if confirm {
@@ -1642,6 +2077,8 @@ fn apply_manual_selection(
         template_id,
         application_id,
         source,
+        generation: state.generation,
+        save_status: None,
     });
     state.default_save_status = None;
     state.default_request = None;
@@ -1671,7 +2108,11 @@ fn selection_source(state: &State) -> &'static str {
     if let Some(selection) = effective_manual_selection(state) {
         selection.source
     } else if selected_template(state).is_some() {
-        "program_default"
+        if state.configuration.button_mapping_follow_enabled {
+            "program_default"
+        } else {
+            "remembered"
+        }
     } else {
         "common"
     }
@@ -1685,7 +2126,11 @@ fn selected_template(state: &State) -> Option<&str> {
             .filter(|id| template_exists(&state.configuration, id));
     }
     if !state.configuration.button_mapping_follow_enabled {
-        return None;
+        return state
+            .configuration
+            .remembered_template_id
+            .as_deref()
+            .filter(|id| template_exists(&state.configuration, id));
     }
     let application = state.token.as_ref()?.application_id();
     state
@@ -1714,6 +2159,7 @@ fn active_button_mapping_from(state: &State) -> Option<ButtonMappings> {
             enabled: true,
             applications: Vec::new(),
             actions: Default::default(),
+            ..ButtonMappings::default()
         };
         for button in [
             RemoteButton::Up,
@@ -1724,7 +2170,9 @@ fn active_button_mapping_from(state: &State) -> Option<ButtonMappings> {
             RemoteButton::Back,
             RemoteButton::Power,
         ] {
-            mappings.actions.entry(button).or_default().single = recognition_marker();
+            let actions = mappings.actions.entry(button).or_default();
+            actions.single = recognition_marker();
+            actions.hold_repeat = Some(HoldRepeat::Off);
         }
         mappings
             .actions
@@ -1747,14 +2195,13 @@ fn active_scene_mappings_from(state: &State) -> ButtonMappings {
         enabled: false,
         applications: Vec::new(),
         actions: Default::default(),
+        ..ButtonMappings::default()
     };
     if state.configuration.menu_template_switch_enabled {
         mappings.enabled = true;
-        mappings
-            .actions
-            .entry(RemoteButton::Menu)
-            .or_default()
-            .single = recognition_marker();
+        let actions = mappings.actions.entry(RemoteButton::Menu).or_default();
+        actions.single = recognition_marker();
+        actions.hold_repeat = Some(HoldRepeat::Off);
         if state.panel.is_some() {
             mappings.actions.entry(RemoteButton::Menu).or_default().long = recognition_marker();
             for button in [
@@ -1766,7 +2213,9 @@ fn active_scene_mappings_from(state: &State) -> ButtonMappings {
                 RemoteButton::Back,
                 RemoteButton::Power,
             ] {
-                mappings.actions.entry(button).or_default().single = recognition_marker();
+                let actions = mappings.actions.entry(button).or_default();
+                actions.single = recognition_marker();
+                actions.hold_repeat = Some(HoldRepeat::Off);
             }
         }
     }
@@ -1799,6 +2248,10 @@ fn mapping_notice_from(state: &State) -> MappingNotice {
         name: template.map(|t| t.name),
         actions_available: false,
         default_save_status: state.default_save_status.clone(),
+        manual_save_status: state
+            .manual_selection
+            .as_ref()
+            .and_then(|selection| selection.save_status.clone()),
     }
 }
 fn snapshot_from(state: &State) -> SceneSnapshot {
@@ -1822,6 +2275,7 @@ fn snapshot_from(state: &State) -> SceneSnapshot {
             .map_or_else(Vec::new, |p| menu_items(state, p.kind)),
         waiting_for_release: state.waiting_for_release,
         voice_active: state.voice_active,
+        voice_button_pressed: state.voice_button_pressed,
         status: state.status.clone(),
     }
 }
@@ -2053,6 +2507,92 @@ mod tests {
             foreground_watcher: Mutex::new(None),
         }
     }
+
+    #[test]
+    fn voice_button_observation_is_distinct_from_streaming_state() {
+        let controller = controller();
+        controller.notify_voice_active(true);
+        let snapshot = serde_json::to_value(controller.snapshot()).unwrap();
+        assert_eq!(snapshot["voiceActive"], true);
+        assert_eq!(snapshot["voiceButtonPressed"], false);
+    }
+
+    #[test]
+    fn voice_button_observation_survives_audio_abort_and_releases_while_pipeline_idle() {
+        use sayall_core::{AtvvVoicePipeline, VoiceSessionState};
+        let controller = controller();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        controller.subscribe(Arc::new(move |event| {
+            if let SceneEvent::Snapshot { snapshot } = event {
+                lock(&sink).push(snapshot.voice_button_pressed);
+            }
+        }));
+        let mut pipeline = AtvvVoicePipeline::default();
+        pipeline
+            .handle_control(&[0x0B, 0x01, 0x00, 0x02, 0x03, 0, 120])
+            .unwrap();
+        controller.observe_voice_control(&[0x04, 0x03, 0x02, 0x01]);
+        pipeline.handle_control(&[0x04, 0x03, 0x02, 0x01]).unwrap();
+        // The production preparation failure releases the session gate and
+        // interrupts the pipeline, but has not observed the remote's STOP yet.
+        controller.notify_voice_active(true);
+        controller.notify_voice_active(false);
+        pipeline.interrupt();
+        assert_eq!(pipeline.state(), VoiceSessionState::Idle);
+        assert!(controller.snapshot().voice_button_pressed);
+        assert!(!controller.snapshot().voice_active);
+
+        controller.observe_voice_control(&[0x00]);
+        assert!(!controller.snapshot().voice_button_pressed);
+        assert_eq!(lock(&observed).first(), Some(&true));
+        assert_eq!(lock(&observed).last(), Some(&false));
+    }
+
+    #[test]
+    fn voice_button_observation_publishes_fast_edges_once_and_ignores_other_controls() {
+        let controller = controller();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        controller.subscribe(Arc::new(move |event| {
+            if let SceneEvent::Snapshot { snapshot } = event {
+                lock(&sink).push(snapshot.voice_button_pressed);
+            }
+        }));
+        for bytes in [
+            &[0x04, 0x03, 0x02, 0x01][..],
+            &[0x04],
+            &[0x0B, 0x01, 0x00, 0x02, 0x03, 0, 120],
+            &[0x08],
+            &[0x0A],
+            &[0x74], // An F5 virtual key value is not an ATVV voice control.
+            &[],
+            &[0x00],
+            &[0x00],
+        ] {
+            controller.observe_voice_control(bytes);
+        }
+        assert_eq!(*lock(&observed), vec![true, false]);
+        assert!(!controller.snapshot().voice_button_pressed);
+        assert!(!controller.snapshot().voice_active);
+    }
+
+    #[test]
+    fn voice_button_observation_clears_idempotently_before_connection_teardown() {
+        let controller = controller();
+        for reason in [
+            "connection_invalidated",
+            "disconnected",
+            "shutdown",
+            "worker_stopped",
+        ] {
+            controller.observe_voice_control(&[0x04]);
+            controller.set_voice_button_pressed(false, reason);
+            controller.set_voice_button_pressed(false, reason);
+            assert!(!controller.snapshot().voice_button_pressed);
+        }
+    }
+
     #[derive(Default)]
     struct TaskBackend {
         current: Mutex<Option<WindowToken>>,
@@ -2122,7 +2662,7 @@ mod tests {
             menu_gesture(&controller, ButtonTrigger::Single),
             GestureDisposition::Handled
         );
-        controller.set_template_menu_focus(true);
+        controller.set_template_menu_focus(true, "test", None, Some(90));
         assert_eq!(
             controller.snapshot().application_id,
             original.application_id
@@ -2145,6 +2685,13 @@ mod tests {
             GestureDisposition::Handled
         );
         assert!(controller.snapshot().panel.is_none());
+        *lock(&backend.current) = Some(WindowToken::from_identity(
+            "sayall".into(),
+            ApplicationAdapterKind::Generic,
+            std::process::id(),
+            91,
+            91,
+        ));
         assert!(controller.restore_target_foreground().is_ok());
         assert_eq!(*lock(&backend.restored), vec![main]);
         assert_eq!(
@@ -2214,7 +2761,7 @@ mod tests {
                 "menu foreground setup failed; requested={requested}"
             );
         }
-        controller.set_template_menu_focus(true);
+        controller.set_template_menu_focus(true, "test", None, Some(menu.0 .0 as usize as u64));
         {
             let mut state = lock(&controller.state);
             state.menu_close_after_release = Some(false);
@@ -2313,6 +2860,13 @@ mod tests {
         backend
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        *lock(&backend.current) = Some(WindowToken::from_identity(
+            "sayall".into(),
+            ApplicationAdapterKind::Generic,
+            std::process::id(),
+            91,
+            91,
+        ));
         assert!(controller.restore_target_foreground().is_err());
         controller.template_menu_restore_failed();
         let retained = controller.snapshot();
@@ -2343,7 +2897,7 @@ mod tests {
                 menu_gesture(&controller, ButtonTrigger::Single),
                 GestureDisposition::Handled
             );
-            controller.set_template_menu_focus(true);
+            controller.set_template_menu_focus(true, "test", None, Some(1));
             match cause {
                 "external" => observe(&controller.state, token("other", 80)),
                 "unavailable" => {
@@ -2358,10 +2912,10 @@ mod tests {
                 "voice" => {
                     controller.notify_voice_active(true);
                     // The host acknowledges the completed hide even if focus was already lost.
-                    controller.set_template_menu_focus(false);
+                    controller.set_template_menu_focus(false, "test", None, None);
                     controller.notify_voice_active(false);
                 }
-                _ => controller.set_template_menu_focus(false),
+                _ => controller.set_template_menu_focus(false, "test", None, None),
             }
             assert!(
                 lock(&controller.state).menu_return_target.is_none(),
@@ -2375,6 +2929,662 @@ mod tests {
                 Err(ApplicationControlError::NoForegroundWindow)
             ));
         }
+    }
+
+    #[test]
+    fn denied_menu_activation_keeps_remote_control_only_for_the_original_foreground() {
+        let backend = Arc::new(TaskBackend::default());
+        let original = token("a", 1);
+        *lock(&backend.current) = Some(original.clone());
+        let controller = menu_controller(backend.clone());
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        assert!(controller.snapshot().panel.is_some());
+        assert!(!lock(&controller.state).template_menu_focused);
+        assert!(!controller.template_menu_key(generation, RemoteButton::Down, true));
+        assert_eq!(
+            controller.handle_gesture(RoutedGesture {
+                gesture: FiredGesture {
+                    button: RemoteButton::Down,
+                    trigger: ButtonTrigger::Single,
+                },
+                native_delivered: false,
+            }),
+            GestureDisposition::Handled
+        );
+
+        *lock(&backend.current) = Some(token("other", 2));
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        assert!(controller.snapshot().panel.is_none());
+    }
+
+    #[test]
+    fn pending_menu_activation_keeps_its_target_through_same_foreground_observation() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend);
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        observe(&controller.state, token("a", 1));
+        assert_eq!(
+            lock(&controller.state).menu_open_generation,
+            Some(generation)
+        );
+        assert_eq!(
+            lock(&controller.state).menu_return_target,
+            Some(token("a", 1))
+        );
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        assert!(controller.snapshot().panel.is_some());
+        assert!(lock(&controller.state).template_menu_remote_only);
+    }
+
+    #[test]
+    fn pending_menu_activation_closes_on_changed_or_unavailable_foreground() {
+        for unavailable in [false, true] {
+            let backend = Arc::new(TaskBackend::default());
+            *lock(&backend.current) = Some(token("a", 1));
+            let controller = menu_controller(backend);
+            assert_eq!(
+                menu_gesture(&controller, ButtonTrigger::Single),
+                GestureDisposition::Handled
+            );
+            let generation = controller.snapshot().generation;
+            if unavailable {
+                apply_foreground_observation(
+                    &controller.state,
+                    &controller.callbacks,
+                    generation,
+                    Err(ApplicationControlError::NoForegroundWindow),
+                );
+            } else {
+                observe(&controller.state, token("other", 2));
+            }
+            assert!(controller.snapshot().panel.is_none());
+            assert!(lock(&controller.state).menu_return_target.is_none());
+        }
+    }
+
+    #[test]
+    fn pending_activation_does_not_cancel_menu_on_another_buttons_release() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend);
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Down,
+            is_pressed: true,
+        });
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Down,
+            is_pressed: false,
+        });
+        assert!(controller.snapshot().panel.is_some());
+        assert_eq!(
+            lock(&controller.state).menu_open_generation,
+            Some(generation)
+        );
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        assert!(lock(&controller.state).template_menu_remote_only);
+    }
+
+    #[test]
+    fn remote_only_menu_survives_observing_its_original_target_again() {
+        for stale_watcher_token in [false, true] {
+            let backend = Arc::new(TaskBackend::default());
+            *lock(&backend.current) = Some(token("a", 1));
+            let controller = menu_controller(backend);
+            if stale_watcher_token {
+                lock(&controller.state).token = Some(token("other", 2));
+            }
+            assert_eq!(
+                menu_gesture(&controller, ButtonTrigger::Single),
+                GestureDisposition::Handled
+            );
+            let generation = controller.snapshot().generation;
+            controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+            assert!(controller.snapshot().panel.is_some());
+            observe(&controller.state, token("a", 1));
+            assert!(controller.snapshot().panel.is_some());
+            assert_eq!(
+                lock(&controller.state).menu_open_generation,
+                Some(generation)
+            );
+            assert_eq!(
+                lock(&controller.state).menu_return_target,
+                Some(token("a", 1))
+            );
+            assert_eq!(
+                controller.handle_gesture(RoutedGesture {
+                    gesture: FiredGesture {
+                        button: RemoteButton::Down,
+                        trigger: ButtonTrigger::Single,
+                    },
+                    native_delivered: false,
+                }),
+                GestureDisposition::Handled
+            );
+        }
+    }
+
+    #[test]
+    fn menu_uses_captured_foreground_program_when_watcher_identity_is_stale() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("b", 2));
+        let controller = menu_controller(backend);
+        {
+            let mut state = lock(&controller.state);
+            state.configuration.menu_update_default = true;
+            state
+                .configuration
+                .application_bindings
+                .push(ApplicationBinding {
+                    application_id: "b".into(),
+                    template_id: BUILTIN_CHAT_TEMPLATE_ID.into(),
+                    menu_order: 1,
+                    launch_target: None,
+                });
+        }
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let snapshot = controller.snapshot();
+        assert_eq!(snapshot.application_id.as_deref(), Some("b"));
+        assert_eq!(
+            snapshot.template_id.as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+        assert!(snapshot
+            .menu_items
+            .iter()
+            .any(|item| item.template_id == BUILTIN_CHAT_TEMPLATE_ID && item.running));
+        assert_eq!(
+            lock(&controller.state).menu_application_id.as_deref(),
+            Some("b")
+        );
+        let generation = snapshot.generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        {
+            let mut state = lock(&controller.state);
+            state.panel.as_mut().unwrap().selected = 1;
+            state.menu_close_after_release = Some(true);
+            assert!(finish_template_menu(&mut state));
+            assert_eq!(
+                state
+                    .manual_selection
+                    .as_ref()
+                    .unwrap()
+                    .application_id
+                    .as_deref(),
+                Some("b")
+            );
+            assert_eq!(state.default_request.as_ref().unwrap().1, "b");
+        }
+    }
+
+    #[test]
+    fn unavailable_observation_closes_remote_only_menu_with_no_watcher_token() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend);
+        lock(&controller.state).token = None;
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        let observed_generation = controller.snapshot().generation;
+        apply_foreground_observation(
+            &controller.state,
+            &controller.callbacks,
+            observed_generation,
+            Err(ApplicationControlError::NoForegroundWindow),
+        );
+        assert!(controller.snapshot().panel.is_none());
+        assert!(lock(&controller.state).menu_return_target.is_none());
+    }
+
+    #[test]
+    fn canceled_menu_press_cannot_reopen_on_its_release_gesture() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend.clone());
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Menu,
+            is_pressed: true,
+        });
+        *lock(&backend.current) = Some(token("other", 2));
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Menu,
+            is_pressed: false,
+        });
+        assert_eq!(
+            controller.handle_gesture(RoutedGesture {
+                gesture: FiredGesture {
+                    button: RemoteButton::Menu,
+                    trigger: ButtonTrigger::Single,
+                },
+                native_delivered: false,
+            }),
+            GestureDisposition::Blocked
+        );
+        assert!(controller.snapshot().panel.is_none());
+    }
+
+    #[test]
+    fn voice_cancelled_menu_press_cannot_reopen_after_release_drain() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend);
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Menu,
+            is_pressed: true,
+        });
+        controller.notify_voice_active(true);
+        controller.notify_voice_active(false);
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Menu,
+            is_pressed: false,
+        });
+        assert_eq!(
+            controller.handle_gesture(RoutedGesture {
+                gesture: FiredGesture {
+                    button: RemoteButton::Menu,
+                    trigger: ButtonTrigger::Single,
+                },
+                native_delivered: false,
+            }),
+            GestureDisposition::Blocked
+        );
+        assert!(controller.snapshot().panel.is_none());
+    }
+
+    #[test]
+    fn remote_only_confirmation_uses_already_foreground_target_without_restoring_it() {
+        let backend = Arc::new(TaskBackend::default());
+        let original = token("a", 1);
+        *lock(&backend.current) = Some(original);
+        let controller = menu_controller(backend.clone());
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: true,
+        });
+        assert_eq!(
+            controller.handle_gesture(RoutedGesture {
+                gesture: FiredGesture {
+                    button: RemoteButton::Ok,
+                    trigger: ButtonTrigger::Single,
+                },
+                native_delivered: false,
+            }),
+            GestureDisposition::Handled
+        );
+        assert!(controller.snapshot().panel.is_some());
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: false,
+        });
+        assert!(controller.snapshot().panel.is_none());
+        assert!(lock(&controller.state).manual_selection.is_some());
+        assert!(controller.restore_target_foreground().is_ok());
+        assert!(lock(&backend.restored).is_empty());
+    }
+
+    #[test]
+    fn remote_only_menu_closes_on_unavailable_or_changed_real_foreground() {
+        for unavailable in [false, true] {
+            let backend = Arc::new(TaskBackend::default());
+            *lock(&backend.current) = Some(token("a", 1));
+            let controller = menu_controller(backend.clone());
+            assert_eq!(
+                menu_gesture(&controller, ButtonTrigger::Single),
+                GestureDisposition::Handled
+            );
+            let generation = controller.snapshot().generation;
+            if unavailable {
+                *lock(&backend.current) = None;
+                controller.set_template_menu_focus(
+                    false,
+                    "activation_result",
+                    Some(generation),
+                    None,
+                );
+            } else {
+                controller.set_template_menu_focus(
+                    false,
+                    "activation_result",
+                    Some(generation),
+                    None,
+                );
+                assert!(controller.snapshot().panel.is_some());
+                observe(&controller.state, token("other", 2));
+            }
+            assert!(controller.snapshot().panel.is_none());
+            assert!(lock(&controller.state).menu_return_target.is_none());
+        }
+    }
+
+    #[test]
+    fn remote_only_gesture_rechecks_the_target_before_confirming() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend.clone());
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        *lock(&backend.current) = Some(token("other", 2));
+        assert_eq!(
+            controller.handle_gesture(RoutedGesture {
+                gesture: FiredGesture {
+                    button: RemoteButton::Ok,
+                    trigger: ButtonTrigger::Single,
+                },
+                native_delivered: false,
+            }),
+            GestureDisposition::Blocked
+        );
+        assert!(controller.snapshot().panel.is_none());
+        assert!(lock(&controller.state).manual_selection.is_none());
+    }
+
+    #[test]
+    fn remote_only_confirm_release_does_not_apply_after_the_target_changes() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend.clone());
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(generation), None);
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: true,
+        });
+        assert_eq!(
+            controller.handle_gesture(RoutedGesture {
+                gesture: FiredGesture {
+                    button: RemoteButton::Ok,
+                    trigger: ButtonTrigger::Single,
+                },
+                native_delivered: false,
+            }),
+            GestureDisposition::Handled
+        );
+        *lock(&backend.current) = Some(token("other", 2));
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: false,
+        });
+        assert!(controller.snapshot().panel.is_none());
+        assert!(lock(&controller.state).manual_selection.is_none());
+    }
+
+    #[test]
+    fn focused_menu_confirm_release_rechecks_exact_foreground_window() {
+        let own_window = |window_id| {
+            WindowToken::from_identity(
+                "sayall".into(),
+                ApplicationAdapterKind::Generic,
+                std::process::id(),
+                window_id,
+                window_id,
+            )
+        };
+        for next_window in [
+            Some(token("a", 1)),
+            Some(token("other", 2)),
+            Some(own_window(100)),
+            None,
+        ] {
+            let backend = Arc::new(TaskBackend::default());
+            *lock(&backend.current) = Some(token("a", 1));
+            let controller = menu_controller(backend.clone());
+            assert_eq!(
+                menu_gesture(&controller, ButtonTrigger::Single),
+                GestureDisposition::Handled
+            );
+            let generation = controller.snapshot().generation;
+            *lock(&backend.current) = Some(own_window(99));
+            controller.set_template_menu_focus(
+                true,
+                "activation_result",
+                Some(generation),
+                Some(99),
+            );
+            controller.handle_edge(ButtonEdge {
+                button: RemoteButton::Ok,
+                is_pressed: true,
+            });
+            assert_eq!(
+                controller.handle_gesture(RoutedGesture {
+                    gesture: FiredGesture {
+                        button: RemoteButton::Ok,
+                        trigger: ButtonTrigger::Single,
+                    },
+                    native_delivered: false,
+                }),
+                GestureDisposition::Handled
+            );
+            assert_eq!(lock(&controller.state).menu_close_after_release, Some(true));
+            let switched = next_window.is_some();
+            if let Some(next_window) = next_window {
+                *lock(&backend.current) = Some(next_window);
+            }
+            controller.handle_edge(ButtonEdge {
+                button: RemoteButton::Ok,
+                is_pressed: false,
+            });
+            assert!(controller.snapshot().panel.is_none());
+            assert_eq!(
+                lock(&controller.state).manual_selection.is_some(),
+                !switched
+            );
+            if switched {
+                assert!(lock(&controller.state).default_request.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn stale_focus_success_never_binds_another_foreground_window_as_the_menu() {
+        for (reason, next_window) in [
+            ("activation_result", token("a", 1)),
+            ("activation_result", token("other", 2)),
+            ("native_focus_verified", token("a", 1)),
+            ("native_focus_verified", token("other", 2)),
+        ] {
+            let backend = Arc::new(TaskBackend::default());
+            *lock(&backend.current) = Some(token("a", 1));
+            let controller = menu_controller(backend.clone());
+            assert_eq!(
+                menu_gesture(&controller, ButtonTrigger::Single),
+                GestureDisposition::Handled
+            );
+            let generation = controller.snapshot().generation;
+            *lock(&backend.current) = Some(next_window.clone());
+            controller.set_template_menu_focus(true, reason, Some(generation), Some(99));
+            assert!(!lock(&controller.state).template_menu_focused);
+            assert!(lock(&controller.state).menu_focused_window_id.is_none());
+            assert!(!lock(&controller.state).template_menu_remote_only);
+            assert!(controller.snapshot().panel.is_none());
+        }
+    }
+
+    #[test]
+    fn focused_remote_gestures_block_when_exact_menu_foreground_is_lost() {
+        for (button, trigger) in [
+            (RemoteButton::Menu, ButtonTrigger::Long),
+            (RemoteButton::Down, ButtonTrigger::Single),
+            (RemoteButton::Ok, ButtonTrigger::Single),
+        ] {
+            for next_window in [token("a", 1), token("other", 2)] {
+                let backend = Arc::new(TaskBackend::default());
+                *lock(&backend.current) = Some(token("a", 1));
+                let controller = menu_controller(backend.clone());
+                assert_eq!(
+                    menu_gesture(&controller, ButtonTrigger::Single),
+                    GestureDisposition::Handled
+                );
+                let generation = controller.snapshot().generation;
+                *lock(&backend.current) = Some(WindowToken::from_identity(
+                    "sayall".into(),
+                    ApplicationAdapterKind::Generic,
+                    std::process::id(),
+                    99,
+                    99,
+                ));
+                controller.set_template_menu_focus(
+                    true,
+                    "activation_result",
+                    Some(generation),
+                    Some(99),
+                );
+                controller.handle_edge(ButtonEdge {
+                    button,
+                    is_pressed: true,
+                });
+                *lock(&backend.current) = Some(next_window);
+                assert_eq!(
+                    controller.handle_gesture(RoutedGesture {
+                        gesture: FiredGesture { button, trigger },
+                        native_delivered: false,
+                    }),
+                    GestureDisposition::Blocked
+                );
+                assert!(controller.snapshot().panel.is_none());
+                assert!(lock(&controller.state).preference_request.is_none());
+                assert!(lock(&controller.state).default_event.is_none());
+                assert!(lock(&controller.state).menu_close_after_release.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn focused_native_confirm_release_cannot_apply_after_foreground_changes() {
+        for switched in [true, false] {
+            let backend = Arc::new(TaskBackend::default());
+            *lock(&backend.current) = Some(token("a", 1));
+            let controller = menu_controller(backend.clone());
+            assert_eq!(
+                menu_gesture(&controller, ButtonTrigger::Single),
+                GestureDisposition::Handled
+            );
+            let generation = controller.snapshot().generation;
+            *lock(&backend.current) = Some(WindowToken::from_identity(
+                "sayall".into(),
+                ApplicationAdapterKind::Generic,
+                std::process::id(),
+                99,
+                99,
+            ));
+            controller.set_template_menu_focus(
+                true,
+                "activation_result",
+                Some(generation),
+                Some(99),
+            );
+            assert!(controller.template_menu_key(generation, RemoteButton::Ok, true));
+            if switched {
+                *lock(&backend.current) = Some(token("a", 1));
+            }
+            assert_eq!(
+                controller.template_menu_key(generation, RemoteButton::Ok, false),
+                !switched
+            );
+            assert!(controller.snapshot().panel.is_none());
+            assert_eq!(
+                lock(&controller.state).manual_selection.is_some(),
+                !switched
+            );
+        }
+    }
+
+    #[test]
+    fn completed_menu_hide_clears_its_return_target_after_selection_generation_advances() {
+        let backend = Arc::new(TaskBackend::default());
+        *lock(&backend.current) = Some(token("a", 1));
+        let controller = menu_controller(backend);
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let menu_generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "activation_result", Some(menu_generation), None);
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: true,
+        });
+        controller.handle_gesture(RoutedGesture {
+            gesture: FiredGesture {
+                button: RemoteButton::Ok,
+                trigger: ButtonTrigger::Single,
+            },
+            native_delivered: false,
+        });
+        controller.handle_edge(ButtonEdge {
+            button: RemoteButton::Ok,
+            is_pressed: false,
+        });
+        assert_ne!(controller.snapshot().generation, menu_generation);
+        assert!(lock(&controller.state).menu_return_target.is_some());
+        controller.set_template_menu_focus(false, "hide_completed", Some(menu_generation), None);
+        assert!(lock(&controller.state).menu_return_target.is_none());
+    }
+
+    #[test]
+    fn old_menu_focus_loss_does_not_close_a_new_menu() {
+        let controller = controller();
+        assert_eq!(
+            menu_gesture(&controller, ButtonTrigger::Single),
+            GestureDisposition::Handled
+        );
+        let old_generation = controller.snapshot().generation;
+        controller.set_template_menu_focus(false, "native_focus_lost", Some(old_generation), None);
+        {
+            let mut state = lock(&controller.state);
+            open_panel(&mut state, ScenePanel::Template);
+            state.menu_return_target = Some(token("a", 1));
+        }
+        let new_generation = controller.snapshot().generation;
+        assert_ne!(old_generation, new_generation);
+        controller.set_template_menu_focus(false, "hide_completed", Some(old_generation), None);
+        assert!(controller.snapshot().panel.is_some());
     }
 
     #[test]
@@ -2410,7 +3620,7 @@ mod tests {
             });
             assert_eq!(lock(&controller.state).menu_return_target, Some(main));
             assert_eq!(controller.snapshot().application_id.as_deref(), Some("a"));
-            controller.set_template_menu_focus(false);
+            controller.set_template_menu_focus(false, "test", None, None);
         }
     }
 
@@ -2429,7 +3639,7 @@ mod tests {
                 (state.menu_return_target.clone().unwrap(), state.generation)
             };
             if !expired {
-                controller.set_template_menu_focus(false);
+                controller.set_template_menu_focus(false, "test", None, None);
             }
             let (reply, receiver) = mpsc::sync_channel(1);
             controller
@@ -2971,6 +4181,7 @@ mod tests {
         let mut s = lock(&controller.state);
         open_panel(&mut s, ScenePanel::Template);
         s.template_menu_focused = true;
+        s.menu_focused_window_id = Some(1);
         let mut recognizer = GestureRecognizer::new();
         recognizer.configure(&active_scene_mappings_from(&s));
         recognizer
@@ -2991,7 +4202,7 @@ mod tests {
             menu_edge(&controller, &mut recognizer, true, now),
             vec![GestureDisposition::Handled]
         );
-        controller.set_template_menu_focus(true);
+        controller.set_template_menu_focus(true, "test", None, Some(1));
         assert_eq!(
             menu_gesture(&controller, ButtonTrigger::Long),
             GestureDisposition::Blocked
@@ -3085,7 +4296,7 @@ mod tests {
             menu_edge(&controller, &mut recognizer, true, now);
             let old_generation = controller.snapshot().generation;
             match reason {
-                "focus" => controller.set_template_menu_focus(false),
+                "focus" => controller.set_template_menu_focus(false, "test", None, None),
                 "exit" => {
                     assert!(!controller.prepare_template_menu_exit());
                 }
@@ -3205,7 +4416,7 @@ mod tests {
         assert!(controller.set_update_default(generation, true));
         controller.complete_menu_preference_save(stale_id, true);
         assert!(controller.snapshot().preference_pending);
-        controller.set_template_menu_focus(false);
+        controller.set_template_menu_focus(false, "test", None, None);
         open_for_menu_hold(&controller);
         let new_generation = controller.snapshot().generation;
         assert!(!controller.snapshot().update_default);
@@ -3347,10 +4558,21 @@ mod tests {
     #[test]
     fn button_selection_requires_mapping_ack_and_rejects_late_ack_after_timeout() {
         let controller = controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
         let before = controller.active_button_mapping();
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&callbacks);
+        let save_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requested = Arc::clone(&save_requests);
         controller.subscribe(Arc::new(move |event| {
+            if matches!(
+                &event,
+                SceneEvent::ManualTemplatePersistenceRequested { .. }
+            ) {
+                requested.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             if let SceneEvent::Snapshot { snapshot } = event {
                 lock(&observed).push((snapshot.generation, snapshot.foreground_generation));
             }
@@ -3359,6 +4581,7 @@ mod tests {
             .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
             .is_err());
         assert_eq!(controller.active_button_mapping(), before);
+        assert_eq!(save_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         let (generation, foreground) = lock(&callbacks)[0];
         let mut notice = controller.mapping_notice_candidate().2;
         notice.template_id = Some(BUILTIN_CHAT_TEMPLATE_ID.into());
@@ -3468,7 +4691,7 @@ mod tests {
         );
     }
     #[test]
-    fn reenabling_follow_keeps_only_the_current_program_manual_override() {
+    fn reenabling_follow_clears_global_choice_and_uses_program_default() {
         for switch_program in [false, true] {
             let controller = acknowledged_controller();
             lock(&controller.state)
@@ -3493,7 +4716,7 @@ mod tests {
             } else {
                 assert_eq!(
                     active_template_id(&lock(&controller.state)).as_deref(),
-                    Some(BUILTIN_CHAT_TEMPLATE_ID)
+                    Some(BUILTIN_AGENT_TEMPLATE_ID)
                 );
             }
         }
@@ -3518,7 +4741,7 @@ mod tests {
         assert!(lock(&controller.state).manual_selection.is_none());
     }
     #[test]
-    fn restarting_runtime_keeps_preferences_and_defaults_but_not_manual_selection() {
+    fn remembered_template_restarts_without_changing_program_defaults() {
         let controller = acknowledged_controller();
         lock(&controller.state)
             .configuration
@@ -3528,9 +4751,10 @@ mod tests {
             .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
             .unwrap();
         let configuration = lock(&controller.state).configuration.clone();
-        let json = serde_json::to_string(&configuration).unwrap();
+        let mut json = serde_json::to_value(&configuration).unwrap();
+        json["rememberedTemplateId"] = BUILTIN_CHAT_TEMPLATE_ID.into();
         let restarted = State {
-            configuration: serde_json::from_str(&json).unwrap(),
+            configuration: serde_json::from_value(json).unwrap(),
             token: Some(token("a", 2)),
             ..Default::default()
         };
@@ -3539,7 +4763,244 @@ mod tests {
             restarted.configuration.application_bindings,
             configuration.application_bindings
         );
-        assert!(active_button_mapping_from(&restarted).is_none());
+        assert_eq!(
+            selected_template(&restarted),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+        assert!(active_button_mapping_from(&restarted).is_some());
+    }
+    #[test]
+    fn remembered_template_starts_in_the_first_configured_mapping_generation() {
+        let controller = acknowledged_controller();
+        // This helper normally starts in program-following mode; a fresh runtime does not.
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let configuration: MappingConfiguration = serde_json::from_value(serde_json::json!({
+            "rememberedTemplateId": BUILTIN_AGENT_TEMPLATE_ID,
+            "buttonMappingFollowEnabled": false
+        }))
+        .unwrap();
+        controller.set_configuration(configuration);
+        let snapshot = controller.snapshot();
+        assert_eq!(selection_source(&lock(&controller.state)), "remembered");
+        assert_eq!(
+            snapshot.mapping_notice.unwrap().template_id.as_deref(),
+            Some(BUILTIN_AGENT_TEMPLATE_ID)
+        );
+    }
+    #[test]
+    fn remembered_template_mode_switch_clears_global_manual_choice() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        let mut configuration = lock(&controller.state).configuration.clone();
+        configuration.button_mapping_follow_enabled = true;
+        controller.set_configuration(configuration.clone());
+        assert!(lock(&controller.state).manual_selection.is_none());
+        configuration.button_mapping_follow_enabled = false;
+        controller.set_configuration(configuration);
+        assert!(controller.snapshot().template_id.is_none());
+    }
+    #[test]
+    fn remembered_template_is_requested_only_once_after_engine_ack() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        controller.subscribe(Arc::new(move |event| {
+            lock(&captured).push(serde_json::to_value(event).unwrap())
+        }));
+        let snapshot = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(snapshot.mapping_notice).unwrap()["manualSaveStatus"],
+            "saving"
+        );
+        let (generation, foreground, notice) = controller.mapping_notice_candidate();
+        controller.confirm_mapping_notice(generation, foreground, notice, true);
+        assert_eq!(
+            lock(&events)
+                .iter()
+                .filter(|event| event["type"] == "manual_template_persistence_requested")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn remembered_template_save_failure_keeps_the_actual_profile_and_can_retry() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let first = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        controller.complete_manual_template_save(first.generation, false);
+        assert_eq!(
+            controller
+                .snapshot()
+                .mapping_notice
+                .unwrap()
+                .manual_save_status
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            controller.snapshot().template_id.as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+        assert!(lock(&controller.state)
+            .configuration
+            .remembered_template_id
+            .is_none());
+        let second = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        controller.complete_manual_template_save(first.generation, true);
+        assert_eq!(
+            controller
+                .snapshot()
+                .mapping_notice
+                .unwrap()
+                .manual_save_status
+                .as_deref(),
+            Some("saving")
+        );
+        controller.complete_manual_template_save(second.generation, true);
+        assert_eq!(
+            lock(&controller.state)
+                .configuration
+                .remembered_template_id
+                .as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+    }
+    #[test]
+    fn remembered_template_explicit_common_clears_restart_memory() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let selected = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        controller.complete_manual_template_save(selected.generation, true);
+        let common = controller.select_template(None).unwrap();
+        assert!(common.mapping_notice.unwrap().template_id.is_none());
+        controller.complete_manual_template_save(common.generation, true);
+        assert!(lock(&controller.state)
+            .configuration
+            .remembered_template_id
+            .is_none());
+    }
+    #[test]
+    fn remembered_template_save_settles_the_previous_choice_during_an_unconfirmed_request() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let selected = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        {
+            let mut state = lock(&controller.state);
+            let (reply, _) = mpsc::sync_channel(1);
+            state.generation += 1;
+            state.pending_selection = Some(PendingTemplateSelection {
+                generation: state.generation,
+                foreground_generation: state.foreground_generation,
+                previous: state.manual_selection.clone(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                reply,
+            });
+            apply_manual_selection(&mut state, None, None, "buttons_page");
+        }
+        assert!(controller
+            .manual_template_save_is_current(selected.generation, Some(BUILTIN_CHAT_TEMPLATE_ID)));
+        controller.complete_manual_template_save(selected.generation, true);
+        cancel_state(&mut lock(&controller.state), "selection_ack_timeout");
+        assert_eq!(
+            lock(&controller.state)
+                .manual_selection
+                .as_ref()
+                .unwrap()
+                .save_status
+                .as_deref(),
+            Some("saved")
+        );
+        assert_eq!(
+            lock(&controller.state)
+                .configuration
+                .remembered_template_id
+                .as_deref(),
+            Some(BUILTIN_CHAT_TEMPLATE_ID)
+        );
+    }
+    #[test]
+    fn remembered_template_missing_id_and_following_never_override_program_rules() {
+        let mut configuration: MappingConfiguration = serde_json::from_value(
+            serde_json::json!({ "rememberedTemplateId": "missing-template" }),
+        )
+        .unwrap();
+        configuration = configuration.normalized().unwrap();
+        assert!(configuration.remembered_template_id.is_none());
+        configuration.remembered_template_id = Some(BUILTIN_CHAT_TEMPLATE_ID.into());
+        configuration.button_mapping_follow_enabled = true;
+        configuration = configuration.normalized().unwrap();
+        assert!(configuration.remembered_template_id.is_none());
+        let controller = acknowledged_controller();
+        let selected = controller
+            .select_template(Some(BUILTIN_CHAT_TEMPLATE_ID))
+            .unwrap();
+        assert!(selected
+            .mapping_notice
+            .unwrap()
+            .manual_save_status
+            .is_none());
+    }
+    #[test]
+    fn remembered_template_menu_confirmation_uses_the_same_save_request_as_ui() {
+        let controller = acknowledged_controller();
+        lock(&controller.state)
+            .configuration
+            .button_mapping_follow_enabled = false;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        controller.subscribe(Arc::new(move |event| {
+            if let SceneEvent::ManualTemplatePersistenceRequested {
+                request_id,
+                template_id,
+            } = event
+            {
+                lock(&captured).push((request_id, template_id));
+            }
+        }));
+        choose(&mut lock(&controller.state), false);
+        controller.emit_snapshot();
+        let (request_id, selected) = lock(&events)[0].clone();
+        assert_eq!(selected.as_deref(), Some(BUILTIN_CHAT_TEMPLATE_ID));
+        controller.complete_manual_template_save(request_id, true);
+        assert_eq!(
+            lock(&controller.state).configuration.remembered_template_id,
+            selected
+        );
+        assert_eq!(
+            controller
+                .snapshot()
+                .mapping_notice
+                .unwrap()
+                .manual_save_status
+                .as_deref(),
+            Some("saved")
+        );
     }
     #[cfg(windows)]
     mod mapping_worker_tests {
@@ -3566,6 +5027,19 @@ mod tests {
             }
             fn launch_app(&self, _: &str) -> Result<(), String> {
                 panic!("unexpected launch")
+            }
+            fn focus_frontmost(&self) -> Result<(), String> {
+                panic!("unexpected focus")
+            }
+            fn launch_app_and_focus(
+                &self,
+                _: &str,
+                _: Option<&crate::focus::AppFocusProfile>,
+            ) -> Result<(), String> {
+                panic!("unexpected launch and focus")
+            }
+            fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+                panic!("unexpected focus learning")
             }
         }
         fn mappings(key: KeyCode) -> ButtonMappings {
@@ -3697,7 +5171,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let _key_gate = crate::key_gate::KeyGate::start();
-            let controller = Arc::new(controller());
+            let mut scene = controller();
+            let backend = Arc::new(TaskBackend {
+                current: Mutex::new(Some(token("a", 1))),
+                ..Default::default()
+            });
+            scene.application = backend.clone();
+            let controller = Arc::new(scene);
             let recorded = Arc::new(RecordedActions::default());
             let runtime = Arc::new(ButtonMappingRuntime::new(
                 recorded.clone(),
@@ -3730,6 +5210,7 @@ mod tests {
                 .unwrap();
             press(&runtime, RemoteButton::Back);
             let observe_actual = |application, window| {
+                *lock(&backend.current) = Some(token(application, window));
                 let generation = controller.snapshot().generation;
                 apply_foreground_observation(
                     &controller.state,
@@ -3741,7 +5222,7 @@ mod tests {
             };
             observe_actual("b", 2);
             press(&runtime, RemoteButton::Menu);
-            controller.set_template_menu_focus(true);
+            controller.set_template_menu_focus(true, "test", None, Some(2));
             let generation = controller.snapshot().generation;
             assert!(controller.template_menu_key(generation, RemoteButton::Down, true));
             assert!(controller.template_menu_key(generation, RemoteButton::Down, false));
@@ -3776,7 +5257,17 @@ mod tests {
     }
     #[test]
     fn cold_start_manual_menu_does_not_require_an_external_application() {
-        let controller = controller();
+        let mut controller = controller();
+        controller.application = Arc::new(TaskBackend {
+            current: Mutex::new(Some(WindowToken::from_identity(
+                "sayall".into(),
+                ApplicationAdapterKind::Generic,
+                std::process::id(),
+                90,
+                90,
+            ))),
+            ..Default::default()
+        });
         {
             let mut state = lock(&controller.state);
             state.token = None;
@@ -3790,7 +5281,7 @@ mod tests {
             menu_gesture(&controller, ButtonTrigger::Single),
             GestureDisposition::Handled
         );
-        controller.set_template_menu_focus(true);
+        controller.set_template_menu_focus(true, "test", None, Some(90));
         let generation = controller.snapshot().generation;
         assert!(!controller.set_update_default(generation, true));
         assert!(controller.template_menu_key(generation, RemoteButton::Ok, true));
@@ -3872,6 +5363,90 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn menu_recognition_markers_do_not_enable_default_repeat() {
+        let state = state();
+        let mut state = lock(&state);
+        let saved_configuration = state.configuration.clone();
+        open_panel(&mut state, ScenePanel::Template);
+        let mappings = active_scene_mappings_from(&state);
+        assert!(mappings
+            .actions
+            .values()
+            .all(|actions| actions.hold_repeat == Some(HoldRepeat::Off)));
+        let mut recognizer = GestureRecognizer::new();
+        recognizer.configure(&mappings);
+        let now = Instant::now();
+        for button in [
+            RemoteButton::Up,
+            RemoteButton::Down,
+            RemoteButton::Left,
+            RemoteButton::Right,
+            RemoteButton::Ok,
+            RemoteButton::Back,
+            RemoteButton::Power,
+        ] {
+            let config =
+                crate::button_gestures::GestureConfig::for_button(&mappings, button).unwrap();
+            assert_eq!(config.repeat_single, None, "scene marker {button:?}");
+            assert_eq!(config.repeat_long, None, "scene marker {button:?}");
+            assert_eq!(recognizer.press(button, now), vec![ButtonTrigger::Single]);
+            assert!(recognizer.advance(now + Duration::from_secs(2)).is_empty());
+            assert!(recognizer
+                .release(button, now + Duration::from_secs(2))
+                .is_empty());
+        }
+        assert_eq!(state.configuration, saved_configuration);
+    }
+
+    #[test]
+    fn task_recognition_markers_do_not_enable_default_repeat_or_rewrite_tv() {
+        for view in [TaskSwitchView::Applications, TaskSwitchView::Desktops] {
+            let state = state();
+            let mut state = lock(&state);
+            let tv_actions = state
+                .configuration
+                .template_mappings(BUILTIN_AGENT_TEMPLATE_ID)
+                .unwrap()
+                .actions(RemoteButton::Tv);
+            let saved_configuration = state.configuration.clone();
+            state.task_switch = Some(TaskSwitchSession {
+                origin: token("a", 1),
+                target: None,
+                view,
+                started_at: Instant::now(),
+                tv_actions: tv_actions.clone(),
+            });
+            let mappings = active_button_mapping_from(&state).unwrap();
+            assert_eq!(mappings.actions(RemoteButton::Tv), tv_actions);
+            let mut recognizer = GestureRecognizer::new();
+            recognizer.configure(&mappings);
+            let now = Instant::now();
+            for button in [
+                RemoteButton::Up,
+                RemoteButton::Down,
+                RemoteButton::Left,
+                RemoteButton::Right,
+                RemoteButton::Ok,
+                RemoteButton::Back,
+                RemoteButton::Power,
+            ] {
+                let config =
+                    crate::button_gestures::GestureConfig::for_button(&mappings, button).unwrap();
+                assert_eq!(mappings.actions(button).hold_repeat, Some(HoldRepeat::Off));
+                assert_eq!(config.repeat_single, None, "task marker {button:?}");
+                assert_eq!(config.repeat_long, None, "task marker {button:?}");
+                assert_eq!(recognizer.press(button, now), vec![ButtonTrigger::Single]);
+                assert!(recognizer.advance(now + Duration::from_secs(2)).is_empty());
+                assert!(recognizer
+                    .release(button, now + Duration::from_secs(2))
+                    .is_empty());
+            }
+            assert_eq!(state.configuration, saved_configuration);
+        }
+    }
+
     #[test]
     fn menu_wraps_and_cancel_retains_native_release_barrier() {
         let state = state();

@@ -25,6 +25,9 @@ diagnostic_schema=1
 app_version=0.2.1
 app_build=42
 source_revision=<完整 SHA 或 unknown>
+source_fingerprint=<构建输入 SHA-256 或 unknown>
+source_state=clean|dirty|unknown
+payload_inputs=included|not-bundling|unknown
 build_channel=stable|pr_preview|local|unknown
 release_tag=v0.2.1|none|unknown
 process_id=1234
@@ -34,6 +37,10 @@ windows_build=<build 或 unknown>
 ```
 
 构建时写入 `source_revision`，运行时不得读取 Git 工作区。无法可靠取得的值写 `unknown`，不能省略字段。
+
+`source_revision` 是构建基线，不代表 dirty 源码已完整提交。`source_fingerprint` 由构建时约定的源码输入集合计算；打包时还纳入本轮 staging 回执的 Helper、Gadget 和许可文件实际字节，`payload_inputs=included`。日常 check/test 为 `not-bundling`，不拿它证明包内载荷。`source_state=dirty|unknown` 时 `sourceCommit` 必须为 null；以基线、指纹与包摘要共同识别内容，不声称可由单一提交重建。
+
+最终交付须从已安装 EXE 的真实运行日志或诊断读回上述字段及 `build_channel`，与当轮 build manifest、包 metadata 和安装载荷哈希对齐；仅构建脚本成功或 manifest 存在不算运行身份通过。输入范围以 `scripts/build-identity.ps1` 的 root/扩展名 allowlist 为准，排除构建缓存、过程证据和文档正文，不将指纹解释为全磁盘快照或逐字可重建源码档案。
 
 正式应用默认写入 `%LOCALAPPDATA%\SayAll\Logs\sayall-diagnostic.log`，不再要求用户
 预先设置环境变量。受控测试仍可用 `SAYALL_GATT_LOG` 覆盖写入位置；日志正文不得
@@ -51,6 +58,28 @@ Vue 渲染或 IPC 阶段故障。
 [安装器专项](Testing/WindowsInstallerGracefulExit.md)，现场归因见
 [前台按键回归记录](Bugs/2026-10-03-foreground-input-regression.md)。
 
+### 轮转与体积上限：单个文件不超过 10 MB（2026-10-08）
+
+- **硬上限**：任何单个诊断日志文件不得超过 **10 MB**。写入前按「当前大小 + 本次长度 > 10 MB」
+  判断；超过就把当前文件改名成 `<主名>-<UTC 时间戳>-p<进程号>.log`，再新建当前文件继续写。
+- **保留份数**：轮转文件保留最近 **5 份**（不含当前文件），更旧的按文件名里的时间戳序列删除；
+  总量上限约 60 MB。
+- **两个写入方共用同一份"当前文件"**（见上一节）。实现上刻意"无长句柄"——每次追加都重新
+  打开文件；任一进程轮转之后，另一方下一次写入自然落到新文件，不会继续写进已被改名的旧文件。
+  代码在 `crates/sayall-windows/src/diagnostic_log.rs` 与 `hardware/RC003/helper/src/main.rs`
+  两处（分属不同 workspace，无法共享代码）——**改上限/份数时两处必须一起改**。
+- **心跳节流**：
+  - 助手 `[HB]`：只在**状态变化**时或每 **30 s** 落一条（原来逐条落盘、实测约 2 条/秒，是日志膨胀主因）；
+  - 主程序诊断心跳：**只在无线麦窗口处于前台时**记录，**10 s** 一条（2026-10-08 用户要求；
+    前台判定只比较进程号，不记录窗口标题/类名等窗口身份）。应用在后台时没有周期状态行——
+    这是有意取舍：后台的静默停摆改由事件行与 `capture_inactive` 一类判据行体现。
+  - 心跳的用途是"证明进程还活着 + 保留趋势计数"，不是逐次留痕；高频重复相同日志本来就违反
+    上一节「状态未变化时不得重复刷相同日志」。
+- **Helper 捕获期间日志隔离（2026-10-15）**：启动捕获/桥接线程前创建唯一后台日志线程，接收线程、续约线程和桥接线程只通过 `try_send` 投递脱敏且已带入口时间戳的记录；stdout、追加、轮转与回退写入均在后台执行。队列最多 256 条，满时只丢诊断记录，恢复后聚合输出 `[LOG-QUEUE] result=overflow dropped_count=…`；不能把此期间日志缺项理解为对应功能未发生。捕获控制、所有权和 DOWN/UP 不经过此队列，不允许丢弃。日志线程启动失败则不开始捕获；正常停止先完成 Agent/桥接清理，再关闭日志队列、最多等待 2 秒排空。输出端永久阻塞时仅放弃等待诊断线程，退出可损失尚未写出的日志，不伪称已排空；`terminal_result=drained` 只在实际排空后由该线程写入。启动前的一次性命令/自检保持同步；panic 紧急落盘也保持既有独立路径。受控阻塞证据与真实硬件边界归 [Menu 续约故障](Bugs/2026-10-03-foreground-input-regression.md#2026-10-15-晚间-menu-未唤醒捕获续约超时与桥接重连)。
+- **体积实测（2026-10-08）**：治理前单机累计 768 MB、约 107 MB/天（助手 `[HB]` 逐条为主因）；
+  治理后健康态实测约 **3 MB/天**（主程序心跳行 406 B、助手 `[HB]` 行 618 B）。按 10 MB/文件
+  轮转，约每 3 天一个文件，保留 5 份 ⇒ 约 50 MB 封顶、约半个月历史。
+
 ## 必需事件链
 
 每项功能按实际存在的边界记录：
@@ -65,6 +94,18 @@ Vue 渲染或 IPC 阶段故障。
 8. 唯一 `terminal_result` 及总耗时。
 
 失败应带 `error_domain`、`error_code`、`reason` 和 `retryable=true|false`。状态未变化时不得重复刷相同日志；高频 HID、音频包和轮询只记录首尾、聚合计数、字节/帧数、丢弃数量和耗时。
+
+返回键取证沿用同一日志：`rc003_bridge event=edge_received` 与所有权确认的
+`rx_seq` 为单次桥接连接内接收顺序，`target_generation` 区分配置代次；目标/所有权
+mask 使用 `RemoteButton` 序号位。`state_snapshot=true` 仅表示接收时快照，不能当作
+跨线程原子状态或注入成功。首次报告及返回按下/释放的状态变化留痕，重复报告不刷屏，
+未知 usage 仅计数。`map_capabilities` 只在能力摘要变化时写入；`map_gesture` 说明语义
+边沿是否进入识别、是否配置和未输出原因，后接既有 `map_route`、`map_skip_inject`、
+`map_fire` 与带 `button/trigger` 的 `map_inject`。快捷键只记录键数，不输出自定义和弦；
+`map_inject result=ok` 仅表示注入提交，目标软件是否响应仍需用户观察。现场步骤及
+未确认原因见[前台按键回归记录](Bugs/2026-10-03-foreground-input-regression.md#2026-10-06-朋友的-rc003-返回键报障待现场日志)。
+
+音频负载取证的 `audio_pump` 只在正常 finish 与失败终态聚合，不增加逐包日志，也不宣称普通 interrupt/Shutdown 均有该行。`max_pump_gap_ms` 是活跃渲染循环的最大调用间隔，`late_pump_excess_ms` 为间隔超过实际 buffer 时长的累计差值，并非直接丢帧数；`empty_render_buffer_count` 只数“已启动、PCM 待发且可写空间等于完整 buffer”的观察，不等同可听断音次数。空间查询、WASAPI 写入及会话静音检查最大耗时包括失败调用；写入指标不包括后续失败日志 I/O。端点只读回 mix sample rate、实际 buffer frames/period，不记录端点名字或身份；`audio_scheduling` 区分 MMCSS 注册失败、实际注册与同线程撤销，单独注册成功不能代替真实音频消费验证。
 
 ## 隐私红线
 

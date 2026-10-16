@@ -7,6 +7,35 @@ const root = path.resolve(__dirname, '..');
 const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
 const code = (s) => s.split(/\r?\n/).map((l) => l.split(';')[0]).join('\n');
 
+test('installer workflows require staged-payload identity for package builds', () => {
+  for (const workflow of ['windows-ci.yml', 'windows-release.yml']) {
+    const source = read(`.github/workflows/${workflow}`);
+    const packageSteps = source.split(/^      - /m).filter((step) => /run: pnpm tauri build --bundles nsis\b/.test(step));
+    assert.equal(packageSteps.length, 1, `${workflow} must identify its package build`);
+    if (workflow === 'windows-release.yml') {
+      assert.match(source, /^    env:\r?\n      SAYALL_BUNDLE_BUILD: ["']?1["']?\s*$/m, 'release build and signature verification must share staged-payload identity');
+    } else {
+      assert.match(packageSteps[0], /^          SAYALL_BUNDLE_BUILD: ["']?1["']?\s*$/m, `${workflow} must verify staged payload bytes`);
+    }
+  }
+});
+
+test('pull-request CI does not reference the personal release signing secrets', () => {
+  const source = read('.github/workflows/windows-ci.yml');
+  assert.doesNotMatch(source, /secrets\.(?:TAURI_SIGNING_PRIVATE_KEY|TAURI_SIGNING_PRIVATE_KEY_PASSWORD)\b/);
+  assert.match(source, /run: \.\/scripts\/ensure-updater-signing-key\.ps1/);
+});
+
+test('silent lifecycle uses normal exit and preserves cleanup evidence', () => {
+  const source = read('scripts/test-windows-silent-install.ps1');
+  assert.doesNotMatch(source, /Stop-Process|KillProcess|TerminateProcess|taskkill/);
+  assert.match(source, /OpenExisting\('Local\\SayAll-GracefulExit'\)/);
+  assert.match(source, /WaitForExit\(20000\)/);
+  assert.match(source, /Get-FileHash -LiteralPath \$cleanupPreservationMarker/);
+  assert.doesNotMatch(source, /WriteAllText\([^\n]*session\.token/);
+  assert.match(source, /-not \$normalUninstallCompleted -and \$canUninstall/);
+});
+
 test('interactive reinstall offers both choices while unattended installation stays overlay', () => {
   const config = JSON.parse(read('src-tauri/tauri.conf.json'));
   assert.equal(config.bundle.windows.nsis.template, 'windows/installer.nsi');
@@ -56,6 +85,7 @@ test('every payload write fails closed before registry commit and retired-file c
   assert.match(hooks, /SayAllRecycleRetiredFiles/);
   assert.match(hooks, /SayAllCleanupHelper\.exe|sayall-helper\.exe/);
   assert.match(hooks, /-CleanupHelperPath/);
+  assert.match(hooks, /!macro SayAllRecycleRetiredShortcuts[^]*?File \/oname=[^\n]+\n\s*!insertmacro SayAllRequireWriteSuccess shortcut_recycler/);
   assert.doesNotMatch(hooks, /KillProcess|TerminateProcess|taskkill|Stop-Process/i);
 });
 

@@ -98,6 +98,8 @@ impl PrepareIo {
 }
 
 struct Native {
+    #[cfg(test)]
+    target_read_delay: Option<(String, Duration)>,
     enumerator: IMMDeviceEnumerator,
     policy: Option<PolicyConfig>,
     journal: Option<PathBuf>,
@@ -112,6 +114,8 @@ impl Native {
         let enumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|e| api_error("enumerator", e))?;
         Ok(Self {
+            #[cfg(test)]
+            target_read_delay: None,
             enumerator,
             policy: None,
             journal: None,
@@ -208,6 +212,13 @@ impl RouteBackend for Native {
         result
     }
     fn active_name(&mut self, id: &str) -> Result<String, String> {
+        #[cfg(test)]
+        if let Some((target, delay)) = &self.target_read_delay {
+            if id == target {
+                thread::sleep(*delay);
+                return Err("injected_target_read_failure".into());
+            }
+        }
         let started = Instant::now();
         let result = (|| {
             // Enumeration is capture + active only. A render ID is never accepted.
@@ -340,9 +351,12 @@ impl MutationGuard {
     }
 }
 enum Command {
+    #[cfg(test)]
+    DelayTargetRead(String, Duration, Sender<Result<(), String>>),
     Initialize(PathBuf, CaptureInputSettings, Sender<Result<(), String>>),
     Configure(
         CaptureInputSettings,
+        bool,
         MutationGuard,
         Sender<Result<(), String>>,
     ),
@@ -422,7 +436,20 @@ impl CaptureInputRuntime {
         result
     }
     pub(crate) fn configure(&self, settings: CaptureInputSettings) -> Result<(), String> {
-        let result = self.mutate(|g, r| Command::Configure(settings, g, r));
+        self.configure_mode(settings, false)
+    }
+    pub(crate) fn restore_configuration(
+        &self,
+        settings: CaptureInputSettings,
+    ) -> Result<(), String> {
+        self.configure_mode(settings, true)
+    }
+    fn configure_mode(
+        &self,
+        settings: CaptureInputSettings,
+        restoring: bool,
+    ) -> Result<(), String> {
+        let result = self.mutate(|g, r| Command::Configure(settings, restoring, g, r));
         if result.as_ref().is_err_and(|e| e == "route_request_timeout") {
             self.configuration_uncertain.store(true, Ordering::SeqCst);
             publish(
@@ -707,6 +734,11 @@ fn run(
             }
         };
         match command {
+            #[cfg(test)]
+            Command::DelayTargetRead(id, delay, reply) => {
+                io.target_read_delay = Some((id, delay));
+                let _ = reply.send(Ok(()));
+            }
             Command::Initialize(path, config, reply) => {
                 let result = if io.journal.is_some() {
                     Err("already_initialized".into())
@@ -739,14 +771,14 @@ fn run(
             Command::List(reply) => {
                 let _ = reply.send(io.list());
             }
-            Command::Configure(config, request, reply) => {
+            Command::Configure(config, restoring, request, reply) => {
                 let result = (|| {
                     request.check()?;
                     // No controller-side restore while the voice owner's hotkey is DOWN.
                     if active.is_some() {
                         return Err("voice_session_active_release_before_configuring".into());
                     }
-                    if config.enabled {
+                    if config.enabled && !restoring {
                         let id = config
                             .endpoint_id
                             .as_deref()
@@ -756,15 +788,38 @@ fn run(
                         }
                     }
                     request.check()?;
+                    // Rollback restores the committed configuration identity,
+                    // not device readiness. A failed old device lookup must not
+                    // block this commit or leave the unpersisted new target live.
+                    let restored_target_unverified = restoring && config.enabled;
+                    if restoring {
+                        crate::gatt_note(format!(
+                            "capture_input action=rollback_target result=passed reason=configuration_restored readiness={}",
+                            if restored_target_unverified { "unverified" } else { "disabled" }
+                        ));
+                    }
                     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     if !s.recovery_pending {
-                        s.phase = if config.enabled { "idle" } else { "disabled" }.into();
+                        s.phase = if restored_target_unverified {
+                            "failed"
+                        } else if config.enabled {
+                            "idle"
+                        } else {
+                            "disabled"
+                        }
+                        .into();
+                        s.last_error = restored_target_unverified
+                            .then(|| "原设置已恢复，麦克风可用性尚未确认；请刷新设备状态".into());
                     }
                     s.settings = config;
                     Ok(())
                 })();
                 note(
-                    "configure",
+                    if restoring {
+                        "restore_configuration"
+                    } else {
+                        "configure"
+                    },
                     result
                         .as_ref()
                         .map(|_| "passed")
@@ -958,6 +1013,96 @@ mod tests {
         };
         (b, release, epoch)
     }
+    #[test]
+    fn cancelled_or_expired_restore_never_overwrites_configuration_in_real_worker() {
+        let runtime = CaptureInputRuntime::new();
+        let committed = CaptureInputSettings {
+            endpoint_id: Some("committed".into()),
+            ..Default::default()
+        };
+        runtime.configure(committed.clone()).unwrap();
+        for request in [
+            MutationGuard {
+                deadline: Instant::now() + REQUEST_BOUND,
+                cancelled: Arc::new(AtomicBool::new(true)),
+            },
+            MutationGuard {
+                deadline: Instant::now(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ] {
+            let result = runtime.request(|reply| {
+                Command::Configure(
+                    CaptureInputSettings {
+                        enabled: true,
+                        endpoint_id: Some("old-target".into()),
+                        endpoint_name: Some("old".into()),
+                    },
+                    true,
+                    request,
+                    reply,
+                )
+            });
+            assert_eq!(result, Err("route_operation_expired".into()));
+            assert_eq!(runtime.snapshot().settings, committed);
+        }
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn restoring_configuration_does_not_wait_for_blocked_old_target_read() {
+        let runtime = CaptureInputRuntime::new();
+        let next = CaptureInputSettings {
+            enabled: false,
+            endpoint_id: Some("new-target".into()),
+            endpoint_name: Some("new".into()),
+        };
+        runtime.configure(next).unwrap();
+        runtime
+            .request(|reply| {
+                Command::DelayTargetRead(
+                    "old-target".into(),
+                    REQUEST_BOUND + Duration::from_millis(100),
+                    reply,
+                )
+            })
+            .unwrap();
+        let previous = CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("old-target".into()),
+            endpoint_name: Some("old".into()),
+        };
+        let result = runtime.restore_configuration(previous.clone());
+        // Join the real worker even on red so no blocked test thread survives.
+        runtime.shutdown().unwrap();
+        assert!(
+            result.is_ok(),
+            "configuration rollback waited on hardware: {result:?}"
+        );
+        assert_eq!(runtime.snapshot().settings, previous);
+        assert!(!runtime.configuration_uncertain.load(Ordering::SeqCst));
+        assert_eq!(runtime.snapshot().phase, "failed");
+    }
+
+    #[test]
+    fn restoring_missing_target_keeps_authorization_but_begin_still_rejects_device() {
+        let runtime = CaptureInputRuntime::new();
+        let config = CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("isolated-missing-endpoint".into()),
+            endpoint_name: Some("missing".into()),
+        };
+        runtime.restore_configuration(config.clone()).unwrap();
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.settings, config);
+        assert_eq!(snapshot.phase, "failed");
+        let release = Arc::new(AtomicU64::new(0));
+        let guard = AudioBeginGuard::new(release, Arc::new(AtomicU64::new(0)));
+        assert!(runtime.begin(1, Some(guard)).is_err());
+        assert_eq!(runtime.snapshot().settings, config);
+        runtime.shutdown().unwrap();
+    }
+
     #[test]
     fn successful_apply_or_queued_reply_after_deadline_is_rejected() {
         let (b, _, epoch) = pending();

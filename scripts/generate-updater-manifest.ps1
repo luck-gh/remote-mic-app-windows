@@ -9,7 +9,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Tag,
-    [string]$Repository = "GetSayAll/remote-mic-app-windows",
+    [string]$Repository = "luck-gh/remote-mic-app-windows",
     # 测试/本地运行可显式指定仓库根；CI 默认取脚本所在目录的父目录。
     [string]$RepositoryRoot = ""
 )
@@ -25,6 +25,9 @@ $bundleDirectory = Join-Path $RepositoryRoot "target/release/bundle/nsis"
 $stagingDirectory = Join-Path $RepositoryRoot "artifacts/windows-release"
 
 $config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
+if ($Repository -ne "luck-gh/remote-mic-app-windows") {
+    throw "Personal updates must be published from luck-gh/remote-mic-app-windows"
+}
 $version = [string]$config.version
 if ([string]::IsNullOrWhiteSpace($version)) {
     throw "tauri.conf.json 缺少 version，无法生成更新清单"
@@ -61,7 +64,7 @@ $pubDate = ([DateTimeOffset]::UtcNow).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
 
 $manifest = [ordered]@{
     version = $version
-    notes = "无线麦 SayAll Windows 版 $Tag"
+    notes = "无线麦 · 个人版 $Tag"
     pub_date = $pubDate
     platforms = [ordered]@{
         "windows-x86_64" = [ordered]@{

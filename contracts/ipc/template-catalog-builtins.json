@@ -5,6 +5,7 @@
     "kind": "direct",
     "builtIn": true,
     "buttonMappings": {
+      "schemaVersion": 2,
       "enabled": true,
       "actions": {
         "up": {
@@ -205,6 +206,7 @@
     "kind": "direct",
     "builtIn": true,
     "buttonMappings": {
+      "schemaVersion": 2,
       "enabled": true,
       "actions": {
         "up": {
@@ -405,6 +407,7 @@
     "kind": "direct",
     "builtIn": true,
     "buttonMappings": {
+      "schemaVersion": 2,
       "enabled": true,
       "actions": {
         "up": {

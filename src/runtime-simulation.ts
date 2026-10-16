@@ -4,12 +4,12 @@ import {
   disconnectRemote,
   getAudioSnapshot,
   getDiagnosticReport,
+  getGainDb,
   getRawInputSnapshot,
   getRuntimeSnapshot,
   listAudioEndpoints,
   saveButtonMappings,
   scanPairedRemotes,
-  setAppIcon,
   stopRawInput,
   testButtonMapping,
   type PlatformSnapshot,
@@ -82,37 +82,6 @@ async function openPage(label: string, heading = label): Promise<void> {
   );
 }
 
-/**
- * 设置页外部入口（官网 / GitHub）的 CI 判据。
- *
- * 2026-10-02 用户指定：成功不再显示任何提示，只有失败就地给原因。因此判据是
- * "在窗口期内要么出现失败原因、要么保持静默"；capability 白名单是产品配置，
- * 被 opener 拒绝（"Not allowed to open url"）必须报红，runner 上没有可用的
- * 默认浏览器只是环境差异（失败文案会如实带出来），不制造与本产品无关的红灯。
- */
-async function recordExternalEntry(label: string, steps: string[]): Promise<void> {
-  await clickButton(label);
-  const deadline = Date.now() + 3_000;
-  let message: string | null = null;
-  while (Date.now() < deadline) {
-    const text = document.querySelector(".link-message")?.textContent?.trim();
-    if (text) {
-      message = text;
-      break;
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
-  }
-  assert(
-    message === null || !message.includes("Not allowed to open url"),
-    `设置页“${label}”入口被 opener capability 拒绝：${message}`,
-  );
-  steps.push(
-    message === null
-      ? `设置页“${label}”入口点击后未显示错误；浏览器可见打开结果 deferred`
-      : `设置页“${label}”入口返回不可用（deferred）：${message}`,
-  );
-}
-
 async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   mark("journey_start");
   // 驱动页允许已连接时重新扫描；连接页在自动连接后会禁用扫描入口。
@@ -164,6 +133,34 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(audio.phase === "ready", "仿真音频端点没有进入 WASAPI 就绪");
   assert(audio.selectedEndpointId === endpoints[0].id, "仿真 CABLE Input 没有被明确选择");
   steps.push("连接页面仅常规展示目标麦克风；高级显式选择仿真声音写入端，真实通道配对 deferred");
+
+  // 语音增益（2026-10-04，对齐 Mac 设置页「增益」滑块）：0 dB = 原始音量。
+  // 拖动（input）只改显示、松手（change）才落盘——这里按真实手势派发两个事件，
+  // 再用 IPC 读回持久化值核对。
+  const gainSlider = await waitFor(
+    () => document.querySelector<HTMLInputElement>('input[name="audio-gain"]'),
+    "语音设备卡增益滑块",
+  );
+  assert(
+    document.body.textContent?.includes("0 dB 保持原始音量"),
+    "增益说明文案缺失",
+  );
+  gainSlider.value = "12";
+  gainSlider.dispatchEvent(new Event("input", { bubbles: true }));
+  gainSlider.dispatchEvent(new Event("change", { bubbles: true }));
+  await waitFor(() => (gainSlider.value === "12" ? true : null), "增益滑块显示 12 dB");
+  assert(document.body.textContent?.includes("12 dB"), "增益读数没有更新为 12 dB");
+  // change 之后的落盘是异步 IPC：必须轮询读回，不能拿本地读数当保存完成的证据
+  //（首次实现就这么错过一次：界面显示 12 dB，磁盘当时还是 0 dB）。
+  let savedGain = 0;
+  const gainDeadline = Date.now() + 10_000;
+  while (Date.now() < gainDeadline) {
+    savedGain = await getGainDb();
+    if (savedGain === 12) break;
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+  }
+  assert(savedGain === 12, `仿真增益没有经 IPC 落盘：${savedGain}`);
+  steps.push("连接页增益滑块经真实 IPC 落盘并读回 12 dB");
 
   mark("buttons_page");
   await openPage("按键", "按键映射");
@@ -254,7 +251,8 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   await openPage("设置");
   mark("settings_page");
   // 2026-10-02 设置页改版（对齐 Mac 新设置页）：顶部模块 = 应用标识 + 版本 +
-  // 检查更新；通用 / 问题反馈两个分组在卡外有分组标题。
+  // 检查更新；各分组在卡外有分组标题。2026-10-08 起多一个「首次设置」分组
+  // （向导重跑入口，随首次设置向导一起交付）。
   const settingsOverview = document.querySelector<HTMLElement>("article.settings-overview");
   assert(settingsOverview !== null, "设置页缺少顶部标识与检查更新模块");
   assert(
@@ -269,19 +267,17 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     document.querySelectorAll<HTMLElement>(".settings-section .section-title"),
   ).map((element) => element.textContent?.trim());
   assert(
-    sectionTitles.join(" / ") === "通用 / 问题反馈",
+    sectionTitles.join(" / ") === "通用 / 首次设置",
     `设置页分组标题异常：${sectionTitles.join(" / ")}`,
   );
-  const entryLabels = Array.from(
-    document.querySelectorAll<HTMLButtonElement>(".settings-section .button-row button"),
-  ).map((button) => button.textContent?.trim());
-  assert(
-    entryLabels.length === 2 && entryLabels[0] === "官网" && entryLabels[1] === "GitHub",
-    `设置页问题反馈入口异常：${entryLabels.join(" / ")}`,
-  );
-  steps.push("设置页顶部为应用标识/版本/检查更新，问题反馈分组提供官网与 GitHub 入口");
-  await recordExternalEntry("官网", steps);
-  await recordExternalEntry("GitHub", steps);
+  const wizardEntry = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".settings-section .settings-row button"),
+  ).find((button) => button.textContent?.trim() === "重新运行向导");
+  assert(wizardEntry !== null, "设置页缺少「重新运行向导」入口");
+  assert(!sectionTitles.includes("问题反馈"), "设置页仍显示官方问题反馈分组");
+  assert(!document.querySelector('input[name="app-icon"]'), "设置页仍显示废弃图标选择");
+  assert(document.querySelector('img.app-logo')?.getAttribute('src') === '/app-logo.png', "设置页未显示固定个人图标");
+  steps.push("设置页固定个人图标，无官方反馈入口及旧图标选择");
 
   const darkTheme = await waitFor(
     () =>
@@ -306,25 +302,18 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(!document.querySelector('[role="alert"]'), "恢复系统外观后显示错误");
   steps.push("设置页深色/系统外观经 Windows WebView、Tauri capability 与设置持久化闭环");
 
-  // 应用图标（2026-10-02）：仿真后端不建托盘，这里证明选项、IPC 与持久化往返
-  // 可用，并且窗口图标接口不报错（真实托盘/任务栏换图属真机验收，见
-  // Testing/WindowsRC003Preview.md 用例十四）。
-  const appIconOption = document.querySelector<HTMLInputElement>(
-    'input[name="app-icon"][value="faceted-duck"]:not(:disabled)',
-  );
-  assert(appIconOption !== null, "设置页缺少应用图标选项");
-  appIconOption.click();
-  await waitFor(() => (appIconOption.checked ? true : null), "应用图标切换");
-  assert(!document.querySelector('[role="alert"]'), "切换应用图标后显示错误");
-  // 直达断言：命令参数契约（前端 `{ identifier }` ↔ Rust 命令参数名）。名字不匹配
-  // 时 Tauri 判成缺参，前端只会看到 "IPC 不可用"（2026-10-02 本机仿真现场教训）。
-  const appliedIcon = await setAppIcon("faceted-duck");
-  assert(appliedIcon === "faceted-duck", `仿真切换应用图标没有生效：${appliedIcon}`);
-  const restoredIcon = await setAppIcon("standard");
-  assert(restoredIcon === "standard", `仿真还原应用图标没有生效：${restoredIcon}`);
-  steps.push("设置页应用图标选项经真实 IPC 与设置持久化往返");
-
   await openPage("连接");
+  // 重新挂载连接页：增益必须从持久化设置恢复（证明读取路径真的从 IPC 取值，
+  // 而不是界面硬编码 0）——上一步已把 12 dB 写入仿真设置目录。
+  const restoredGainSlider = await waitFor(
+    () => {
+      const slider = document.querySelector<HTMLInputElement>('input[name="audio-gain"]');
+      return slider && slider.value === "12" ? slider : null;
+    },
+    "增益从持久化设置恢复为 12 dB",
+  );
+  assert(restoredGainSlider.value === "12", "增益没有从持久化设置恢复");
+  steps.push("重新进入连接页后增益从持久化设置恢复为 12 dB");
   steps.push("六个侧栏页面均在 Windows WebView 中完成导航和渲染");
 
   mark("voice_session");
