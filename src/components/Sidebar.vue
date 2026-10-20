@@ -25,6 +25,14 @@ const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
   template: {
     strokes: ["M5 3.8h11l3 3v13.4H5z", "M16 3.8v3.5h3", "M8.2 11h7.6", "M8.2 14.5h7.6", "M8.2 18h4.6"],
   },
+  layers: {
+    // SF "square.stack.3d.up"：层叠方块（组合动作；对齐 Mac 侧边栏图标）
+    strokes: [
+      "M12 3.2l9 4.6-9 4.6-9-4.6z",
+      "M3.6 12.4l8.4 4.3 8.4-4.3",
+      "M3.6 16.6l8.4 4.3 8.4-4.3",
+    ],
+  },
   link: {
     // SF "link"：两段互扣链环（对角）
     strokes: [

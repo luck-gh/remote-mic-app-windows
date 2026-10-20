@@ -83,7 +83,10 @@ impl Default for FocusRetryPolicy {
         Self {
             attempts: 8,
             gap: Duration::from_millis(200),
-            budget: Duration::from_millis(3000),
+            // 6 秒：单次 UIA 扫描在 Electron 大树上可能要 2.5–3.3 秒
+            // （2026-10-19 WorkBuddy 实测），3 秒预算会让第一次 no_candidate
+            // 直接耗尽预算、没有第二次机会。
+            budget: Duration::from_millis(6000),
         }
     }
 }
@@ -196,7 +199,12 @@ pub trait FocusBackend: Send + Sync {
     fn current_process_id(&self) -> u32;
     fn process_alive(&self, pid: u32) -> bool;
     /// 一次聚焦尝试：扫描 + 选择 + 聚焦 + 读回。
-    fn attempt(&self, pid: u32, choice: &FocusChoice) -> AttemptResult;
+    fn attempt(
+        &self,
+        pid: u32,
+        choice: &FocusChoice,
+        cancellation: Arc<AtomicBool>,
+    ) -> AttemptResult;
     /// 「学习输入框」单次采样：返回**当前系统焦点**对应的可编辑目标；焦点在
     /// 本进程、拿不到元素或元素不合格（只读/敏感/不可聚焦）时返回 `None`。
     fn sample_learning_target(&self) -> Option<crate::focus::RecordedFocusTarget>;
@@ -241,6 +249,23 @@ fn focus_note(note: String) {
 
 #[cfg(not(windows))]
 fn focus_note(_note: String) {}
+
+/// 尝试结果的稳定短标签（结构化日志用）。
+fn attempt_result_label(result: AttemptResult) -> &'static str {
+    match result {
+        AttemptResult::Focused => "focused",
+        AttemptResult::NoCandidate => "no_candidate",
+        AttemptResult::NotForeground => "not_foreground",
+        AttemptResult::Fatal(FocusFailure::SelfForeground) => "fatal_self_foreground",
+        AttemptResult::Fatal(FocusFailure::TargetExited) => "fatal_target_exited",
+        AttemptResult::Fatal(FocusFailure::NotAccessible) => "fatal_not_accessible",
+        AttemptResult::Fatal(FocusFailure::NotConfigured) => "fatal_not_configured",
+        AttemptResult::Fatal(FocusFailure::Cancelled) => "fatal_cancelled",
+        AttemptResult::Fatal(FocusFailure::NoCandidate) => "fatal_no_candidate",
+        AttemptResult::Fatal(FocusFailure::NotForeground) => "fatal_not_foreground",
+        AttemptResult::Fatal(FocusFailure::Timeout) => "fatal_timeout",
+    }
+}
 
 struct FocusShared {
     backend: Arc<dyn FocusBackend>,
@@ -297,6 +322,14 @@ pub struct FocusRunner {
 
 impl FocusRunner {
     pub fn spawn(backend: Arc<dyn FocusBackend>, policy: FocusRetryPolicy) -> Self {
+        Self::spawn_with_cancellation(backend, policy, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub(crate) fn spawn_with_cancellation(
+        backend: Arc<dyn FocusBackend>,
+        policy: FocusRetryPolicy,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
         let (sender, receiver) = channel::<FocusJob>();
         let (exit_sender, exited) = channel::<()>();
         let shared = Arc::new(FocusShared {
@@ -304,7 +337,7 @@ impl FocusRunner {
             policy,
             gate: FocusRequestGate::new(),
             report: Mutex::new(None),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown: cancellation,
         });
         let worker_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -419,11 +452,15 @@ fn run_task(shared: &FocusShared, request_id: u64, task: &FocusTask) -> FocusRep
     let started = backend.now_ms();
     let outcome = drive_attempts(
         shared.policy,
-        |_attempt| {
+        |attempt| {
             if shared.superseded(request_id) {
                 return AttemptResult::Fatal(FocusFailure::Cancelled);
             }
             let Some(pid) = backend.foreground_process_id() else {
+                focus_note(format!(
+                    "focus_attempt index={} pid=0 result=no_foreground",
+                    attempt + 1
+                ));
                 return AttemptResult::NotForeground;
             };
             if pid == backend.current_process_id() {
@@ -432,7 +469,17 @@ fn run_task(shared: &FocusShared, request_id: u64, task: &FocusTask) -> FocusRep
             if !backend.process_alive(pid) {
                 return AttemptResult::Fatal(FocusFailure::TargetExited);
             }
-            backend.attempt(pid, &choice)
+            let result = backend.attempt(pid, &choice, Arc::clone(&shared.shutdown));
+            // 每次尝试都落一条：前台 PID + 结果。失败时无需再靠探针复现
+            // （2026-10-19 现场：只有最终 timeout，看不出是打错前台还是匹配失败）。
+            focus_note(format!(
+                "focus_attempt index={} pid={} kind={} result={}",
+                attempt + 1,
+                pid,
+                task.kind(),
+                attempt_result_label(result)
+            ));
+            result
         },
         || Duration::from_millis(backend.now_ms().saturating_sub(started)),
         |duration| backend.sleep(duration),
@@ -716,7 +763,12 @@ mod tests {
             true
         }
 
-        fn attempt(&self, _pid: u32, choice: &FocusChoice) -> AttemptResult {
+        fn attempt(
+            &self,
+            _pid: u32,
+            choice: &FocusChoice,
+            cancellation: Arc<AtomicBool>,
+        ) -> AttemptResult {
             self.attempts.lock().unwrap().push(choice.clone());
             if let Some(sender) = self.started.lock().unwrap().as_ref() {
                 let _ = sender.send(());
@@ -724,6 +776,9 @@ mod tests {
             if let Some(gate) = self.gate.lock().unwrap().as_ref() {
                 // 阻塞到测试放行（模拟一次「还在进行中」的尝试）。
                 let _ = gate.recv_timeout(Duration::from_secs(2));
+            }
+            if cancellation.load(Ordering::Acquire) {
+                return AttemptResult::Fatal(FocusFailure::Cancelled);
             }
             self.results
                 .lock()
@@ -813,16 +868,18 @@ mod tests {
         let (gate_sender, gate_receiver) = channel::<()>();
         *backend.started.lock().unwrap() = Some(started_sender);
         *backend.gate.lock().unwrap() = Some(gate_receiver);
-        let runner = FocusRunner::spawn(
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let runner = FocusRunner::spawn_with_cancellation(
             Arc::clone(&backend) as Arc<dyn FocusBackend>,
             FocusRetryPolicy::default(),
+            Arc::clone(&cancellation),
         );
         runner.submit(FocusTask::Frontmost).unwrap();
         wait_for(&started_receiver);
         runner
             .submit(FocusTask::LaunchThenFocus(FocusChoice::Index(1)))
             .unwrap();
-        runner.cancellation_signal().store(true, Ordering::Relaxed);
+        cancellation.store(true, Ordering::Release);
         assert!(runner.is_cancelled());
         assert_eq!(runner.submit(FocusTask::Frontmost), None);
         assert_eq!(runner.learn_target(), Err(FocusFailure::Cancelled));

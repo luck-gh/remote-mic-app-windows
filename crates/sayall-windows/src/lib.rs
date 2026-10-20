@@ -24,6 +24,9 @@ mod bluetooth_radio;
 mod button_gestures;
 pub mod button_mapping;
 pub mod capture_input;
+/// 常用语（内置内容、用户副本、五键分配、面板期认领与插入事务；纯逻辑，跨平台可单测）：
+/// 平台实现见 `clipboard_windows` 与 `phrase_insert_windows`。
+pub mod common_phrases;
 pub mod compatibility;
 pub mod component_support;
 mod diagnostic_log;
@@ -94,6 +97,8 @@ pub mod key_gate;
 mod key_suppressor;
 #[cfg(windows)]
 mod lock_open_with_guard;
+/// 组合动作执行器（模型/校验在 sayall-core；平台步骤经 MacroStepper 注入）。
+pub mod macro_runtime;
 /// 本机的原生系统架构（x64 / arm64），与"本进程的仿真架构"区分开。
 pub mod os_arch;
 #[cfg(windows)]
@@ -347,6 +352,13 @@ pub struct WindowsPlatform {
     ime_align_pending: Arc<Mutex<Option<(VoiceInputTool, std::time::Instant, u64)>>>,
     button_mapping: Arc<ButtonMappingRuntime>,
     scene_control: Arc<scene_control::SceneController>,
+    /// 组合动作运行时（引擎 RunMacro 手势与 UI 测试入口共用）。
+    macro_runtime: Arc<macro_runtime::MacroRuntime>,
+    /// 组合动作执行器读取的聚焦档案镜像：与 `set_button_mappings` 同步
+    /// （执行器不直接持有 `ButtonMappingRuntime`，避免引用环）。
+    #[cfg(windows)]
+    macro_focus_profiles:
+        Arc<std::sync::RwLock<std::collections::BTreeMap<String, focus::AppFocusProfile>>>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
     // 抑制器与门控句柄"持有即运行"：字段本身不被读取，随平台生命周期保活
     //（Drop 时停止钩子线程）。
@@ -397,12 +409,17 @@ impl MappingInjector for UnsupportedInjector {
         &self,
         _target: &str,
         _profile: Option<&crate::focus::AppFocusProfile>,
+        _cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(), String> {
         Err("打开应用仅在 Windows 上可用".to_owned())
     }
 
     fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
         Err("学习输入框仅在 Windows 上可用".to_owned())
+    }
+
+    fn learn_focus_point(&self, _target: &str) -> Result<crate::focus::RecordedPoint, String> {
+        Err("记录点击位置仅在 Windows 上可用".to_owned())
     }
 }
 
@@ -467,10 +484,28 @@ impl Default for WindowsPlatform {
             let injector: Arc<dyn MappingInjector> = Arc::new(
                 button_mapping::SendInputInjector::new(Arc::clone(&send_input)),
             );
+            // 组合动作执行器：聚焦档案经共享镜像读取（由 set_button_mappings 同步），
+            // 平台步骤实现走真实 SendInput / 应用启动 / UIA 聚焦 / 受限 URL 打开。
+            let macro_focus_profiles =
+                Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new()));
+            let macro_source: Arc<dyn macro_runtime::MacroStepperSource> = Arc::new(
+                macro_runtime::WindowsMacroStepperSource::new(Arc::clone(&injector), {
+                    let profiles = Arc::clone(&macro_focus_profiles);
+                    Arc::new(move |target: &str| {
+                        profiles
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(target)
+                            .cloned()
+                    })
+                }),
+            );
+            let macro_runtime = Arc::new(macro_runtime::MacroRuntime::new(macro_source));
             let button_mapping = Arc::new(ButtonMappingRuntime::new(
                 injector,
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
+                Arc::clone(&macro_runtime),
             ));
             let rc003_bridge = rc003_bridge::Rc003Bridge::start(button_mapping.sender());
             rc003_bridge.attach_mapping_runtime(&button_mapping);
@@ -533,6 +568,8 @@ impl Default for WindowsPlatform {
                 ime_align_pending,
                 button_mapping,
                 scene_control,
+                macro_runtime,
+                macro_focus_profiles,
                 raw_input_snapshot,
                 voice_key_suppressor,
                 key_gate,
@@ -549,10 +586,14 @@ impl Default for WindowsPlatform {
             let mut initial = raw_input_snapshot.lock().unwrap();
             initial.phase = RawInputPhase::Unsupported;
             drop(initial);
+            let macro_runtime = Arc::new(macro_runtime::MacroRuntime::new(Arc::new(
+                macro_runtime::UnsupportedStepperSource,
+            )));
             let button_mapping = Arc::new(ButtonMappingRuntime::new(
                 Arc::new(UnsupportedInjector),
                 Arc::clone(&usage),
                 Arc::clone(&raw_input_snapshot),
+                Arc::clone(&macro_runtime),
             ));
             let scene_control = scene_control::SceneController::new();
             scene_control::register_voice_scene(&scene_control);
@@ -573,6 +614,7 @@ impl Default for WindowsPlatform {
                 ime_align_pending,
                 button_mapping,
                 scene_control,
+                macro_runtime,
                 raw_input_snapshot,
             }
         }
@@ -1007,6 +1049,15 @@ impl WindowsPlatform {
 
     /// 更新按键映射：持久化由 Tauri 层负责，这里热加载到引擎并同步门控配置。
     pub fn set_button_mappings(&self, mappings: send_input::ButtonMappings) {
+        #[cfg(windows)]
+        {
+            // 组合动作执行器读的聚焦档案镜像：与映射同一次热加载更新。
+            let mut profiles = self
+                .macro_focus_profiles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *profiles = mappings.focus_profiles.clone();
+        }
         self.button_mapping.set_mappings(mappings);
     }
 
@@ -1017,7 +1068,7 @@ impl WindowsPlatform {
         ble::gatt_note(format!("template_configuration result=applied program_defaults_enabled={} third_party_ui_query=false", configuration.button_mapping_follow_enabled));
         let common = configuration.common_mappings.clone();
         let _ = self.scene_control.set_configuration(configuration);
-        self.button_mapping.set_mappings(common);
+        self.set_button_mappings(common);
     }
 
     pub fn scene_snapshot(&self) -> scene_control::SceneSnapshot {
@@ -1044,6 +1095,16 @@ impl WindowsPlatform {
             observed_menu_generation,
             menu_window_id,
         );
+    }
+
+    /// 同步组合动作库快照（Tauri 层在加载/保存后调用；引擎与执行器共用）。
+    pub fn set_macro_library(&self, document: sayall_core::MacroLibraryDocument) {
+        self.macro_runtime.set_library(document);
+    }
+
+    /// 组合动作运行时句柄（IPC 层做"测试动作/测试这步/取消"时用）。
+    pub fn macro_runtime(&self) -> Arc<macro_runtime::MacroRuntime> {
+        Arc::clone(&self.macro_runtime)
     }
 
     pub fn template_menu_key(
@@ -1108,6 +1169,7 @@ impl WindowsPlatform {
     /// Synchronize the identified connection at the same transition that owns it.
     pub fn set_input_context(&self, model: RemoteModel, connected: bool) {
         if !connected {
+            self.macro_runtime.cancel_all();
             self.scene_control.cancel_task_switch("disconnected");
         }
         self.button_mapping.set_input_context(model, connected);
@@ -1117,16 +1179,23 @@ impl WindowsPlatform {
     /// has been cancelled. The barrier is bounded so normal exit cannot wait
     /// forever for the mapping worker.
     pub fn quiesce_input(&self) -> Result<(), PlatformError> {
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(2);
         self.button_mapping.close_focus();
         #[cfg(windows)]
         ime::stop_recovery();
         self.scene_control.cancel_task_switch("normal_exit");
         self.button_mapping
             .set_input_context(RemoteModel::Unknown, false);
-        if self
+        let macros_stopped = self.macro_runtime.shutdown(timeout);
+        let mappings_stopped = self
             .button_mapping
-            .wait_for_idle(std::time::Duration::from_secs(2))
-        {
+            .wait_for_idle(timeout.saturating_sub(started.elapsed()));
+        if !macros_stopped {
+            Err(PlatformError::WindowsApi(
+                "macro shutdown barrier timed out".to_owned(),
+            ))
+        } else if mappings_stopped {
             Ok(())
         } else {
             Err(PlatformError::WindowsApi(
@@ -1161,6 +1230,13 @@ impl WindowsPlatform {
     pub fn learn_focus_target(&self) -> Result<focus::RecordedFocusTarget, PlatformError> {
         self.button_mapping
             .learn_focus_target()
+            .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「记录点击位置」：读取物理光标并要求其落在目标应用窗口内。
+    pub fn learn_focus_point(&self, target: &str) -> Result<focus::RecordedPoint, PlatformError> {
+        self.button_mapping
+            .learn_focus_point(target)
             .map_err(PlatformError::SendInput)
     }
 

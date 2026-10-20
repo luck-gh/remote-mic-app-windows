@@ -235,6 +235,7 @@ const VOICE_ICON_FILLED = "M12 2.8a3.4 3.4 0 0 1 3.4 3.4v5.6a3.4 3.4 0 0 1-6.8 0
 const VOICE_ICON_STROKES = ["M6.3 11.5a5.7 5.7 0 0 0 11.4 0", "M12 17.2v3.8"];
 
 const mappings = ref<ButtonMappings>({ enabled: true, actions: {} });
+/** 映射是否已从设置读回：「启用自定义按键功能」开关就绪前用占位符顶位（防滑入）。 */
 const savedSnapshot = ref<ButtonMappings>({ enabled: true, actions: {} });
 type EditingSource = "common" | `template:${string}`;
 const currentTemplate = useCurrentTemplate();
@@ -249,6 +250,8 @@ const templateCatalog = ref<TemplateCatalogEntry[]>([]);
 const editingSource = ref<EditingSource>("common");
 /** 已安装的预设应用（打开应用动作可选列表）。 */
 const presetApps = ref<PresetAppInfo[]>([]);
+/** 组合动作库（「组合动作」动作分组的候选；2026-10-15）。 */
+/** 常用语组件是否可用（页面加载快照后更新；不可用时不显示动作入口）。 */
 const selectedButton = ref<RemoteButton | null>(null);
 const editingTarget = ref<{ button: RemoteButton; trigger: ButtonTrigger } | null>(null);
 const editorPanel = ref<HTMLElement | null>(null);
@@ -1258,7 +1261,6 @@ onUnmounted(() => {
         @applications="mappings = { ...mappings, applications: $event }"
         @status="statusMessage = $event"
       />
-
       <div v-if="repeatGroupVisible" class="repeat-group">
         <span class="repeat-label">按住时连续执行</span>
         <div class="repeat-options">

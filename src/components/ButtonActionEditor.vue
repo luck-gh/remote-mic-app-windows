@@ -4,9 +4,11 @@ import RegisteredAppsDialog from "./RegisteredAppsDialog.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import {
   actionSummary,
+  getCombinedActions, getCommonPhrasePanelSnapshot, latestMacroDefinitions,
+  registerMacroNames, registerCommonPhraseAvailability, openCommonPhraseExample,
   mouseClickLabels, mouseMoveLabels, registerPresetAppNames,
   startShortcutCapture, stopShortcutCapture, subscribeShortcutCaptureEdges,
-  type MoveDirection, type AppLibraryEntry,
+  type MoveDirection, type AppLibraryEntry, type MacroDefinition,
   chordLabel,
   pickCustomApp,
   type ButtonAction,
@@ -15,9 +17,10 @@ import {
   type KeyCode,
   type PresetAppInfo,
   type RemoteButton,
-  learnFocusTarget, testAppFocus,
+  learnFocusTarget, learnFocusPoint, testAppFocus,
   type AppFocusProfile, type FocusStrategy,
 } from "../lib/bridge";
+import { settingsComponent as commonPhraseSettingsComponent } from "../private/windows-common-phrases";
 
 const props = defineProps<{
   mappings: ButtonMappings;
@@ -49,6 +52,10 @@ let captureFocusTarget: string | null = null;
 let unmounted = false;
 let unlistenCapture: (() => void) | null = null;
 const statusMessage = ref<string | null>(null);
+const macroDefinitions = ref<MacroDefinition[]>([]);
+const commonPhrasesAvailable = ref(false);
+const commonPhraseEditor = commonPhraseSettingsComponent();
+const showCommonPhraseEditor = ref(false);
 watch(statusMessage, message => { if (message) emit("status", message); });
 const action = computed<ButtonAction>(() => props.mappings.actions[props.button]?.[props.trigger] ?? { type: "disabled" });
 const focusTarget = computed(() => !props.shortcutsOnly && action.value.type === "open_app" ? action.value.target : null);
@@ -57,13 +64,15 @@ const focusStrategy = computed(() => focusProfile.value?.strategy ?? "open_only"
 const learningFocus = ref(false);
 const testingFocus = ref(false);
 let focusRequest = 0;
+let pointLearnTimer: number | null = null;
 const focusDraftSaved = computed(() => {
   const savedAction = props.savedMappings?.actions[props.button]?.[props.trigger];
   return !!focusTarget.value && savedAction?.type === "open_app" && savedAction.target === focusTarget.value
     && JSON.stringify(focusProfile.value) === JSON.stringify(props.savedMappings?.focusProfiles?.[focusTarget.value]);
 });
 const focusProfileComplete = computed(() => focusStrategy.value === "open_only"
-  || (focusStrategy.value === "app_shortcut" ? !!focusProfile.value?.shortcut?.keys.length : !!focusProfile.value?.recorded));
+  || (focusStrategy.value === "app_shortcut" ? !!focusProfile.value?.shortcut?.keys.length
+    : focusStrategy.value === "recorded_point" ? !!focusProfile.value?.point : !!focusProfile.value?.recorded));
 function updateFocusProfile(profile: AppFocusProfile): void {
   if (!focusTarget.value || props.busy) return;
   emit("focusProfile", focusTarget.value, profile);
@@ -74,7 +83,33 @@ function changeFocusStrategy(event: Event): void {
   const strategy = (event.target as HTMLSelectElement).value as FocusStrategy;
   const previous = focusProfile.value;
   updateFocusProfile(strategy === "app_shortcut" && previous?.shortcut ? { strategy, shortcut: previous.shortcut }
-    : strategy === "recorded_element" && previous?.recorded ? { strategy, recorded: previous.recorded } : { strategy });
+    : strategy === "recorded_element" && previous?.recorded ? { strategy, recorded: previous.recorded }
+    : strategy === "recorded_point" && previous?.point ? { strategy, point: previous.point } : { strategy });
+}
+function recordFocusPoint(): void {
+  const target = focusTarget.value;
+  if (!target || learningFocus.value || props.busy) return;
+  const request = ++focusRequest;
+  learningFocus.value = true;
+  statusMessage.value = "请把鼠标停在目标输入框上，六秒后记录位置";
+  reportFrontendEvent({ event: "app_focus_point", phase: "started", result: "unknown", reason: "explicit_request" });
+  pointLearnTimer = window.setTimeout(async () => {
+    pointLearnTimer = null;
+    try {
+      const point = await learnFocusPoint(target);
+      if (unmounted || request !== focusRequest || target !== focusTarget.value) {
+        reportFrontendEvent({ event: "app_focus_point", phase: "completed", result: "unknown", reason: "stale_result" });
+        return;
+      }
+      updateFocusProfile({ strategy: "recorded_point", point });
+      reportFrontendEvent({ event: "app_focus_point", phase: "completed", result: "passed", reason: "point_recorded" });
+    } catch (cause) {
+      if (!unmounted && request === focusRequest) statusMessage.value = `记录位置失败：${String(cause)}`;
+      reportFrontendEvent({ event: "app_focus_point", phase: "completed", result: "failed", reason: "point_learning_failed" });
+    } finally {
+      if (request === focusRequest) learningFocus.value = false;
+    }
+  }, 6000);
 }
 async function learnAppFocus(): Promise<void> {
   const target = focusTarget.value;
@@ -111,6 +146,8 @@ async function testSelectedAppFocus(): Promise<void> {
   } finally { if (request === focusRequest) testingFocus.value = false; }
 }
 watch([focusTarget, focusStrategy], () => {
+  if (pointLearnTimer !== null) window.clearTimeout(pointLearnTimer);
+  pointLearnTimer = null;
   focusRequest += 1;
   learningFocus.value = false;
   testingFocus.value = false;
@@ -407,6 +444,20 @@ onMounted(async () => {
   window.addEventListener("keydown", handleCaptureKeydown, true);
   window.addEventListener("keyup", handleCaptureKeyup, true);
   window.addEventListener("blur", handleCaptureBlur);
+  if (!props.shortcutsOnly) {
+    try {
+      const [library, commonPhrases] = await Promise.all([getCombinedActions(), getCommonPhrasePanelSnapshot()]);
+      if (unmounted) return;
+      macroDefinitions.value = latestMacroDefinitions(library.definitions);
+      registerMacroNames(macroDefinitions.value);
+      commonPhrasesAvailable.value = commonPhrases.available;
+      registerCommonPhraseAvailability(commonPhrases.available);
+      reportFrontendEvent({ event: "mapping_action_catalog", phase: "completed", result: "passed", reason: "catalog_loaded" });
+    } catch (cause) {
+      if (!unmounted) statusMessage.value = `读取组合动作或常用语失败：${String(cause)}`;
+      reportFrontendEvent({ event: "mapping_action_catalog", phase: "completed", result: "failed", reason: "catalog_load_failed" });
+    }
+  }
   try {
     const stop = await subscribeShortcutCaptureEdges(edge => acceptCapturedKey(edge.key, edge.isPressed));
     if (unmounted) stop(); else unlistenCapture = stop;
@@ -415,6 +466,8 @@ onMounted(async () => {
 onUnmounted(() => {
   unmounted = true;
   focusRequest += 1;
+  if (pointLearnTimer !== null) window.clearTimeout(pointLearnTimer);
+  pointLearnTimer = null;
   window.removeEventListener("keydown", handleCaptureKeydown, true);
   window.removeEventListener("keyup", handleCaptureKeyup, true);
   window.removeEventListener("blur", handleCaptureBlur);
@@ -424,7 +477,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="button-action-editor">
+  <div v-if="showCommonPhraseEditor && commonPhraseEditor" class="button-action-editor">
+    <button class="chip" type="button" @click="showCommonPhraseEditor = false">返回按键配置</button>
+    <component :is="commonPhraseEditor" />
+  </div>
+  <div v-else class="button-action-editor">
     <p class="muted">当前：{{ actionSummary(action) }}</p>
 <div class="action-sections">
         <p v-if="button === 'ok' && (trigger !== 'single' || action.type !== 'shortcut' || action.chord.keys.length !== 1 || action.chord.keys[0] !== 'enter')" class="muted editor-note" role="note">确认键的首次原生 Enter 可能先到达目标窗口；其他组合键、双击或长按不能保证阻止这次原生确认。需要即时确认时请使用单击 Enter。</p>
@@ -494,6 +551,24 @@ onUnmounted(() => {
         </section>
 
         <section v-if="!shortcutsOnly" class="action-section">
+          <h4 class="action-section-title">组合动作</h4>
+          <p v-if="macroDefinitions.length === 0" class="muted">还没有组合动作。先到“组合动作”页创建。</p>
+          <div v-else class="preset-grid">
+            <button v-for="macro in macroDefinitions" :key="macro.macroId" class="chip" type="button"
+              :class="{ selected: action.type === 'run_macro' && action.macroId === macro.macroId }"
+              :title="`${macro.steps.length} 个步骤`"
+              @click="apply({ type: 'run_macro', macroId: macro.macroId, macroVersion: macro.version })">{{ macro.name }}</button>
+          </div>
+        </section>
+        <section v-if="!shortcutsOnly && commonPhrasesAvailable" class="action-section">
+          <h4 class="action-section-title">常用语</h4>
+          <div class="preset-grid">
+            <button class="chip" type="button" :class="{ selected: action.type === 'open_common_phrases' }" @click="apply({ type: 'open_common_phrases' })">打开常用语</button>
+            <button v-if="commonPhraseEditor" class="chip" type="button" @click="showCommonPhraseEditor = true">调整常用语</button>
+            <button class="chip" type="button" @click="openCommonPhraseExample().catch(cause => statusMessage = String(cause))">常用语示例</button>
+          </div>
+        </section>
+        <section v-if="!shortcutsOnly" class="action-section">
           <h4 class="action-section-title">打开应用</h4>
           <div class="preset-grid">
             <button
@@ -529,6 +604,7 @@ onUnmounted(() => {
                 <option value="open_only">只打开应用</option>
                 <option value="app_shortcut">用应用快捷键聚焦</option>
                 <option value="recorded_element">聚焦已记录的输入框</option>
+                <option value="recorded_point">记录点击位置</option>
               </select>
             </label>
             <template v-if="focusStrategy === 'app_shortcut'">
@@ -539,6 +615,10 @@ onUnmounted(() => {
               <p class="muted editor-note">{{ focusProfile?.recorded ? '已记录输入框特征' : '尚未记录输入框' }}；仅在执行此按键动作时定位，不持续扫描应用。</p>
               <button class="chip" type="button" data-testid="learn-app-focus" :disabled="busy || learningFocus || capturingShortcut || captureStarting" @click="learnAppFocus">{{ learningFocus ? '请点击目标输入框…' : '记录输入框' }}</button>
               <button v-if="focusProfile?.recorded" class="chip" type="button" :disabled="busy || learningFocus" @click="updateFocusProfile({ strategy: 'open_only' })">清除记录并只打开应用</button>
+            </template>
+            <template v-if="focusStrategy === 'recorded_point'">
+              <p class="muted editor-note">{{ focusProfile?.point ? '已记录点击位置' : '尚未记录点击位置' }}；只在执行此动作时点击目标位置。</p>
+              <button class="chip" type="button" data-testid="learn-app-point" :disabled="busy || learningFocus || capturingShortcut || captureStarting" @click="recordFocusPoint">{{ learningFocus ? '请定位目标位置…' : '记录点击位置' }}</button>
             </template>
             <button class="chip" type="button" data-testid="test-app-focus" :disabled="busy || !focusDraftSaved || !focusProfileComplete || learningFocus || testingFocus || capturingShortcut || captureStarting" @click="testSelectedAppFocus">测试已保存的应用聚焦设置</button>
             <p v-if="!focusDraftSaved" class="muted editor-note">保存当前配置后可测试。</p>

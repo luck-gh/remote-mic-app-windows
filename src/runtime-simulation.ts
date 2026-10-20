@@ -3,8 +3,15 @@ import {
   connectRemote,
   disconnectRemote,
   getAudioSnapshot,
+  getButtonMappings,
+  getMappingConfiguration,
+  getCombinedActions,
+  saveMacro,
+  deleteMacro,
+  macroReferences,
   getDiagnosticReport,
   getGainDb,
+  getOpenWindowAtLaunch,
   getRawInputSnapshot,
   getRuntimeSnapshot,
   listAudioEndpoints,
@@ -44,10 +51,14 @@ function mark(stage: string): void {
   });
 }
 
-async function waitFor<T>(read: () => T | null, description: string): Promise<T> {
+async function waitFor<T>(
+  read: () => T | null | Promise<T | null>,
+  description: string,
+): Promise<T> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const value = read();
+    // 允许异步读取（如经 IPC 读回持久化真值）；同步读取器行为不变。
+    const value = await read();
     if (value !== null) return value;
     await new Promise((resolve) => window.setTimeout(resolve, 50));
   }
@@ -206,6 +217,33 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(document.querySelector(".run-modes") !== null, "模板页缺少独立模板切换设置");
   steps.push("模板页通过真实 IPC 加载完整按键模板与独立切换设置");
 
+  mark("macros_page");
+  const beforeMacroConfiguration = await getMappingConfiguration();
+  const macroId = "macro.cisimulation";
+  await saveMacro({
+    schemaVersion: "0.1", macroId, version: "1.0.0", name: "仿真组合动作",
+    steps: [{ stepId: "step.01", action: "send_shortcut", parameters: { chord: { modifiers: ["control"], key: "a" } } }],
+  });
+  await openPage("组合动作");
+  await waitFor(() => document.body.textContent?.includes("仿真组合动作") ? true : null, "组合动作库真实 IPC 读回与渲染");
+  const beforeMacroMappings = await getButtonMappings();
+  await saveButtonMappings({
+    ...beforeMacroMappings,
+    actions: { ...beforeMacroMappings.actions, power: {
+      single: { type: "run_macro", macroId, macroVersion: "1.0.0" },
+      double: { type: "disabled" }, long: { type: "disabled" },
+    } },
+  });
+  const references = await macroReferences(macroId);
+  assert(references.buttons.some(reference => reference.button === "power" && reference.trigger === "single"), "宏绑定未出现在删除引用清单");
+  await deleteMacro(macroId);
+  const afterMacroConfiguration = await getMappingConfiguration();
+  assert(afterMacroConfiguration.commonMappings.actions.power?.single.type === "disabled", "删除宏没有清理通用按键绑定");
+  assert(JSON.stringify({ ...afterMacroConfiguration, commonMappings: beforeMacroConfiguration.commonMappings }) === JSON.stringify(beforeMacroConfiguration), "宏绑定清理改变了个人模板或关联设置");
+  assert(!(await getCombinedActions()).definitions.some(definition => definition.macroId === macroId), "删除宏后库中仍有定义");
+  await saveButtonMappings(beforeMacroMappings);
+  steps.push("组合动作库真实 IPC 保存/渲染、绑定引用与删除清理通过，个人模板保持；未执行系统快捷键");
+
   mark("drivers_page");
   await openPage("驱动", "驱动与配对");
   assert(document.querySelector(".guide-grid") !== null, "驱动页缺少可选增强与配对引导");
@@ -302,6 +340,46 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(!document.querySelector('[role="alert"]'), "恢复系统外观后显示错误");
   steps.push("设置页深色/系统外观经 Windows WebView、Tauri capability 与设置持久化闭环");
 
+  // 「启动时自动打开主面板」（2026-10-19）：仿真状态目录每次都是新装，这里证明
+  // 默认值经真实 IPC 读回，且开关写入 → 读回 → 复位走同一条持久化路径。
+  //
+  // 2026-10-19 CI 回归：`click()` 之后不能立刻等 DOM 上的 `disabled`/`checked`——
+  // Vue 的响应式刷新是微任务，`waitFor` 的第一次判断是同步执行的，会看到点击前
+  // 的 DOM 直接放行，随后的 IPC 读回就可能抢在保存落盘之前（实测 CI 报
+  // 「关闭后读回仍是开启」）。这里改为轮询**后端读回值**：它才是持久化的真值。
+  const openWindowToggle = await waitFor(
+    () => {
+      const toggle = document.querySelector<HTMLInputElement>(
+        'input[name="open-window-at-launch"]:not(:disabled)',
+      );
+      return toggle && toggle.checked ? toggle : null;
+    },
+    "启动时自动打开主面板默认开启",
+  );
+  openWindowToggle.click();
+  await waitFor(
+    async () => ((await getOpenWindowAtLaunch()) === false ? true : null),
+    "启动时自动打开主面板关闭并落盘",
+  );
+  assert(
+    !document.querySelector('.settings-group [role="alert"]'),
+    "切换启动页面设置后显示错误",
+  );
+  // 再点一次开关恢复开启（走同一条界面 → IPC → 持久化路径，不用直达命令）。
+  // 重新取元素：保存完成后的重渲染不保证还持有同一个 DOM 节点。
+  const reopenToggle = await waitFor(
+    () =>
+      document.querySelector<HTMLInputElement>(
+        'input[name="open-window-at-launch"]:not(:disabled)',
+      ),
+    "启动时自动打开主面板可再次切换",
+  );
+  reopenToggle.click();
+  await waitFor(
+    async () => ((await getOpenWindowAtLaunch()) === true ? true : null),
+    "启动时自动打开主面板恢复开启并落盘",
+  );
+  steps.push("设置页「启动时自动打开主面板」新装默认开启，切换经真实 IPC 与设置持久化往返");
   await openPage("连接");
   // 重新挂载连接页：增益必须从持久化设置恢复（证明读取路径真的从 IPC 取值，
   // 而不是界面硬编码 0）——上一步已把 12 dB 写入仿真设置目录。
@@ -314,7 +392,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   );
   assert(restoredGainSlider.value === "12", "增益没有从持久化设置恢复");
   steps.push("重新进入连接页后增益从持久化设置恢复为 12 dB");
-  steps.push("六个侧栏页面均在 Windows WebView 中完成导航和渲染");
+  steps.push("七个侧栏页面均在 Windows WebView 中完成导航和渲染");
 
   mark("voice_session");
   const voice = await invoke<PlatformSnapshot>("run_runtime_simulation_voice_session");

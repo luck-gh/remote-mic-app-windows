@@ -1767,3 +1767,15 @@ mod tests {
         assert_eq!(pending, 1);
     }
 }
+pub fn phrase_panel_mask() -> u64 {
+    [
+        crate::raw_input::RemoteButton::Ok,
+        crate::raw_input::RemoteButton::Left,
+        crate::raw_input::RemoteButton::Up,
+        crate::raw_input::RemoteButton::Right,
+        crate::raw_input::RemoteButton::Down,
+        crate::raw_input::RemoteButton::Back,
+    ]
+    .iter()
+    .fold(0, |mask, button| mask | (1u64 << button.ordinal()))
+}

@@ -53,6 +53,11 @@ pub struct AppSettings {
     /// 连接页选择的输入工具（微信输入法 / 豆包输入法 / 其他工具）。
     pub voice_input_tool: Option<VoiceInputTool>,
     pub launch_at_login: bool,
+    /// 启动时是否自动打开主面板（设置页「启动行为」第二项，默认 **开启**）。
+    ///
+    /// 对齐 Mac `AppSettings.openMainWindowAtLaunch`：关闭后普通启动只驻留托盘，
+    /// 用户从托盘或再次双击快捷方式打开。未完成首次设置或本次启动前刚完成更新时
+    /// 仍会显示主面板（判定见 `sayall_windows_app` 的启动可见性）。
     pub open_window_at_launch: bool,
     pub rc003_capture_enabled: bool,
     pub check_prerelease_updates: bool,
@@ -253,5 +258,61 @@ mod enhancement_default_tests {
         let reopened: AppSettings =
             serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         assert!(reopened.rc003_capture_enabled);
+    }
+
+    /// 「启动时自动打开主面板」（设置页「启动行为」，2026-10-19 用户定稿）。
+    ///
+    /// 语义对齐 Mac `openMainWindowAtLaunch`：新装 / 老配置（无此字段）默认**开启**；
+    /// 用户关掉后落盘，读回保持关闭。关闭后启动只驻留托盘，托盘菜单、托盘左键
+    /// 或再次启动应用都会显示主面板。
+    #[test]
+    fn open_window_at_launch_defaults_on_and_round_trips() {
+        assert!(AppSettings::default().open_window_at_launch);
+
+        // 老配置没有这个字段：容器级 `#[serde(default)]` 落回默认（开启）。
+        let older: AppSettings = serde_json::from_str(
+            r#"{"schema_version":4,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+        assert!(older.open_window_at_launch);
+
+        // 用户关闭后：原样写出，读回与 `normalized` 后都保持关闭。
+        let settings = AppSettings {
+            open_window_at_launch: false,
+            ..AppSettings::default()
+        };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert!(encoded.contains("\"open_window_at_launch\":false"));
+        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
+        assert!(!decoded.normalized().open_window_at_launch);
+    }
+
+    /// 「锁定当前按键」（按键页页脚开关，2026-10-18 用户定稿持久化）。
+    ///
+    /// 语义：新装 / 老配置（无此字段）默认**开启**（对齐 Mac `MappingSelectionPolicy`）；
+    /// 用户关掉后落盘，读回必须保持关闭。
+    #[test]
+    fn lock_mapping_selection_defaults_to_locked_and_round_trips() {
+        assert!(AppSettings::default().ui_preferences.lock_button_selection);
+
+        // 老配置没有这个字段：容器级 `#[serde(default)]` 落回默认（开启）。
+        let older: AppSettings = serde_json::from_str(
+            r#"{"schema_version":4,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+        assert!(older.ui_preferences.lock_button_selection);
+
+        // 用户关闭后：原样写出，读回与 `normalized` 后都保持关闭。
+        let settings = AppSettings {
+            ui_preferences: super::UiPreferences {
+                lock_button_selection: false,
+                ..super::UiPreferences::default()
+            },
+            ..AppSettings::default()
+        };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert!(encoded.contains("\"lockButtonSelection\":false"));
+        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
+        assert!(!decoded.normalized().ui_preferences.lock_button_selection);
     }
 }

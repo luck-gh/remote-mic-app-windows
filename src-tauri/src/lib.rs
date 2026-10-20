@@ -1,3 +1,4 @@
+use sayall_core::{MacroDefinition, MacroLibraryDocument};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::rc003_bridge::{BridgePhase, BridgeSnapshot};
 use sayall_windows::send_input::{
@@ -15,7 +16,9 @@ use tauri::{Emitter, Manager};
 
 mod accent;
 mod app_icon;
+mod common_phrase_panel;
 mod diagnostics;
+mod launch_state;
 mod onboarding;
 mod platform;
 mod rc003_task;
@@ -645,6 +648,9 @@ struct AppState {
     /// check_app_update 暂存的待安装更新（install_app_update 取走）。
     /// tauri_plugin_updater::Update 未实现 Debug，用手写 impl 只呈现存在性。
     pending_update: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// 本次启动前刚完成更新时的版本号；前端取走一次后清空（对齐 Mac
+    /// `showUpdateCompletedAlert`：只在更新后的第一次启动提示）。
+    update_completed_version: std::sync::Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -844,6 +850,7 @@ impl ExitCleanup {
         );
         let input_result = self.0.platform.quiesce_input();
         sayall_windows::key_host::shutdown_global();
+        sayall_windows::common_phrases::current_common_phrase_host().shutdown();
         failures += u8::from(input_result.is_err());
         sayall_windows::gatt_note(format!(
             "app_shutdown stage=input_quiesce phase=completed terminal_result={} error_code={} took_ms={}",
@@ -959,6 +966,19 @@ impl std::fmt::Debug for AppState {
                     .pending_update
                     .lock()
                     .map(|u| u.is_some())
+                    .unwrap_or(false)
+                {
+                    "Some"
+                } else {
+                    "None"
+                },
+            )
+            .field(
+                "update_completed_version",
+                &if self
+                    .update_completed_version
+                    .lock()
+                    .map(|v| v.is_some())
                     .unwrap_or(false)
                 {
                     "Some"
@@ -1705,6 +1725,24 @@ fn refocus_main_window_soon(app: tauri::AppHandle) {
             let _ = window.set_focus();
         }
     });
+}
+
+/// 启动时是否显示主面板（纯判定，单测覆盖）。
+///
+/// 对齐 Mac `OnboardingLaunchPolicy.shouldShowMainWindow`：
+/// `!isComplete || completedUpdate || openMainWindowAtLaunch`。
+/// - 未完成首次设置必须显示，否则用户没有入口完成向导；
+/// - 本次启动前刚完成更新必须显示（Mac：更新完成后仍会显示主面板）；
+/// - 其余情况由「启动时自动打开主面板」决定（默认开启）。
+///
+/// 关闭该开关后，普通启动（含手动双击快捷方式）只驻留托盘；托盘左键 /
+/// 托盘菜单「显示主界面」以及再次启动应用都会把主面板显示出来。
+fn should_show_main_window_on_startup(
+    onboarding_active: bool,
+    completed_update: bool,
+    open_window_at_launch: bool,
+) -> bool {
+    onboarding_active || completed_update || open_window_at_launch
 }
 
 /// 把主窗口从「最小化 / 收进托盘」恢复到可见并尝试置前（2026-10-03 用户报障：
@@ -2713,13 +2751,348 @@ async fn reset_button_mappings(
     result
 }
 
+/// 读取组合动作库（库浏览页初始加载与保存后刷新共用）。
+#[tauri::command]
+fn get_combined_actions(state: tauri::State<'_, AppState>) -> Result<MacroLibraryDocument, String> {
+    state.settings.load_combined_actions()
+}
+
+/// 保存一条组合动作定义（新建 / 编辑共用）。
+///
+/// 语义 = 不可变版本合并：同 `macro_id@version` 一致跳过、不同拒绝
+/// （编辑总是新版本号）；整库校验通过才落盘并热同步到执行器。
+#[tauri::command]
+async fn save_macro(
+    state: tauri::State<'_, AppState>,
+    definition: MacroDefinition,
+) -> Result<MacroLibraryDocument, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=combined_actions action=save phase=requested macro_id={} version={} steps={}",
+        definition.macro_id,
+        definition.version,
+        definition.steps.len()
+    ));
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    let macro_id = definition.macro_id.clone();
+    let result = match tauri::async_runtime::spawn_blocking(
+        move || -> Result<MacroLibraryDocument, String> {
+            let current = settings.load_combined_actions()?;
+            let incoming = MacroLibraryDocument {
+                format_version: sayall_core::MACRO_LIBRARY_FORMAT_VERSION,
+                definitions: vec![definition],
+            };
+            let merged =
+                sayall_core::merge_library(&current, incoming).map_err(|issue| issue.code())?;
+            let saved = settings.save_combined_actions(merged)?;
+            // 保存即热加载（与按键映射同一模式）：RunMacro 引用立即解析新版本。
+            platform.set_macro_library(saved.clone());
+            Ok(saved)
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("保存组合动作任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(document) => format!(
+            "shortcut_settings feature=combined_actions action=save phase=completed terminal_result=passed macro_id={macro_id} definitions={} elapsed_ms={}",
+            document.definitions.len(),
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "shortcut_settings feature=combined_actions action=save phase=completed terminal_result=failed error_domain=settings error_code=validation_or_persistence_failed reason=save_rejected retryable=true macro_id={macro_id} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+/// 删除前的引用清单：哪些按键绑定了它、哪些组合动作嵌套引用它。
+///
+/// 删除确认弹窗用它把影响说清楚（2026-10-15 用户要求：按键要改成未设置、
+/// 嵌套引用要提示）。
+#[tauri::command]
+async fn macro_references(
+    state: tauri::State<'_, AppState>,
+    macro_id: String,
+) -> Result<sayall_windows::send_input::MacroReferenceReport, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(
+        move || -> Result<sayall_windows::send_input::MacroReferenceReport, String> {
+            let library = settings.load_combined_actions()?;
+            let mappings = settings.load_button_mappings()?;
+            Ok(sayall_windows::send_input::collect_macro_references(
+                &macro_id,
+                &library.definitions,
+                &mappings,
+            ))
+        },
+    )
+    .await
+    .map_err(|error| format!("读取组合动作引用失败：{error}"))?
+}
+
+/// 删除组合动作（该 ID 的全部版本），并把绑定它的按键槽位改成「未设置」。
+///
+/// 嵌套引用不改写：执行期按 `missing_dependency` 报「本机不可用」（对齐 Mac），
+/// 删除前的确认弹窗已列出受影响的组合动作名称。
+#[tauri::command]
+async fn delete_macro(
+    state: tauri::State<'_, AppState>,
+    macro_id: String,
+) -> Result<MacroDeleteResult, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=combined_actions action=delete phase=requested macro_id={macro_id}"
+    ));
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    let log_macro_id = macro_id.clone();
+    let result = match tauri::async_runtime::spawn_blocking(
+        move || -> Result<(MacroDeleteResult, usize), String> {
+            let mut current = settings.load_combined_actions()?;
+            let outcome = sayall_core::macros::delete_macro_with_references(&current, &macro_id);
+            current = outcome.document;
+            let saved = settings.save_combined_actions(current)?;
+            platform.set_macro_library(saved.clone());
+            // 按键绑定联动：引用被删动作的槽位一律改成「未设置」（含级联删除的动作）。
+            let mut mappings = settings.load_button_mappings()?;
+            let mut cleared = 0usize;
+            for removed in &outcome.removed_macro_ids {
+                cleared +=
+                    sayall_windows::send_input::clear_macro_references(&mut mappings, removed);
+            }
+            if cleared > 0 {
+                settings.save_button_mappings_with(mappings, |configuration| {
+                    platform.set_mapping_configuration(configuration.clone());
+                })?;
+            }
+            let report = MacroDeleteResult {
+                library: saved,
+                removed_macro_ids: outcome.removed_macro_ids,
+                rewritten_macro_ids: outcome.rewritten_macro_ids,
+            };
+            Ok((report, cleared))
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("删除组合动作任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok((report, cleared)) => format!(
+            "shortcut_settings feature=combined_actions action=delete phase=completed terminal_result=passed macro_id={log_macro_id} definitions={} removed={} rewritten={} cleared_button_slots={cleared} elapsed_ms={}",
+            report.library.definitions.len(),
+            report.removed_macro_ids.len(),
+            report.rewritten_macro_ids.len(),
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "shortcut_settings feature=combined_actions action=delete phase=completed terminal_result=failed error_domain=settings error_code=persistence_failed reason=delete_rejected retryable=true macro_id={log_macro_id} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result.map(|(report, _)| report)
+}
+
+/// 删除组合动作的结果（含级联删除与因清理嵌套步骤而生成新版本的动作）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacroDeleteResult {
+    pub library: MacroLibraryDocument,
+    pub removed_macro_ids: Vec<String>,
+    pub rewritten_macro_ids: Vec<String>,
+}
+
+/// 导出组合动作库（文件对话框取消返回 false）。
+#[tauri::command]
+async fn export_combined_actions(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(
+        "shortcut_settings feature=combined_actions action=export phase=requested".to_owned(),
+    );
+    let settings = state.settings.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        let document = settings.load_combined_actions()?;
+        let Some(path) = sayall_windows::file_dialog::pick_combined_actions_export_path()? else {
+            return Ok(false);
+        };
+        settings.export_combined_actions(&path, document)?;
+        Ok(true)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("导出组合动作任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(true) => format!(
+            "shortcut_settings feature=combined_actions action=export phase=completed terminal_result=passed elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+        Ok(false) => format!(
+            "shortcut_settings feature=combined_actions action=export phase=completed terminal_result=cancelled elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "shortcut_settings feature=combined_actions action=export phase=completed terminal_result=failed error_domain=settings error_code=export_failed reason=dialog_or_write_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+/// 导入组合动作（不可变版本合并；取消返回 None）。
+#[tauri::command]
+async fn import_combined_actions(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<MacroLibraryDocument>, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(
+        "shortcut_settings feature=combined_actions action=import phase=requested".to_owned(),
+    );
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    let result = match tauri::async_runtime::spawn_blocking(
+        move || -> Result<Option<MacroLibraryDocument>, String> {
+            let Some(path) = sayall_windows::file_dialog::pick_combined_actions_import_path()?
+            else {
+                return Ok(None);
+            };
+            let merged = settings.import_combined_actions(&path)?;
+            // 完整校验并持久化成功后才热加载。
+            platform.set_macro_library(merged.clone());
+            Ok(Some(merged))
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("导入组合动作任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(Some(document)) => format!(
+            "shortcut_settings feature=combined_actions action=import phase=completed terminal_result=passed definitions={} elapsed_ms={}",
+            document.definitions.len(),
+            started.elapsed().as_millis()
+        ),
+        Ok(None) => format!(
+            "shortcut_settings feature=combined_actions action=import phase=completed terminal_result=cancelled elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "shortcut_settings feature=combined_actions action=import phase=completed terminal_result=failed error_domain=settings error_code=import_failed reason=dialog_read_parse_validation_or_persistence_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+/// 测试运行一个已保存的组合动作（按最新版本；异步受理）。
+#[tauri::command]
+async fn test_macro(state: tauri::State<'_, AppState>, macro_id: String) -> Result<(), String> {
+    let platform = Arc::clone(&state.platform);
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=combined_actions action=test phase=requested macro_id={macro_id}"
+    ));
+    tauri::async_runtime::spawn_blocking(move || platform.start_macro(&macro_id))
+        .await
+        .map_err(|error| format!("测试组合动作任务失败：{error}"))?
+}
+
+/// 测试运行一条**未保存的草稿定义**（「测试动作」用；运行 ID 独立于库）。
+#[tauri::command]
+async fn test_macro_definition(
+    state: tauri::State<'_, AppState>,
+    definition: MacroDefinition,
+) -> Result<String, String> {
+    let run_id = macro_test_run_id();
+    let platform = Arc::clone(&state.platform);
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=combined_actions action=test_definition phase=requested steps={}",
+        definition.steps.len()
+    ));
+    let run_definition = MacroDefinition {
+        macro_id: run_id.clone(),
+        ..definition
+    };
+    tauri::async_runtime::spawn_blocking(move || platform.start_macro_definition(run_definition))
+        .await
+        .map_err(|error| format!("测试组合动作任务失败：{error}"))??;
+    Ok(run_id)
+}
+
+/// 测试运行草稿里的**单个步骤**（「测试这步」用）。
+#[tauri::command]
+async fn test_macro_step(
+    state: tauri::State<'_, AppState>,
+    definition: MacroDefinition,
+    step_id: String,
+) -> Result<String, String> {
+    let run_id = macro_test_run_id();
+    let platform = Arc::clone(&state.platform);
+    sayall_windows::gatt_note(
+        "shortcut_settings feature=combined_actions action=test_step phase=requested".to_owned(),
+    );
+    let Some(step) = definition
+        .steps
+        .iter()
+        .find(|step| step.step_id == step_id)
+        .cloned()
+    else {
+        return Err("找不到要测试的步骤".to_owned());
+    };
+    let run_definition = MacroDefinition {
+        macro_id: run_id.clone(),
+        name: definition.name.clone(),
+        steps: vec![step],
+        ..definition
+    };
+    tauri::async_runtime::spawn_blocking(move || platform.start_macro_definition(run_definition))
+        .await
+        .map_err(|error| format!("测试步骤任务失败：{error}"))??;
+    Ok(run_id)
+}
+
+/// 取消一次组合动作执行（未在运行返回 false；幂等）。
+#[tauri::command]
+async fn cancel_macro(state: tauri::State<'_, AppState>, macro_id: String) -> Result<bool, String> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || platform.cancel_macro(&macro_id))
+        .await
+        .map_err(|error| format!("取消组合动作任务失败：{error}"))
+}
+
+/// 轮询一次执行的运行状态与最近报告（UI 状态行 / 测试结果用）。
+#[tauri::command]
+fn get_macro_run_status(
+    state: tauri::State<'_, AppState>,
+    macro_id: String,
+) -> sayall_windows::macro_runtime::MacroRunStatus {
+    state.platform.macro_run_status(&macro_id)
+}
+
+/// 测试运行 ID：与库 ID 同形但前缀固定为 `test.`（重入互斥按它生效）。
+fn macro_test_run_id() -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("test.{stamp:032x}")
+}
 fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut shortcut_count = 0_usize;
     let mut open_app_count = 0_usize;
     let mut focus_input_count = 0_usize;
+    let mut common_phrases_count = 0_usize;
     let mut scroll_count = 0_usize;
     let mut mouse_count = 0_usize;
     let mut task_switch_count = 0_usize;
+    let mut macro_count = 0_usize;
     let mut disabled_count = 0_usize;
     for actions in mappings.actions.values() {
         for action in [&actions.single, &actions.double, &actions.long] {
@@ -2728,16 +3101,18 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
                 ButtonAction::TaskSwitch { .. } => task_switch_count += 1,
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
                 ButtonAction::FocusInput => focus_input_count += 1,
+                ButtonAction::OpenCommonPhrases => common_phrases_count += 1,
                 ButtonAction::Scroll { .. } => scroll_count += 1,
                 ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
                     mouse_count += 1
                 }
+                ButtonAction::RunMacro { .. } => macro_count += 1,
                 ButtonAction::Disabled => disabled_count += 1,
             }
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} scroll_count={scroll_count} mouse_count={mouse_count} task_switch_count={task_switch_count} disabled_cell_count={disabled_count}",
+        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} common_phrases_count={common_phrases_count} scroll_count={scroll_count} mouse_count={mouse_count} macro_count={macro_count} task_switch_count={task_switch_count} disabled_cell_count={disabled_count}",
         mappings.enabled,
         mappings.actions.len()
     )
@@ -2791,7 +3166,22 @@ async fn test_button_mapping(
         .await
         .map_err(|error| format!("测试聚焦输入框任务失败：{error}"))?
         .map_err(|error| error.to_string()),
+        ButtonAction::RunMacro { macro_id, .. } => {
+            // 「测试」= 按最新已保存版本执行一次组合动作（异步受理，终态见
+            // 组合动作页的状态行与 `map_macro_*` 日志）。
+            tauri::async_runtime::spawn_blocking(move || {
+                platform
+                    .start_macro(&macro_id)
+                    .map(|_| platform.send_input_snapshot())
+            })
+            .await
+            .map_err(|error| format!("测试组合动作任务失败：{error}"))?
+            .map_err(|error| error.to_string())
+        }
         ButtonAction::Disabled => Err("该触发方式当前未配置动作".to_owned()),
+        ButtonAction::OpenCommonPhrases => {
+            Err("「打开常用语」不在试一下范围内：请绑定按键后到目标应用里使用".to_owned())
+        }
     }
 }
 
@@ -2818,6 +3208,21 @@ async fn learn_focus_target(
     tauri::async_runtime::spawn_blocking(move || platform.learn_focus_target())
         .await
         .map_err(|error| format!("学习输入框任务失败：{error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// 「记录点击位置」：读取物理光标并要求它落在目标应用窗口内。
+///
+/// 面向完全不暴露无障碍接口的应用（微信 4.x）。UI 负责把它写进对应目标的聚焦档案。
+#[tauri::command]
+async fn learn_focus_point(
+    target: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::focus::RecordedPoint, String> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || platform.learn_focus_point(target))
+        .await
+        .map_err(|error| format!("记录点击位置任务失败：{error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -3608,6 +4013,91 @@ async fn set_theme_preference(
         )),
     }
     result
+}
+
+#[tauri::command]
+async fn get_open_window_at_launch(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let settings = state.settings.clone();
+    let started = std::time::Instant::now();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        settings
+            .load()
+            .map(|settings| settings.open_window_at_launch)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("读取启动页面设置任务失败：{error}")),
+    };
+    match &result {
+        Ok(enabled) => sayall_windows::gatt_note(format!(
+            "startup feature=open_window_at_launch action=load terminal_result=passed enabled={enabled} elapsed_ms={}",
+            started.elapsed().as_millis()
+        )),
+        Err(_) => sayall_windows::gatt_note(format!(
+            "startup feature=open_window_at_launch action=load terminal_result=failed error_domain=settings error_code=load_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        )),
+    }
+    result
+}
+
+#[tauri::command]
+async fn set_open_window_at_launch(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let settings = state.settings.clone();
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "startup feature=open_window_at_launch action=save phase=requested enabled={enabled}"
+    ));
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        settings.save_open_window_at_launch(enabled)?;
+        Ok(enabled)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("保存启动页面设置任务失败：{error}")),
+    };
+    sayall_windows::gatt_note(match &result {
+        Ok(enabled) => format!(
+            "startup feature=open_window_at_launch action=save phase=completed terminal_result=passed enabled={enabled} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "startup feature=open_window_at_launch action=save phase=completed terminal_result=failed error_domain=settings error_code=save_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+/// 本次启动前刚完成更新时的版本号；没有则返回 `null`。
+///
+/// 对齐 Mac `showUpdateCompletedAlert`：只在更新后的第一次启动提示一次。
+/// 前端取走后清空——同一次运行里再挂载页面不会重复弹。
+#[tauri::command]
+fn take_update_completed_version(state: tauri::State<'_, AppState>) -> Option<String> {
+    let version = take_pending_update_completed_version(&state.update_completed_version);
+    sayall_windows::gatt_note(format!(
+        "startup feature=update_completed action=take terminal_result=passed available={}",
+        version.is_some()
+    ));
+    version
+}
+
+/// 一次性取走待提示的版本号（纯逻辑，便于单测「只提示一次」）。
+///
+/// 锁中毒时按「没有待提示」处理：更新提示不是功能路径，不能因此阻塞前端。
+fn take_pending_update_completed_version(
+    pending: &std::sync::Mutex<Option<String>>,
+) -> Option<String> {
+    pending
+        .lock()
+        .ok()
+        .and_then(|mut pending_version| pending_version.take())
 }
 
 #[tauri::command]
@@ -4951,7 +5441,12 @@ pub fn run() {
     }
 
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+        // 主窗口前端用 `openUrl()` 走 opener；**关闭**插件的「自动接管 target=_blank」
+        // 注入脚本：该脚本在任意 WebView 内拦截链接并直接调 IPC，推荐页子 WebView
+        // 不在 ACL 范围内会抛 `Command plugin:opener|open_url not allowed by ACL`，
+        // 用户看到的就是「按钮点了没反应」（2026-10-19 实测）。站外链接改由推荐页
+        // 自己的 `on_new_window` / `on_navigation` 交给系统浏览器。
+        .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         // 应用内更新（GitHub Releases 静态 latest.json + minisign 验签）。
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_page_load(|webview, payload| {
@@ -4968,6 +5463,16 @@ pub fn run() {
             sayall_windows::gatt_note(
                 "app_lifecycle event=tauri_setup phase=started result=passed".to_owned(),
             );
+            // 常用语浮层窗口（可选私有组件）：窗口先建好并隐藏；组件未注入时能力不可用。
+            let common_phrases_available = common_phrase_panel::install(app.handle());
+            sayall_windows::gatt_note(format!(
+                "COMMON_PHRASES COMPONENT phase=installed result={}",
+                if common_phrases_available {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            ));
             // 托盘图标：主窗口关闭后驻留；菜单 = 显示主界面 / 退出；
             // 左键点击托盘 = 显示并聚焦主窗口（Mac StatusIcon 同款行为）。
             #[cfg(all(windows, not(feature = "runtime-simulation")))]
@@ -5019,12 +5524,21 @@ pub fn run() {
             };
             #[cfg(not(feature = "runtime-simulation"))]
             let settings_path = app.path().app_config_dir()?.join("settings.json");
+            let launch_settings_path = settings_path.clone();
             let settings = SettingsStore::new(settings_path);
             // 向导迁移判定：必须在任何设置写入之前执行（首次引入时的老用户直接标记
             // 完成，全新安装从欢迎开始；设计稿 §6.2）。失败不阻断启动，命令层会重试。
-            if let Err(error) = settings.ensure_onboarding_state() {
-                eprintln!("{error}");
-            }
+            //
+            // 这里同时保留判定结果给「启动时是否显示主面板」用：未完成首次设置时
+            // 必须显示窗口，否则用户没有入口完成向导。读不到状态时按「显示」处理
+            // （fail-open：宁可多显示一次，也不能让应用启动后完全不可见）。
+            let onboarding_active = match settings.ensure_onboarding_state() {
+                Ok(state) => state.is_active(),
+                Err(error) => {
+                    eprintln!("{error}");
+                    true
+                }
+            };
             // 未完成向导里残留的 staged 语音绑定：启动时回滚正式配置（设计稿 §5.4：
             // 退出未完成流程必须恢复进入向导前的配置）。无事务时是空操作、不落日志。
             if let Err(error) = settings.restore_onboarding_staged_binding("startup_recovery") {
@@ -5035,6 +5549,81 @@ pub fn run() {
             // 主窗口（任务栏 / Alt-Tab）与托盘图标一起换成用户选的那一个。
             #[cfg(windows)]
             app_icon::apply(app.handle());
+
+            // 「本次启动前刚完成更新」（2026-10-19，对齐 Mac
+            // `recordLaunchAndDetectCompletedUpdate`）：记录写在独立的
+            // `launch-state.json`（不碰 settings.json，安装生命周期测试对后者做逐字节
+            // 哈希断言）。读取/写入失败都只记日志、按「不算更新」继续，不阻断启动。
+            let completed_update = match launch_state::record_launch(
+                &launch_settings_path,
+                &app.package_info().version.to_string(),
+                onboarding::install_evidence_exists(&launch_settings_path),
+            ) {
+                Ok(outcome) => {
+                    sayall_windows::gatt_note(format!(
+                        "startup feature=completed_update action=decide terminal_result=passed completed={} previous_version={} current_version={}",
+                        outcome.completed_update,
+                        outcome.previous_version.as_deref().unwrap_or("none"),
+                        outcome.current_version
+                    ));
+                    outcome.completed_update
+                }
+                Err(error) => {
+                    sayall_windows::gatt_note(
+                        "startup feature=completed_update action=decide terminal_result=failed error_domain=settings error_code=launch_state_io reason=treated_as_regular_launch retryable=true".to_owned(),
+                    );
+                    eprintln!("{error}");
+                    false
+                }
+            };
+
+            // 启动可见性（2026-10-19 用户定稿，对齐 Mac `OnboardingLaunchPolicy`）：
+            // 「启动时自动打开主面板」关闭后，普通启动只驻留托盘；未完成首次设置
+            // 或本次启动前刚完成更新时仍显示窗口（Mac 同款：更新完成后仍会显示主面板）。
+            // 托盘左键 / 托盘菜单 / 再次启动应用都走 `show_main_window`，不受本设置影响。
+            //
+            // 仿真构建不隐藏：CI 的 runtime simulation 依赖窗口里的 WebView 完成
+            // 页面旅程，隐藏窗口会让 WebView2 进入后台节流，报告可能写不出来。
+            let show_main_window_on_startup = should_show_main_window_on_startup(
+                onboarding_active,
+                completed_update,
+                saved_settings.open_window_at_launch,
+            );
+            #[cfg(feature = "runtime-simulation")]
+            let show_main_window_on_startup =
+                show_main_window_on_startup || runtime_simulation_requested();
+            if let Some(window) = app.get_webview_window("main") {
+                let visible_before = window.is_visible().unwrap_or(true);
+                if show_main_window_on_startup {
+                    // 窗口在 `tauri.conf.json` 里以 `visible: false` 创建，避免设置读取
+                    // 之前先闪一帧；这里按判定结果显式显示（幂等）。
+                    let show_result = window.show();
+                    let _ = window.set_focus();
+                    let visible_after = window.is_visible().unwrap_or(true);
+                    sayall_windows::gatt_note(format!(
+                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason={} onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} show_result={show_result:?} visible_before={visible_before} visible_after={visible_after}",
+                        if visible_after { "passed" } else { "failed" },
+                        visible_after,
+                        if onboarding_active {
+                            "onboarding_active"
+                        } else if completed_update {
+                            "completed_update"
+                        } else {
+                            "open_window_at_launch"
+                        },
+                        saved_settings.open_window_at_launch
+                    ));
+                } else {
+                    let hide_result = window.hide();
+                    let visible_after = window.is_visible().unwrap_or(true);
+                    sayall_windows::gatt_note(format!(
+                        "startup feature=main_window_visibility action=decide terminal_result={} visible={} reason=open_window_at_launch_disabled onboarding_active={onboarding_active} completed_update={completed_update} open_window_at_launch={} hide_result={hide_result:?} visible_before={visible_before} visible_after={visible_after}",
+                        if visible_after { "failed" } else { "passed" },
+                        visible_after,
+                        saved_settings.open_window_at_launch
+                    ));
+                }
+            }
             // 启动时把持久化偏好同步到 Windows 当前用户登录启动项；失败只记录，
             // 不阻断主程序启动，用户可在“关于”页重试。
             #[cfg(all(windows, not(feature = "runtime-simulation")))]
@@ -5098,6 +5687,25 @@ pub fn run() {
                 }
             };
             // 启动即热加载已保存映射（引擎与门控吞键配置同步就绪）。
+            // 组合动作库：与按键映射同一启动时序同步到执行器（RunMacro 引用
+            // 在引擎点火前即可解析；缺失引用按 missing_dependency 处理）。
+            let combined_actions = match settings.load_combined_actions() {
+                Ok(document) => {
+                    sayall_windows::gatt_note(format!(
+                        "shortcut_settings feature=combined_actions action=load phase=completed terminal_result=passed definitions={}",
+                        document.definitions.len()
+                    ));
+                    document
+                }
+                Err(error) => {
+                    sayall_windows::gatt_note(
+                        "shortcut_settings feature=combined_actions action=load phase=completed terminal_result=failed error_domain=settings error_code=parse_or_read_failed reason=defaults_applied retryable=true".to_owned(),
+                    );
+                    eprintln!("{error}");
+                    sayall_core::MacroLibraryDocument::default()
+                }
+            };
+            platform.set_macro_library(combined_actions);
             platform.set_mapping_configuration(mapping_configuration);
             platform.set_rc003_capture_enabled(false);
             #[cfg(all(windows, not(feature = "runtime-simulation")))]
@@ -5196,6 +5804,9 @@ pub fn run() {
                 exit_cleanup,
                 settings: settings.clone(),
                 pending_update: std::sync::Mutex::new(None),
+                update_completed_version: std::sync::Mutex::new(
+                    completed_update.then(|| app.package_info().version.to_string()),
+                ),
             });
             create_scene_overlay(app)?;
             #[cfg(windows)]
@@ -5385,8 +5996,24 @@ pub fn run() {
         end_key_observation,
         save_button_mappings,
         reset_button_mappings,
+        get_combined_actions,
+        save_macro,
+        delete_macro,
+        export_combined_actions,
+        import_combined_actions,
+        test_macro,
+        test_macro_definition,
+        test_macro_step,
+        cancel_macro,
+        get_macro_run_status,
         test_button_mapping,
         learn_focus_target,
+        learn_focus_point,
+        macro_references,
+        common_phrase_panel::common_phrase_panel_snapshot,
+        common_phrase_panel::close_common_phrase_panel,
+        common_phrase_panel::select_common_phrase,
+        common_phrase_panel::common_phrase_dispatch,
         test_app_focus,
         list_preset_apps,
         list_running_apps,
@@ -5418,6 +6045,9 @@ pub fn run() {
         set_theme_preference,
         get_launch_at_login,
         set_launch_at_login,
+        get_open_window_at_launch,
+        set_open_window_at_launch,
+        take_update_completed_version,
         report_theme_result,
         get_app_update_preferences,
         set_app_update_preferences,
@@ -5495,8 +6125,24 @@ pub fn run() {
         end_key_observation,
         save_button_mappings,
         reset_button_mappings,
+        get_combined_actions,
+        save_macro,
+        delete_macro,
+        export_combined_actions,
+        import_combined_actions,
+        test_macro,
+        test_macro_definition,
+        test_macro_step,
+        cancel_macro,
+        get_macro_run_status,
         test_button_mapping,
         learn_focus_target,
+        learn_focus_point,
+        macro_references,
+        common_phrase_panel::common_phrase_panel_snapshot,
+        common_phrase_panel::close_common_phrase_panel,
+        common_phrase_panel::select_common_phrase,
+        common_phrase_panel::common_phrase_dispatch,
         test_app_focus,
         list_preset_apps,
         list_running_apps,
@@ -5528,6 +6174,9 @@ pub fn run() {
         set_theme_preference,
         get_launch_at_login,
         set_launch_at_login,
+        get_open_window_at_launch,
+        set_open_window_at_launch,
+        take_update_completed_version,
         report_theme_result,
         get_app_update_preferences,
         set_app_update_preferences,
@@ -6013,6 +6662,13 @@ mod lifecycle_tests {
         fn learn_focus_target(
             &self,
         ) -> Result<sayall_windows::focus::RecordedFocusTarget, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+
+        fn learn_focus_point(
+            &self,
+            _target: String,
+        ) -> Result<sayall_windows::focus::RecordedPoint, PlatformError> {
             Err(PlatformError::UnsupportedPlatform)
         }
 
@@ -6550,6 +7206,36 @@ mod tests {
     /// 安装器从未实现）。
     const INSTALLER_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 
+    #[test]
+    fn startup_visibility_follows_onboarding_and_preference() {
+        // 未完成向导：无论开关与更新状态都显示。
+        assert!(should_show_main_window_on_startup(true, false, true));
+        assert!(should_show_main_window_on_startup(true, false, false));
+        assert!(should_show_main_window_on_startup(true, true, false));
+        // 已完成向导 + 普通启动：只看开关。
+        assert!(should_show_main_window_on_startup(false, false, true));
+        assert!(!should_show_main_window_on_startup(false, false, false));
+        // 已完成向导 + 本次启动前刚完成更新：开关关着也必须显示（Mac 同款）。
+        assert!(should_show_main_window_on_startup(false, true, false));
+    }
+
+    #[test]
+    fn update_completed_version_is_taken_once() {
+        let pending = std::sync::Mutex::new(Some("1.0.0".to_owned()));
+
+        // 第一次取走：返回版本号并清空。
+        assert_eq!(
+            take_pending_update_completed_version(&pending),
+            Some("1.0.0".to_owned())
+        );
+        // 同一次运行里再挂载页面不会再弹（对齐 Mac 的「只提示一次」）。
+        assert_eq!(take_pending_update_completed_version(&pending), None);
+        // 普通启动（没有更新完成）永远是 None，不编造版本号。
+        assert_eq!(
+            take_pending_update_completed_version(&std::sync::Mutex::new(None)),
+            None
+        );
+    }
     /// 版本号唯一来源（2026-09-30 收敛）：安装包名、exe 版本资源、关于页显示、
     /// 更新器比较和诊断日志全部取自 `src-tauri/tauri.conf.json` 的 `version`。
     /// 运行期 `package_info().version` 必须与它一致——把版本号写回 Cargo.toml

@@ -1,7 +1,8 @@
 # Windows「聚焦输入框」验收
 
-本手册覆盖按键动作「聚焦输入框」与「打开应用」的三种聚焦方式（只打开应用 /
-用应用快捷键聚焦 / 聚焦已记录的输入框）。步骤是验收方法，不代表所有场景均已通过。
+本手册覆盖通用映射中的「聚焦输入框」与「打开应用」四种方式（只打开应用 /
+用应用快捷键聚焦 / 聚焦已记录的输入框 / 显式记录点击位置）。个人模板仍只允许固定按键。
+步骤是验收方法，不代表所有场景均已通过；本轮整合结果归 WindowsRC003Preview。
 
 实现边界（先读，避免把预期错当成缺陷）：
 
@@ -10,7 +11,7 @@
 - 学习输入框只记录控件特征（`controlType` / `automationId` / `className` / `name` /
   相对矩形），其中 `name` 与窗口标题属本地配置数据，只写本机配置文件，不进日志、不随诊断上传；
 - 目标应用以管理员身份运行时读不到界面（UIPI）：按 `not_accessible` 失败并提示，不要求用户提权；
-- 不提供「无 UIA 树应用」的位置点击兜底（决策点 D1/D2 未启用）。
+- 不自动回退到位置点击；只有用户显式选择并记录的位置才允许点击，窗口尺寸或来源不满足当前契约时拒绝。
 
 ## 自动化检查
 
@@ -45,13 +46,32 @@ cargo run -p sayall-windows --example focus_probe -- --learn               # 生
 - 候选扫描与聚焦读回：Chrome fixture（搜索框 + composer）、DimAgent（TipTap `Group`）、
   记事本（`Document`）；焦点迁移用独立读回的元素身份哈希确认，`attempts=1`、`elapsed_ms≈90–120`。
 - 学习：Chrome fixture 搜索框，`learned control_type=Edit id_chars=10 elapsed_ms=107`。
+- 地址栏学习（2026-10-15）：Chrome omnibox（`Edit / OmniboxViewViews / 地址和搜索栏`）
+  修复前 `learn_failed=NoCandidate`，修复后 `learned id_chars=9 class_chars=16 elapsed_ms=107`；
+  自动选择路径仍然拒绝地址栏（学习档与自动档分离）。
+- 位置点击（2026-10-15，面向无 UIA 树应用）：记事本记录 `x_ratio=0.5000 y_ratio=0.5961
+  window=888x671`，点击阶段 `absolute=(2389,694)`、`click_submitted=ok`、
+  `focused_after=Document/RichEditD2DPT`。
 - 候选门槛：Chromium 只读网页根（`Document` + `IsReadOnly=true`）被拒绝。
 - 失败路径：UIA 不可达/无树应用立即失败（不做长重试）。
+
+探针（只读/低风险，见 `Testing/probe-uia-focus.ps1`）：
+
+```powershell
+# 学习路径（生产函数）
+cargo run -p sayall-windows --example focus_probe -- --learn
+# 记录点击位置 / 按记录位置点击（生产函数；坐标为相对窗口比例）
+cargo run -p sayall-windows --example focus_probe -- --learn-point notepad
+cargo run -p sayall-windows --example focus_probe -- --point-click notepad --x-ratio 0.5 --y-ratio 0.6 --window-width 888 --window-height 671
+# 目标应用有没有向系统暴露无障碍接口（两个 lresult 都为 0 = 完全没有）
+powershell -NoProfile -ExecutionPolicy Bypass -File Testing\probe-msaa-provider.ps1 -WindowHandle 0x1234
+```
 
 ## deferred（需要环境或人工参与）
 
 - RC001 / RC003 实体按键链路的完整回归（含冷态首用、连按、断连、睡眠恢复）：需出本地测试包后现场验收；
 - 「打开应用 + 应用快捷键聚焦」「打开应用 + 聚焦已记录的输入框」的真机闭环：需真实目标应用；
-- 无 UIA 树应用（微信 4.0 聊天窗口、WorkBuddy）：当前只提供「只打开应用 + 提示」，不提供位置点击兜底（待决策点 D1/D2 拍板）；
+- 微信 4.x 的「记录点击位置」实际聚焦效果：应用不暴露 UIA，读不到客观焦点，
+  只能人工目视确认（按键页记录位置 → 测试打开与聚焦 → 看光标是否落在输入框）；
 - 管理员权限目标应用的 `not_accessible` 现场确认；
 - Onboarding 覆盖（Windows 侧 Onboarding 尚未实现，见 `TODO.md`）。

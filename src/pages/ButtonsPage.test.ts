@@ -76,6 +76,21 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     saveButtonMappingTemplate: vi.fn(async (name: string, mappings: unknown) => ({ id: "new-template", name, mappings })),
     updateButtonMappingTemplate: vi.fn(async (templateId: string, mappings: unknown) => ({ id: templateId, name: "模板 A", mappings })),
     resetButtonMappings: vi.fn(async () => ({ enabled: true, actions: {} })),
+    // 组合动作分组候选（2026-10-15）：默认给一条动作，个别用例覆盖为空库。
+    getCombinedActions: vi.fn(async () => ({
+      formatVersion: 1,
+      definitions: [
+        {
+          schemaVersion: "0.1",
+          macroId: "macro.aaaaaaa1",
+          version: "1.0.0",
+          name: "打开记事本并聚焦",
+          steps: [
+            { stepId: "step.01", action: "open_application", parameters: { target: "notepad" } },
+          ],
+        },
+      ],
+    })),
     scanRegisteredApps: vi.fn(async () => [
       { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
     ]),

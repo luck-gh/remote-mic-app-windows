@@ -11,8 +11,13 @@ import {
   openLogDirectory,
   setCaptureInput,
   openVokieHomepage,
+  getOpenWindowAtLaunch,
+  latestMacroDefinitions,
   openVbCableDownloadPage,
+  registerCommonPhraseAvailability,
   remoteModelLabel,
+  setOpenWindowAtLaunch,
+  takeUpdateCompletedVersion,
   VB_CABLE_DOWNLOAD_URL,
   VOKIE_HOMEPAGE_URL,
   type AudioPhase,
@@ -33,6 +38,18 @@ describe("mouse actions", () => {
   it("summarizes the focus-input action", () => {
     // 动作摘要会显示在按键格子上，文案即用户可见串（product-copy 口径）。
     expect(actionSummary({ type: "focus_input" })).toBe("聚焦输入框");
+  });
+});
+
+describe("common phrases action（公开构建兼容与可用性）", () => {
+  it("summarizes the open-common-phrases action with the component availability", () => {
+    // 缺私有组件（公开构建默认）：已保存的绑定不静默替换，标为「当前不可用」。
+    registerCommonPhraseAvailability(false);
+    expect(actionSummary({ type: "open_common_phrases" })).toBe("打开常用语（当前不可用）");
+    registerCommonPhraseAvailability(true);
+    expect(actionSummary({ type: "open_common_phrases" })).toBe("打开常用语");
+    // 复原全局状态，避免污染其他用例（注册是模块级缓存，同预设应用名）。
+    registerCommonPhraseAvailability(false);
   });
 });
 
@@ -232,6 +249,50 @@ describe("设置页移除普通官方入口，同时保留必要第三方链接"
 
 });
 
+
+describe("组合动作：同一条动作只保留最新版本（2026-10-15 现场回归）", () => {
+  const make = (macroId: string, version: string, name: string) => ({
+    schemaVersion: "0.1",
+    macroId,
+    version,
+    name,
+    steps: [
+      {
+        stepId: "step.01",
+        action: "open_application" as const,
+        parameters: { target: "notepad" },
+      },
+    ],
+  });
+
+  it("同 id 多版本只保留最新，顺序按首次出现（编辑后不跳位）", () => {
+    const grouped = latestMacroDefinitions([
+      make("macro.aaaaaaa1", "1.0.0", "旧名字"),
+      make("macro.aaaaaaa1", "1.0.1", "新名字"),
+      make("macro.bbbbbbb2", "1.0.0", "另一个"),
+    ]);
+    expect(grouped).toHaveLength(2);
+    expect(grouped[0].name).toBe("新名字");
+    expect(grouped[0].version).toBe("1.0.1");
+    expect(grouped[1].macroId).toBe("macro.bbbbbbb2");
+  });
+
+  it("新版本在前时同样只留最新", () => {
+    const grouped = latestMacroDefinitions([
+      make("macro.aaaaaaa1", "1.0.2", "最新"),
+      make("macro.aaaaaaa1", "1.0.0", "旧"),
+    ]);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0].version).toBe("1.0.2");
+  });
+
+  it("空库与单条原样返回", () => {
+    expect(latestMacroDefinitions([])).toEqual([]);
+    const single = [make("macro.aaaaaaa1", "1.0.0", "唯一")];
+    expect(latestMacroDefinitions(single)).toEqual(single);
+  });
+});
+
 describe("诊断日志目录入口", () => {
   afterEach(() => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -265,5 +326,59 @@ describe("explicit capture and writer transaction", () => {
     const config = { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' };
     await setCaptureInput(config, 'render-16');
     expect(invoke).toHaveBeenCalledExactlyOnceWith('set_capture_input', { config, writerEndpointId: 'render-16' });
+  });
+});
+
+describe("启动时自动打开主面板", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("浏览器预览按新装默认返回开启，不调用 IPC", async () => {
+    await expect(getOpenWindowAtLaunch()).resolves.toBe(true);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("Tauri 运行时使用精确命令名与参数名", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    vi.mocked(invoke).mockResolvedValue(false);
+
+    await expect(getOpenWindowAtLaunch()).resolves.toBe(false);
+    expect(invoke).toHaveBeenCalledWith("get_open_window_at_launch");
+
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockResolvedValue(false);
+    await expect(setOpenWindowAtLaunch(false)).resolves.toBe(false);
+    // 参数名必须与 Rust `set_open_window_at_launch(enabled: bool)` 一致；
+    // 不匹配时 Tauri 只会报缺参，界面只能看到一句 IPC 失败。
+    expect(invoke).toHaveBeenCalledWith("set_open_window_at_launch", { enabled: false });
+  });
+
+  it("浏览器预览下保存明确不可用", async () => {
+    await expect(setOpenWindowAtLaunch(false)).rejects.toThrow(
+      "当前是浏览器预览，无法设置启动时打开主面板",
+    );
+    expect(invoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("更新完成提示（对齐 Mac `update.completed.*`）", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("浏览器预览没有更新机制，返回 null 且不调 IPC", async () => {
+    await expect(takeUpdateCompletedVersion()).resolves.toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("Tauri 运行时使用精确命令名", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    vi.mocked(invoke).mockResolvedValue("1.0.0");
+
+    await expect(takeUpdateCompletedVersion()).resolves.toBe("1.0.0");
+    expect(invoke).toHaveBeenCalledWith("take_update_completed_version");
   });
 });

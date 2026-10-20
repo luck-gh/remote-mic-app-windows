@@ -84,6 +84,7 @@
 ## 产品与 UI 基准
 
 - `HD838A/remote-mic-app`：无线麦 macOS 原版的信息架构、产品文案、RC003 图片、RC001/RC003 型号识别、ATVV 行为和测试边界；RC001 支持参考提交 `b233a88cc4457b00413dda6b37ec8b4af12c5121`。
+  - 2026-10-18 推荐页（语义参考，未复制代码）：产品规范来自私有平台仓库 `sayall-private-platform` 的 `docs/product/recommendations.md`（提交 `9845c01`）与 `docs/design/recommendations-20261013/implementation.md`；Mac 宿主实现参考同仓库 `packages/macos-membership/Sources/SayAllMembershipUI/RemoteWebPageView.swift`、`RecommendationsWebPage.swift`、`RemoteWebPageConfiguration.swift` 与 `SayAllMembershipHostAdapter/SupplementalSettingsPages.swift`（提交 `725061f`）。Windows 只复用产品行为：侧栏入口、`embed=app`、主题/语言、加载/失败/重试/打开官网、地址白名单与站外浏览器出口。与 Mac 的差异：按用户 2026-10-18 指定加载 `https://sayall.app/recommendations/`（Mac 使用 `getsayall.com`），平台参数为 `windows`，承载方式为 Tauri 子 WebView 而非 WKWebView；推荐内容与页面 UI 全部由官网提供，本仓库不复制。
   - 2026-09-05 按键映射功能移植补充（均为语义移植，非代码复制）：`RemoteButtonGestureRecognizer` + `HIDRemoteScheduler` 的手势参数（双击窗口 300ms、长按 550ms、连发起始 350ms、返回 50ms/方向与音量 100ms 连发）与"按配置动态启用双击/长按识别、未配置时单击零延迟"的语义；`KeyboardEventSuppressor` 的预测式武装 + 有限窗口匹配吞键模型；`RemoteMappingCanvas` 的按键卡片布局表（锚点/目标 Y 坐标逐键移植）与三态高亮（按下=橙、选中=强调、普通=中性）；`MappingSelectionPolicy` 的"锁定当前按键"默认值。Mac 版 `KeyboardEventSuppressor` 的 UP 沿无配对兜底（DOWN 泄漏+UP 吞下=粘键缺陷）未移植——Windows 版沿用本仓库 2026-09-05 规则（DOWN 漏进 OS 则 UP 必放行）。
   - 2026-09-14 Windows 图形与拖动边界：按键图形从实际渲染图片内容框统一计算热点与连线，不继续复制旧固定像素。程序关联的 HTML5 拖动使用 Tauri 2 主窗口 `dragDropEnabled=false` 的公开配置让 WebView2 页面接收事件；overlay 保持原值，仓库未发现原生文件拖入消费者。隔离浏览器真实 pointer 与 CDP 截获的原生 drag data 验证见 [模板图形与拖动证据](Testing/StructuredTemplatesAndDrivers.md#历史模板验证证据)；该证据不替代安装版 WebView2 的用户实际拖动。
   - 2026-09-09 按键映射配置导入导出补充（本地 Mac 仓库 HEAD `feba1d6`，语义参考，未复制代码）：参考 `AppSettings.exportedConfigurationData/importConfiguration` 的版本化 JSON、导入前完整解码校验与一次性应用，以及 `SettingsView.exportConfiguration/importConfiguration` 的系统文件选择器、用户取消静默、成功/失败反馈。Windows 版仅迁移按键映射，不导入 Mac 专属设置或统计；格式使用独立 `formatVersion: 1` + `buttonMappings` 契约，不宣称与 Mac 配置文件互通。
@@ -115,6 +116,23 @@
   不移植 `SMAppService`，改用微软公开的当前用户登录启动项
   `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，只写本应用值且不需管理员权限。
   设置默认关闭，应用启动时以持久化偏好同步系统状态，失败只记录结构化日志、不阻断启动。
+
+- **启动时自动打开主面板（2026-10-19，语义与文案参考 Mac，未复制代码）**：产品行为参考 macOS 仓库
+  `HD838A/remote-mic-app` 提交 `a69fae76`（该功能由 `6c7d543e`「feat: improve launch and update
+  visibility」引入）的 `AppSettings.openMainWindowAtLaunch`（默认开启）与
+  `OnboardingLaunchPolicy.shouldShowMainWindow`（`!isComplete || completedUpdate ||
+  openMainWindowAtLaunch`）：设置页「启动行为」提供开关，关闭后普通启动只驻留托盘，托盘与再次启动
+  仍可打开主面板；向导未完成时必须显示窗口。
+  - **Windows 差异**：① `completedUpdate` 用本仓库 `launch-state.json` 记录“上次启动的
+    版本”（首次有安装证据但无记录视为更新完成，对齐 Mac 的 Sparkle 首启判定），更新后的
+    首次启动强制显示主面板并弹一次更新完成提示（`UpdateCompletedDialog.vue`，文案原样取
+    Mac `update.completed.*`）；同版本重启、降级不弹，也不会重复弹；② 未完成向导的判据用
+    本仓库 `OnboardingState::is_active()`（`completed_version < flow_version`），读取失败
+    按“显示”处理（fail-open）；③ 主窗口改为 `tauri.conf.json` 里 `visible: false` 创建、
+    由 Rust 读取设置后显式 `show()`/`hide()`，避免设置读回前先闪一帧（Mac 由 `NSWindow`
+    生命周期控制，无对应实现）；④ Mac 的 `showDockIcon` / `showStatusBarIcon` 与权限修复
+    分支在 Windows 没有对应物，未移植。
+  - 验收见 `Testing/WindowsRC003Preview.md` 用例十六。
 
 - **LL 吞键对 Raw Input 交付影响的本机实证（2026-09-05，`docs/investigations/2026-09-05-ll-swallow-vs-raw-input.md`）**：双线程探针（钩子线程 + Raw Input INPUTSINK 线程分离，key_suppressor 同构）两轮一致证实 **WH_KEYBOARD_LL 返回 1 吞掉的键盘事件不会再投递 WM_INPUT**——按键映射门控（`key_gate.rs`）据此采用"被吞键盘边沿由钩子线程直接喂引擎 + 监听器喂 HID 报文与透传键盘事件"双源合并架构；HID 报文归因武装 + 60ms 有界等待沿用 key_suppressor 实证参数。
 
@@ -516,6 +534,16 @@
 用户明确替换本地旧“关闭自动跟随时手选仅当前进程保留”的契约：手动使用经引擎确认后记住，重启恢复；显式通用清除记忆。复用本仓库 `MappingConfiguration`、SettingsStore原子写入/最新配置锁，以及SceneController的映射确认、现有scene-settings事件队列和代次；只新增 `rememberedTemplateId`，无新依赖、迁移或外部实现复制。菜单与两处鼠标使用入口共同触发确认后的记忆保存，编辑仍独立。开启自动跟随清全局记忆并按程序规则选择，再次关闭从通用开始，不改程序默认关联；保存失败保留实际应用并明确上次磁盘选择仍有效。旧配置缺字段就是新增设置None，不补猜用户此前选择。
 
 来源归因与验收分开：f7安装版新启动common、后续菜单手选后恢复是旧契约造成，不能写为0.8.6随机覆盖；旧17:56同运行问题保留未知。本次回归先红后绿，冻结前端407/Rust workspace728/Host158/Helper58等及身份/载荷门禁passed；18步隔离模拟未支持手选API，不作为模板记忆验收。d884候选上用户确认两处使用正常、编辑不变；其成功提示闪动通过删除提示最小修正，最终静默候选fp `8a38c43cce592fff5636e0aa9aafa06abd38f0b6092b21e73e34cff1cc774007` 实际安装运行匹配。正常退出前记忆browser且安装五配置保持，新启动source remembered/generation2/动作可用证明恢复；之后generation3 buttons_page切Agent已由用户确认是手动使用，用户确认再次切换不闪动。不声称用户亲眼确认启动初始browser，也不外推双型号或未验硬件边界；完整身份和分层证据归既有Bug与Preview，capture租约/驻留换代继续暂停。
+
+### 2026-10-20 上游组合动作与启动能力整合
+
+本轮固定输入为 `GetSayAll/remote-mic-app-windows` 的 `upstream/main@ab9aa197e59c65b6c7b22e51a968cd0cb4312446`（PR #265），实际共同基线为 `05c37cf5f740db7f34cc2d9a4270dca7bd2c2e6d`；此前 `df0d3a4316f02594f30129216693b73ac2058e88` 只作为捕获规则候选的历史参考。按用户最新顺序先在既有任务分支做真实三方整合，再处理接管和实体键盘来源故障，不以源码拷贝或上游通过记录替代合并与本地验证。
+
+采用 `sayall-core/macros`、Windows `macro_runtime`、组合动作页面、公开常用语组件接缝、应用启动/聚焦及位置锚定修复、启动显示设置与更新后一次性提示。冲突融合保留个人模板/程序关联、手选记忆、草稿显式保存、固定个人图标、输入设备锁定和唯一正常退出链；宏绑定接入既有 `ButtonActionEditor`，仅扩展通用映射，个人模板仍按固定按键白名单校验。宏构造使用同一运行时，删除绑定通过完整模板配置回调热加载；退出与输入来源失效取消宏，不重建旧捕获兜底。按键选择锁复用既有 `UiPreferences`，不增加第二份设置。
+
+排除仅承载 `sayall.app/recommendations/` 的官方推荐页面/宿主及其专用 `unstable` 依赖开关，不恢复官方推广入口、上游图标选择、旧整页编辑器、旧连发迁移、报告层语音合成或 Raw Input/全局钩子的 Home/TV 常驻接管。常用语在当前公开组件为空壳时仍不可用，不宣称拥有上游私有实现或其验收。
+
+共同基线至本次输入之间，`hardware/RC003/helper`、`src-tauri/src/rc003_task.rs` 和 `crates/sayall-windows/src/rc003_bridge.rs` 均无上游变更；不能把本次整合解释为两项已知接管/实体反引号故障已修复。此结论只覆盖源码核查，真实交接与双型号硬件结果仍按原 Bug/TODO 记录。整合验证归既有 [Preview 手册](Testing/WindowsRC003Preview.md)，不沿用上游 `passed`。
 
 ### 2026-10-06 安装器个人品牌与开始菜单选择
 

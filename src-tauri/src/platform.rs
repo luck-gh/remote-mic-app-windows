@@ -98,6 +98,11 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn learn_focus_target(
         &self,
     ) -> Result<sayall_windows::focus::RecordedFocusTarget, PlatformError>;
+    /// 「记录点击位置」：读取物理光标并要求其落在目标应用窗口内。
+    fn learn_focus_point(
+        &self,
+        target: String,
+    ) -> Result<sayall_windows::focus::RecordedPoint, PlatformError>;
     /// 预设应用清单（含安装状态）。
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo>;
     /// 仿真旅程是否跳过「外部入口（官网 / GitHub）」这两步。
@@ -184,6 +189,31 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn template_menu_restore_failed(&self) {}
     fn set_mapping_notice_enabled(&self, enabled: bool);
     fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback);
+    /// 同步组合动作库快照（加载/保存后调用；引擎的 RunMacro 手势与 UI
+    /// 测试入口都读这份内存快照）。默认 no-op：不支持组合动作的平台保持空库。
+    fn set_macro_library(&self, _document: sayall_core::MacroLibraryDocument) {}
+    /// 按库里的最新已保存版本执行一次组合动作（异步受理；终态见日志与报告）。
+    fn start_macro(&self, _macro_id: &str) -> Result<(), String> {
+        Err("当前平台不支持组合动作".to_owned())
+    }
+    /// 运行一条给定定义（「测试动作 / 测试这步」用；`macro_id` 参与重入互斥）。
+    fn start_macro_definition(
+        &self,
+        _definition: sayall_core::MacroDefinition,
+    ) -> Result<(), String> {
+        Err("当前平台不支持组合动作".to_owned())
+    }
+    /// 取消指定组合动作的本次执行（未在运行时返回 false）。
+    fn cancel_macro(&self, _macro_id: &str) -> bool {
+        false
+    }
+    /// 组合动作运行状态（UI 轮询：运行中标志 + 最近报告）。
+    fn macro_run_status(&self, _macro_id: &str) -> sayall_windows::macro_runtime::MacroRunStatus {
+        sayall_windows::macro_runtime::MacroRunStatus {
+            running: false,
+            report: None,
+        }
+    }
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
     fn subscribe_button_edges(&self, callback: sayall_windows::button_mapping::ButtonEdgeCallback);
     fn subscribe_button_gestures(
@@ -377,6 +407,13 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::learn_focus_target(self)
     }
 
+    fn learn_focus_point(
+        &self,
+        target: String,
+    ) -> Result<sayall_windows::focus::RecordedPoint, PlatformError> {
+        WindowsPlatform::learn_focus_point(self, &target)
+    }
+
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
         sayall_windows::app_launcher::probe_preset_apps()
     }
@@ -495,6 +532,33 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn subscribe_scene_events(&self, callback: sayall_windows::scene_control::SceneEventCallback) {
         WindowsPlatform::subscribe_scene_events(self, callback)
+    }
+
+    fn set_macro_library(&self, document: sayall_core::MacroLibraryDocument) {
+        WindowsPlatform::set_macro_library(self, document)
+    }
+
+    fn start_macro(&self, macro_id: &str) -> Result<(), String> {
+        WindowsPlatform::macro_runtime(self)
+            .start(macro_id)
+            .map_err(|error| error.code())
+    }
+
+    fn start_macro_definition(
+        &self,
+        definition: sayall_core::MacroDefinition,
+    ) -> Result<(), String> {
+        WindowsPlatform::macro_runtime(self)
+            .start_definition(definition)
+            .map_err(|error| error.code())
+    }
+
+    fn cancel_macro(&self, macro_id: &str) -> bool {
+        WindowsPlatform::macro_runtime(self).cancel(macro_id)
+    }
+
+    fn macro_run_status(&self, macro_id: &str) -> sayall_windows::macro_runtime::MacroRunStatus {
+        WindowsPlatform::macro_runtime(self).run_status(macro_id)
     }
 
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot {
@@ -1129,6 +1193,23 @@ mod simulation {
                 window_title: String::new(),
                 normalized_rect: None,
                 context_tokens: Vec::new(),
+            })
+        }
+
+        fn learn_focus_point(
+            &self,
+            _target: String,
+        ) -> Result<sayall_windows::focus::RecordedPoint, PlatformError> {
+            // 固定样本：CI 断言 UI 的位置记录状态机能落到「已记录位置」。
+            Ok(sayall_windows::focus::RecordedPoint {
+                x_ratio: 0.5,
+                y_ratio: 0.82,
+                window_width: 1200,
+                window_height: 800,
+                left_offset: Some(600),
+                top_offset: Some(656),
+                right_offset: Some(600),
+                bottom_offset: Some(144),
             })
         }
 

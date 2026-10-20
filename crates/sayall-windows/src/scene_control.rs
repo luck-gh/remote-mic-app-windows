@@ -5035,6 +5035,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: Option<&crate::focus::AppFocusProfile>,
+                _: Option<&std::sync::atomic::AtomicBool>,
             ) -> Result<(), String> {
                 panic!("unexpected launch and focus")
             }
@@ -5079,6 +5080,9 @@ mod tests {
                 recorded.clone(),
                 Arc::new(crate::UsageCounters::default()),
                 Arc::new(Mutex::new(RawInputSnapshot::default())),
+                Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                    crate::macro_runtime::UnsupportedStepperSource,
+                ))),
             ));
             runtime.set_input_context(crate::RemoteModel::Rc001, true);
             {
@@ -5183,6 +5187,9 @@ mod tests {
                 recorded.clone(),
                 Arc::new(crate::UsageCounters::default()),
                 Arc::new(Mutex::new(RawInputSnapshot::default())),
+                Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                    crate::macro_runtime::UnsupportedStepperSource,
+                ))),
             ));
             crate::subscribe_button_profile(&controller, &runtime);
             let weak = Arc::downgrade(&controller);

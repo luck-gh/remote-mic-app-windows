@@ -15,6 +15,7 @@ describe("Windows navigation", () => {
       "drivers",
       "buttons",
       "templates",
+      "macros",
       "connection",
       "permissions",
       "settings",
@@ -23,6 +24,12 @@ describe("Windows navigation", () => {
     expect(navigationItems.at(-1)?.label).toBe("设置");
     expect(navigationItems.at(-1)?.icon).toBe("gear");
     expect(navigationItems.every((item) => item.label.length > 0)).toBe(true);
+  });
+
+  it("shows the combination actions entry after the buttons page", () => {
+    const macros = navigationItems.find((item) => item.id === "macros");
+    expect(macros?.label).toBe("组合动作");
+    expect(macros?.icon).toBe("layers");
   });
 });
 
