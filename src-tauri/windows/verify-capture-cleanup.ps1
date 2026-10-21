@@ -23,7 +23,7 @@ function Test-CaptureCleanupState($State, [int]$ExpectedPid, [long]$ExpectedStar
 }
 
 function Request-CaptureStop {
-    $directory = Join-Path $env:LOCALAPPDATA 'SayAll'
+    $directory = Join-Path $env:LOCALAPPDATA 'SayAllPersonal'
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     # Persist cancellation even if a previously submitted task has not started yet.
     [IO.File]::WriteAllText((Join-Path $directory 'rc003-capture-stop'), 'stop')
@@ -47,7 +47,7 @@ function Get-CaptureHelpers {
 }
 
 function Read-CaptureCleanupState {
-    $path = Join-Path $env:LOCALAPPDATA 'SayAll/rc003-capture-cleanup.json'
+    $path = Join-Path $env:LOCALAPPDATA 'SayAllPersonal/rc003-capture-cleanup.json'
     if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
 }
 

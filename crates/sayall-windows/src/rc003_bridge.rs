@@ -18,9 +18,9 @@
 //!
 //! ## 方向与发现机制：为什么是「主程序监听、助手连接」
 //!
-//! - 助手是**提权**进程，其运行时目录在 `%ProgramData%\SayAll\rc003-helper`；
+//! - 助手是**提权**进程，其运行时目录在 `%ProgramData%\SayAllPersonal\rc003-helper`；
 //!   主程序是普通权限，默认**读不到**该目录的写入（也不该去猜）。
-//! - 反过来则权限确定成立：主程序在 `%LOCALAPPDATA%\SayAll\` 下写桥接描述文件，
+//! - 反过来则权限确定成立：主程序在 `%LOCALAPPDATA%\SayAllPersonal\` 下写桥接描述文件，
 //!   提权助手读取用户目录**没有障碍**。
 //! - 因此：**主程序创建命名管道并写出「管道 + 诊断端口 + 令牌」描述文件，助手
 //!   读取后回连。** 命名管道是 Windows 产品主路径，不经过会改写 loopback 的
@@ -199,7 +199,7 @@ pub fn default_bridge_dir() -> PathBuf {
         let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
         format!("{home}\\AppData\\Local")
     });
-    PathBuf::from(base).join("SayAll")
+    PathBuf::from(base).join("SayAllPersonal")
 }
 
 /// 解析结果：一行协议消息。
@@ -381,7 +381,7 @@ fn generate_token() -> String {
 
 #[cfg(windows)]
 fn named_pipe_name() -> &'static str {
-    r"\\.\pipe\SayAll.Rc003Bridge"
+    r"\\.\pipe\SayAllPersonal.Rc003Bridge"
 }
 
 /// 跨线程共享的桥接状态。
@@ -1892,10 +1892,15 @@ mod tests {
 
     #[test]
     fn descriptor_body_publishes_optional_pipe_and_log_fields() {
-        let body = descriptor_body(53124, Some(r"\\.\pipe\SayAll.Rc003Bridge"), "tok", None);
+        let body = descriptor_body(
+            53124,
+            Some(r"\\.\pipe\SayAllPersonal.Rc003Bridge"),
+            "tok",
+            None,
+        );
         assert!(body.starts_with("version=2\nport=53124\n"), "{body:?}");
         assert!(
-            body.contains("pipe=\\\\.\\pipe\\SayAll.Rc003Bridge\n"),
+            body.contains("pipe=\\\\.\\pipe\\SayAllPersonal.Rc003Bridge\n"),
             "{body:?}"
         );
         assert!(body.contains("token=tok\n"), "{body:?}");
@@ -1945,7 +1950,7 @@ mod tests {
         let pipe = text
             .lines()
             .find_map(|line| line.strip_prefix("pipe="))
-            .filter(|line| line.starts_with(r"\\.\pipe\SayAll.Rc003Bridge"))
+            .filter(|line| line.starts_with(r"\\.\pipe\SayAllPersonal.Rc003Bridge"))
             .unwrap_or_else(|| {
                 panic!(
                     "计划任务 Helper 的 TCP loopback 会被本机 WFP/TUN 重定向，描述文件必须发布命名管道：{text:?}"
@@ -2043,7 +2048,7 @@ mod tests {
         let pipe = text
             .lines()
             .find_map(|line| line.strip_prefix("pipe="))
-            .filter(|line| line.starts_with(r"\\.\pipe\SayAll.Rc003Bridge"))
+            .filter(|line| line.starts_with(r"\\.\pipe\SayAllPersonal.Rc003Bridge"))
             .expect("描述文件必须发布命名管道");
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut stream = loop {

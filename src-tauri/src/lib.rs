@@ -5327,7 +5327,7 @@ pub fn run() {
     let log_path = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("SayAll")
+        .join("SayAllPersonal")
         .join("Logs")
         .join("sayall-diagnostic.log");
     // 版本号唯一来源是 tauri.conf.json 的 `version`（安装包名、exe 版本资源、关于页
@@ -5398,7 +5398,8 @@ pub fn run() {
         use windows::core::w;
         use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
         use windows::Win32::System::Threading::CreateMutexW;
-        const SINGLE_INSTANCE_MUTEX: windows::core::PCWSTR = w!("SayAll.Windows.SingleInstance");
+        const SINGLE_INSTANCE_MUTEX: windows::core::PCWSTR =
+            w!("SayAllPersonal.Windows.SingleInstance");
         match unsafe { CreateMutexW(None, false, SINGLE_INSTANCE_MUTEX) } {
             Ok(handle) => {
                 // CreateMutexW 对"已存在"返回有效句柄 + GetLastError=
@@ -7157,19 +7158,22 @@ mod lifecycle_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn personal_branding_keeps_install_identity() {
+    fn personal_branding_isolates_install_identity() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        assert_eq!(config["productName"], "无线麦");
+        assert_eq!(config["productName"], "无线麦个人版");
         assert_eq!(config["bundle"]["publisher"], "luck-gh");
-        assert_eq!(config["identifier"], "app.getsayall.remote-mic.windows");
+        assert_eq!(
+            config["identifier"],
+            "app.luckgh.remote-mic.personal.windows"
+        );
         assert_eq!(
             config["bundle"]["windows"]["nsis"]["startMenuFolder"],
-            "无线麦"
+            "无线麦个人版"
         );
         let installer = include_str!("../windows/installer.nsi");
-        assert!(installer.contains("!define INSTALLIDENTITY \"无线麦 SayAll\""));
-        assert!(installer.contains("!define MANUKEY \"Software\\GetSayAll\""));
+        assert!(installer.contains("!define INSTALLIDENTITY \"无线麦个人版\""));
+        assert!(installer.contains("!define MANUKEY \"Software\\LuckGH\""));
         assert!(installer.contains("Uninstall\\${INSTALLIDENTITY}"));
         assert!(installer.contains("$LOCALAPPDATA\\${INSTALLIDENTITY}"));
     }

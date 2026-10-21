@@ -28,11 +28,11 @@ $bundleDirectory = Join-Path $repositoryRoot "target/release/bundle/nsis"
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $productName = $config.productName
 $publisher = $config.bundle.publisher
-$diagnosticLogPath = Join-Path $env:LOCALAPPDATA "SayAll/Logs/sayall-diagnostic.log"
+$diagnosticLogPath = Join-Path $env:LOCALAPPDATA "SayAllPersonal/Logs/sayall-diagnostic.log"
 
 # 与 crates/sayall-windows/src/graceful_exit.rs 的 GRACEFUL_EXIT_EVENT_NAME 一致；
 # src-tauri 的契约测试断言它与 installer-hooks.nsh 中的定义逐字相同。
-$gracefulExitEventName = "Local\SayAll-GracefulExit"
+$gracefulExitEventName = "Local\SayAllPersonal-GracefulExit"
 # 复用实际 NSIS 等待预算；超时钩子会 Abort，不能落入 Tauri 强杀分支。
 $installerHooks = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repositoryRoot "src-tauri/windows/installer-hooks.nsh")
 $installerGraceMilliseconds = 0

@@ -16,7 +16,7 @@ $normalUninstallCompleted = $false
 function Request-GracefulExit {
     $handle = $null
     try {
-        $handle = [System.Threading.EventWaitHandle]::OpenExisting('Local\SayAll-GracefulExit')
+        $handle = [System.Threading.EventWaitHandle]::OpenExisting('Local\SayAllPersonal-GracefulExit')
         $null = $handle.Set()
         return $true
     } catch {
@@ -181,7 +181,7 @@ try {
 
     # 当前 fork 保留运行目录及清理记录，不恢复旧 --uninstall-cleanup 递归删除。
     # 独立标记仅验证目录保留，不伪造会话令牌或实际停止回执。
-    $runtimeDirectory = Join-Path $env:PROGRAMDATA "SayAll\rc003-helper"
+    $runtimeDirectory = Join-Path $env:PROGRAMDATA "SayAllPersonal\rc003-helper"
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
     $cleanupPreservationMarker = Join-Path $runtimeDirectory 'ci-cleanup-preservation-marker.txt'
     [IO.File]::WriteAllText($cleanupPreservationMarker, "CI cleanup preservation marker`n", $utf8WithoutBom)

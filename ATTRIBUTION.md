@@ -6,6 +6,12 @@
 
 ## 统一上游全按键支持（2026-10-03）
 
+2026-10-20 驻留归属与模块快照修复采用 Microsoft [Module32NextW](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-module32nextw) 返回契约：FALSE 后立即读取 GetLastError，只有 `ERROR_NO_MORE_FILES` 表示正常结束，其他错误不得用局部列表决定注入。路径归属使用 Rust 标准库真实规范路径和路径组件边界，不新增来源固定偏移/系统 DLL 散列。独立 Helper 单测与自有 loopback 验证不证明旧驻留组件已经交接，真实边界见同主题 Bug。
+
+2026-10-20 双安装对照采用 [上游正式版 v1.0.0](https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/v1.0.0)，Tag 指向 `a4c1311d405509daf486fff3c82f7c8ec76f03fe`；它不是当前 `upstream/main@df0d3a4` 的重新构建。个人版身份隔离按 [Tauri 配置契约](https://v2.tauri.app/reference/config/) 的唯一 identifier 与独立存储模式处理，并逐项隔离本项目自行命名的 IPC/任务/运行目录。没有复制新的上游实现或改动捕获判断规则；安装和硬件对照结果单独记录，不能用离线实验或安装成功替代上游实机复现。
+
+- 2026-10-20 按用户明确要求恢复上游捕获规则，固定参考 [Helper](https://github.com/GetSayAll/remote-mic-app-windows/blob/df0d3a4316f02594f30129216693b73ac2058e88/hardware/RC003/helper/src/main.rs#L5628) 与 [Agent](https://github.com/GetSayAll/remote-mic-app-windows/blob/df0d3a4316f02594f30129216693b73ac2058e88/hardware/RC003/helper/agent/rc003_agent.js#L760)。恢复按 `ntdll!NtDeviceIoControlFile` 导出定位和 IOCTL/报告格式/动态 usage 处理，删除本地固定 WDF 表偏移、系统模块 SHA-256 白名单和 PDO 续约；不保留旧来源实现作为 fallback。保留本地正常退出、持键释放与回执协议、非阻塞诊断，以及上层模板/菜单和基础 ATVV 语音。上游共享宿主日志的“三键”描述不适用于动态十三键集合，本地日志明确其内容判定不证明逐设备来源。系统 DLL 更新不再触发旧哈希拒绝，但同格式同 usage 的其他设备可能参与捕获；不将上游测试量或历史真机结果外推为本 fork 已通过。新 Agent 标识为 `2026-10-20.upstream-usage`，与保留的本地清理协议一起核对，不能沿用旧驻留实例身份。
+
 - 固定来源为 [GetSayAll/remote-mic-app-windows `4d4de099`](https://github.com/GetSayAll/remote-mic-app-windows/tree/4d4de099f823cc67f334ff2a498e98c2806e4455)，采用 `hardware/RC003/helper` 的 Rust Helper、内嵌 agent、固定 Gadget 构建输入，以及 `rc003_bridge.rs`、`rc003_task.rs` 和授权交互。项目与来源均按已有 GPL-3.0-only 归属保留；Frida 固定 17.18.0 的许可和下载散列随资源锁定及安装包提供。
 - 本地整合保留模板/程序关联和 Menu 控制；捕获集合来自实际有效模板与菜单，删除五键专用 Helper、驱动生产链及无来源 LL 兜底。没有映射的键只观察，禁用动作不回放原生按键。基础 ATVV 与音频设备锁定保持独立。上游可选报告层语音合成固定关闭，保留本地设备准备成功后成对 SendInput 的现有语音路径；固定延时不能替代本地设备准备的完成回执。
 - 根据 [Frida Thread API](https://frida.re/docs/javascript-api/#thread)，`Thread.sleep()` 接收秒：原 agent 将毫秒直接传入的等待已改为换算秒，并以真实 API 单位更新测试。该修复不调整既定 150 ms 门限，不能算作冷态延迟优化实测。
@@ -495,6 +501,8 @@
 此前“保留逐报告 WDF/PDO 来源”是本地契约，不能作为当前 Agent 已实现的证明，本次核查纠正该外推。已补先红后绿的来源、嵌套/线程、代次、释放和隐私回归；源码修复不修改用户模板、连发或系统键盘设置。0.8.6 输入法/焦点恢复、旧驻留版本与这次误路由分别归因；10 月 10 日旧脚本拒绝/撤除不等于新链路通过。2026-10-12 用户重启后已取得新 Agent 的实际来源分类、报告处理与菜单完整链证据，且用户确认菜单和实体键盘正常；仅覆盖当前 PC/RC003，显式连发开启、冷/闲置首用、其他系统模块及 ARM64 不外推。实机证据、最小材料和验收归 [既有 Bug](Bugs/2026-10-03-foreground-input-regression.md#2026-10-12-用户重启后的来源菜单与连发配置续验)、Testing 与 TODO。未新增外部依赖、恢复迁移或提交本次修复。
 
 2026-10-11 菜单失效追加核查：[Frida Gadget Script 官方文档](https://frida.re/docs/gadget/#script) 明确 `on_change` 默认 `ignore`，脚本只加载一次；Listen 与 Script 为不同交互模式。当前 Helper 的 `serde_like_config` 仅写 script/parameters，旧 Agent 只有应用自建 JSON 命令，没有 reload 或 Frida 控制服务。对照 [Frida 17.18.0 Gadget 实现](https://github.com/frida/frida-core/blob/17.18.0/lib/gadget/gadget.vala#L360-L403)，重复 load 不重新初始化已加载实例。本结论用于解释当日已安装新文件但旧脚本仍驻留的阻碍，不授权强制卸载、第二实例或重新启用已证实误捕获的旧脚本，也不将官方生命周期说明当作本地新脚本功能验收。当前无在线换代实现，12 日通过用户重启结束旧宿主后取得新代次实证，不凭猜测添加热更新补丁。
+
+2026-10-21 进程观察竞态修复另复用现有 windows 0.62：[GetExitCodeProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess) 与 [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew) 均允许 query-limited 句柄。实际受控子进程自然 exit0 后保留同一 handle，已观察 image 查询失败 Win32=31、退出状态查询成功 code0；候选只据该句柄已结束状态忽略条目，仍活或状态未知继续阻断，不把路径查询失败单独当作退出证明。微软的 STILL_ACTIVE 歧义提醒仍适用；候选遇到该值保守视为活进程，不因此放行。未申请额外等待权限、读取进程内存或终止进程，未引入依赖。
 
 ### 2026-10-12 虚拟音频设备名称与严格配对
 

@@ -1,5 +1,9 @@
 # Windows RC001 / RC003 Preview 测试手册
 
+2026-10-20 当前候选实体键盘共存已 **failed**：用户报告反引号→Tab，当前Helper TV报告与应用Tab注入链已记录；上游/个人版原始Agent的同报告离线对照均不区分设备来源。语音、UI布局及接管所有权通过不关闭该回归；详情见 [当前回归](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-上游规则候选的实体键盘回归)。
+
+2026-10-20 起的上游规则候选另须核对 Agent build=`2026-10-20.upstream-usage` 和 Helper `[CAPTURE] policy=upstream_usage_gate system_module_binding=false`。界面“已开启”须有当前目标代次的实际 ownership ACK，不能只看计划任务启动或桥连接。分别验证目标/非目标键、Menu 模板切换、持键释放/快速连按、冷态首用及普通键盘共存（含反引号、方向键）；同宿主同格式同 usage 不再保证来源隔离，不能复用下文 10 月 12 日旧实现的隔离结论。停止须核对新鲜回执和实际进程结束；记录归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-系统模块变化后恢复上游捕获规则)。
+
 ## 适用范围
 
 - 仓库：本 Windows fork；官方上游为 `GetSayAll/remote-mic-app-windows`

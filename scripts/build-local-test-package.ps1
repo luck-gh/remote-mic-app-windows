@@ -14,7 +14,7 @@
 #    RFC 7396 顺序合并（数组整体覆盖），因此两份配置叠加是安全的。默认
 #    src-tauri/tauri.conf.json 必须保持 x64 单载荷，理由见 RELEASING.md。
 #
-# 签名：默认读取仓库外的个人密钥 %LOCALAPPDATA%\SayAll\personal-updater.key；
+# 签名：默认读取仓库外的个人密钥 %LOCALAPPDATA%\SayAllPersonal\personal-updater.key；
 # 口令取参数或环境变量，未提供时使用空口令。公私钥必须通过实际产物验签。
 # 本地产物身份仍为 local/dirty，不因使用个人密钥而获得发布授权。
 #
@@ -98,7 +98,7 @@ if ($LASTEXITCODE -ne 0) { throw "前端构建失败" }
 Write-Host "[5/6] tauri build --bundles nsis"
 (Get-Item (Join-Path $repo "src-tauri\src\lib.rs")).LastWriteTime = Get-Date
 if ($CargoTargetDir) { $env:CARGO_TARGET_DIR = $CargoTargetDir }
-if (-not $SigningKeyPath) { $SigningKeyPath = Join-Path $env:LOCALAPPDATA "SayAll\personal-updater.key" }
+if (-not $SigningKeyPath) { $SigningKeyPath = Join-Path $env:LOCALAPPDATA "SayAllPersonal\personal-updater.key" }
 if (Test-Path $SigningKeyPath) {
     if (-not $SigningKeyPassword) {
         $SigningKeyPassword = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { "" }

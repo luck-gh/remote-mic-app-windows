@@ -71,7 +71,7 @@ mod imp {
     const ENUM_ROOT: &str = "SYSTEM\\CurrentControlSet\\Enum";
     const DIAGNOSTIC_SUFFIX: &str = "Device Parameters\\WUDFDiagnosticInfo";
 
-    const DEFAULT_PORT: u16 = 47831;
+    const DEFAULT_PORT: u16 = 47832;
     const RENEW_MS: u64 = 500;
     /// agent 侧租约（agent 在执行 `LEASE_MS` 后停止清键）。这里必须与 agent 的默认值一致。
     const LEASE_MS: u64 = 2000;
@@ -128,15 +128,114 @@ mod imp {
         instance: String,
     }
 
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ResidentBinding {
+        host_pid: u32,
+        host_created: u64,
+        agent_instance: String,
+        module_path: PathBuf,
+        port: u16,
+    }
+    impl ResidentBinding {
+        fn parse(text: &str) -> Result<Self, &'static str> {
+            let binding: Self = serde_json::from_str(text).map_err(|_| "binding_invalid_json")?;
+            if binding.host_pid == 0
+                || binding.host_created == 0
+                || !valid_agent_instance(&binding.agent_instance)
+                || !binding.module_path.is_absolute()
+                || !binding
+                    .module_path
+                    .file_name()
+                    .is_some_and(|name| is_gadget_module(&name.to_string_lossy()))
+                || binding.port == 0
+                || binding.port == DEFAULT_PORT
+            {
+                return Err("binding_invalid_identity");
+            }
+            Ok(binding)
+        }
+        fn identity(&self) -> AgentIdentity {
+            AgentIdentity {
+                host_pid: self.host_pid,
+                host_created: self.host_created,
+                instance: self.agent_instance.clone(),
+            }
+        }
+    }
+
+    fn validate_resident_binding(
+        binding: &ResidentBinding,
+        host_pid: u32,
+        host_created: u64,
+        taps: &[ModuleInfo],
+    ) -> Result<(), String> {
+        if binding.host_pid != host_pid || binding.host_created != host_created {
+            return Err("binding_host_mismatch".into());
+        }
+        if taps.len() != 1 {
+            return Err("binding_resident_not_unique".into());
+        }
+        let expected = fs::canonicalize(&binding.module_path)
+            .map_err(|_| "binding_module_unavailable".to_string())?;
+        let actual = fs::canonicalize(&taps[0].path)
+            .map_err(|_| "binding_resident_path_unavailable".to_string())?;
+        if expected != actual {
+            return Err("binding_resident_module_mismatch".into());
+        }
+        Ok(())
+    }
+
+    fn select_resident_binding(args: &mut Args, logger: &Logger) -> Result<(), String> {
+        let path = app_stop_signal_path().with_file_name("rc003-resident-binding.json");
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("binding_file_unreadable".into()),
+        };
+        let binding = ResidentBinding::parse(&text).map_err(str::to_string)?;
+        let Some(host) = recorded_host(&binding.identity()).map_err(str::to_string)? else {
+            logger.line("[RESIDENT-BINDING] result=invalidated reason=host_instance_ended capture_authorized=false");
+            return Ok(());
+        };
+        if !process_name(host.pid).is_some_and(|name| name.eq_ignore_ascii_case("WUDFHost.exe")) {
+            return Err("binding_host_process_mismatch".into());
+        }
+        let modules =
+            enum_modules(host.pid).map_err(|_| "binding_module_scan_failed".to_string())?;
+        validate_resident_binding(&binding, host.pid, host.created, &resident_taps(&modules))?;
+        let module = fs::canonicalize(&binding.module_path)
+            .map_err(|_| "binding_module_unavailable".to_string())?;
+        let runtime = module
+            .parent()
+            .ok_or("binding_runtime_missing")?
+            .to_path_buf();
+        if (args.port != DEFAULT_PORT && args.port != binding.port)
+            || args.target_pid.is_some_and(|pid| pid != binding.host_pid)
+            || (args.runtime_dir != default_runtime_dir()
+                && fs::canonicalize(&args.runtime_dir).ok().as_deref() != Some(runtime.as_path()))
+        {
+            return Err("binding_explicit_selection_conflict".into());
+        }
+        args.target_pid = Some(binding.host_pid);
+        args.port = binding.port;
+        args.runtime_dir = runtime;
+        args.attach_only = true;
+        args.resident_binding = Some(binding);
+        logger.line("[RESIDENT-BINDING] result=selected mode=attach_only credentials=existing_read_only capture_authorized=false");
+        Ok(())
+    }
+
     struct CleanupState {
         target_pid: u32,
         target_created: u64,
         identity: Option<AgentIdentity>,
         pending: bool,
         unresolved_multiple: bool,
-        attach_prior_terminal: bool,
+        attach_prior_identity: Option<AgentIdentity>,
         capture_attempted: bool,
         version_rejected: bool,
+        expected_instance: Option<String>,
     }
     impl CleanupState {
         fn new(target_pid: u32, target_created: u64) -> Self {
@@ -146,14 +245,19 @@ mod imp {
                 identity: None,
                 pending: false,
                 unresolved_multiple: false,
-                attach_prior_terminal: false,
+                attach_prior_identity: None,
                 capture_attempted: false,
                 version_rejected: false,
+                expected_instance: None,
             }
         }
         fn admit(&mut self, identity: AgentIdentity) -> bool {
             if identity.host_pid != self.target_pid
                 || identity.host_created != self.target_created
+                || self
+                    .expected_instance
+                    .as_ref()
+                    .is_some_and(|expected| expected != &identity.instance)
                 || self.identity.as_ref().is_some_and(|old| old != &identity)
             {
                 // 不覆盖第一笔未确认身份，也不让另一实例的 ACK 消除它。
@@ -187,13 +291,29 @@ mod imp {
             self.capture_attempted = true;
             Ok(())
         }
-        fn version_blocked_without_capture(&self) -> bool {
-            self.attach_prior_terminal
-                && self.version_rejected
-                && !self.capture_attempted
+        fn untouched_attach_with_prior_proof(&self) -> bool {
+            self.attach_prior_identity.as_ref().is_some_and(|identity| {
+                identity.host_pid == self.target_pid
+                    && identity.host_created == self.target_created
+                    && valid_agent_instance(&identity.instance)
+            }) && !self.capture_attempted
                 && self.identity.is_none()
                 && !self.pending
                 && !self.unresolved_multiple
+        }
+        fn version_blocked_without_capture(&self) -> bool {
+            self.version_rejected && self.untouched_attach_with_prior_proof()
+        }
+        fn terminal_status(&self, saw_authenticated: bool) -> &'static str {
+            if self.version_blocked_without_capture() {
+                "agent_version_blocked"
+            } else if !saw_authenticated && self.untouched_attach_with_prior_proof() {
+                "not_started"
+            } else if !self.is_clean() || !saw_authenticated {
+                "unconfirmed"
+            } else {
+                "passed"
+            }
         }
     }
 
@@ -450,20 +570,6 @@ mod imp {
         fn RegCloseKey(key: Handle) -> i32;
     }
 
-    #[link(name = "cfgmgr32")]
-    extern "system" {
-        fn CM_Locate_DevNodeW(node: *mut u32, id: *const u16, flags: u32) -> u32;
-        fn CM_Get_DevNode_Status(state: *mut u32, problem: *mut u32, node: u32, flags: u32) -> u32;
-        fn CM_Get_DevNode_Registry_PropertyW(
-            node: u32,
-            property: u32,
-            kind: *mut u32,
-            buffer: *mut c_void,
-            bytes: *mut u32,
-            flags: u32,
-        ) -> u32;
-    }
-
     #[link(name = "shell32")]
     extern "system" {
         fn IsUserAnAdmin() -> i32;
@@ -473,6 +579,7 @@ mod imp {
     const KEY_READ: u32 = 0x2_0019;
     const ERROR_SUCCESS: i32 = 0;
     const ERROR_NO_MORE_ITEMS: i32 = 259;
+    const ERROR_NO_MORE_FILES: u32 = 18;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_MORE_DATA: i32 = 234;
     /// 注册表值类型
@@ -959,14 +1066,9 @@ mod imp {
                 });
                 ok = Module32NextW(snap, &mut entry);
             }
+            let terminal_error = GetLastError();
             CloseHandle(snap);
-            if out.is_empty() {
-                return Err(format!(
-                    "模块枚举返回空列表（pid={pid}, GetLastError={}）",
-                    lasts_error()
-                ));
-            }
-            Ok(out)
+            finish_module_scan(out, terminal_error)
         }
     }
 
@@ -976,6 +1078,19 @@ mod imp {
         path: String,
         base: usize,
         size: u32,
+    }
+
+    fn finish_module_scan(
+        modules: Vec<ModuleInfo>,
+        terminal_error: u32,
+    ) -> Result<Vec<ModuleInfo>, String> {
+        if terminal_error != ERROR_NO_MORE_FILES {
+            return Err(format!("module_scan_incomplete error={terminal_error}"));
+        }
+        if modules.is_empty() {
+            return Err("module_scan_empty".into());
+        }
+        Ok(modules)
     }
 
     /// 该模块是否是我们自己注入的 Gadget（按基名判断，兼容将来的分代文件名）。
@@ -1009,8 +1124,6 @@ mod imp {
         /// 属 `LOGGING.md` 隐私红线的"HID 路径"。
         /// 不保留设备名：它同样含设备接口路径，排错不需要它。
         is_rc003: bool,
-        // 私有来源核验：完整功能实例，不写入日志或 Debug 输出。
-        instance_id: String,
     }
 
     /// RC003 识别判据（纯函数）：BTHLEDevice 枚举器 + HID 服务前缀 + 本型号硬件串。
@@ -1235,7 +1348,6 @@ mod imp {
                         pid,
                         enumerator: enumerator.clone(),
                         is_rc003,
-                        instance_id: format!("{enumerator}\\{device}\\{instance}"),
                     });
                 }
                 unsafe { RegCloseKey(device_key) };
@@ -2032,6 +2144,7 @@ mod imp {
 
     struct Args {
         target_pid: Option<u32>,
+        resident_binding: Option<ResidentBinding>,
         port: u16,
         token: String,
         /// 令牌是否来自运行时目录里**此前就存在**的 `session.token`
@@ -2052,7 +2165,7 @@ mod imp {
         canary_usages: Vec<u16>,
         /// 向主程序转发三键边沿的桥接描述文件路径（`None` = 不转发）。
         ///
-        /// 默认 `%LOCALAPPDATA%\SayAll\rc003-bridge.ini`，由主程序写出（命名管道 + 兼容端口 + 令牌），
+        /// 默认 `%LOCALAPPDATA%\SayAllPersonal\rc003-bridge.ini`，由主程序写出（命名管道 + 兼容端口 + 令牌），
         /// 助手读取后回连。`--no-app-bridge` 关闭；`--app-bridge <PATH>` 指定。
         ///
         /// **为什么默认开启**：不转发时三键只是"被清掉"，映射永远不触发；
@@ -2098,6 +2211,7 @@ mod imp {
     fn default_args() -> Args {
         Args {
             target_pid: None,
+            resident_binding: None,
             port: DEFAULT_PORT,
             token: String::new(),
             token_from_file: false,
@@ -2213,7 +2327,9 @@ mod imp {
 
     fn default_runtime_dir() -> PathBuf {
         let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-        PathBuf::from(base).join("SayAll").join("rc003-helper")
+        PathBuf::from(base)
+            .join("SayAllPersonal")
+            .join("rc003-helper")
     }
 
     /// 解析 `--canary-usage` 的取值：十六进制，支持 `0x4A` / `4a` / `74`，逗号分隔多个。
@@ -2307,13 +2423,13 @@ mod imp {
 用法：sayall-helper [选项]\n\
   --selftest            内置自检：需无提权、无设备、不注入；全通过退出码 0，否则 1\n\
   --target-pid <PID>    直接指定宿主 PID（自检用，跳过注册表定位）\n\
-  --port <PORT>         监听端口（默认 47831；自检时可用 0 自动分配）\n\
+  --port <PORT>         监听端口（默认 47832；自检时可用 0 自动分配）\n\
   --token <TOKEN>       握手令牌（默认读取/创建运行时目录里的 session.token，跨运行稳定）\n\
   --new-token           强制换一个新令牌（**会让常驻 tap 无法接管**，见下）\n\
   --gadget <PATH>       Gadget 路径（默认与可执行文件同目录；文件名随架构：\n\
                         x64 = frida-gadget.dll，arm64 = frida-gadget-arm64.dll）\n\
                         由卸载器调用；仍在运行的助手见到卸载标记也会自行执行\n\
-  --runtime-dir <PATH>  运行时目录（默认 %ProgramData%\\SayAll\\rc003-helper）\n\
+  --runtime-dir <PATH>  运行时目录（默认 %ProgramData%\\SayAllPersonal\\rc003-helper）\n\
   --duration <SEC>      运行多少秒后自动收尾（默认 0 = 一直运行）。\n\
                         到点会打 [TIMEUP] 并发 disarm；**会话存活期间同样生效**\n\
                         （2026-09-23 起；此前该上限在有 agent 连接时是失效的）\n\
@@ -2333,11 +2449,11 @@ mod imp {
   --no-restore          不在 onLeave 回写复原（默认复原）\n\
   --force               宿主非独占 RC003 时也继续（默认即是，见 --require-exclusive-host）\n\
   --require-exclusive-host  恢复旧行为：宿主非独占 RC003 时直接停止\n\
-  --app-bridge <PATH>   主程序桥接描述文件（默认 %LOCALAPPDATA%\\SayAll\\rc003-bridge.ini）。\n\
+  --app-bridge <PATH>   主程序桥接描述文件（默认 %LOCALAPPDATA%\\SayAllPersonal\\rc003-bridge.ini）。\n\
                         助手读取它后回连主程序，把三键边沿转发过去 —— 见下方\n\
                         「三键为什么按下去没反应」。默认启用\n\
   --no-app-bridge       关闭转发：三键仍会被清空，但主程序侧的映射不会触发\n\
-  --install-task        【需管理员】注册计划任务 SayAll RC003 Helper（最高权限、仅手动触发）。\n\
+  --install-task        【需管理员】注册计划任务 SayAll Personal RC003 Helper（最高权限、仅手动触发）。\n\
                         主程序打开三键开关时装一次，之后用 schtasks /run 拉起，不再弹 UAC\n\
   --remove-task         【需管理员】移除上述计划任务（卸载 / 用户关闭并移除授权时用）\n\
   --task-status         查询计划任务是否存在（免提权）\n\
@@ -2362,7 +2478,7 @@ RC003 的返回/音量± 在 Windows 侧**本来就零事件**（kbdhid 丢弃�
 ------------------------------------\n\
 “清空”只做到“让 Windows 看不到这三个键”，**不等于**“主程序知道了”。主程序侧的\n\
 Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直接后果）。所以边沿必须由\n\
-助手**主动**送过去：主程序在 %LOCALAPPDATA%\\SayAll\\rc003-bridge.ini 里写出“端口 +\n\
+助手**主动**送过去：主程序在 %LOCALAPPDATA%\\SayAllPersonal\\rc003-bridge.ini 里写出“端口 +\n\
 令牌”并监听，助手读取后回连、出示令牌，之后把每个边沿按**绝对状态**转发。\n\
 \n\
 判断这段通没通，看两处：\n\
@@ -2435,6 +2551,66 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             return Err("--attach-only 要求宿主里已有 tap，但模块枚举没有发现。".to_string());
         }
         Ok(DllPlan::Canonical)
+    }
+
+    fn plan_capture_runtime(
+        args: &mut Args,
+        taps: &[ModuleInfo],
+        logger: &Logger,
+    ) -> Result<DllPlan, String> {
+        if args.attach_only && (args.new_token || args.new_generation || taps.is_empty()) {
+            return Err("attach_only_requires_existing_resident_and_token".into());
+        }
+        if taps.len() > 1 {
+            return Err("multiple_resident_taps".into());
+        }
+        if let Some(tap) = taps.first() {
+            let resident =
+                fs::canonicalize(&tap.path).map_err(|_| "resident_path_unavailable".to_string())?;
+            let runtime = fs::canonicalize(&args.runtime_dir).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "foreign_resident_tap"
+                } else {
+                    "runtime_path_unavailable"
+                }
+                .to_string()
+            })?;
+            if !resident.starts_with(runtime) {
+                return Err("foreign_resident_tap".into());
+            }
+        }
+        logger.kv(
+            "[TAP-OWNERSHIP]",
+            &[(
+                "result",
+                if taps.is_empty() { "absent" } else { "owned" }.into(),
+            )],
+        );
+        if args.token.is_empty() {
+            if args.attach_only {
+                let token = fs::read_to_string(args.runtime_dir.join(TOKEN_FILE))
+                    .map_err(|_| "attach_only_token_unavailable".to_string())?;
+                if token.trim().is_empty() {
+                    return Err("attach_only_token_empty".into());
+                }
+                args.token = token.trim().to_string();
+                args.token_from_file = true;
+                logger.kv("[TOKEN]", &[("source", "existing_read_only".into())]);
+            } else {
+                let (token, from_file) =
+                    load_or_create_token(&args.runtime_dir, args.new_token, logger)?;
+                args.token = token;
+                args.token_from_file = from_file;
+            }
+        } else {
+            logger.kv("[TOKEN]", &[("source", "explicit".into())]);
+        }
+        decide_plan(
+            !taps.is_empty(),
+            args.token_from_file,
+            args.attach_only,
+            args.new_generation,
+        )
     }
 
     /// 绑定回环端口。单独抽出来有两个目的：①让失败文案**可操作**；
@@ -2687,8 +2863,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         plan: &DllPlan,
     ) -> Result<PreparedRuntime, String> {
         let dir = &args.runtime_dir;
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("创建运行时目录失败 {}: {e}", dir.display()))?;
 
         let gen_name = match plan {
             DllPlan::Generation(_) => generation_dir_name(&args.token),
@@ -2712,9 +2886,17 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     ("dir", normalize_display(dir)),
                     ("dll", normalize_display(&dll)),
                     ("action", "skip_copy_attaching_existing_tap".into()),
+                    ("runtime_files_written", "false".into()),
                 ],
             );
+            return Ok(PreparedRuntime {
+                dll,
+                reused: false,
+                verified: false,
+            });
         } else {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("创建运行时目录失败 {}: {e}", dir.display()))?;
             if matches!(plan, DllPlan::Generation(_)) {
                 fs::create_dir_all(&target_dir)
                     .map_err(|e| format!("创建分代目录失败 {}: {e}", target_dir.display()))?;
@@ -3283,7 +3465,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// **方向**：主程序创建命名管道并写出描述文件（管道 + 兼容端口 + 令牌），
     /// 助手读取后**回连**；旧描述文件没有 pipe 字段时才回落 TCP loopback。
     /// 反向（助手监听、主程序连接）在权限上不成立：助手以管理员身份运行、运行时目录
-    /// 在 `%ProgramData%\SayAll\rc003-helper`，普通权限的主程序既读不到那里的写入，
+    /// 在 `%ProgramData%\SayAllPersonal\rc003-helper`，普通权限的主程序既读不到那里的写入，
     /// 也不该去猜。而"主程序写在 `%LOCALAPPDATA%`、提权助手去读"没有权限障碍。
     ///
     /// **边沿是绝对状态**：agent 只在集合变化时上报当前按下的 usage 集合，助手原样
@@ -3377,7 +3559,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
     }
 
-    /// 默认桥接描述文件：`%LOCALAPPDATA%\SayAll\rc003-bridge.ini`。
+    /// 默认桥接描述文件：`%LOCALAPPDATA%\SayAllPersonal\rc003-bridge.ini`。
     ///
     /// 与主程序侧 `rc003_bridge::default_bridge_dir()` 必须指向同一位置——
     /// 这条一致性由助手自检里的一项显式核对（避免"主程序写了、助手找不着"的静默失配）。
@@ -3386,7 +3568,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
             format!("{home}\\AppData\\Local")
         });
-        PathBuf::from(base).join("SayAll").join("rc003-bridge.ini")
+        PathBuf::from(base)
+            .join("SayAllPersonal")
+            .join("rc003-bridge.ini")
     }
 
     /// 主程序请求停止的信号文件（与桥接描述文件同目录）。
@@ -3401,7 +3585,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             format!("{home}\\AppData\\Local")
         });
         PathBuf::from(base)
-            .join("SayAll")
+            .join("SayAllPersonal")
             .join("rc003-capture-stop")
     }
 
@@ -3471,6 +3655,21 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             .is_none_or(|text| CleanupReceipt::parse(text).is_some_and(|receipt| receipt.settled()))
     }
 
+    fn prior_terminal_identity(
+        previous: &str,
+        target_pid: u32,
+        target_created: u64,
+    ) -> Option<AgentIdentity> {
+        let receipt = CleanupReceipt::parse(previous)?;
+        let identity = receipt.resource_identity()?;
+        (receipt.settled()
+            && receipt.status != "host_exited"
+            && identity.host_pid == target_pid
+            && identity.host_created == target_created
+            && valid_agent_instance(&identity.instance))
+        .then_some(identity)
+    }
+
     fn previous_cleanup_is_clear() -> bool {
         let path = app_stop_signal_path().with_file_name("rc003-capture-cleanup.json");
         match fs::read_to_string(path) {
@@ -3479,11 +3678,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
     }
 
-    fn previous_cleanup_has_terminal_proof() -> bool {
+    fn previous_cleanup_terminal_identity(
+        target_pid: u32,
+        target_created: u64,
+    ) -> Option<AgentIdentity> {
         let path = app_stop_signal_path().with_file_name("rc003-capture-cleanup.json");
         fs::read_to_string(path)
             .ok()
-            .is_some_and(|previous| prior_cleanup_is_clear(Some(&previous)))
+            .and_then(|previous| prior_terminal_identity(&previous, target_pid, target_created))
     }
 
     fn write_cleanup_state(status: &str, completed: bool) -> std::io::Result<()> {
@@ -3711,9 +3913,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             return Ok(());
         }
         let previous = previous.unwrap();
-        let identity = previous
+        let mut identity = previous
             .resource_identity()
             .ok_or("prior_host_identity_missing")?;
+        if let Some(binding) = &args.resident_binding {
+            if identity.host_pid != binding.host_pid
+                || identity.host_created != binding.host_created
+                || (!identity.instance.is_empty() && identity.instance != binding.agent_instance)
+            {
+                return Err("binding_prior_identity_mismatch");
+            }
+            identity.instance = binding.agent_instance.clone();
+        }
         match AppProcess::open(previous.helper_pid) {
             Ok(process)
                 if (process.created / 10_000).saturating_sub(11_644_473_600_000)
@@ -4056,7 +4267,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     }
 
     fn derived_bridge_pipe_name() -> &'static str {
-        r"\\.\pipe\SayAll.Rc003Bridge"
+        r"\\.\pipe\SayAllPersonal.Rc003Bridge"
     }
 
     fn open_named_pipe(pipe: &str) -> std::io::Result<fs::File> {
@@ -4619,7 +4830,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
     /// 计划任务名。主程序靠它触发助手，所以**改名必须与主程序侧同步**
     /// （两边各有一份常量，靠自检核对字符串、靠联调核对行为）。
-    const SCHEDULED_TASK_NAME: &str = "SayAll RC003 Helper";
+    const SCHEDULED_TASK_NAME: &str = "SayAll Personal RC003 Helper";
 
     /// `schtasks /create` 的参数。**纯函数**——自检要对它做断言，
     /// 真正的执行在 `manage_scheduled_task`（装/删任务都要提权，不该在自检里发生）。
@@ -5306,6 +5517,27 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             std::process::exit(3);
         }
 
+        if !args.dry_run {
+            if let Err(reason) = select_resident_binding(&mut args, &logger) {
+                logger.kv(
+                    "[RESIDENT-BINDING]",
+                    &[("result", "blocked".into()), ("reason", reason)],
+                );
+                std::process::exit(13);
+            }
+        }
+        let _personal_listener = if args.resident_binding.is_some() {
+            match bind_listener(DEFAULT_PORT) {
+                Ok(listener) => Some(listener),
+                Err(_) => {
+                    logger.line("[RESIDENT-BINDING] result=busy reason=personal_listener_occupied capture_authorized=false");
+                    std::process::exit(8);
+                }
+            }
+        } else {
+            None
+        };
+
         // ---- 定位宿主 ----
         // The listener is the process-lifetime singleton. Recovery occurs before
         // runtime preparation or any bridge worker; closing the App cannot cancel it.
@@ -5378,7 +5610,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             for (index, m) in members.iter().enumerate() {
                 logger.line(&member_line(index + 1, &m.enumerator, m.is_rc003));
             }
-            // 内容只决定映射范围，不能证明来源；共享宿主必须逐请求核验功能 PDO。
             if !(members.len() == 1 && rc003_members == 1) {
                 if args.require_exclusive_host || args.force {
                     // 旧行为（--require-exclusive-host；--force 保持同义）：
@@ -5389,45 +5620,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 logger.kv(
                     "[SHARED-HOST]",
                     &[
-                        ("decision", "require_request_source".to_string()),
+                        ("decision", "continue_with_usage_gate".to_string()),
                         ("members", members.len().to_string()),
                         ("rc003_members", rc003_members.to_string()),
                     ],
                 );
                 logger.line(
-                    "[INFO] 宿主同时承载其它 HID 设备：先证明每个请求来自所选功能节点，再应用按键目标。",
+                    "[INFO] 宿主同时承载其它 HID 设备：按报告格式和动态目标 usage 接管按键；相同报告不区分设备来源。",
                 );
             }
         }
 
-        // 固定来源适配仅在此前验证过的系统模块组合上运行；未知组合零注入。
-        let _source_module_locks = match verify_source_modules(target_pid) {
-            Ok(locks) => locks,
-            Err(reason) => {
-                logger.kv(
-                    "[SOURCE]",
-                    &[("result", "blocked".into()), ("reason", reason.into())],
-                );
-                std::process::exit(16);
-            }
-        };
-        logger.kv(
-            "[SOURCE]",
-            &[
-                ("result", "modules_verified".into()),
-                ("contract", "umdf_2_15".into()),
-            ],
-        );
-        let source_instance = entries
-            .iter()
-            .filter(|entry| entry.pid == target_pid && entry.is_rc003)
-            .map(|entry| entry.instance_id.clone())
-            .collect::<Vec<_>>();
-        if source_instance.len() != 1 || current_source_pdo(&source_instance[0]).is_none() {
-            logger.line("[SOURCE] result=blocked reason=selected_function_unproven");
-            std::process::exit(16);
-        }
-        let source_instance = source_instance[0].clone();
+        logger.line("[CAPTURE] policy=upstream_usage_gate system_module_binding=false");
 
         // ---- Gadget 与 agent ----
         let gadget_src = match args.gadget.clone().or_else(default_gadget_path) {
@@ -5503,22 +5707,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             }
         };
         let mut cleanup = CleanupState::new(target_pid, target_created);
-
-        // ---- 令牌：默认跨运行稳定（见 TOKEN_FILE 注释） ----
-        // 必须**在**探测常驻 tap 之前做：磁盘上本来就有令牌，才谈得上"接管上一代"。
-        if args.token.is_empty() {
-            match load_or_create_token(&args.runtime_dir, args.new_token, &logger) {
-                Ok((t, from_file)) => {
-                    args.token = t;
-                    args.token_from_file = from_file;
-                }
-                Err(e) => {
-                    logger.line(&format!("[STOP] {e}"));
-                    std::process::exit(10);
-                }
+        if let Some(binding) = &args.resident_binding {
+            if target_pid != binding.host_pid || target_created != binding.host_created {
+                logger.line("[RESIDENT-BINDING] result=blocked reason=host_instance_changed capture_authorized=false");
+                std::process::exit(13);
             }
-        } else {
-            logger.kv("[TOKEN]", &[("source", "explicit".into())]);
+            cleanup.expected_instance = Some(binding.agent_instance.clone());
         }
 
         // ---- 宿主里是否已有 tap？----
@@ -5553,19 +5747,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         normalize_display(Path::new(&m.path))
                     ));
                 }
-                // 归属核对：只有"从我们的运行时目录加载起来的"那份才可能是我们注入的。
-                // 名字相同但路径在别处 → 别人（或别的工具）也注入了 frida-gadget，明确说出来，
-                // 免得把"接不上"归因成自己的 bug。
-                let root = args.runtime_dir.to_string_lossy().to_ascii_lowercase();
-                for m in &found {
-                    if !m.path.to_ascii_lowercase().starts_with(&root) {
-                        logger.line(&format!(
-                            "[WARN] 宿主里的 Gadget 模块不在我们的运行时目录下（{}），\
-                             不是本助手注入的那一份；它的令牌必然对不上。",
-                            normalize_display(Path::new(&m.path))
-                        ));
-                    }
-                }
                 found
             }
             Err(e) => {
@@ -5574,38 +5755,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     &[
                         ("scan", "failed".into()),
                         ("error", e.clone()),
-                        (
-                            "note",
-                            "无法枚举宿主模块；若有上一代 tap，本次注入会是无操作（LoadLibrary 返回已加载基址）"
-                                .into(),
-                        ),
+                        ("capture_authorized", "false".into()),
                     ],
                 );
-                Vec::new()
+                std::process::exit(13);
             }
         };
 
-        let plan = match decide_plan(
-            !taps.is_empty(),
-            args.token_from_file,
-            args.attach_only,
-            args.new_generation,
-        ) {
+        let plan = match plan_capture_runtime(&mut args, &taps, &logger) {
             Ok(p) => p,
             Err(e) if e == "STALE-TAP" => {
                 logger.line(
-                    "[STALE-TAP] 宿主里已经有我们的 Gadget，但它握着的令牌与磁盘上的 \
-                     `session.token` 不一致（或磁盘上本来就没有令牌文件）——说明那是**本机制引入之前**\
-                     注入的旧世代，无法接管，也无法覆盖它的 DLL（它正被宿主映射着，err=32）。",
-                );
-                logger.line(
-                    "怎么清（任选其一，都需要提权或人工操作）：\n\
-                     \x20 1) 断开并重新配对 RC003（最干净：设备节点重建会带走整个 WUDFHost 进程）；\n\
-                     \x20 2) 设备管理器 → 找到 RC003 的 HID 设备 → 禁用再启用；\n\
-                     \x20 3) 重启系统。\n\
-                     清干净之后可以用探针确认（users=(none) 即为已释放）：\n\
-                     \x20 python hardware/RC003/probes/windows-restart-manager-probe.py C:\\ProgramData\\SayAll\\rc003-helper\\frida-gadget.dll\n\
-                     本次仍可尝试实验性的并行注入（不保证，依赖 Frida 允许同进程双实例）：加 --new-generation。",
+                    "[STALE-TAP] reason=resident_token_unavailable capture_authorized=false receipt_preserved=true",
                 );
                 logger.line(&format!(
                     "[STOP] 退出码 13。旧世代 tap: {}",
@@ -5617,7 +5778,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 std::process::exit(13);
             }
             Err(e) => {
-                logger.line(&format!("[STOP] {e}"));
+                logger.kv(
+                    "[TAP-OWNERSHIP]",
+                    &[
+                        ("result", "blocked".into()),
+                        ("reason", e),
+                        ("capture_authorized", "false".into()),
+                        ("receipt_preserved", "true".into()),
+                    ],
+                );
                 std::process::exit(11);
             }
         };
@@ -5701,13 +5870,22 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
 
         CAPTURE_STARTED_MS.store(now_ms_u64(), Ordering::Relaxed);
-        set_capture_identity(Some(AgentIdentity {
-            host_pid: target_pid,
-            host_created: target_created,
-            instance: String::new(),
-        }));
-        cleanup.attach_prior_terminal =
-            matches!(plan, DllPlan::Attach) && previous_cleanup_has_terminal_proof();
+        cleanup.attach_prior_identity = matches!(plan, DllPlan::Attach)
+            .then(|| previous_cleanup_terminal_identity(target_pid, target_created))
+            .flatten()
+            .filter(|identity| {
+                cleanup
+                    .expected_instance
+                    .as_ref()
+                    .is_none_or(|expected| expected == &identity.instance)
+            });
+        set_capture_identity(Some(cleanup.attach_prior_identity.clone().unwrap_or(
+            AgentIdentity {
+                host_pid: target_pid,
+                host_created: target_created,
+                instance: String::new(),
+            },
+        )));
         if args.follow_app
             && (CTRL_STOP.load(Ordering::Relaxed) || take_stop_signal(&app_stop_signal_path()))
         {
@@ -5768,7 +5946,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let renew_counter = Arc::clone(&renew_count);
         let renew_stale = Arc::clone(&conn_stale);
         let renew_token = args.token.clone();
-        let renew_source_instance = source_instance;
         // 注意：这里是 `new` **不是** `open_round` —— 续约线程不是新一轮运行，
         // 它若写分隔线会让"每轮起点"的 grep 多算一次（2026-09-23 实测）。
         let renew_logger = logger.clone();
@@ -5785,8 +5962,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     Err(_) => break,
                 };
                 if let Some(stream) = guard.as_mut() {
-                    let pdo = current_source_pdo(&renew_source_instance);
-                    let line = source_renewal(&renew_token, pdo.as_deref());
+                    let line = format!("{{\"type\":\"renew\",\"token\":\"{renew_token}\"}}\n");
                     if stream.write_all(line.as_bytes()).is_err() {
                         renew_logger.kv("[RENEW]", &[("state", "write_failed".into())]);
                         *guard = None;
@@ -6035,14 +6211,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             ],
         );
         let version_blocked = cleanup.version_blocked_without_capture();
-        let cleanup_failed = !version_blocked && (!cleanup.is_clean() || !saw_authenticated);
-        let cleanup_status = if version_blocked {
-            "agent_version_blocked"
-        } else if cleanup_failed {
-            "unconfirmed"
-        } else {
-            "passed"
-        };
+        let cleanup_status = cleanup.terminal_status(saw_authenticated);
+        let cleanup_failed = cleanup_status == "unconfirmed";
         if write_cleanup_state(cleanup_status, true).is_err() {
             logger.line("[CLEANUP] result=unconfirmed reason=state_write_failed");
             logger.exit(15);
@@ -6051,6 +6221,16 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             "[CLEANUP]",
             &[
                 ("result", cleanup_status.into()),
+                ("capture_attempted", cleanup.capture_attempted.to_string()),
+                ("authenticated_ever", saw_authenticated.to_string()),
+                (
+                    "prior_terminal",
+                    cleanup.attach_prior_identity.is_some().to_string(),
+                ),
+                (
+                    "identity_unresolved",
+                    cleanup.unresolved_multiple.to_string(),
+                ),
                 ("module_unloaded", "false".into()),
             ],
         );
@@ -6324,6 +6504,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         cleanup: &mut CleanupState,
     ) {
         AGENT_AUTHORIZED.store(false, Ordering::Relaxed);
+        if cleanup.expected_instance.is_some() && !socket_peer_matches(&stream, cleanup.target_pid)
+        {
+            cleanup.unresolved_multiple = true;
+            logger.line("[RESIDENT-BINDING] result=blocked reason=tcp_owner_mismatch capture_authorized=false");
+            CTRL_STOP.store(true, Ordering::Relaxed);
+            return;
+        }
         serve_connection_inner(
             &mut stream,
             session,
@@ -6358,8 +6545,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         .is_some_and(|build| !build.is_empty())
                         && extract_str(hello, "agent").as_deref() == Some("rc003_agent/1")
                         && extract_num(hello, "pid") == Some(u64::from(cleanup.target_pid))
+                        && cleanup.attach_prior_identity.as_ref().is_some_and(|prior| {
+                            extract_str(hello, "instance").as_deref()
+                                == Some(prior.instance.as_str())
+                        })
                 });
                 if !cleanup.version_rejected {
+                    cleanup.unresolved_multiple = true;
                     logger.line(
                         "[START-FAILED] reason=agent_identity_unknown cleanup_result=unconfirmed",
                     );
@@ -6376,6 +6568,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 CTRL_STOP.store(true, Ordering::Relaxed);
                 return;
             };
+            if cleanup
+                .expected_instance
+                .as_ref()
+                .is_some_and(|expected| expected != &identity.instance)
+            {
+                cleanup.unresolved_multiple = true;
+                logger.line("[RESIDENT-BINDING] result=blocked reason=agent_instance_mismatch capture_authorized=false");
+                return;
+            }
             let confirmed = stop_agent(&mut stream, token, &identity);
             if confirmed {
                 cleanup.confirm(&identity);
@@ -6693,9 +6894,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 return;
                             }
                             AGENT_AUTHORIZED.store(true, Ordering::Relaxed);
-                            let pdo = source_pdo_for_host(cleanup.target_pid);
                             if stream
-                                .write_all(source_renewal(token, pdo.as_deref()).as_bytes())
+                                .write_all(
+                                    format!("{{\"type\":\"renew\",\"token\":\"{token}\"}}\n")
+                                        .as_bytes(),
+                                )
                                 .is_err()
                             {
                                 return;
@@ -6987,6 +7190,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 5) 配置生成：参数确实进了 parameters
         let args = Args {
             target_pid: None,
+            resident_binding: None,
             port: 47831,
             token: "deadbeef".to_string(),
             token_from_file: false,
@@ -7679,7 +7883,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 24) 桥接描述文件解析（捕获链第 ② 段）。解析错一处，现象是
         //     "主程序在跑、助手也在跑，但三键就是不动"——日志上只有 APP-BRIDGE unavailable，
         //     而那是一条折叠日志，本身不会告诉你是哪一项不匹配。逐项钉住。
-        let good = "version=2\nport=53124\npipe=\\\\.\\pipe\\SayAll.Rc003Bridge.999.deadbeef\ntoken=deadbeefcafe\npid=999\n";
+        let good = "version=2\nport=53124\npipe=\\\\.\\pipe\\SayAllPersonal.Rc003Bridge.999.deadbeef\ntoken=deadbeefcafe\npid=999\n";
         let parsed = parse_bridge_descriptor(good);
         check(
             "桥接描述文件：正常解析",
@@ -7688,7 +7892,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 .map(|t| {
                     t.port == 53124
                         && t.token == "deadbeefcafe"
-                        && t.pipe.as_deref() == Some(r"\\.\pipe\SayAll.Rc003Bridge.999.deadbeef")
+                        && t.pipe.as_deref()
+                            == Some(r"\\.\pipe\SayAllPersonal.Rc003Bridge.999.deadbeef")
                 })
                 .unwrap_or(false),
             format!(
@@ -7704,7 +7909,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 这是阳性对照：若解析器忽略 version，这条必然 FAIL。
         check(
             "桥接命名管道：固定本机名不依赖可被网络层改写的端口",
-            derived_bridge_pipe_name() == r"\\.\pipe\SayAll.Rc003Bridge",
+            derived_bridge_pipe_name() == r"\\.\pipe\SayAllPersonal.Rc003Bridge",
             derived_bridge_pipe_name().to_owned(),
         );
         check(
@@ -7747,12 +7952,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             .unwrap_or_default();
         let bridge_joined = bridge_path.to_string_lossy().to_ascii_lowercase();
         check(
-            "桥接描述文件路径：与主程序侧约定一致（SayAll\\rc003-bridge.ini）",
+            "桥接描述文件路径：与主程序侧约定一致（SayAllPersonal\\rc003-bridge.ini）",
             bridge_leaf == "rc003-bridge.ini"
                 && bridge_joined.contains("\\sayall\\")
                 && bridge_path
                     .parent()
-                    .map(|parent| parent.ends_with("SayAll"))
+                    .map(|parent| parent.ends_with("SayAllPersonal"))
                     .unwrap_or(false),
             bridge_path.display().to_string(),
         );
@@ -8203,154 +8408,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 有了代次，接管旧实例时日志会打 `[AGENT-STALE]`，让这件事一眼可见。
     ///
     /// 旧/未知代次不允许接管；本助手不结束共享宿主来替换 DLL。
-    const AGENT_BUILD: &str = "2026-10-10.request-source";
+    const AGENT_BUILD: &str = "2026-10-20.upstream-usage";
 
-    fn decode_pdo_property(kind: u32, bytes: u32, buffer: &[u16]) -> Option<String> {
-        let count = (bytes / 2) as usize;
-        if kind != 1
-            || bytes < 4
-            || bytes & 1 != 0
-            || count > buffer.len()
-            || buffer[count - 1] != 0
-            || buffer[..count - 1].contains(&0)
-        {
-            return None;
-        }
-        String::from_utf16(&buffer[..count - 1]).ok()
-    }
-
-    // 每次租约都重新读取当前已启动的功能节点；不把旧 PDO 当作恢复依据。
-    fn current_source_pdo(instance: &str) -> Option<String> {
-        let id = to_wide(instance);
-        let (mut node, mut state, mut problem) = (0, 0, 0);
-        let (mut kind, mut bytes) = (0, 2048);
-        let mut buffer = [0u16; 1024];
-        unsafe {
-            if CM_Locate_DevNodeW(&mut node, id.as_ptr(), 0) != 0
-                || CM_Get_DevNode_Status(&mut state, &mut problem, node, 0) != 0
-                || state & 8 == 0
-                || CM_Get_DevNode_Registry_PropertyW(
-                    node,
-                    0x0f,
-                    &mut kind,
-                    buffer.as_mut_ptr().cast(),
-                    &mut bytes,
-                    0,
-                ) != 0
-            {
-                return None;
-            }
-        }
-        decode_pdo_property(kind, bytes, &buffer)
-    }
-
-    fn source_pdo_for_host(pid: u32) -> Option<String> {
-        let entries = enum_hosts().ok()?.entries;
-        let mut selected = entries
-            .iter()
-            .filter(|entry| entry.pid == pid && entry.is_rc003);
-        let instance = &selected.next()?.instance_id;
-        if selected.next().is_some() {
-            return None;
-        }
-        current_source_pdo(instance)
-    }
-
-    fn source_renewal(token: &str, pdo: Option<&str>) -> String {
-        // 仅写已鉴权的 loopback；包含身份的文本不得送入 Logger。
-        format!(
-            "{}\n",
-            serde_json::json!({"type": "renew", "token": token, "source_pdo": pdo})
-        )
-    }
-
-    fn verify_source_modules(pid: u32) -> Result<Vec<fs::File>, &'static str> {
-        use std::os::windows::fs::OpenOptionsExt;
-        if !cfg!(target_arch = "x86_64") {
-            return Err("source_architecture_unverified");
-        }
-        let system = std::env::var_os("SystemRoot").ok_or("system_directory_unknown")?;
-        let system = PathBuf::from(system).join("System32");
-        let expected = [
-            (
-                "Microsoft.Bluetooth.Profiles.HidOverGatt.dll",
-                system
-                    .join("drivers")
-                    .join("UMDF")
-                    .join("Microsoft.Bluetooth.Profiles.HidOverGatt.dll"),
-                "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6",
-            ),
-            (
-                "WUDFx02000.dll",
-                system.join("WUDFx02000.dll"),
-                "e97a8bbbda4dd4989d9b3063cbfea05df9f60cdc7758fd21b163ebe3ce6786e0",
-            ),
-        ];
-        let modules = enum_modules(pid).map_err(|_| "source_modules_unknown")?;
-        let mut locks = Vec::new();
-        for (name, path, digest) in expected {
-            if !modules.iter().any(|module| {
-                module.name.eq_ignore_ascii_case(name)
-                    && Path::new(&module.path)
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&path.to_string_lossy())
-            }) {
-                return Err("source_module_path_unverified");
-            }
-            // 持有只共享读的句柄，防止核验后系统文件被替换；随 Helper 正常退出释放。
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .share_mode(1)
-                .open(&path)
-                .map_err(|_| "source_module_lock_failed")?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|_| "source_module_read_failed")?;
-            if sha256_hex(&bytes) != digest {
-                return Err("source_module_version_unverified");
-            }
-            locks.push(file);
-        }
-        Ok(locks)
-    }
-
-    #[cfg(test)]
-    mod request_source_binding_tests {
-        use super::*;
-
-        #[test]
-        fn pdo_property_requires_one_complete_string() {
-            let valid: Vec<u16> = "\\Device\\TestRemote\0".encode_utf16().collect();
-            assert_eq!(
-                decode_pdo_property(1, (valid.len() * 2) as u32, &valid),
-                Some("\\Device\\TestRemote".into())
-            );
-            assert_eq!(
-                decode_pdo_property(1, (valid.len() * 2 - 1) as u32, &valid),
-                None
-            );
-            assert_eq!(
-                decode_pdo_property(7, (valid.len() * 2) as u32, &valid),
-                None
-            );
-            assert_eq!(decode_pdo_property(1, 0, &valid), None);
-            assert_eq!(decode_pdo_property(1, 4, &[65, 66]), None);
-            assert_eq!(decode_pdo_property(1, 6, &[65, 0, 0]), None);
-        }
-
-        #[test]
-        fn source_renewal_uses_private_json_and_unknown_is_null() {
-            let line = source_renewal("token", Some("\\Device\\TestRemote"));
-            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(value["source_pdo"], "\\Device\\TestRemote");
-            assert_eq!(value["type"], "renew");
-            assert!(
-                serde_json::from_str::<serde_json::Value>(&source_renewal("token", None)).unwrap()
-                    ["source_pdo"]
-                    .is_null()
-            );
-        }
-    }
     /// 锁定文件在编译期内联。三重作用：
     /// 1) **缺失即编译失败**：锁定文件被删/路径写错，构建直接报错，不会产出"看起来正常、
     ///    实际没登记完整性"的二进制（本常量写错路径时已实测触发编译错误）；
@@ -8539,6 +8598,238 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     }
 
     #[cfg(test)]
+    mod resident_ownership_tests {
+        use super::*;
+
+        fn module(path: PathBuf) -> ModuleInfo {
+            ModuleInfo {
+                name: "frida-gadget.dll".into(),
+                path: path.to_string_lossy().into_owned(),
+                base: 1,
+                size: 1,
+            }
+        }
+
+        #[test]
+        fn resident_binding_rejects_partial_or_untrusted_payloads() {
+            let valid = r#"{"host_pid":42,"host_created":100,"agent_instance":"0123456789abcdef0123456789abcdef","module_path":"C:\\ProgramData\\SayAll\\rc003-helper\\frida-gadget.dll","port":47831}"#;
+            assert!(ResidentBinding::parse(valid).is_ok());
+            for invalid in [
+                "{}".to_string(),
+                valid.replace("\"host_pid\":42,", ""),
+                valid.replace("\"host_created\":100", "\"host_created\":0"),
+                valid.replace("0123456789abcdef0123456789abcdef", "invalid"),
+                valid.replace("47831", "0"),
+                valid.replace("47831", &DEFAULT_PORT.to_string()),
+                valid.replace(
+                    "\"host_pid\":42",
+                    "\"token\":\"synthetic-secret\",\"host_pid\":42",
+                ),
+                valid.trim_end_matches('}').to_string(),
+            ] {
+                assert!(ResidentBinding::parse(&invalid).is_err());
+            }
+        }
+
+        #[test]
+        fn resident_binding_requires_exact_host_generation_and_unique_module() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/dev/upstream-key-capture/resident-tests")
+                .join(format!("{}-{}", std::process::id(), random_token()));
+            fs::create_dir_all(&root).unwrap();
+            let owned = root.join(RUNTIME_GADGET_NAME);
+            fs::write(&owned, b"synthetic gadget").unwrap();
+            let binding = ResidentBinding {
+                host_pid: 42,
+                host_created: 100,
+                agent_instance: "0123456789abcdef0123456789abcdef".into(),
+                module_path: owned.clone(),
+                port: 47831,
+            };
+            let tap = module(owned);
+            assert!(validate_resident_binding(&binding, 43, 100, &[tap.clone()]).is_err());
+            assert!(validate_resident_binding(&binding, 42, 101, &[tap.clone()]).is_err());
+            assert!(validate_resident_binding(&binding, 42, 100, &[]).is_err());
+            assert!(
+                validate_resident_binding(&binding, 42, 100, &[tap.clone(), tap.clone()]).is_err()
+            );
+            let other = root.join("foreign/frida-gadget.dll");
+            fs::create_dir_all(other.parent().unwrap()).unwrap();
+            fs::write(&other, b"synthetic foreign gadget").unwrap();
+            assert!(validate_resident_binding(&binding, 42, 100, &[module(other)]).is_err());
+            assert!(validate_resident_binding(&binding, 42, 100, &[tap]).is_ok());
+        }
+
+        #[test]
+        fn attach_preparation_preserves_resident_payload_and_timestamps() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/dev/upstream-key-capture/resident-tests")
+                .join(format!("{}-{}", std::process::id(), random_token()));
+            fs::create_dir_all(&root).unwrap();
+            let mut args = default_args();
+            args.runtime_dir = root;
+            args.attach_only = true;
+            let mut before = Vec::new();
+            for name in [
+                RUNTIME_GADGET_NAME,
+                "rc003_agent.js",
+                "frida-gadget.config",
+                TOKEN_FILE,
+            ] {
+                let path = args.runtime_dir.join(name);
+                let content = format!("synthetic resident {name}").into_bytes();
+                fs::write(&path, &content).unwrap();
+                before.push((
+                    path.clone(),
+                    content,
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                ));
+            }
+            let prepared = prepare_runtime(
+                &args,
+                Path::new("nonexistent-source.dll"),
+                &Logger::new(None),
+                &DllPlan::Attach,
+            )
+            .unwrap();
+            assert!(!prepared.reused);
+            assert!(!prepared.verified);
+            for (path, content, modified) in before {
+                assert!(
+                    fs::read(&path).unwrap() == content,
+                    "resident payload changed"
+                );
+                assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+            }
+        }
+
+        #[test]
+        fn attach_only_never_creates_or_rotates_a_resident_token() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/dev/upstream-key-capture/resident-tests")
+                .join(format!("{}-{}", std::process::id(), random_token()));
+            fs::create_dir_all(&root).unwrap();
+            let owned = root.join(RUNTIME_GADGET_NAME);
+            fs::write(&owned, b"synthetic gadget").unwrap();
+            let mut args = default_args();
+            args.runtime_dir = root;
+            args.attach_only = true;
+            assert!(
+                plan_capture_runtime(&mut args, &[module(owned.clone())], &Logger::new(None))
+                    .is_err()
+            );
+            assert!(!args.runtime_dir.join(TOKEN_FILE).exists());
+            fs::write(args.runtime_dir.join(TOKEN_FILE), b"synthetic-token").unwrap();
+            args.token.clear();
+            args.new_token = true;
+            assert!(plan_capture_runtime(&mut args, &[module(owned)], &Logger::new(None)).is_err());
+            assert_eq!(
+                fs::read(args.runtime_dir.join(TOKEN_FILE)).unwrap(),
+                b"synthetic-token"
+            );
+        }
+
+        #[test]
+        fn foreign_resident_is_rejected_before_creating_or_reading_a_token() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/dev/upstream-key-capture/resident-tests")
+                .join(format!("{}-{}", std::process::id(), random_token()));
+            let mut args = default_args();
+            args.runtime_dir = root.join("runtime");
+            let foreign = root.join("runtime-sibling/frida-gadget.dll");
+            fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+            fs::write(&foreign, b"synthetic gadget").unwrap();
+            let tap = module(foreign);
+            assert_eq!(
+                plan_capture_runtime(&mut args, &[tap.clone()], &Logger::new(None)),
+                Err("foreign_resident_tap".into())
+            );
+            assert!(!args.runtime_dir.exists());
+            fs::create_dir_all(&args.runtime_dir).unwrap();
+            fs::write(args.runtime_dir.join(TOKEN_FILE), b"synthetic-token").unwrap();
+            args.token.clear();
+            args.token_from_file = false;
+            assert_eq!(
+                plan_capture_runtime(&mut args, &[tap], &Logger::new(None)),
+                Err("foreign_resident_tap".into())
+            );
+            assert!(args.token.is_empty());
+            assert_eq!(
+                fs::read(args.runtime_dir.join(TOKEN_FILE)).unwrap(),
+                b"synthetic-token"
+            );
+        }
+
+        #[test]
+        fn only_a_single_resolved_owned_resident_can_attach() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/dev/upstream-key-capture/resident-tests")
+                .join(format!("{}-{}", std::process::id(), random_token()));
+            let mut args = default_args();
+            args.runtime_dir = root.join("runtime");
+            fs::create_dir_all(args.runtime_dir.join("generation")).unwrap();
+            let owned = args.runtime_dir.join("generation/frida-gadget.dll");
+            fs::write(&owned, b"synthetic gadget").unwrap();
+            let tap = module(owned);
+            assert_eq!(
+                plan_capture_runtime(&mut args, &[tap.clone(), tap.clone()], &Logger::new(None)),
+                Err("multiple_resident_taps".into())
+            );
+            assert!(!args.runtime_dir.join(TOKEN_FILE).exists());
+            fs::write(args.runtime_dir.join(TOKEN_FILE), b"synthetic-token").unwrap();
+            assert_eq!(
+                plan_capture_runtime(&mut args, &[tap], &Logger::new(None)),
+                Ok(DllPlan::Attach)
+            );
+            assert!(args.token_from_file);
+            args.token.clear();
+            assert_eq!(
+                plan_capture_runtime(
+                    &mut args,
+                    &[module(root.join("missing/frida-gadget.dll"))],
+                    &Logger::new(None)
+                ),
+                Err("resident_path_unavailable".into())
+            );
+            assert!(args.token.is_empty());
+            args.runtime_dir = root.join("fresh-runtime");
+            assert_eq!(
+                plan_capture_runtime(&mut args, &[], &Logger::new(None)),
+                Ok(DllPlan::Canonical)
+            );
+            assert!(!args.token_from_file);
+            assert!(args.runtime_dir.join(TOKEN_FILE).is_file());
+        }
+
+        #[test]
+        fn incomplete_module_scan_cannot_prepare_runtime() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/dev/upstream-key-capture/resident-tests")
+                .join(format!("{}-{}", std::process::id(), random_token()));
+            let mut args = default_args();
+            args.runtime_dir = root;
+            let mut ordinary = module(PathBuf::from("synthetic-module.dll"));
+            ordinary.name = "ntdll.dll".into();
+            let result = finish_module_scan(vec![ordinary.clone()], 5).and_then(|modules| {
+                plan_capture_runtime(&mut args, &resident_taps(&modules), &Logger::new(None))
+            });
+            assert!(result.is_err());
+            assert!(!args.runtime_dir.exists());
+            assert!(finish_module_scan(vec![ordinary], 18).is_ok());
+            assert!(finish_module_scan(Vec::new(), 18).is_err());
+        }
+
+        #[test]
+        fn listener_remains_exclusive_until_the_previous_helper_releases_it() {
+            let listener = bind_listener(0).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert!(bind_listener(port).is_err());
+            drop(listener);
+            assert!(bind_listener(port).is_ok());
+        }
+    }
+
+    #[cfg(test)]
     mod recovery_tests {
         use super::*;
         use std::io::{BufRead, BufReader};
@@ -8634,7 +8925,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("target/dev/recovery-tests")
                     .join(format!("{}-{}-{label}", std::process::id(), random_token()));
-                fs::create_dir_all(root.join("SayAll")).unwrap();
+                fs::create_dir_all(root.join("SayAllPersonal")).unwrap();
                 fs::create_dir_all(root.join("runtime")).unwrap();
                 fs::write(
                     root.join("runtime").join(TOKEN_FILE),
@@ -8647,7 +8938,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 Self { root, port }
             }
             fn path(&self) -> PathBuf {
-                self.root.join("SayAll/rc003-capture-cleanup.json")
+                self.root.join("SayAllPersonal/rc003-capture-cleanup.json")
             }
             fn write(&self, receipt: &CleanupReceipt) {
                 fs::write(self.path(), serde_json::to_vec(receipt).unwrap()).unwrap();
@@ -8966,7 +9257,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             for (fields, known_version) in [
-                (r#""pid":42,"agent":"rc003_agent/1","build":"old""#, true),
+                (
+                    r#""pid":42,"agent":"rc003_agent/1","build":"old","instance":"0123456789abcdef0123456789abcdef""#,
+                    true,
+                ),
+                (
+                    r#""pid":42,"agent":"rc003_agent/1","build":"old","instance":"ffffffffffffffffffffffffffffffff""#,
+                    false,
+                ),
+                (r#""pid":42,"agent":"rc003_agent/1","build":"old""#, false),
                 (r#""pid":42,"agent":"rc003_agent/1""#, false),
                 (r#""pid":42,"agent":"rc003_agent/1","build":"""#, false),
                 (r#""pid":43,"agent":"rc003_agent/1","build":"old""#, false),
@@ -8987,7 +9286,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 });
                 let (stream, _) = listener.accept().unwrap();
                 let mut cleanup = CleanupState::new(42, 100);
-                cleanup.attach_prior_terminal = true;
+                cleanup.attach_prior_identity =
+                    Some(identity(42, 100, "0123456789abcdef0123456789abcdef"));
                 serve_connection(
                     stream,
                     &mut session(),
@@ -9015,7 +9315,151 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     known_version,
                     "unknown or malformed identity must not become a no-capture terminal: {fields}"
                 );
+                assert_eq!(
+                    cleanup.terminal_status(false),
+                    if known_version {
+                        "agent_version_blocked"
+                    } else {
+                        "unconfirmed"
+                    }
+                );
             }
+        }
+
+        #[test]
+        fn cancelled_pinned_attach_preserves_prior_proof_without_sending_commands() {
+            let _guard = CONNECTION_TEST_GATE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let pid = std::process::id();
+            let created = process_creation_time(pid).unwrap();
+            let instance = "0123456789abcdef0123456789abcdef";
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = [0; 256];
+                stream.read(&mut bytes).unwrap()
+            });
+            let (stream, _) = listener.accept().unwrap();
+            let mut cleanup = CleanupState::new(pid, created);
+            cleanup.expected_instance = Some(instance.into());
+            cleanup.attach_prior_identity = Some(identity(pid, created, instance));
+            serve_connection(
+                stream,
+                &mut session(),
+                &Logger::new(None),
+                "test",
+                false,
+                true,
+                &[],
+                None,
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                None,
+                &Arc::new(AtomicBool::new(false)),
+                &mut cleanup,
+            );
+            assert_eq!(peer.join().unwrap(), 0);
+            assert_eq!(cleanup.terminal_status(false), "not_started");
+            assert!(!cleanup.capture_attempted);
+        }
+
+        #[test]
+        fn pinned_agent_instance_mismatch_receives_no_capture_or_stop_commands() {
+            let _guard = CONNECTION_TEST_GATE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let pid = std::process::id();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                writeln!(stream, "{{\"type\":\"hello\",\"token\":\"test\",\"build\":\"{AGENT_BUILD}\",\"pid\":{pid},\"instance\":\"ffffffffffffffffffffffffffffffff\"}}\n{{\"type\":\"bye\"}}").unwrap();
+                let mut bytes = [0; 4096];
+                stream.read(&mut bytes).unwrap()
+            });
+            let (stream, _) = listener.accept().unwrap();
+            let mut cleanup = CleanupState::new(pid, process_creation_time(pid).unwrap());
+            cleanup.expected_instance = Some("0123456789abcdef0123456789abcdef".into());
+            serve_connection(
+                stream,
+                &mut session(),
+                &Logger::new(None),
+                "test",
+                false,
+                true,
+                &[],
+                None,
+                &Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                &Arc::new(AtomicBool::new(false)),
+                &mut cleanup,
+            );
+            assert_eq!(
+                peer.join().unwrap(),
+                0,
+                "pinned instance mismatch received commands"
+            );
+            assert_eq!(cleanup.terminal_status(false), "unconfirmed");
+            CTRL_STOP.store(false, Ordering::Relaxed);
+        }
+
+        #[test]
+        fn terminal_proof_requires_the_current_host_generation_and_known_agent() {
+            let instance = "0123456789abcdef0123456789abcdef";
+            let receipt = format!(
+                r#"{{"helper_pid":2,"started_unix_ms":3,"completed_unix_ms":4,"status":"passed","host_pid":42,"host_created":100,"agent_instance":"{instance}"}}"#
+            );
+            assert!(prior_terminal_identity(&receipt, 43, 100).is_none());
+            assert!(prior_terminal_identity(&receipt, 42, 101).is_none());
+            assert!(prior_terminal_identity("{}", 42, 100).is_none());
+            assert!(prior_terminal_identity(
+                r#"{"helper_pid":2,"started_unix_ms":3,"completed_unix_ms":4,"status":"passed"}"#,
+                42,
+                100
+            )
+            .is_none());
+            assert!(prior_terminal_identity(&receipt.replace(instance, ""), 42, 100).is_none());
+            assert_eq!(
+                prior_terminal_identity(&receipt, 42, 100),
+                Some(identity(42, 100, instance))
+            );
+        }
+
+        #[test]
+        fn untouched_attach_timeout_is_not_a_cleanup_failure() {
+            let mut cleanup = CleanupState::new(42, 100);
+            cleanup.attach_prior_identity =
+                Some(identity(42, 100, "0123456789abcdef0123456789abcdef"));
+            assert_eq!(cleanup.terminal_status(false), "not_started");
+            assert!(!cleanup.is_clean());
+        }
+
+        #[test]
+        fn missing_proof_or_possible_capture_cannot_become_not_started() {
+            let mut cleanup = CleanupState::new(42, 100);
+            assert_eq!(cleanup.terminal_status(false), "unconfirmed");
+            cleanup.attach_prior_identity =
+                Some(identity(42, 100, "0123456789abcdef0123456789abcdef"));
+            cleanup.capture_attempted = true;
+            assert_eq!(cleanup.terminal_status(false), "unconfirmed");
+            cleanup.capture_attempted = false;
+            cleanup.unresolved_multiple = true;
+            assert_eq!(cleanup.terminal_status(false), "unconfirmed");
+            cleanup.unresolved_multiple = false;
+            let agent = identity(42, 100, "a");
+            assert!(cleanup.admit(agent.clone()));
+            assert_eq!(cleanup.terminal_status(true), "unconfirmed");
+            cleanup.confirm(&agent);
+            assert_eq!(cleanup.terminal_status(true), "passed");
         }
 
         #[test]
@@ -9026,7 +9470,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 !cleanup.version_blocked_without_capture(),
                 "absence of prior receipt is not proof"
             );
-            cleanup.attach_prior_terminal = true;
+            cleanup.attach_prior_identity =
+                Some(identity(42, 100, "0123456789abcdef0123456789abcdef"));
             assert!(cleanup.version_blocked_without_capture());
             assert!(
                 !cleanup.is_clean(),
@@ -9148,7 +9593,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
 
         #[test]
-        fn real_socket_reconnect_can_confirm_the_same_agents_previous_failed_stop() {
+        fn real_socket_reconnect_recovers_failed_stop_and_reopens_after_confirmed_stop() {
             use std::io::{BufRead, BufReader};
             let _guard = CONNECTION_TEST_GATE
                 .lock()
@@ -9157,7 +9602,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let created = process_creation_time(pid).unwrap();
             let mut cleanup = CleanupState::new(pid, created);
             let instance = "0123456789abcdef0123456789abcdef";
-            for acknowledge in [false, true] {
+            cleanup.expected_instance = Some(instance.into());
+            for acknowledge in [false, true, true] {
                 let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
                 let addr = listener.local_addr().unwrap();
                 let peer = std::thread::spawn(move || {
@@ -9167,9 +9613,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         .unwrap();
                     writeln!(stream, "{{\"type\":\"hello\",\"token\":\"test\",\"build\":\"{AGENT_BUILD}\",\"pid\":{pid},\"instance\":\"{instance}\"}}\n{{\"type\":\"bye\"}}").unwrap();
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut saw_arm = false;
                     loop {
                         let mut command = String::new();
                         assert!(reader.read_line(&mut command).unwrap() > 0);
+                        saw_arm |= extract_str(&command, "type").as_deref() == Some("arm");
                         if extract_str(&command, "type").as_deref() == Some("disarm") {
                             if acknowledge {
                                 let request = extract_str(&command, "stop_id").unwrap();
@@ -9178,6 +9626,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                             break;
                         }
                     }
+                    assert!(
+                        saw_arm,
+                        "each reopened session must receive arm before disarm"
+                    );
                 });
                 let (stream, _) = listener.accept().unwrap();
                 serve_connection(
@@ -9197,6 +9649,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 );
                 peer.join().unwrap();
                 assert_eq!(cleanup.is_clean(), acknowledge);
+                assert_eq!(
+                    cleanup.terminal_status(true),
+                    if acknowledge { "passed" } else { "unconfirmed" }
+                );
             }
         }
     }
@@ -9380,18 +9836,19 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     mod shared_log_tests {
         use super::*;
 
-        const DESCRIPTOR: &str = r"C:\Users\x\AppData\Local\SayAll\rc003-bridge.ini";
-        const CONVENTION: &str = r"C:\Users\x\AppData\Local\SayAll\Logs\sayall-diagnostic.log";
+        const DESCRIPTOR: &str = r"C:\Users\x\AppData\Local\SayAllPersonal\rc003-bridge.ini";
+        const CONVENTION: &str =
+            r"C:\Users\x\AppData\Local\SayAllPersonal\Logs\sayall-diagnostic.log";
 
         #[test]
         fn descriptor_log_field_wins_over_convention() {
             // 主程序写明 `log=` 时以它为准（它能反映 SAYALL_GATT_LOG 覆盖）。
             let text =
-                "version=2\nport=1\ntoken=t\nlog=C:\\Users\\x\\AppData\\Local\\SayAll\\Logs\\other.log\n";
+                "version=2\nport=1\ntoken=t\nlog=C:\\Users\\x\\AppData\\Local\\SayAllPersonal\\Logs\\other.log\n";
             assert_eq!(
                 resolve_shared_log(Some(Path::new(DESCRIPTOR)), Some(text)),
                 Some(PathBuf::from(
-                    r"C:\Users\x\AppData\Local\SayAll\Logs\other.log"
+                    r"C:\Users\x\AppData\Local\SayAllPersonal\Logs\other.log"
                 ))
             );
         }
@@ -9421,17 +9878,17 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
         #[test]
         fn personal_paths_are_redacted() {
-            let text = r"descriptor=C:\Users\alice\AppData\Local\SayAll\rc003-bridge.ini other=C:\Users\alice\Documents";
+            let text = r"descriptor=C:\Users\alice\AppData\Local\SayAllPersonal\rc003-bridge.ini other=C:\Users\alice\Documents";
             let redacted = mask_user_profile_segment(text);
             assert!(
-                redacted.contains(r"C:\Users\$USER\AppData\Local\SayAll\rc003-bridge.ini"),
+                redacted.contains(r"C:\Users\$USER\AppData\Local\SayAllPersonal\rc003-bridge.ini"),
                 "{redacted}"
             );
             assert!(!redacted.contains("alice"), "{redacted}");
             // 已知环境变量的值优先替换成长名（保留"这是哪一类目录"的信息）。
             let with_var = redact_personal_paths(
                 &std::env::var("ProgramData")
-                    .map(|base| format!(r"{base}\SayAll\rc003-helper\frida-gadget.dll"))
+                    .map(|base| format!(r"{base}\SayAllPersonal\rc003-helper\frida-gadget.dll"))
                     .unwrap_or_default(),
             );
             assert!(

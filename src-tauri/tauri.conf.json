@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "无线麦",
+  "productName": "无线麦个人版",
   "version": "1.0.0",
-  "identifier": "app.getsayall.remote-mic.windows",
+  "identifier": "app.luckgh.remote-mic.personal.windows",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:2430",
@@ -67,7 +67,7 @@
         "installerHooks": "windows/installer-hooks.nsh",
         "template": "windows/installer.nsi",
         "uninstallerIcon": "icons/icon.ico",
-        "startMenuFolder": "无线麦"
+        "startMenuFolder": "无线麦个人版"
       }
     },
     "license": "GPL-3.0-only"

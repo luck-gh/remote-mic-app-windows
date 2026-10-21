@@ -131,7 +131,7 @@ jobs:
       - name: Test isolated installer contracts
         shell: pwsh
         run: |
-          node --test scripts/test-windows-overlay-install.cjs
+          node --test scripts/test-windows-overlay-install.cjs scripts/test-personal-install-isolation.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-capture-cleanup.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

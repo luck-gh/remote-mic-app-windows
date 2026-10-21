@@ -9,10 +9,10 @@ if ([string]::IsNullOrWhiteSpace($ArtifactDirectory)) { $ArtifactDirectory = Joi
 $applicationPath = Join-Path $repositoryRoot "target/release/sayall-windows-app.exe"
 
 $config = Get-Content -Raw -Encoding UTF8 $configPath | ConvertFrom-Json
-if ($config.productName -ne "无线麦") {
+if ($config.productName -ne "无线麦个人版") {
     throw "Unexpected productName: $($config.productName)"
 }
-if ($config.identifier -ne "app.getsayall.remote-mic.windows") {
+if ($config.identifier -ne "app.luckgh.remote-mic.personal.windows") {
     throw "Unexpected application identifier: $($config.identifier)"
 }
 if ($config.bundle.publisher -ne "luck-gh") {

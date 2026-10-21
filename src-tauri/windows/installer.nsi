@@ -43,7 +43,7 @@ ${StrLoc}
 !define MANUFACTURER "{{manufacturer}}"
 !define PRODUCTNAME "{{product_name}}"
 ; Stable installation identity; display branding is independent.
-!define INSTALLIDENTITY "无线麦 SayAll"
+!define INSTALLIDENTITY "无线麦个人版"
 !define VERSION "{{version}}"
 !define VERSIONWITHBUILD "{{version_with_build}}"
 !define HOMEPAGE "{{homepage}}"
@@ -69,7 +69,7 @@ ${StrLoc}
 !define WEBVIEW2INSTALLERPATH "{{webview2_installer_path}}"
 !define MINIMUMWEBVIEW2VERSION "{{minimum_webview2_version}}"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${INSTALLIDENTITY}"
-!define MANUKEY "Software\GetSayAll"
+!define MANUKEY "Software\LuckGH"
 !define MANUPRODUCTKEY "${MANUKEY}\${INSTALLIDENTITY}"
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
@@ -339,7 +339,7 @@ Function .onInit
 
   !insertmacro SetContext
 
-  StrCpy $SayAllInstallResultDirectory "$LOCALAPPDATA\SayAll"
+  StrCpy $SayAllInstallResultDirectory "$LOCALAPPDATA\SayAllPersonal"
   StrCpy $SayAllInstallStage initialization
   !insertmacro SayAllLogInstallResult w start installer
   ReadRegStr $SayAllPreviousInstallDirectory SHCTX "${MANUPRODUCTKEY}" ""
@@ -620,7 +620,7 @@ FunctionEnd
 
 Function un.onInit
   !insertmacro SetContext
-  StrCpy $SayAllInstallResultDirectory "$LOCALAPPDATA\SayAll"
+  StrCpy $SayAllInstallResultDirectory "$LOCALAPPDATA\SayAllPersonal"
 
   !if "${INSTALLMODE}" == "both"
     !insertmacro MULTIUSER_UNINIT

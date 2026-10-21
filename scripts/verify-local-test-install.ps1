@@ -202,7 +202,7 @@ public class W32 {
 }
 
 # ---- 6. 诊断日志尾部（运行修订号 / 关键链路现场） ----
-$diag = Join-Path $env:LOCALAPPDATA "SayAll\Logs\sayall-diagnostic.log"
+$diag = Join-Path $env:LOCALAPPDATA "SayAllPersonal\Logs\sayall-diagnostic.log"
 if (Test-Path $diag) {
     Write-Host "诊断日志尾部："
     Get-Content $diag -Tail 12 | ForEach-Object { Write-Host ("  " + $_) }

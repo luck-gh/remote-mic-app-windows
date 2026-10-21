@@ -104,7 +104,7 @@ Invoke-Step "Test unified report agent" {
 # Only isolated contracts/path fixtures here. Actual recycling and NSIS compilation
 # belong to the installer CI job after its bundle build.
 Invoke-Step "Test isolated installer contracts" {
-    node --test scripts/test-windows-overlay-install.cjs
+    node --test scripts/test-windows-overlay-install.cjs scripts/test-personal-install-isolation.cjs
     if ($LASTEXITCODE -ne 0) { return }
     powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-capture-cleanup.ps1
     if ($LASTEXITCODE -ne 0) { return }

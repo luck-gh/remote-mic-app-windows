@@ -29,7 +29,7 @@ test('pull-request CI does not reference the personal release signing secrets', 
 test('silent lifecycle uses normal exit and preserves cleanup evidence', () => {
   const source = read('scripts/test-windows-silent-install.ps1');
   assert.doesNotMatch(source, /Stop-Process|KillProcess|TerminateProcess|taskkill/);
-  assert.match(source, /OpenExisting\('Local\\SayAll-GracefulExit'\)/);
+  assert.match(source, /OpenExisting\('Local\\SayAllPersonal-GracefulExit'\)/);
   assert.match(source, /WaitForExit\(20000\)/);
   assert.match(source, /Get-FileHash -LiteralPath \$cleanupPreservationMarker/);
   assert.doesNotMatch(source, /WriteAllText\([^\n]*session\.token/);

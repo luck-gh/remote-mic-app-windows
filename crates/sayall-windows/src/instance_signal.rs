@@ -24,7 +24,7 @@ use windows::Win32::System::Threading::{
 
 /// 命名事件名（会话内约定）。`src-tauri/src/lib.rs` 的等待线程与二次启动分支
 /// 都只经本模块引用，改名不会漏掉任一端。
-pub const SHOW_MAIN_WINDOW_EVENT_NAME: &str = r"Local\SayAll-ShowMainWindow";
+pub const SHOW_MAIN_WINDOW_EVENT_NAME: &str = r"Local\SayAllPersonal-ShowMainWindow";
 
 fn wide(name: &str) -> Vec<u16> {
     let mut buffer: Vec<u16> = name.encode_utf16().collect();
@@ -99,7 +99,10 @@ mod tests {
     /// 事件名是两端唯一契约；改名会让"二次启动显示主窗口"静默失效。
     #[test]
     fn event_name_is_stable() {
-        assert_eq!(SHOW_MAIN_WINDOW_EVENT_NAME, r"Local\SayAll-ShowMainWindow");
+        assert_eq!(
+            SHOW_MAIN_WINDOW_EVENT_NAME,
+            r"Local\SayAllPersonal-ShowMainWindow"
+        );
     }
 
     /// 没有等待端时，请求必须返回错误，调用方才能如实记录请求未送达。
@@ -107,12 +110,12 @@ mod tests {
     /// 应用（测试是把真实应用弹到前台的外部副作用）。
     #[test]
     fn requesting_without_a_listener_fails() {
-        assert!(request_named(r"Local\SayAll-ShowMainWindow-absent").is_err());
+        assert!(request_named(r"Local\SayAllPersonal-ShowMainWindow-absent").is_err());
     }
 
     #[test]
     fn request_is_observed_by_a_waiter_and_not_repeated() {
-        const NAME: &str = r"Local\SayAll-ShowMainWindow-test-signal";
+        const NAME: &str = r"Local\SayAllPersonal-ShowMainWindow-test-signal";
         let signal = ShowMainWindowSignal::create_named(NAME).expect("create named event");
         let setter = std::thread::spawn(move || request_named(NAME).expect("set named event"));
         assert!(signal.wait_timeout(Duration::from_secs(5)));

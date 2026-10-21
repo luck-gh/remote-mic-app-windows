@@ -113,7 +113,7 @@ Var SayAllRestoreDesktopShortcut
 ;      连弹窗都不会出现；
 ;   3. 有实例但打不开事件（旧版）→ 不杀也不装，中止并引导走应用内更新
 ;      （见宏内说明）。
-!define SAYALL_GRACEFUL_EXIT_EVENT "Local\SayAll-GracefulExit"
+!define SAYALL_GRACEFUL_EXIT_EVENT "Local\SayAllPersonal-GracefulExit"
 !define SAYALL_GRACEFUL_EXIT_SETTLE_MS 1500
 !define SAYALL_GRACEFUL_EXIT_POLL_INTERVAL_MS 500
 ; 轮询总预算必须 ≥ 应用侧 GRACEFUL_EXIT_TIMEOUT（5s）+ 退出开销，否则进程还没

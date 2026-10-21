@@ -93,8 +93,6 @@ class Helper:
     def send(self, obj: dict) -> None:
         if self.conn is None:
             return
-        if obj.get("type") == "renew":
-            obj = {**obj, "source_pdo": "\\Device\\SelftestRemote"}
         try:
             self.conn.sendall((json.dumps(obj) + "\n").encode("ascii"))
         except OSError:
@@ -217,7 +215,7 @@ class ReconnectHarness:
     def _renew_loop(self, conn: socket.socket) -> None:
         while not self._stop.is_set():
             try:
-                conn.sendall(json.dumps({"type": "renew", "source_pdo": "\\Device\\SelftestRemote"}).encode("ascii") + b'\n')
+                conn.sendall(json.dumps({"type": "renew"}).encode("ascii") + b'\n')
             except OSError:
                 return
             time.sleep(0.5)
@@ -263,15 +261,11 @@ class ReconnectHarness:
 class Sandbox:
     """一个哑进程 + 一份加载好的 agent。"""
 
-    def __init__(self, port: int | None, source_stub: bool = True) -> None:
+    def __init__(self, port: int | None) -> None:
         self.device = frida.get_local_device()
         self.pid = self.device.spawn([PYTHON, "-c", "import time; time.sleep(60)"])
         self.session = self.device.attach(self.pid)
         source = AGENT.read_text(encoding="utf-8")
-        if source_stub:
-            # 仅此自有哑进程的传输测试桩。生产源码仍逐请求验证来源，空作用域绝不改写。
-            # 真实 WDF 绑定拒绝另由 G 验证；报告和嵌套来源由 agent_logic_test.mjs 验证。
-            source += "\nfunction installSourceHooks() { return true; }\n"
         self.script = self.session.create_script(source)
         self.errors: list[str] = []
         self.script.on("message", self._on_message)
@@ -737,20 +731,20 @@ def case_f_burst_writes() -> tuple[bool, str]:
         helper.close()
 
 
-def case_g_source_rejection() -> tuple[bool, str]:
+def case_g_export_binding() -> tuple[bool, str]:
     helper = Helper()
     helper.start()
-    box = Sandbox(helper.port, source_stub=False)
+    box = Sandbox(helper.port)
     try:
         result, _ = box.init()
         hello = helper.wait_for("hello", 3.0)
-        if not hello or '"hook": false' not in result:
-            return False, "非 HID 哑进程不能安装真实来源钩子"
+        if not hello or '"hook": true' not in result:
+            return False, "仅依赖 ntdll 导出应能在自有哑进程安装捕获钩子"
         helper.send({"type": "renew"})
-        hb = helper.wait_for("hb", 3.0, lambda line: line.get("disarmed") is True)
-        if not hb or hb.get("lease_ok") is not False:
-            return False, "来源拒绝后不能声明捕获所有权"
-        return True, "真实绑定失败，disarmed=true / lease_ok=false，未触及系统宿主"
+        hb = helper.wait_for("hb", 3.0, lambda line: line.get("lease_ok") is True)
+        if not hb or hb.get("disarmed") is not False:
+            return False, "普通续约后捕获钩子应保持就绪"
+        return True, "真实导出绑定成功，disarmed=false / lease_ok=true；未触及系统宿主或证明硬件接管"
     finally:
         box.close()
         helper.close()
@@ -768,7 +762,7 @@ def main() -> int:
         ("D 助手消失后重新上线：只允许连一次（连接不得堆积）", case_d_reconnect),
         ("E targets 护栏：只许追加哨兵键，被拒的命令不得改动清空范围", case_e_targets_guard),
         ("F 一次回调连写多行：每一行上行都必须到达（write 单飞互斥回归）", case_f_burst_writes),
-        ("G 非 HID 宿主：真实来源绑定必须拒绝", case_g_source_rejection),
+        ("G 自有进程：仅 ntdll 导出即可安装钩子", case_g_export_binding),
     ]
 
     all_ok = True

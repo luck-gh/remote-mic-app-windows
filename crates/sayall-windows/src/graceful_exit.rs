@@ -37,7 +37,7 @@ use windows::Win32::System::Threading::{
 };
 
 /// 命名事件名（与会话内安装器约定）。见模块头部的同步要求。
-pub const GRACEFUL_EXIT_EVENT_NAME: &str = r"Local\SayAll-GracefulExit";
+pub const GRACEFUL_EXIT_EVENT_NAME: &str = r"Local\SayAllPersonal-GracefulExit";
 
 fn wide(name: &str) -> Vec<u16> {
     let mut buffer: Vec<u16> = name.encode_utf16().collect();
@@ -119,13 +119,17 @@ mod tests {
     /// 安装器钩子里硬编码了同一个名字；改名会让"部署前请求退出"静默失效。
     #[test]
     fn event_name_matches_the_installer_contract() {
-        assert_eq!(GRACEFUL_EXIT_EVENT_NAME, r"Local\SayAll-GracefulExit");
+        assert_eq!(
+            GRACEFUL_EXIT_EVENT_NAME,
+            r"Local\SayAllPersonal-GracefulExit"
+        );
     }
 
     #[test]
     fn bounded_wait_times_out_without_a_signal() {
-        let signal = GracefulExitSignal::create_named(r"Local\SayAll-GracefulExit-test-timeout")
-            .expect("create named event");
+        let signal =
+            GracefulExitSignal::create_named(r"Local\SayAllPersonal-GracefulExit-test-timeout")
+                .expect("create named event");
         assert!(!signal.wait_timeout(Duration::from_millis(50)));
     }
 
@@ -133,12 +137,12 @@ mod tests {
     /// 这条测试把这个前提钉住：事件不存在时置位必须返回错误，而不是静默成功。
     #[test]
     fn signalling_an_absent_event_fails_so_the_installer_can_skip() {
-        assert!(signal_named(r"Local\SayAll-GracefulExit-absent").is_err());
+        assert!(signal_named(r"Local\SayAllPersonal-GracefulExit-absent").is_err());
     }
 
     #[test]
     fn signal_is_observed_by_a_waiter() {
-        const NAME: &str = r"Local\SayAll-GracefulExit-test-signal";
+        const NAME: &str = r"Local\SayAllPersonal-GracefulExit-test-signal";
         let signal = GracefulExitSignal::create_named(NAME).expect("create named event");
         let setter = std::thread::spawn(move || signal_named(NAME).expect("set named event"));
         assert!(signal.wait_timeout(Duration::from_secs(5)));
@@ -149,7 +153,10 @@ mod tests {
 
     #[test]
     fn reset_allows_a_second_exit_request_after_incomplete_cleanup() {
-        let name = format!("Local\\SayAll-GracefulExit-retry-{}", std::process::id());
+        let name = format!(
+            "Local\\SayAllPersonal-GracefulExit-retry-{}",
+            std::process::id()
+        );
         let signal = GracefulExitSignal::create_named(&name).unwrap();
         signal_named(&name).unwrap();
         assert!(signal.wait_timeout(Duration::from_millis(50)));

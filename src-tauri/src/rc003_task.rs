@@ -3,7 +3,7 @@
 //! 每次手动开启都重新授权；保存为开启时重启应用可恢复。停止须取得本轮 agent
 //! 的释放回执，保留计划任务不代表下一次手动开启已获授权。
 
-pub const SCHEDULED_TASK_NAME: &str = "SayAll RC003 Helper";
+pub const SCHEDULED_TASK_NAME: &str = "SayAll Personal RC003 Helper";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -526,17 +526,110 @@ fn is_capture_helper_image(name: &str) -> bool {
         || name.eq_ignore_ascii_case("sayall-helper-arm64.exe")
 }
 
+fn finish_helper_inspection(
+    process_id: u32,
+    inspection: Result<Option<u64>, (&'static str, u32)>,
+    exit_code: Result<u32, u32>,
+) -> Result<Option<u64>, String> {
+    use windows::Win32::Foundation::STILL_ACTIVE;
+    let (stage, win32) = match &inspection {
+        Ok(_) => ("complete", 0),
+        Err(failure) => *failure,
+    };
+    match exit_code {
+        Err(exit_win32) => {
+            sayall_windows::gatt_note(format!(
+                "rc003 feature=enhanced-capture action=process_observation helper_pid={process_id} stage=exit_code win32={exit_win32} query_stage={stage} query_win32={win32} process_state=unknown outcome=blocked"
+            ));
+            Err("无法确认按键助手是否已退出，未执行重启。".to_owned())
+        }
+        Ok(exit_code) if exit_code != STILL_ACTIVE.0 as u32 => {
+            sayall_windows::gatt_note(format!(
+                "rc003 feature=enhanced-capture action=process_observation helper_pid={process_id} stage={stage} win32={win32} exit_code={exit_code} process_state=exited outcome=ignored"
+            ));
+            Ok(None)
+        }
+        Ok(_) => inspection.map_err(|_| {
+            sayall_windows::gatt_note(format!(
+                "rc003 feature=enhanced-capture action=process_observation helper_pid={process_id} stage={stage} win32={win32} process_state=running outcome=blocked"
+            ));
+            "无法核对按键助手身份，未执行重启。".to_owned()
+        }),
+    }
+}
+
+fn inspect_helper_process(
+    process: windows::Win32::Foundation::HANDLE,
+    process_id: u32,
+    expected: &str,
+) -> Result<Option<u64>, String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    };
+    let inspection = (|| {
+        let mut image = vec![0u16; 32_768];
+        let mut length = image.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(image.as_mut_ptr()),
+                &mut length,
+            )
+        }
+        .map_err(|error| ("image", error.code().0 as u32 & 0xffff))?;
+        if !String::from_utf16_lossy(&image[..length as usize]).eq_ignore_ascii_case(expected) {
+            return Ok(None);
+        }
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
+            .map_err(|error| ("created", error.code().0 as u32 & 0xffff))?;
+        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        Ok(Some((ticks / 10_000).saturating_sub(11_644_473_600_000)))
+    })();
+    finish_helper_inspection(process_id, inspection, helper_exit_code(process))
+}
+
+fn helper_exit_code(process: windows::Win32::Foundation::HANDLE) -> Result<u32, u32> {
+    let mut exit_code = 0;
+    unsafe { windows::Win32::System::Threading::GetExitCodeProcess(process, &mut exit_code) }
+        .map(|()| exit_code)
+        .map_err(|error| error.code().0 as u32 & 0xffff)
+}
+
+fn helper_session_requires_inspection(session: Result<u32, u32>, current_session: u32) -> bool {
+    session.is_err() || session == Ok(current_session)
+}
+
+fn process_snapshot_has_next(stage: &'static str, result: Result<(), u32>) -> Result<bool, String> {
+    use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
+    match result {
+        Ok(()) => Ok(true),
+        Err(win32) if win32 == ERROR_NO_MORE_FILES.0 => Ok(false),
+        Err(win32) => {
+            sayall_windows::gatt_note(format!(
+                "rc003 feature=enhanced-capture action=process_observation stage={stage} win32={win32} outcome=blocked"
+            ));
+            Err("无法完整核对按键助手进程列表，未执行重启。".to_owned())
+        }
+    }
+}
+
 fn helper_processes() -> Result<Vec<(u32, u64)>, String> {
-    use windows::core::{HRESULT, PWSTR};
-    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME};
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows::Win32::System::Threading::{
-        GetCurrentProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     let Some(expected) = locate_helper_exe() else {
         return Ok(Vec::new());
@@ -547,16 +640,33 @@ fn helper_processes() -> Result<Vec<(u32, u64)>, String> {
     let expected = expected.trim_start_matches(r"\\?\");
     let mut current_session = 0;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session) }
-        .map_err(|_| "无法核对当前 Windows 会话。".to_owned())?;
+        .map_err(|error| {
+            sayall_windows::gatt_note(format!(
+                "rc003 feature=enhanced-capture action=process_observation stage=current_session win32={} outcome=blocked",
+                error.code().0 as u32 & 0xffff
+            ));
+            "无法核对当前 Windows 会话。".to_owned()
+        })?;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
-        .map_err(|_| "无法核对按键助手进程，未执行重启。".to_owned())?;
+        .map_err(|error| {
+            sayall_windows::gatt_note(format!(
+                "rc003 feature=enhanced-capture action=process_observation stage=snapshot win32={} outcome=blocked",
+                error.code().0 as u32 & 0xffff
+            ));
+            "无法核对按键助手进程，未执行重启。".to_owned()
+        })?;
     let result = (|| {
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        unsafe { Process32FirstW(snapshot, &mut entry) }
-            .map_err(|_| "无法读取按键助手进程列表。".to_owned())?;
+        if !process_snapshot_has_next(
+            "first",
+            unsafe { Process32FirstW(snapshot, &mut entry) }
+                .map_err(|error| error.code().0 as u32 & 0xffff),
+        )? {
+            return Ok(Vec::new());
+        }
         let mut found = Vec::new();
         loop {
             let end = entry
@@ -564,71 +674,58 @@ fn helper_processes() -> Result<Vec<(u32, u64)>, String> {
                 .iter()
                 .position(|unit| *unit == 0)
                 .unwrap_or(entry.szExeFile.len());
-            let mut session = 0;
-            let same_session = unsafe { ProcessIdToSessionId(entry.th32ProcessID, &mut session) }
-                .is_ok()
-                && session == current_session;
-            if same_session
-                && is_capture_helper_image(&String::from_utf16_lossy(&entry.szExeFile[..end]))
-            {
-                let process = match unsafe {
-                    OpenProcess(
-                        PROCESS_QUERY_LIMITED_INFORMATION,
-                        false,
-                        entry.th32ProcessID,
-                    )
-                } {
-                    Ok(handle) => Some(handle),
-                    Err(error)
-                        if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
-                    {
-                        None
-                    }
-                    Err(_) => return Err("无法核对按键助手身份，未执行重启。".to_owned()),
-                };
-                if let Some(process) = process {
-                    let inspect: Result<Option<u64>, String> = (|| {
-                        let mut image = vec![0u16; 32_768];
-                        let mut length = image.len() as u32;
-                        unsafe {
-                            QueryFullProcessImageNameW(
-                                process,
-                                PROCESS_NAME_WIN32,
-                                PWSTR(image.as_mut_ptr()),
-                                &mut length,
-                            )
-                        }
-                        .map_err(|_| "无法核对按键助手路径。".to_owned())?;
-                        if !String::from_utf16_lossy(&image[..length as usize])
-                            .eq_ignore_ascii_case(expected)
+            if is_capture_helper_image(&String::from_utf16_lossy(&entry.szExeFile[..end])) {
+                let mut session_id = 0;
+                let session = unsafe { ProcessIdToSessionId(entry.th32ProcessID, &mut session_id) }
+                    .map(|()| session_id)
+                    .map_err(|error| error.code().0 as u32 & 0xffff);
+                if helper_session_requires_inspection(session, current_session) {
+                    let process = match unsafe {
+                        OpenProcess(
+                            PROCESS_QUERY_LIMITED_INFORMATION,
+                            false,
+                            entry.th32ProcessID,
+                        )
+                    } {
+                        Ok(handle) => Some(handle),
+                        Err(error)
+                            if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
                         {
-                            return Ok(None);
+                            sayall_windows::gatt_note(format!(
+                            "rc003 feature=enhanced-capture action=process_observation helper_pid={} stage=open_process win32={} outcome=absent_after_snapshot",
+                            entry.th32ProcessID, ERROR_INVALID_PARAMETER.0
+                        ));
+                            None
                         }
-                        let mut created = FILETIME::default();
-                        let mut exited = FILETIME::default();
-                        let mut kernel = FILETIME::default();
-                        let mut user = FILETIME::default();
-                        unsafe {
-                            GetProcessTimes(
-                                process,
-                                &mut created,
-                                &mut exited,
-                                &mut kernel,
-                                &mut user,
-                            )
+                        Err(error) => {
+                            sayall_windows::gatt_note(format!(
+                            "rc003 feature=enhanced-capture action=process_observation helper_pid={} stage=open_process win32={} outcome=blocked",
+                            entry.th32ProcessID, error.code().0 as u32 & 0xffff
+                        ));
+                            return Err("无法核对按键助手身份，未执行重启。".to_owned());
                         }
-                        .map_err(|_| "无法读取按键助手启动时间。".to_owned())?;
-                        let ticks = (u64::from(created.dwHighDateTime) << 32)
-                            | u64::from(created.dwLowDateTime);
-                        Ok(Some((ticks / 10_000).saturating_sub(11_644_473_600_000)))
-                    })();
-                    let _ = unsafe { CloseHandle(process) };
-                    if let Some(started) = inspect? {
-                        found.push((entry.th32ProcessID, started));
+                    };
+                    if let Some(process) = process {
+                        let inspect = match session {
+                            Ok(_) => inspect_helper_process(process, entry.th32ProcessID, expected),
+                            Err(win32) => finish_helper_inspection(
+                                entry.th32ProcessID,
+                                Err(("session", win32)),
+                                helper_exit_code(process),
+                            ),
+                        };
+                        let _ = unsafe { CloseHandle(process) };
+                        if let Some(started) = inspect? {
+                            found.push((entry.th32ProcessID, started));
+                        }
                     }
                 }
             }
-            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+            if !process_snapshot_has_next(
+                "next",
+                unsafe { Process32NextW(snapshot, &mut entry) }
+                    .map_err(|error| error.code().0 as u32 & 0xffff),
+            )? {
                 break;
             }
         }
@@ -855,7 +952,7 @@ fn stop_signal_path() -> std::path::PathBuf {
         format!("{home}\\AppData\\Local")
     });
     std::path::PathBuf::from(base)
-        .join("SayAll")
+        .join("SayAllPersonal")
         .join("rc003-capture-stop")
 }
 
@@ -865,7 +962,7 @@ pub fn reauth_marker_path() -> std::path::PathBuf {
         format!("{home}\\AppData\\Local")
     });
     std::path::PathBuf::from(base)
-        .join("SayAll")
+        .join("SayAllPersonal")
         .join("rc003-reauth-required")
 }
 
@@ -1042,6 +1139,125 @@ fn schtasks(args: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exited_process_inspection_does_not_create_cleanup_debt() {
+        for inspection in [Err(("image", 31)), Err(("created", 6)), Ok(Some(2_000))] {
+            assert_eq!(finish_helper_inspection(42, inspection, Ok(0)), Ok(None));
+        }
+    }
+
+    #[test]
+    fn failed_helper_session_query_still_requires_exit_evidence() {
+        assert!(helper_session_requires_inspection(Err(87), 1));
+        assert!(helper_session_requires_inspection(Ok(1), 1));
+        assert!(!helper_session_requires_inspection(Ok(2), 1));
+        assert_eq!(
+            finish_helper_inspection(42, Err(("session", 87)), Ok(0)),
+            Ok(None)
+        );
+        assert!(finish_helper_inspection(42, Err(("session", 87)), Ok(259)).is_err());
+        assert!(finish_helper_inspection(42, Err(("session", 87)), Err(5)).is_err());
+    }
+
+    #[test]
+    fn incomplete_snapshot_does_not_return_partial_matches() {
+        assert_eq!(process_snapshot_has_next("first", Ok(())), Ok(true));
+        assert_eq!(process_snapshot_has_next("next", Err(18)), Ok(false));
+        let observed = || {
+            let found = vec![(42, 2_000)];
+            assert!(process_snapshot_has_next("next", Ok(()))?);
+            process_snapshot_has_next("next", Err(5))?;
+            Ok::<_, String>(found)
+        };
+        assert!(observed().is_err());
+    }
+
+    #[test]
+    fn live_or_unknown_process_query_failures_remain_blocked() {
+        for exit_code in [Ok(259), Err(5)] {
+            for stage in ["image", "created"] {
+                assert!(finish_helper_inspection(42, Err((stage, 31)), exit_code).is_err());
+            }
+        }
+        assert!(finish_helper_inspection(42, Ok(Some(2_000)), Err(5)).is_err());
+        assert_eq!(
+            finish_helper_inspection(42, Ok(Some(2_000)), Ok(259)),
+            Ok(Some(2_000))
+        );
+        assert_eq!(finish_helper_inspection(42, Ok(None), Ok(259)), Ok(None));
+    }
+
+    #[test]
+    fn naturally_exited_process_is_ignored_with_its_original_handle() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        let expected = std::env::var("COMSPEC").unwrap();
+        let mut child = silent_command(&expected)
+            .args(["/D", "/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            inspect_helper_process(HANDLE(child.as_raw_handle()), child.id(), &expected),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn reused_helper_pid_requires_its_new_creation_time_receipt() {
+        let started = finish_helper_inspection(42, Ok(Some(4_000)), Ok(259))
+            .unwrap()
+            .unwrap();
+        let state = cleanup_presentation(
+            status_receipt("passed", Some(3_000)),
+            Ok(vec![(42, started)]),
+            true,
+            0,
+        );
+        assert!(state.pending);
+        assert_eq!(state.reason, "release_pending");
+    }
+
+    #[test]
+    fn cancel_during_delayed_enable_blocks_late_apply() {
+        const CHILD: &str = "SAYALL_TEST_CAPTURE_CANCEL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = silent_command(std::env::current_exe().unwrap().to_str().unwrap())
+                .args([
+                    "--exact",
+                    "rc003_task::tests::cancel_during_delayed_enable_blocks_late_apply",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let epoch = capture_epoch();
+        let applied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_applied = std::sync::Arc::clone(&applied);
+        let (ready_send, ready_receive) = std::sync::mpsc::channel();
+        let (resume_send, resume_receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_send.send(()).unwrap();
+            resume_receive.recv().unwrap();
+            complete_capture_enable(epoch, || {
+                worker_applied.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+        });
+        ready_receive.recv().unwrap();
+        cancel_pending_start();
+        resume_send.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert!(!applied.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     fn status_receipt(
         status: &str,
@@ -1377,12 +1593,12 @@ mod tests {
     #[test]
     fn cleanup_receipt_path_matches_helper_contract() {
         assert!(cleanup_receipt_path()
-            .ends_with(std::path::Path::new("SayAll").join("rc003-capture-cleanup.json")));
+            .ends_with(std::path::Path::new("SayAllPersonal").join("rc003-capture-cleanup.json")));
     }
 
     #[test]
     fn task_name_matches_helper_side() {
-        assert_eq!(SCHEDULED_TASK_NAME, "SayAll RC003 Helper");
+        assert_eq!(SCHEDULED_TASK_NAME, "SayAll Personal RC003 Helper");
     }
 
     #[test]
@@ -1395,13 +1611,15 @@ mod tests {
     #[test]
     fn stop_signal_path_matches_helper_side() {
         let path = stop_signal_path();
-        assert!(path.ends_with(std::path::Path::new("SayAll").join("rc003-capture-stop")));
+        assert!(path.ends_with(std::path::Path::new("SayAllPersonal").join("rc003-capture-stop")));
     }
 
     #[test]
     fn reauth_marker_path_matches_installer_side() {
         let path = reauth_marker_path();
-        assert!(path.ends_with(std::path::Path::new("SayAll").join("rc003-reauth-required")));
+        assert!(
+            path.ends_with(std::path::Path::new("SayAllPersonal").join("rc003-reauth-required"))
+        );
     }
 
     #[test]
