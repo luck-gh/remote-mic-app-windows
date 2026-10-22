@@ -48,17 +48,22 @@ const deleteBindingCount = computed(() => deleteDialog.value ? bindingCount(dele
 const triggers: ButtonTrigger[] = ["single", "double", "long"];
 const buttons = Object.keys(buttonLabels) as RemoteButton[];
 
-async function refresh(): Promise<void> {
+async function refresh(showFeedback = false): Promise<void> {
   if (busy.value) return;
   loading.value = true;
   error.value = null;
+  status.value = showFeedback ? "正在刷新…" : null;
+  const started = performance.now();
+  reportFrontendEvent({ event: "template_refresh", phase: "requested", result: "passed", reason: showFeedback ? "user_refresh" : "initial_load" });
   try {
     const [next, nextCatalog] = await Promise.all([getMappingConfiguration(), getTemplateCatalog()]);
     configuration.value = next;
     catalog.value = nextCatalog;
-    status.value = "已从本机配置刷新模板、关联和开关；未改变开关或编辑草稿，实际前台命中仍需按键验证。";
+    status.value = showFeedback ? "已刷新模板、关联和开关" : null;
+    reportFrontendEvent({ event: "template_refresh", phase: "completed", result: "passed", reason: "configuration_loaded", elapsedMs: Math.round(performance.now() - started) });
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason);
+    reportFrontendEvent({ event: "template_refresh", phase: "completed", result: "failed", reason: "configuration_read_failed", elapsedMs: Math.round(performance.now() - started) });
   } finally {
     loading.value = false;
   }
@@ -318,14 +323,13 @@ onMounted(() => {
         <h1>模板</h1>
         <p>为程序选择按键模板，保存普通按键的实际动作。语音键始终按下开始、释放结束。</p>
       </div>
-      <button type="button" class="secondary-button" :disabled="loading || busy" @click="refresh">刷新关联状态</button>
+      <button type="button" class="secondary-button" :disabled="loading || busy" @click="refresh(true)">刷新关联状态</button>
     </header>
-    <p v-if="error && !editing" class="error-text">{{ error }}</p>
-    <p v-if="status" class="operation-message">{{ status }}</p>
+    <p class="operation-message page-feedback" :class="{ 'error-text': error && !editing }" role="status" aria-live="polite" :tabindex="error && !editing ? 0 : undefined">{{ error && !editing ? error : status }}</p>
     <section v-if="loading && !configuration" class="card loading-card"><p class="muted">正在读取模板配置…</p></section>
     <section v-else-if="!configuration" class="card loading-card">
       <p class="error-text">模板配置加载失败。请重试。</p>
-      <button type="button" class="secondary-button" @click="refresh">重试</button>
+      <button type="button" class="secondary-button" @click="refresh(true)">重试</button>
     </section>
 
     <template v-else>
@@ -448,6 +452,9 @@ onMounted(() => {
 <style scoped>
 .templates-page { display: grid; gap: 14px; }
 .templates-page > .page-header { margin-bottom: -2px; }
+.templates-page > .page-feedback { height: 2.8em; margin: 0; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
+.page-feedback.error-text { color: var(--error-text); }
+.page-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .loading-card { display: flex; align-items: center; justify-content: space-between; }
 .run-modes { display: grid; gap: 0; min-width: 0; }
 .run-modes > p { margin: 0; }

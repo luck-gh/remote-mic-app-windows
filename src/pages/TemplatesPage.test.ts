@@ -10,7 +10,7 @@ vi.mock("../lib/frontend-diagnostics", async importOriginal => ({
 import {
   getMappingConfiguration, listPresetApps, saveMappingConfiguration,
   getSceneSnapshot, selectCurrentTemplate, subscribeSceneEvents,
-  getTemplateCatalog, deleteMappingTemplate, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
+  getTemplateCatalog, copyTemplateCatalogEntry, deleteMappingTemplate, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
   listRunningApps, removeApplicationBinding, upsertApplicationBinding,
   type MappingConfiguration,
 } from "../lib/bridge";
@@ -21,7 +21,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     ...actual,
     getSceneSnapshot: vi.fn(), selectCurrentTemplate: vi.fn(), subscribeSceneEvents: vi.fn(),
     getMappingConfiguration: vi.fn(), listPresetApps: vi.fn(),
-    updateButtonMappingTemplate: vi.fn(), deleteMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
+    updateButtonMappingTemplate: vi.fn(), copyTemplateCatalogEntry: vi.fn(), deleteMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
     getTemplateCatalog: vi.fn(), setButtonMappingFollowEnabled: vi.fn(), setMappingNoticeEnabled: vi.fn(), setMenuTemplateSwitchEnabled: vi.fn(),
     listRunningApps: vi.fn(), removeApplicationBinding: vi.fn(),
     upsertApplicationBinding: vi.fn(),
@@ -66,6 +66,48 @@ describe("templates page", () => {
     vi.mocked(setButtonMappingFollowEnabled).mockResolvedValue({ ...structuredClone(configuration), buttonMappingFollowEnabled: true });
     vi.mocked(saveMappingConfiguration).mockImplementation(async (next) => structuredClone(next));
     vi.mocked(listRunningApps).mockResolvedValue([{ applicationId: "edge", name: "Edge", preset: true }]);
+  });
+
+  it("keeps initial loading feedback in place without a routine success explanation", async () => {
+    let resolveRead!: (saved: MappingConfiguration) => void;
+    vi.mocked(getMappingConfiguration).mockReturnValueOnce(new Promise(resolve => { resolveRead = resolve; }));
+    const wrapper = mount(TemplatesPage, { global: { stubs } });
+    await flushPromises();
+    const feedbackBefore = wrapper.find(".operation-message");
+    const existedBefore = feedbackBefore.exists();
+    const elementBefore = existedBefore ? feedbackBefore.element : null;
+    resolveRead(structuredClone(configuration)); await flushPromises();
+    expect(existedBefore).toBe(true);
+    expect(wrapper.get(".operation-message").element).toBe(elementBefore);
+    expect(wrapper.get(".operation-message").text()).toBe("");
+    expect(wrapper.text()).not.toContain("实际前台命中仍需按键验证");
+    await wrapper.findAll("button").find(button => button.text() === "刷新关联状态")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".operation-message").text()).toBe("已刷新模板、关联和开关");
+    wrapper.unmount();
+  });
+
+  it("keeps operation feedback mounted through pending, success and a readable long failure", async () => {
+    let resolveCopy!: () => void;
+    vi.mocked(copyTemplateCatalogEntry).mockReturnValueOnce(new Promise(resolve => { resolveCopy = () => resolve(catalog[0]!); }));
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    const feedback = wrapper.find(".operation-message").element;
+    const copy = wrapper.findAll(".template-row")[0]!.findAll("button").find(button => button.text() === "复制")!;
+    await copy.trigger("click");
+    const remainedDuringPending = wrapper.find(".operation-message").exists();
+    resolveCopy(); await flushPromises();
+    expect(remainedDuringPending).toBe(true);
+    expect(wrapper.get(".operation-message").element).toBe(feedback);
+    expect(wrapper.get(".operation-message").text()).toContain("已复制");
+    const longError = "配置保存失败，请重试。".repeat(30);
+    vi.mocked(copyTemplateCatalogEntry).mockRejectedValueOnce(new Error(longError));
+    await copy.trigger("click"); await flushPromises();
+    expect(wrapper.get(".operation-message").element).toBe(feedback);
+    expect(wrapper.get(".operation-message").text()).toBe(longError);
+    expect(wrapper.get(".operation-message").attributes("tabindex")).toBe("0");
+    expect(wrapper.get(".operation-message").attributes("role")).toBe("status");
+    expect(wrapper.get(".operation-message").classes()).toContain("error-text");
+    wrapper.unmount();
   });
 
   it("highlights only the applied template and changes it on runtime application events", async () => {
