@@ -3,10 +3,14 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import TemplatesPage from "./TemplatesPage.vue";
 import ApplicationTemplateBindings from "../components/ApplicationTemplateBindings.vue";
+import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+vi.mock("../lib/frontend-diagnostics", async importOriginal => ({
+  ...await importOriginal<typeof import("../lib/frontend-diagnostics")>(), reportFrontendEvent: vi.fn(),
+}));
 import {
   getMappingConfiguration, listPresetApps, saveMappingConfiguration,
   getSceneSnapshot, selectCurrentTemplate, subscribeSceneEvents,
-  getTemplateCatalog, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
+  getTemplateCatalog, deleteMappingTemplate, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
   listRunningApps, removeApplicationBinding, upsertApplicationBinding,
   type MappingConfiguration,
 } from "../lib/bridge";
@@ -17,7 +21,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     ...actual,
     getSceneSnapshot: vi.fn(), selectCurrentTemplate: vi.fn(), subscribeSceneEvents: vi.fn(),
     getMappingConfiguration: vi.fn(), listPresetApps: vi.fn(),
-    updateButtonMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
+    updateButtonMappingTemplate: vi.fn(), deleteMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
     getTemplateCatalog: vi.fn(), setButtonMappingFollowEnabled: vi.fn(), setMappingNoticeEnabled: vi.fn(), setMenuTemplateSwitchEnabled: vi.fn(),
     listRunningApps: vi.fn(), removeApplicationBinding: vi.fn(),
     upsertApplicationBinding: vi.fn(),
@@ -414,6 +418,121 @@ describe("templates page", () => {
     expect(wrapper.findAll(".association-row")).toHaveLength(1);
     expect(wrapper.text()).toContain("关联保存失败");
     expect(refresh.attributes("disabled")).toBeUndefined();
+  });
+
+  it("confirms the named template in the app dialog and cancels without writes", async () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const wrapper = mount(TemplatesPage, { attachTo: document.body, global: { stubs } });
+    await flushPromises();
+    const remove = wrapper.findAll(".template-row")[3]!.findAll("button").find(button => button.text() === "删除")!;
+    (remove.element as HTMLButtonElement).focus();
+    await remove.trigger("click"); await flushPromises();
+    const dialog = wrapper.get('[role="dialog"]');
+    expect(dialog.attributes("aria-label")).toBe("删除完整按键模板");
+    expect(dialog.text()).toContain("工作");
+    expect(dialog.text()).toContain("已关联 1 个程序");
+    expect(dialog.text()).toContain("恢复通用配置");
+    expect(nativeConfirm).not.toHaveBeenCalled();
+    expect(deleteMappingTemplate).not.toHaveBeenCalled();
+    expect(wrapper.get(".templates-page").attributes("inert")).toBeDefined();
+    const cancel = dialog.findAll("button").find(button => button.text() === "取消")!;
+    await cancel.trigger("click"); await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(remove.element);
+    expect(deleteMappingTemplate).not.toHaveBeenCalled();
+    expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    expect(reportFrontendEvent).toHaveBeenCalledWith(expect.objectContaining({ event: "template_delete", result: "cancelled" }));
+    await remove.trigger("click"); await flushPromises();
+    await wrapper.get('[role="dialog"]').trigger("keydown", { key: "Escape" });
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(remove.element);
+    expect(deleteMappingTemplate).not.toHaveBeenCalled();
+    wrapper.unmount();
+    nativeConfirm.mockRestore();
+  });
+
+  it("deletes only the confirmed target once and blocks dismissal while pending", async () => {
+    let resolveDelete!: (saved: MappingConfiguration) => void;
+    vi.mocked(deleteMappingTemplate).mockReturnValueOnce(new Promise(resolve => { resolveDelete = resolve; }));
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    await wrapper.findAll(".template-row")[3]!.findAll("button").find(button => button.text() === "删除")!.trigger("click");
+    const dialog = wrapper.get('[role="dialog"]');
+    const confirm = dialog.findAll("button").find(button => button.text() === "删除模板")!;
+    await confirm.trigger("click");
+    await confirm.trigger("click");
+    await dialog.trigger("keydown", { key: "Escape" });
+    await wrapper.get(".settings-dialog-backdrop").trigger("mousedown");
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(dialog.findAll("button").every(button => button.attributes("disabled") !== undefined)).toBe(true);
+    expect(deleteMappingTemplate).toHaveBeenCalledExactlyOnceWith("buttons", null, true);
+    expect(dialog.text()).toContain("正在删除模板，请稍候");
+    expect(wrapper.findAll(".template-row")).toHaveLength(4);
+    resolveDelete({ ...structuredClone(configuration), templates: [], applicationBindings: [] });
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(wrapper.findAll(".template-row").map(row => row.get("strong").text())).toEqual(["Agent", "聊天工具", "浏览器"]);
+    expect(wrapper.getComponent(ApplicationTemplateBindings).props("configuration").applicationBindings).toEqual([]);
+    expect(wrapper.text()).toContain("已删除完整按键模板“工作”");
+    expect(getTemplateCatalog).toHaveBeenCalledOnce();
+    expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    expect(reportFrontendEvent).toHaveBeenCalledWith(expect.objectContaining({ event: "template_delete", phase: "completed", result: "passed", reason: "configuration_saved", elapsedMs: expect.any(Number) }));
+    wrapper.unmount();
+  });
+
+  it("keeps a failed deletion visible with its reason and allows an explicit retry", async () => {
+    vi.mocked(deleteMappingTemplate).mockRejectedValueOnce(new Error("配置保存失败"));
+    vi.mocked(deleteMappingTemplate).mockResolvedValueOnce({ ...structuredClone(configuration), templates: [], applicationBindings: [] });
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({ ...structuredClone(configuration), applicationBindings: [] });
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    await wrapper.findAll(".template-row")[3]!.findAll("button").find(button => button.text() === "删除")!.trigger("click");
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain("已关联");
+    const confirm = wrapper.get('[role="dialog"]').findAll("button").find(button => button.text() === "删除模板")!;
+    await confirm.trigger("click"); await flushPromises();
+    expect(wrapper.get('[role="dialog"] [role="alert"]').text()).toContain("配置保存失败");
+    expect(wrapper.findAll(".template-row")).toHaveLength(4);
+    expect(wrapper.text()).not.toContain("已删除完整按键模板");
+    expect(confirm.attributes("disabled")).toBeUndefined();
+    expect(reportFrontendEvent).toHaveBeenCalledWith(expect.objectContaining({ event: "template_delete", phase: "completed", result: "failed", reason: "delete_rejected" }));
+    await confirm.trigger("click"); await flushPromises();
+    expect(deleteMappingTemplate).toHaveBeenCalledTimes(2);
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(wrapper.findAll(".template-row")).toHaveLength(3);
+    wrapper.unmount();
+  });
+
+  it("keeps current-template state authoritative when deleting the applied template", async () => {
+    let handler!: (event: import("../lib/bridge").SceneEvent) => void;
+    vi.mocked(subscribeSceneEvents).mockImplementation(async callback => { handler = callback; return () => {}; });
+    vi.mocked(getSceneSnapshot).mockResolvedValueOnce({ templateId: "buttons", mappingNotice: { kind: "direct", templateId: "buttons", name: "工作", actionsAvailable: true }, mappingNoticeRevision: 1, generation: 1 } as import("../lib/bridge").SceneSnapshot);
+    vi.mocked(deleteMappingTemplate).mockImplementationOnce(async () => {
+      handler({ type: "mapping_applied", revision: 2, notice: { kind: "common", templateId: null, name: null, actionsAvailable: true } });
+      return { ...structuredClone(configuration), templates: [], applicationBindings: [] };
+    });
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    expect(wrapper.get(".template-row.current-template strong").text()).toBe("工作");
+    await wrapper.findAll(".template-row")[3]!.findAll("button").find(button => button.text() === "删除")!.trigger("click");
+    await wrapper.get('[role="dialog"]').findAll("button").find(button => button.text() === "删除模板")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".template-row.current-template")).toHaveLength(0);
+    expect(selectCurrentTemplate).not.toHaveBeenCalled();
+    expect(wrapper.getComponent(ApplicationTemplateBindings).props("configuration").applicationBindings).toEqual([]);
+    wrapper.unmount();
+  });
+
+  it("keeps keyboard focus within the deletion dialog", async () => {
+    const wrapper = mount(TemplatesPage, { attachTo: document.body, global: { stubs } }); await flushPromises();
+    await wrapper.findAll(".template-row")[3]!.findAll("button").find(button => button.text() === "删除")!.trigger("click");
+    await flushPromises();
+    const dialog = wrapper.get('[role="dialog"]');
+    const controls = dialog.findAll("button");
+    expect(document.activeElement).toBe(controls[0]!.element);
+    (controls.at(-1)!.element as HTMLButtonElement).focus();
+    await controls.at(-1)!.trigger("keydown", { key: "Tab" });
+    expect(document.activeElement).toBe(controls[0]!.element);
+    await controls[0]!.trigger("keydown", { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(controls.at(-1)!.element);
+    wrapper.unmount();
   });
 
   it("edits stable defaults and resets only an explicitly confirmed default", async () => {

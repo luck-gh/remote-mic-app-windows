@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import ButtonActionEditor from "../components/ButtonActionEditor.vue";
 import ApplicationTemplateBindings from "../components/ApplicationTemplateBindings.vue";
 import SettingsDialog from "../components/SettingsDialog.vue";
@@ -40,6 +40,11 @@ const busy = computed(() => saving.value || associationBusy.value || loading.val
 const nameDialog = ref<TemplateCatalogEntry | null>(null);
 const nameDraft = ref("");
 const nameError = ref<string | null>(null);
+const deleteDialog = ref<TemplateCatalogEntry | null>(null);
+const deleteError = ref<string | null>(null);
+const templateList = ref<HTMLElement | null>(null);
+let deleteTrigger: HTMLButtonElement | null = null;
+const deleteBindingCount = computed(() => deleteDialog.value ? bindingCount(deleteDialog.value) : 0);
 const triggers: ButtonTrigger[] = ["single", "double", "long"];
 const buttons = Object.keys(buttonLabels) as RemoteButton[];
 
@@ -140,20 +145,64 @@ async function confirmRename(): Promise<void> {
   }
 }
 
-function removeDirect(template: ButtonMappingTemplate): void {
-  if (!configuration.value) return;
-  const bound = configuration.value.applicationBindings.filter((binding) => binding.templateId === template.id).length;
-  if (!window.confirm(bound
-    ? `该模板已关联 ${bound} 个程序。删除后这些程序恢复通用配置，是否继续？`
-    : `删除完整按键模板“${template.name}”？`)) return;
-  void run(
-    async () => {
-      const saved = await deleteMappingTemplate(template.id, null, true);
-      catalog.value = await getTemplateCatalog();
-      return saved;
-    },
-    `已删除完整按键模板“${template.name}”`,
-  );
+function removeDirect(template: TemplateCatalogEntry, event: MouseEvent): void {
+  if (busy.value || template.builtIn) return;
+  deleteTrigger = event.currentTarget as HTMLButtonElement;
+  deleteDialog.value = template;
+  deleteError.value = null;
+  reportFrontendEvent({ event: "template_delete", phase: "confirmation", result: "passed", reason: deleteBindingCount.value ? "bound_template" : "unbound_template" });
+}
+
+async function closeDeleteDialog(): Promise<void> {
+  if (busy.value) return;
+  deleteDialog.value = null;
+  deleteError.value = null;
+  reportFrontendEvent({ event: "template_delete", phase: "completed", result: "cancelled", reason: "confirmation_dismissed" });
+  await nextTick();
+  deleteTrigger?.focus();
+}
+
+function trapDeleteFocus(event: KeyboardEvent): void {
+  const controls = (event.currentTarget as HTMLElement).querySelectorAll<HTMLButtonElement>("button:not([disabled])");
+  if (!controls.length) { event.preventDefault(); return; }
+  const first = controls[0]!;
+  const last = controls[controls.length - 1]!;
+  if (!Array.from(controls).includes(document.activeElement as HTMLButtonElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+async function confirmDelete(event: MouseEvent): Promise<void> {
+  if (busy.value || !deleteDialog.value) return;
+  const template = deleteDialog.value;
+  saving.value = true;
+  (event.currentTarget as HTMLElement).closest<HTMLElement>('[role="dialog"]')!.focus();
+  deleteError.value = null;
+  error.value = null;
+  status.value = null;
+  const started = performance.now();
+  reportFrontendEvent({ event: "template_delete", phase: "requested", result: "passed", reason: "confirmed" });
+  try {
+    configuration.value = await deleteMappingTemplate(template.id, null, true);
+    catalog.value = catalog.value.filter(item => item.id !== template.id);
+    deleteDialog.value = null;
+    status.value = `已删除完整按键模板“${template.name}”`;
+    reportFrontendEvent({ event: "template_delete", phase: "completed", result: "passed", reason: "configuration_saved", elapsedMs: Math.round(performance.now() - started) });
+    await nextTick();
+    templateList.value?.focus();
+  } catch (reason) {
+    deleteError.value = reason instanceof Error ? reason.message : String(reason);
+    reportFrontendEvent({ event: "template_delete", phase: "completed", result: "failed", reason: "delete_rejected", elapsedMs: Math.round(performance.now() - started) });
+  } finally {
+    saving.value = false;
+  }
 }
 
 function edit(template: ButtonMappingTemplate): void {
@@ -263,7 +312,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <section class="settings-page templates-page">
+  <section class="settings-page templates-page" :inert="!!deleteDialog">
     <header class="page-header">
       <div>
         <h1>模板</h1>
@@ -300,7 +349,7 @@ onMounted(() => {
       </section>
 
       <details class="card collapsible-card complete-template-panel" :open="templateExpansion.value.value" :aria-busy="templateExpansion.pending.value" @toggle="templateExpansion.toggleDetails">
-        <summary><h2>完整按键模板</h2><span class="section-count">{{ catalog.length }} 个模板</span></summary>
+        <summary ref="templateList"><h2>完整按键模板</h2><span class="section-count">{{ catalog.length }} 个模板</span></summary>
         <div class="collapsible-body">
         <p class="muted">所有模板统一发送固定按键或组合键，不读取第三方界面。前三项可直接编辑或单独复位；未配置的动作不执行映射。</p>
         <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
@@ -316,7 +365,7 @@ onMounted(() => {
             <button v-if="template.builtIn" type="button" class="secondary-button" :disabled="busy" @click="resetDefault(template)">复位模板</button>
             <button type="button" class="secondary-button" :disabled="busy" @click="copyCatalogEntry(template)">复制</button>
             <button v-if="!template.builtIn" type="button" class="secondary-button" :disabled="busy" @click="openRename(template)">重命名</button>
-            <button v-if="!template.builtIn && template.kind === 'direct'" type="button" class="secondary-button" :disabled="busy" @click="directTemplate(template) && removeDirect(directTemplate(template)!)">删除</button>
+            <button v-if="!template.builtIn && template.kind === 'direct'" type="button" class="secondary-button" :disabled="busy" @click="removeDirect(template, $event)">删除</button>
           </span>
         </div>
         <p v-if="!catalog.length" class="muted">尚未保存完整按键模板。</p>
@@ -363,6 +412,24 @@ onMounted(() => {
 
 
   <SettingsDialog
+    v-if="deleteDialog"
+    title="删除完整按键模板"
+    description="删除后无法撤销。"
+    :busy="busy"
+    @close="closeDeleteDialog"
+    @keydown.tab="trapDeleteFocus"
+  >
+    <p class="delete-template-name">确定删除“<strong>{{ deleteDialog.name }}</strong>”？</p>
+    <p v-if="deleteBindingCount" class="muted">该模板已关联 {{ deleteBindingCount }} 个程序。删除后这些程序恢复通用配置。</p>
+    <p v-if="saving" role="status" aria-live="polite">正在删除模板，请稍候…</p>
+    <p v-if="deleteError" class="error-text" role="alert">删除失败：{{ deleteError }}</p>
+    <template #actions>
+      <button type="button" class="secondary-button" :disabled="busy" @click="closeDeleteDialog">取消</button>
+      <button type="button" class="primary-button" :disabled="busy" @click="confirmDelete">{{ saving ? "正在删除…" : "删除模板" }}</button>
+    </template>
+  </SettingsDialog>
+
+  <SettingsDialog
     v-if="nameDialog"
     title="重命名完整按键模板"
     description="只修改当前模板名称。"
@@ -404,4 +471,5 @@ onMounted(() => {
 .template-grid .mapping-cell.selected { outline: 2px solid var(--accent); }
 .action-detail { margin: 16px 0 0; }
 .name-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
+.delete-template-name { margin-top: 0; overflow-wrap: anywhere; }
 </style>
