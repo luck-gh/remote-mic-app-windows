@@ -4330,22 +4330,33 @@ struct SceneOverlayState {
     interactive: bool,
     foreground_verified: bool,
     menu_generation: Option<u64>,
+    menu_layout_dirty: bool,
     exit_after_release: Option<i32>,
     notices_enabled: bool,
     last_notice_revision: u64,
     visible_notice_revision: Option<u64>,
 }
 impl SceneOverlayState {
-    fn update_menu(&mut self, generation: u64, interactive: bool) -> bool {
-        let layout_required = !self.panel_open
-            || self.menu_generation != Some(generation)
+    fn menu_needs_activation(&self, generation: Option<u64>, interactive: bool) -> bool {
+        interactive && (!self.interactive || self.menu_generation != generation)
+    }
+
+    fn invalidate_menu_layout(&mut self) {
+        self.menu_layout_dirty = true;
+    }
+
+    fn update_menu(&mut self, generation: Option<u64>, interactive: bool) -> bool {
+        let layout_required = self.menu_layout_dirty
+            || !self.panel_open
+            || self.menu_generation != generation
             || self.interactive != interactive;
         self.panel_open = true;
         self.interactive = interactive;
         if layout_required {
             self.foreground_verified = false;
         }
-        self.menu_generation = Some(generation);
+        self.menu_generation = generation;
+        self.menu_layout_dirty = false;
         self.visible_notice_revision = None;
         layout_required
     }
@@ -4406,7 +4417,7 @@ fn create_scene_overlay(app: &tauri::App) -> tauri::Result<()> {
                 .state::<Mutex<SceneOverlayState>>()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .menu_generation = None;
+                .invalidate_menu_layout();
             let resized_app = handle.clone();
             let _ = handle.run_on_main_thread(move || {
                 if let Some(snapshot) = resized_app.state::<AppState>().platform.scene_snapshot() {
@@ -4485,11 +4496,13 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
     }
     let was_interactive = state.interactive;
     let previous_menu_generation = state.menu_generation;
+    let activate_menu = matches!(event, SceneEvent::Snapshot { snapshot }
+        if state.menu_needs_activation(snapshot.menu_generation, snapshot.panel == Some(sayall_windows::scene_control::ScenePanel::Template)));
     let mode = match event {
         SceneEvent::Snapshot { snapshot } if snapshot.panel.is_some() => {
             let interactive =
                 snapshot.panel == Some(sayall_windows::scene_control::ScenePanel::Template);
-            if state.update_menu(snapshot.generation, interactive) {
+            if state.update_menu(snapshot.menu_generation, interactive) {
                 "menu"
             } else {
                 "contents"
@@ -4609,7 +4622,7 @@ fn update_scene_overlay(app: &tauri::AppHandle, event: &sayall_windows::scene_co
             None,
         );
     }
-    if interactive && !was_interactive {
+    if activate_menu {
         let window_operation_passed = result.is_ok();
         let (activation_api_result, verified, actual_foreground) =
             template_menu_foreground_readback(
@@ -6317,14 +6330,31 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn reopened_menu_reverifies_focus_after_a_retained_close() {
+        let mut state = SceneOverlayState::default();
+        assert!(state.update_menu(Some(8), true));
+        assert_eq!(state.record_native_menu_focus(true, true), Some((true, 8)));
+        assert!(!state.menu_needs_activation(Some(8), true));
+        state.foreground_verified = false;
+        assert!(!state.menu_needs_activation(Some(8), true));
+        assert!(!state.update_menu(Some(8), true));
+        assert!(state.menu_needs_activation(Some(9), true));
+        assert!(state.update_menu(Some(9), true));
+        assert!(!state.foreground_verified);
+        assert_eq!(state.record_native_menu_focus(false, false), None);
+        assert_eq!(state.record_native_menu_focus(true, true), Some((true, 9)));
+        assert!(!state.menu_needs_activation(Some(9), true));
+    }
+
+    #[test]
     fn remote_only_menu_ignores_native_focus_noise_and_new_menu_ignores_old_loss() {
         let mut state = SceneOverlayState::default();
-        assert!(state.update_menu(8, true));
+        assert!(state.update_menu(Some(8), true));
         assert_eq!(state.record_native_menu_focus(false, false), None);
         assert_eq!(state.record_native_menu_focus(true, false), None);
         assert_eq!(state.record_native_menu_focus(true, true), Some((true, 8)));
         assert_eq!(state.record_native_menu_focus(false, true), None);
-        assert!(state.update_menu(9, true));
+        assert!(state.update_menu(Some(9), true));
         assert_eq!(state.record_native_menu_focus(false, false), None);
         assert_eq!(state.record_native_menu_focus(true, true), Some((true, 9)));
         assert_eq!(
@@ -6370,18 +6400,19 @@ mod lifecycle_tests {
     fn same_menu_receipts_do_not_repeat_window_layout_but_new_open_and_dpi_do() {
         let mut state = SceneOverlayState::default();
         state.visible_notice_revision = Some(1);
-        assert!(state.update_menu(2, true));
+        assert!(state.update_menu(Some(2), true));
         assert_eq!(state.visible_notice_revision, None);
         for _ in 0..4 {
-            assert!(!state.update_menu(2, true));
+            assert!(!state.update_menu(Some(2), true));
         }
-        assert!(state.update_menu(3, true));
-        state.menu_generation = None; // existing scale-factor notification
-        assert!(state.update_menu(3, true));
-        assert!(!state.update_menu(3, true));
+        assert!(state.update_menu(Some(3), true));
+        state.invalidate_menu_layout();
+        assert!(!state.menu_needs_activation(Some(3), true));
+        assert!(state.update_menu(Some(3), true));
+        assert!(!state.update_menu(Some(3), true));
         state.panel_open = false;
         state.interactive = false;
-        assert!(state.update_menu(3, true));
+        assert!(state.update_menu(Some(3), true));
     }
 
     #[test]

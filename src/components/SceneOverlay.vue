@@ -7,6 +7,7 @@ const snapshot = ref<SceneSnapshot | null>(null);
 const notice = ref<MappingNotice | null>(null);
 const noticeElement = ref<HTMLElement | null>(null);
 const menuList = ref<HTMLElement | null>(null);
+const appliedTemplateId = ref<string | null>(null);
 let keyQueue = Promise.resolve();
 const menuError = ref<string | null>(null);
 function updateDefault(event: Event) {
@@ -58,6 +59,7 @@ function clearNotice() {
 function applyNotice(value: MappingNotice, revision: number) {
   if (revision <= lastRevision) return;
   lastRevision = revision;
+  appliedTemplateId.value = value.templateId;
   clearNotice();
   if (!enabled || snapshot.value?.panel) return;
   notice.value = value;
@@ -127,7 +129,7 @@ onUnmounted(() => {
       <small :class="{ visible: snapshot.preferenceError }" :role="snapshot.preferenceError ? 'alert' : undefined">选项保存失败，保留原值，请重试。</small>
       <small :class="{ visible: menuError }" :role="menuError ? 'alert' : undefined">{{ menuError ?? '未能更新选择，请重新打开模板菜单。' }}</small>
     </div>
-    <ul ref="menuList"><li v-for="(item, index) in snapshot.menuItems" :key="item.label + '-' + index" :class="{ selected: index === snapshot.selectedIndex }"><span>{{ item.label }}</span><small>{{ item.running ? '当前模板' : '可选择' }}</small></li></ul>
+    <ul ref="menuList"><li v-for="(item, index) in snapshot.menuItems" :key="item.label + '-' + index" :class="{ selected: index === snapshot.selectedIndex, current: item.templateId === appliedTemplateId }" :aria-current="item.templateId === appliedTemplateId ? 'true' : undefined"><span>{{ item.label }}</span><small>{{ item.templateId === appliedTemplateId ? '当前模板' : '可选择' }}</small></li></ul>
     <p>{{ snapshot.status === 'template_menu_restore_failed' ? '未能返回原窗口，请点击目标窗口继续。' : '↑↓ 循环 · 确认松开后应用 · 返回 / 短菜单取消' }}</p>
   </main>
   <main v-else-if="notice" ref="noticeElement" class="mapping-notice" role="status">{{ noticeText(notice) }}</main>
@@ -153,7 +155,9 @@ onUnmounted(() => {
 .preference-feedback small { grid-area: 1 / 1; visibility: hidden; overflow-wrap: anywhere; }
 .preference-feedback small.visible { visibility: visible; }
 .scene-overlay ul { min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0; margin: 0; list-style: none; }
-.scene-overlay li { padding: 10px; border-radius: 6px; overflow-wrap: anywhere; }
+.scene-overlay li { padding: 10px; border: 1px solid transparent; border-radius: 6px; overflow-wrap: anywhere; }
+.scene-overlay li.current { border-color: #b4b7ff; }
+.scene-overlay li.current small { color: #d1d3ff; opacity: 1; }
 .scene-overlay li.selected { background: rgba(143, 146, 255, .25); }
 .scene-overlay small { display: block; opacity: .65; }
 .scene-overlay p { margin: 12px 0 0; font-size: 12px; opacity: .7; }

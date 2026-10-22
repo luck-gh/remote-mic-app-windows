@@ -141,7 +141,7 @@ import type { ButtonMappings, RuntimeSnapshot, SceneSnapshot } from "../lib/brid
 
 function voiceSnapshot(pressed: boolean): SceneSnapshot {
   return { mappingNoticeEnabled: true, mappingNotice: null, mappingNoticeRevision: 1,
-    enabled: true, generation: 1, foregroundGeneration: 1, applicationId: null,
+    enabled: true, generation: 1, menuGeneration: null, foregroundGeneration: 1, applicationId: null,
     templateId: null, panel: null, updateDefault: false, selectedIndex: null,
     menuItems: [], waitingForRelease: false, voiceActive: false,
     voiceButtonPressed: pressed, status: null };

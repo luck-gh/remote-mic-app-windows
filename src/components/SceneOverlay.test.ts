@@ -10,7 +10,7 @@ let receive: (event: SceneEvent) => void;
 const direct: MappingNotice = { kind: "direct", templateId: "actual", name: "实际前台模板", actionsAvailable: true };
 function snapshot(panel: SceneSnapshot["panel"] = null): SceneSnapshot {
   return { mappingNoticeEnabled: true, mappingNotice: null, mappingNoticeRevision: 0, enabled: true, generation: 1,
-    foregroundGeneration: 1, applicationId: "notepad", templateId: null, updateDefault:false, panel, selectedIndex: null, menuItems: [],
+    menuGeneration: panel ? 1 : null, foregroundGeneration: 1, applicationId: "notepad", templateId: null, updateDefault:false, panel, selectedIndex: null, menuItems: [],
     waitingForRelease: false, voiceActive: false, voiceButtonPressed: false, status: null };
 }
 beforeEach(() => {
@@ -22,6 +22,37 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("applied mapping switch notice", () => {
+  it("distinguishes the applied row from the navigation choice and updates only the applied mark on acknowledgement", async () => {
+    const wrapper = mount(SceneOverlay); await flushPromises();
+    const menu = { ...snapshot("template"), selectedIndex: 1, mappingNotice: { ...direct, templateId: "chat" }, mappingNoticeRevision: 1,
+      menuItems: [{ label: "Agent", templateId: "agent", applicationId: null, running: false }, { label: "聊天工具", templateId: "chat", applicationId: null, running: true }] };
+    receive({ type: "snapshot", snapshot: menu }); await flushPromises();
+    expect(wrapper.findAll('li[aria-current="true"]')).toHaveLength(1);
+    expect(wrapper.get('li[aria-current="true"]').classes()).toContain("selected");
+    receive({ type: "snapshot", snapshot: { ...menu, selectedIndex: 0 } }); await flushPromises();
+    expect(wrapper.get('li[aria-current="true"]').text()).toContain("聊天工具");
+    expect(wrapper.get("li.selected").text()).toContain("Agent");
+    receive({ type: "mapping_applied", notice: { ...direct, templateId: "agent" }, revision: 2 }); await flushPromises();
+    expect(wrapper.get('li[aria-current="true"]').text()).toContain("Agent");
+    expect(wrapper.get("li.selected").text()).toContain("Agent");
+    receive({ type: "mapping_applied", notice: { ...direct, templateId: "chat" }, revision: 1 }); await flushPromises();
+    expect(wrapper.get('li[aria-current="true"]').text()).toContain("Agent");
+    receive({ type: "snapshot", snapshot: { ...menu, selectedIndex: 0 } }); await flushPromises();
+    expect(wrapper.get('li[aria-current="true"]').text()).toContain("Agent");
+    wrapper.unmount();
+  });
+
+  it("clears the current mark for confirmed common mappings without changing the choice", async () => {
+    const wrapper = mount(SceneOverlay); await flushPromises();
+    receive({ type: "snapshot", snapshot: { ...snapshot("template"), selectedIndex: 0, mappingNotice: direct, mappingNoticeRevision: 1,
+      menuItems: [{ label: "实际模板", templateId: "actual", applicationId: null, running: true }] } }); await flushPromises();
+    expect(wrapper.get('li[aria-current="true"]').text()).toContain("实际模板");
+    receive({ type: "mapping_applied", notice: { kind: "unconfigured", templateId: null, name: null, actionsAvailable: false }, revision: 2 }); await flushPromises();
+    expect(wrapper.find('[aria-current="true"]').exists()).toBe(false);
+    expect(wrapper.get("li.selected").text()).toContain("实际模板");
+    wrapper.unmount();
+  });
+
   it("routes rapid native DOWN/UP only inside the full template menu in order", async () => {
     const wrapper = mount(SceneOverlay); await flushPromises();
     receive({ type:"snapshot", snapshot: snapshot("template") }); await flushPromises();
