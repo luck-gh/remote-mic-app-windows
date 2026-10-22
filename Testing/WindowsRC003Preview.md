@@ -1,5 +1,21 @@
 # Windows RC001 / RC003 Preview 测试手册
 
+## 2026-10-22 连接续约会话代次候选
+
+针对用户报告的 Menu 偶发原生行为/恢复后重新映射，现有同会话日志已证实 Helper-Agent TCP 10053 断线、App 所有权缺失及后续恢复，最初断线原因仍 unknown。时间线和累计 STAT 的可信边界归 [原 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-22-接管瞬断的连接代次隔离与诊断候选)。候选仅修可重复的跨连接 renew fault/授权污染并补诊断，不宣称整体接管或实体反引号已修。
+
+- **passed（RED）**：旧授权在新连接上的读取回归实际失败；旧共享 fault 在受控 TCP 新会话已开始后到达，读取循环实际提前退出。首轮合跑第二项受预期失败的测试 Mutex poisoning 干扰，随后单独执行取得真实旧 fault 失败，不把 poisoning 当作产品证据。
+- **passed（定向 GREEN）**：Helper 的 `cooperative_cleanup_tests` 22 项与 `capture_log_stall_tests` 3 项通过，包含旧 fault 不关闭新代/同代 fault 仍可结束、授权和旧撤权隔离、正常收尾和日志接收线程不阻塞；新增 HB 诊断回归核对 connection_generation、helper_hb_seq、helper_receive 原点和不泄漏 synthetic token。授权回归还通过真实合成 loopback socket 验证旧代无 renew 字节、当前授权后实际收到完整 renew，再撤权后不再写。
+- **passed（独立 review / 完整自动化）**：两源码独立只读 review 未发现 P1/P2；Helper 独立 workspace 全套为 75 passed / 3 ignored，其 fmt/check 通过。根 workspace 为 core 61 + 4、Windows 597 passed / 21 ignored、Host 185 passed / 1 ignored，其他集成和文档用例通过；根 fmt、workspace check、runtime-simulation check 与 diff check 通过。根 workspace 不含 Helper，不能互相代替。前端源码未变，复用同组合前端 33 文件 / 506 项及 build 证据。回归没有实际运行完整续约线程与 accept 交接的全部调度，不将受控 fault/授权测试外推为该范围通过。
+- 诊断语义：connection_generation 是 Helper 本次 accept 的本地代次；helper_hb_seq 从每条连接首次收到 HB 开始计数；helper_sample_age_ms 包含 Helper 接收后处理/排队时间，不包含 Agent 生成前或网络到达前时间。O 线格式未变，App 的 previous_rx_age_ms/clock_origin=app_receive 只表示 App 本地接收间隔；不能用这两个本地时钟混充端到端延迟。新 read/renew/reader_ended/retired 日志区分错误码、退出原因、收尾和同代健康年龄，不输出凭据或设备身份。
+- **passed（本机正常升级与身份）**：UTC `12:52:22` 完成旧会话正常退出、新鲜匹配 StopACK、Helper 退出和端口释放，安装 exit 0；Explorer 普通权限启动 App 4180，新 Helper 488 的实际安装路径与精确创建时间读回通过，Helper SHA-256 `8a396f0828a245f5f043b68cd0b89e04baee5d957694c59592c2d51a3f183890`。原驻留 host 精确代次与临时 binding 保持，六份 JSON 相对本轮实时基线逐字不变；不恢复历史九关联、不操作真实关联或模板。安装 payload、GUI、前端嵌入、更新签名与 production simulation 隔离通过，无 SYS。隔离检查首次误用 PowerShell 5 因字符串重载不可用失败，改用既有 PowerShell 7 的同一检查通过，未修改产品。
+- **passed（新诊断实际读回）**：新 Helper 连接 generation 1 的 started→authorized，首 HB `helper_hb_seq=1 / sample_origin=helper_receive / lease_ok=true`，对应 O 写出 `result=passed` 与 App `clock_origin=app_receive` 已实际出现；`12:52:21.624` target generation 2 / owned mask 7167 恢复。voice gate/synth ACK 已收到，未触发或宣称实际语音输入通过。它证明新载荷和诊断生效，不证明最初 10053 原因已消除。
+- 本机实装对象为 `无线麦个人版_1.0.0_x64-setup.exe`，SHA-256 `d6c51e4ffb4967e465235927d82286529eabf6af80320ddcfff68cda8f55e14e`；installed App SHA-256 `960f604ca98890c7fffba1d2a390a6aa5f18886d6c5cdf6ad09787293ed03578`。source base `e19add6034313f616505535f9b8fe98f4b299986`，fingerprint `504e23fbcda4034ea388643a071b071bfc704d51a20ecef9be550965a265005b`，local/dirty/included；包含既有未提交修改，不能称为单一 commit 纯净构建。
+- **passed（本机本次用户硬件复验）**：用户明确确认新包闲置首 Menu、Back/TV、按住语音并松开，以及关闭全按键再开启后的首 Menu 均正常。被测包/指纹为上列对象，没有重装、修改映射或换 Agent 后再复用旧验收；仅记录当前 PC/本次遥控器，不外推 RC001、其他 Windows 或来源隔离。
+- **deferred（完整矩阵与持续性）**：完整 RC001/RC003、跨 Windows、断连/全部调度等场景仍按矩阵验收，不继续自动轮询或重启。新 schema 存在不等于已捕获下一次 10053 原因。false HB/旧 O 保活、ACK 后首 HB 前快按以及来源隔离不随本笔关闭。旧协议不能逐边沿证明 consumed/passed，后续 true HB 不能安全追认先前 E，缓冲重放不是已成立的首按修复，详见原 Bug。
+
+命令入口为 `cargo test --locked --manifest-path hardware/RC003/helper/Cargo.toml`、同 manifest 的 fmt/check，以及根 workspace 的 fmt/test/check 和 `cargo check -p sayall-windows-app --features runtime-simulation`。必要红/绿完整日志复用 `target/dev/menu-capture-reliability/connection-generation-*.log`，该目录历史材料保持原用途；审查与实装证据提炼后按 LOGGING 回收可重现输出，不删除本次唯一失败证据。
+
 2026-10-20 当前候选实体键盘共存已 **failed**：用户报告反引号→Tab，当前Helper TV报告与应用Tab注入链已记录；上游/个人版原始Agent的同报告离线对照均不区分设备来源。语音、UI布局及接管所有权通过不关闭该回归；详情见 [当前回归](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-上游规则候选的实体键盘回归)。
 
 2026-10-20 起的上游规则候选另须核对 Agent build=`2026-10-20.upstream-usage` 和 Helper `[CAPTURE] policy=upstream_usage_gate system_module_binding=false`。界面“已开启”须有当前目标代次的实际 ownership ACK，不能只看计划任务启动或桥连接。分别验证目标/非目标键、Menu 模板切换、持键释放/快速连按、冷态首用及普通键盘共存（含反引号、方向键）；同宿主同格式同 usage 不再保证来源隔离，不能复用下文 10 月 12 日旧实现的隔离结论。停止须核对新鲜回执和实际进程结束；记录归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-系统模块变化后恢复上游捕获规则)。

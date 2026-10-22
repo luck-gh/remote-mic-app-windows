@@ -1282,11 +1282,14 @@ fn handle_connection(
                     if generation == target.generation && reported == target.usages {
                         let new_mask = usage_mask(&reported);
                         let resumed = crate::key_gate::enhanced_owned_mask() == 0 && new_mask != 0;
-                        {
+                        let previous_rx_age_ms = {
                             let mut state = lock(shared);
+                            let age = state.ownership_last_rx.map(|at| at.elapsed().as_millis());
                             state.owned = reported.clone();
                             state.ownership_last_rx = Some(Instant::now());
-                        }
+                            age.map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".into())
+                        };
                         crate::key_gate::set_enhanced_owned_mask(new_mask);
                         let mapping = lock(shared).mapping.upgrade();
                         if let Some(mapping) = mapping {
@@ -1294,14 +1297,14 @@ fn handle_connection(
                         }
                         if resumed {
                             note(format!(
-                                "enhanced_capture event=ownership_resumed usages={} rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask}",
+                                "enhanced_capture event=ownership_resumed usages={} rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask} previous_rx_age_ms={previous_rx_age_ms} clock_origin=app_receive",
                                 format_usage_payload(&reported),
                             ));
                         } else if last_logged_ownership.as_ref()
                             != Some(&(generation, reported.clone()))
                         {
                             note(format!(
-                                "enhanced_capture event=ownership_confirmed rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask} usages={}",
+                                "enhanced_capture event=ownership_confirmed rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask} usages={} previous_rx_age_ms={previous_rx_age_ms} clock_origin=app_receive",
                                 format_usage_payload(&reported)
                             ));
                         }

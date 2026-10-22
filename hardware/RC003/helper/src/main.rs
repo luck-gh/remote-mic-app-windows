@@ -119,7 +119,7 @@ mod imp {
     /// 控制台事件（Ctrl+C / 关窗 / 注销 / 关机）置位；由 `SetConsoleCtrlHandler`
     /// 的处理器写入。必须是 `static`：处理器签名固定，拿不到闭包捕获。
     static CTRL_STOP: AtomicBool = AtomicBool::new(false);
-    static AGENT_AUTHORIZED: AtomicBool = AtomicBool::new(false);
+    static AGENT_AUTHORIZED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct AgentIdentity {
@@ -1983,6 +1983,9 @@ mod imp {
             let handle = std::thread::spawn(move || {
                 let logger = capture_logger;
                 let mut session = Session {
+                    connection_generation: 1,
+                    hb_sequence: 0,
+                    last_hb_rx: None,
                     connected_at: Instant::now(),
                     last_rx: Instant::now(),
                     hello: None,
@@ -2033,7 +2036,7 @@ mod imp {
                 matches!(
                     ownership,
                     Ok(QueuedBridgeOutbound {
-                        message: BridgeOutbound::Ownership(_),
+                        message: BridgeOutbound::Ownership { .. },
                         ..
                     })
                 ),
@@ -3442,7 +3445,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     enum BridgeOutbound {
         Edges(Vec<u16>),
         Observed(Vec<u16>),
-        Ownership(BridgeCaptureTargets),
+        Ownership {
+            targets: BridgeCaptureTargets,
+            connection_generation: u64,
+            helper_hb_seq: u64,
+            helper_received_at: Instant,
+        },
         /// agent 已应用语音键合成配置的确认（绝对状态；`None` = 关闭）。
         ///
         /// 只用于转发给主程序置门禁——门禁不再认"S 行写进 socket"
@@ -3505,8 +3513,19 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             self.enqueue(BridgeOutbound::Observed(usages));
         }
 
-        fn push_ownership(&self, targets: BridgeCaptureTargets) {
-            self.enqueue(BridgeOutbound::Ownership(targets));
+        fn push_ownership(
+            &self,
+            targets: BridgeCaptureTargets,
+            connection_generation: u64,
+            helper_hb_seq: u64,
+            helper_received_at: Instant,
+        ) {
+            self.enqueue(BridgeOutbound::Ownership {
+                targets,
+                connection_generation,
+                helper_hb_seq,
+                helper_received_at,
+            });
         }
 
         /// 转发 agent 的合成回执（绝对状态）给主程序（门禁闭环的输入）。
@@ -4577,15 +4596,52 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                             }
                         }
                     }
-                    BridgeOutbound::Ownership(owned) => {
-                        if let Some(stream) = conn.as_mut() {
-                            let _ = bridge_write_line(
+                    BridgeOutbound::Ownership {
+                        targets: owned,
+                        connection_generation,
+                        helper_hb_seq,
+                        helper_received_at,
+                    } => {
+                        let queue_age_ms = elapsed_ms(queued.queued_at);
+                        let helper_sample_age_ms = elapsed_ms(helper_received_at);
+                        let write_started = Instant::now();
+                        let result = if let Some(stream) = conn.as_mut() {
+                            Some(bridge_write_line(
                                 stream,
                                 &format!(
                                     "O {} {}",
                                     owned.generation,
                                     format_edge_payload(&owned.usages)
                                 ),
+                            ))
+                        } else {
+                            None
+                        };
+                        if helper_hb_seq == 1
+                            || helper_sample_age_ms >= LATENCY_SLOW_MS
+                            || result.as_ref().is_none_or(|outcome| outcome.is_err())
+                        {
+                            logger.kv(
+                                "[OWNERSHIP-SAMPLE]",
+                                &[
+                                    ("connection_generation", connection_generation.to_string()),
+                                    ("helper_hb_seq", helper_hb_seq.to_string()),
+                                    ("sample_origin", "helper_receive".into()),
+                                    ("target_generation", owned.generation.to_string()),
+                                    ("phase", "bridge_write".into()),
+                                    ("queue_age_ms", queue_age_ms.to_string()),
+                                    ("helper_sample_age_ms", helper_sample_age_ms.to_string()),
+                                    ("write_ms", elapsed_ms(write_started).to_string()),
+                                    (
+                                        "result",
+                                        match result {
+                                            Some(Ok(())) => "passed",
+                                            Some(Err(_)) => "failed",
+                                            None => "not_connected",
+                                        }
+                                        .into(),
+                                    ),
+                                ],
                             );
                         }
                     }
@@ -4974,6 +5030,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     // ============================================================ 服务
 
     struct Session {
+        connection_generation: u64,
+        hb_sequence: u64,
+        last_hb_rx: Option<Instant>,
         connected_at: Instant,
         last_rx: Instant,
         hello: Option<String>,
@@ -4993,6 +5052,38 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         /// 把日志刷爆；现在只在状态变化或每 `HB_LOG_EVERY` 记一条，
         /// ownership 续约等协议动作不受影响。
         last_hb_log: Option<(Instant, (bool, bool, bool))>,
+    }
+
+    struct AgentRenewalConnection {
+        generation: u64,
+        stream: TcpStream,
+        last_success: Option<Instant>,
+    }
+
+    fn renewal_is_authorized(generation: u64) -> bool {
+        AGENT_AUTHORIZED_GENERATION.load(Ordering::Acquire) == generation
+    }
+
+    fn revoke_renewal_authorization(generation: u64) {
+        let _ = AGENT_AUTHORIZED_GENERATION.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn renew_connection_stream(
+        connection: &mut AgentRenewalConnection,
+        token: &str,
+    ) -> std::io::Result<bool> {
+        if !renewal_is_authorized(connection.generation) {
+            return Ok(false);
+        }
+        let line = format!("{{\"type\":\"renew\",\"token\":\"{token}\"}}\n");
+        connection.stream.write_all(line.as_bytes())?;
+        connection.last_success = Some(Instant::now());
+        Ok(true)
     }
 
     fn now_ms() -> u128 {
@@ -5085,6 +5176,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 if !session.authenticated {
                     return false;
                 }
+                let received_at = Instant::now();
+                session.hb_sequence = session.hb_sequence.checked_add(1).unwrap();
+                session.last_hb_rx = Some(received_at);
                 let lease_ok = extract_bool(line, "lease_ok");
                 let handshake = extract_bool(line, "handshake");
                 let disarmed = extract_bool(line, "disarmed");
@@ -5101,6 +5195,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     logger.kv(
                         "[HB]",
                         &[
+                            (
+                                "connection_generation",
+                                session.connection_generation.to_string(),
+                            ),
+                            ("helper_hb_seq", session.hb_sequence.to_string()),
+                            ("sample_origin", "helper_receive".into()),
                             ("up", format!("{}s", extract_num(line, "up").unwrap_or(0))),
                             ("lease_ok", lease_ok.to_string()),
                             ("handshake", handshake.to_string()),
@@ -5115,7 +5215,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 }
                 if lease_ok {
                     if let (Some(bridge), Some(ack)) = (bridge, session.target_ack.clone()) {
-                        bridge.push_ownership(ack);
+                        bridge.push_ownership(
+                            ack,
+                            session.connection_generation,
+                            session.hb_sequence,
+                            received_at,
+                        );
                     }
                 }
             }
@@ -5935,12 +6040,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 先装控制台处理器，让 Ctrl+C / 关窗走"置位 → 主循环收尾 → 发 disarm"，
         // 而不是默认的硬终止（后者会让下面那段收尾代码永远执行不到）。
         install_ctrl_handler(&logger);
-        let shared: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+        let shared: Arc<Mutex<Option<AgentRenewalConnection>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let renew_count = Arc::new(AtomicU64::new(0));
         // 续约写入失败 ⇒ 当前连接已不可用。置位后由 `serve_connection` **立刻收尾**，
         // 把主循环还给 accept —— 光清 `shared` 是不够的，理由见续约线程内的说明。
-        let conn_stale = Arc::new(AtomicBool::new(false));
+        let conn_stale = Arc::new(AtomicU64::new(0));
         let renew_shared = Arc::clone(&shared);
         let renew_stop = Arc::clone(&stop);
         let renew_counter = Arc::clone(&renew_count);
@@ -5953,18 +6058,35 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let mut tick: u64 = 0;
             while !renew_stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(RENEW_MS));
-                if !AGENT_AUTHORIZED.load(Ordering::Relaxed) {
-                    continue;
-                }
-                tick += 1;
                 let mut guard = match renew_shared.lock() {
                     Ok(g) => g,
                     Err(_) => break,
                 };
-                if let Some(stream) = guard.as_mut() {
-                    let line = format!("{{\"type\":\"renew\",\"token\":\"{renew_token}\"}}\n");
-                    if stream.write_all(line.as_bytes()).is_err() {
-                        renew_logger.kv("[RENEW]", &[("state", "write_failed".into())]);
+                if let Some(connection) = guard.as_mut() {
+                    let generation = connection.generation;
+                    let write_started = Instant::now();
+                    let result = renew_connection_stream(connection, &renew_token);
+                    if matches!(&result, Ok(false)) {
+                        continue;
+                    }
+                    tick += 1;
+                    if let Err(error) = result {
+                        renew_logger.kv(
+                            "[RENEW]",
+                            &[
+                                ("state", "write_failed".into()),
+                                ("connection_generation", generation.to_string()),
+                                ("io_kind", format!("{:?}", error.kind())),
+                                (
+                                    "os_code",
+                                    error
+                                        .raw_os_error()
+                                        .map(|code| code.to_string())
+                                        .unwrap_or_else(|| "none".into()),
+                                ),
+                                ("write_ms", elapsed_ms(write_started).to_string()),
+                            ],
+                        );
                         *guard = None;
                         // **必须同时置位 `conn_stale`**，否则会进入死亡螺旋：
                         //
@@ -5979,13 +6101,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         //
                         // 置位后由 `serve_connection` 立刻收尾，把主循环还给 accept，
                         // 新连接一进来 `shared` 就被重建，续约随即恢复。
-                        renew_stale.store(true, Ordering::Relaxed);
+                        renew_stale.store(generation, Ordering::Release);
                     } else {
                         renew_counter.fetch_add(1, Ordering::Relaxed);
                         if tick % 10 == 0 {
                             renew_logger.kv(
                                 "[RENEW]",
-                                &[("tick", tick.to_string()), ("state", "ok".into())],
+                                &[
+                                    ("tick", tick.to_string()),
+                                    ("state", "ok".into()),
+                                    ("connection_generation", generation.to_string()),
+                                    ("write_ms", elapsed_ms(write_started).to_string()),
+                                ],
                             );
                         }
                     }
@@ -6019,7 +6146,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         } else {
             None
         };
+        let mut connection_generation = 0u64;
         let mut session = Session {
+            connection_generation,
+            hb_sequence: 0,
+            last_hb_rx: None,
             connected_at: Instant::now(),
             last_rx: Instant::now(),
             hello: None,
@@ -6069,10 +6200,20 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             listener.set_nonblocking(true).ok();
             match listener.accept() {
                 Ok((stream, addr)) => {
+                    connection_generation = connection_generation.checked_add(1).unwrap();
                     stream.set_nonblocking(false).ok();
                     stream.set_nodelay(true).ok();
-                    logger.kv("[ACCEPT]", &[("from", addr.to_string())]);
+                    logger.kv(
+                        "[ACCEPT]",
+                        &[
+                            ("from", addr.to_string()),
+                            ("connection_generation", connection_generation.to_string()),
+                        ],
+                    );
                     session = Session {
+                        connection_generation,
+                        hb_sequence: 0,
+                        last_hb_rx: None,
                         connected_at: Instant::now(),
                         last_rx: Instant::now(),
                         hello: None,
@@ -6084,7 +6225,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         last_hb_log: None,
                     };
                     if let Ok(mut guard) = shared.lock() {
-                        *guard = Some(stream.try_clone().expect("clone stream"));
+                        *guard = Some(AgentRenewalConnection {
+                            generation: connection_generation,
+                            stream: stream.try_clone().expect("clone stream"),
+                            last_success: None,
+                        });
                     }
                     serve_connection(
                         stream,
@@ -6105,7 +6250,28 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         saw_authenticated = true;
                     }
                     if let Ok(mut guard) = shared.lock() {
-                        *guard = None;
+                        if let Some(connection) = guard.as_ref().filter(|connection| {
+                            connection.generation == session.connection_generation
+                        }) {
+                            logger.kv(
+                                "[CONNECTION]",
+                                &[
+                                    ("phase", "retired".into()),
+                                    (
+                                        "connection_generation",
+                                        session.connection_generation.to_string(),
+                                    ),
+                                    (
+                                        "last_renew_write_age_ms",
+                                        connection
+                                            .last_success
+                                            .map(|at| elapsed_ms(at).to_string())
+                                            .unwrap_or_else(|| "none".into()),
+                                    ),
+                                ],
+                            );
+                            *guard = None;
+                        }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -6134,10 +6300,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // ---- 收尾 ----
         stop.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = shared.lock() {
-            if let Some(stream) = guard.as_mut() {
+            if let Some(connection) = guard.as_mut() {
                 let line = format!("{{\"type\":\"disarm\",\"token\":\"{}\"}}\n", args.token);
-                let _ = stream.write_all(line.as_bytes());
-                let _ = stream.flush();
+                let _ = connection.stream.write_all(line.as_bytes());
+                let _ = connection.stream.flush();
             }
             *guard = None;
         }
@@ -6500,10 +6666,20 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         stop: &Arc<AtomicBool>,
         deadline: Option<Instant>,
         bridge: Option<&AppBridge>,
-        conn_stale: &Arc<AtomicBool>,
+        conn_stale: &Arc<AtomicU64>,
         cleanup: &mut CleanupState,
     ) {
-        AGENT_AUTHORIZED.store(false, Ordering::Relaxed);
+        logger.kv(
+            "[CONNECTION]",
+            &[
+                ("phase", "started".into()),
+                (
+                    "connection_generation",
+                    session.connection_generation.to_string(),
+                ),
+            ],
+        );
+        revoke_renewal_authorization(session.connection_generation);
         if cleanup.expected_instance.is_some() && !socket_peer_matches(&stream, cleanup.target_pid)
         {
             cleanup.unresolved_multiple = true;
@@ -6511,7 +6687,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             CTRL_STOP.store(true, Ordering::Relaxed);
             return;
         }
-        serve_connection_inner(
+        let end_reason = serve_connection_inner(
             &mut stream,
             session,
             logger,
@@ -6526,7 +6702,27 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             conn_stale,
             cleanup,
         );
-        AGENT_AUTHORIZED.store(false, Ordering::Relaxed);
+        logger.kv(
+            "[CONNECTION]",
+            &[
+                ("phase", "reader_ended".into()),
+                (
+                    "connection_generation",
+                    session.connection_generation.to_string(),
+                ),
+                ("reason", end_reason.into()),
+                ("helper_hb_seq", session.hb_sequence.to_string()),
+                (
+                    "helper_hb_age_ms",
+                    session
+                        .last_hb_rx
+                        .map(|at| elapsed_ms(at).to_string())
+                        .unwrap_or_else(|| "none".into()),
+                ),
+                ("authenticated", session.authenticated.to_string()),
+            ],
+        );
+        revoke_renewal_authorization(session.connection_generation);
         if session
             .hello
             .as_deref()
@@ -6584,6 +6780,10 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             logger.kv(
                 "[AGENT-STOP]",
                 &[
+                    (
+                        "connection_generation",
+                        session.connection_generation.to_string(),
+                    ),
                     (
                         "result",
                         if confirmed { "passed" } else { "unconfirmed" }.into(),
@@ -6715,9 +6915,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         stop: &Arc<AtomicBool>,
         deadline: Option<Instant>,
         bridge: Option<&AppBridge>,
-        conn_stale: &Arc<AtomicBool>,
+        conn_stale: &Arc<AtomicU64>,
         cleanup: &mut CleanupState,
-    ) {
+    ) -> &'static str {
         if stream
             .set_read_timeout(Some(Duration::from_millis(READ_POLL_MS)))
             .is_err()
@@ -6739,23 +6939,31 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 最近一次下发给 agent 的门内延迟开关（主程序能力声明；None = 尚未下发过）。
         let mut sent_gate: Option<bool> = None;
         let mut previous_read_clock: Option<(u64, Instant)> = None;
-        loop {
+        let end_reason = loop {
             logger.latency_summary();
             if stop_requested(stop) {
-                return;
+                return "stop_requested";
             }
             // 续约线程报告本条连接已不可用（写失败）→ **立刻收尾**，把主循环还给
             // accept。不能只清 `shared` 就走：那样主循环仍阻塞在这里，
             // agent 重连的新连接进不了 accept，续约永远恢复不了（死亡螺旋）。
-            if conn_stale.swap(false, Ordering::Relaxed) {
+            if conn_stale
+                .compare_exchange(
+                    session.connection_generation,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
                 logger.line(
                     "[CONN-STALE] 续约写入失败 → 本条连接已不可用，立即收尾以便接受 agent 的新连接。",
                 );
-                return;
+                return "renew_write_failed";
             }
             if let Some(d) = deadline {
                 if Instant::now() >= d {
-                    return; // 主循环会打 [TIMEUP] 并收尾
+                    return "deadline";
                 }
             }
 
@@ -6764,7 +6972,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     let current = bridge.capture_targets();
                     if sent_targets.as_ref() != Some(&current) {
                         if !send_dynamic_targets(stream, token, &current) {
-                            return;
+                            return "targets_write_failed";
                         }
                         sent_targets = Some(current);
                         session.target_ack = None;
@@ -6778,7 +6986,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     let (synth_current, synth_dirty) = bridge.voice_synth_state();
                     if synth_dirty || sent_synth.as_ref() != Some(&synth_current) {
                         if !send_voice_synth(stream, token, synth_current) {
-                            return;
+                            return "synth_write_failed";
                         }
                         logger.kv(
                             "[VOICE-SYNTH]",
@@ -6799,7 +7007,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     let (gate_on, gate_dirty) = bridge.voice_gate_state();
                     if gate_dirty || sent_gate != Some(gate_on) {
                         if !send_voice_gate(stream, token, gate_on) {
-                            return;
+                            return "gate_write_failed";
                         }
                         logger.kv(
                             "[VOICE-GATE]",
@@ -6835,13 +7043,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     wait.as_millis()
                 ));
                 if !send_dynamic_targets(stream, token, sent) {
-                    return;
+                    return "targets_retry_write_failed";
                 }
                 sent_at = Some(Instant::now());
             }
 
             match stream.read(&mut chunk) {
-                Ok(0) => break, // 对端关闭
+                Ok(0) => break "peer_closed",
                 Ok(n) => {
                     let read_at = Instant::now();
                     let read_ms = now_ms_u64();
@@ -6875,7 +7083,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         LATENCY.record(LatencyStage::HandleLine, elapsed_ms(handle_started));
                         if !keep_session {
                             logger.line("[INFO] 连接结束（令牌不符或 agent 主动 bye）。");
-                            return;
+                            return "agent_message_ended";
                         }
                         if session.authenticated && !session.config_sent {
                             let identity = session
@@ -6886,14 +7094,25 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 cleanup.unresolved_multiple = true;
                                 logger.line("[CLEANUP] result=blocked reason=agent_identity_mismatch arm_sent=false");
                                 CTRL_STOP.store(true, Ordering::Relaxed);
-                                return;
+                                return "agent_identity_mismatch";
                             }
                             if cleanup.begin_capture().is_err() {
                                 logger.line("[CLEANUP] result=blocked reason=requested_write_failed capture_authorized=false");
                                 CTRL_STOP.store(true, Ordering::Relaxed);
-                                return;
+                                return "cleanup_write_failed";
                             }
-                            AGENT_AUTHORIZED.store(true, Ordering::Relaxed);
+                            AGENT_AUTHORIZED_GENERATION
+                                .store(session.connection_generation, Ordering::Release);
+                            logger.kv(
+                                "[CONNECTION]",
+                                &[
+                                    ("phase", "authorized".into()),
+                                    (
+                                        "connection_generation",
+                                        session.connection_generation.to_string(),
+                                    ),
+                                ],
+                            );
                             if stream
                                 .write_all(
                                     format!("{{\"type\":\"renew\",\"token\":\"{token}\"}}\n")
@@ -6901,7 +7120,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 )
                                 .is_err()
                             {
-                                return;
+                                return "initial_renew_write_failed";
                             }
                             session.config_sent = true;
                             let targets = bridge
@@ -6936,11 +7155,29 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     continue
                 }
                 Err(e) => {
+                    logger.kv(
+                        "[CONNECTION]",
+                        &[
+                            ("phase", "read_failed".into()),
+                            (
+                                "connection_generation",
+                                session.connection_generation.to_string(),
+                            ),
+                            ("io_kind", format!("{:?}", e.kind())),
+                            (
+                                "os_code",
+                                e.raw_os_error()
+                                    .map(|code| code.to_string())
+                                    .unwrap_or_else(|| "none".into()),
+                            ),
+                            ("buffered_bytes", buf.len().to_string()),
+                        ],
+                    );
                     logger.line(&format!("[WARN] 读取连接失败: {e}"));
-                    break;
+                    break "read_failed";
                 }
             }
-        }
+        };
         logger.kv(
             "[DISCONNECT]",
             &[
@@ -6961,8 +7198,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 ),
                 ("lines", session.lines.to_string()),
                 ("edges", session.edges.len().to_string()),
+                (
+                    "connection_generation",
+                    session.connection_generation.to_string(),
+                ),
             ],
         );
+        end_reason
     }
 
     fn resolve_target(args: &Args, logger: &Logger) -> Result<(u32, Vec<HostEntry>), i32> {
@@ -7395,6 +7637,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let spinner = std::thread::spawn(move || {
                 if let Ok((stream, _)) = listener.accept() {
                     let mut sess = Session {
+                        connection_generation: 1,
+                        hb_sequence: 0,
+                        last_hb_rx: None,
                         connected_at: Instant::now(),
                         last_rx: Instant::now(),
                         hello: None,
@@ -7407,7 +7652,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     };
                     let quiet = Logger::new(None);
                     let stop = Arc::new(AtomicBool::new(false));
-                    let stale = Arc::new(AtomicBool::new(false));
+                    let stale = Arc::new(AtomicU64::new(0));
                     let t0 = Instant::now();
                     serve_connection(
                         stream,
@@ -8021,12 +8266,15 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             Ok(stale_listener) => {
                 let stale_port = stale_listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 let (stale_tx, stale_rx) = mpsc::channel::<u64>();
-                let stale_flag = Arc::new(AtomicBool::new(false));
+                let stale_flag = Arc::new(AtomicU64::new(0));
                 {
                     let stale_flag = Arc::clone(&stale_flag);
                     std::thread::spawn(move || {
                         if let Ok((stream, _)) = stale_listener.accept() {
                             let mut sess = Session {
+                                connection_generation: 1,
+                                hb_sequence: 0,
+                                last_hb_rx: None,
                                 connected_at: Instant::now(),
                                 last_rx: Instant::now(),
                                 hello: None,
@@ -8063,7 +8311,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 let _stale_client =
                     TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, stale_port)).ok();
                 std::thread::sleep(Duration::from_millis(300));
-                stale_flag.store(true, Ordering::Relaxed);
+                stale_flag.store(1, Ordering::Relaxed);
                 match stale_rx.recv_timeout(Duration::from_millis(3000)) {
                     Ok(elapsed) => check(
                         "续约写失败（conn_stale）能立刻打断当前连接",
@@ -9222,6 +9470,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
         fn session() -> Session {
             Session {
+                connection_generation: 1,
+                hb_sequence: 0,
+                last_hb_rx: None,
                 connected_at: Instant::now(),
                 last_rx: Instant::now(),
                 hello: None,
@@ -9232,6 +9483,133 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 target_ack: None,
                 last_hb_log: None,
             }
+        }
+
+        #[test]
+        fn connection_generation_delayed_fault_does_not_end_replacement() {
+            let _guard = CONNECTION_TEST_GATE.lock().unwrap();
+            CTRL_STOP.store(false, Ordering::Relaxed);
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stale = Arc::new(AtomicU64::new(0));
+            let server_stale = Arc::clone(&stale);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut replacement = session();
+                replacement.connection_generation = 2;
+                ready_tx.send(()).unwrap();
+                serve_connection_inner(
+                    &mut stream,
+                    &mut replacement,
+                    &Logger::new(None),
+                    "synthetic-renewal-token",
+                    false,
+                    true,
+                    &[],
+                    None,
+                    &Arc::new(AtomicBool::new(false)),
+                    Some(Instant::now() + Duration::from_secs(2)),
+                    None,
+                    &server_stale,
+                    &mut CleanupState::new(0, 0),
+                );
+                done_tx.send(()).unwrap();
+            });
+            let client = TcpStream::connect(address).unwrap();
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            stale.store(1, Ordering::Release);
+            let replacement_ended = done_rx.recv_timeout(Duration::from_millis(600)).is_ok();
+            stale.store(2, Ordering::Release);
+            let current_fault_ended = done_rx.recv_timeout(Duration::from_millis(600)).is_ok();
+            drop(client);
+            server.join().unwrap();
+            assert!(
+                !replacement_ended,
+                "late old renewal failure ended the replacement session"
+            );
+            assert!(
+                current_fault_ended,
+                "current renewal failure did not end its own session"
+            );
+        }
+
+        #[test]
+        fn connection_generation_old_authorization_does_not_authorize_replacement() {
+            let _guard = CONNECTION_TEST_GATE.lock().unwrap();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(60)))
+                .unwrap();
+            let mut connection = AgentRenewalConnection {
+                generation: 2,
+                stream,
+                last_success: None,
+            };
+            AGENT_AUTHORIZED_GENERATION.store(1, Ordering::Release);
+            let replacement_authorized =
+                renew_connection_stream(&mut connection, "synthetic-renewal-token").unwrap();
+            let mut buffer = [0u8; 256];
+            let no_old_authority_bytes = peer.read(&mut buffer).is_err();
+            AGENT_AUTHORIZED_GENERATION.store(2, Ordering::Release);
+            revoke_renewal_authorization(1);
+            let current_authorization_preserved =
+                renew_connection_stream(&mut connection, "synthetic-renewal-token").unwrap();
+            let expected = b"{\"type\":\"renew\",\"token\":\"synthetic-renewal-token\"}\n";
+            let received = peer.read_exact(&mut buffer[..expected.len()]);
+            revoke_renewal_authorization(2);
+            let authorization_cleared =
+                !renew_connection_stream(&mut connection, "synthetic-renewal-token").unwrap();
+            AGENT_AUTHORIZED_GENERATION.store(0, Ordering::Release);
+            assert!(
+                !replacement_authorized,
+                "old authorization renewed the replacement stream"
+            );
+            assert!(no_old_authority_bytes);
+            assert!(current_authorization_preserved);
+            received.unwrap();
+            assert_eq!(&buffer[..expected.len()], expected);
+            assert!(authorization_cleared);
+        }
+
+        #[test]
+        fn connection_generation_heartbeat_diagnostics_identify_helper_sampling() {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let sink_records = Arc::clone(&records);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                sink_records.lock().unwrap().push(record.to_owned())
+            }));
+            let mut current = session();
+            current.connection_generation = 2;
+            current.authenticated = true;
+            assert!(handle_line(
+                r#"{"type":"hb","lease_ok":true,"handshake":true,"since_renew_ms":25}"#,
+                &mut current,
+                &logger,
+                "synthetic-secret",
+                None
+            ));
+            assert!(handle_line(
+                r#"{"type":"hb","lease_ok":false,"handshake":true,"since_renew_ms":2100}"#,
+                &mut current,
+                &logger,
+                "synthetic-secret",
+                None
+            ));
+            assert_eq!(current.hb_sequence, 2);
+            assert!(current.last_hb_rx.is_some());
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records[0]
+                .contains("connection_generation=2 helper_hb_seq=1 sample_origin=helper_receive"));
+            assert!(records[1].contains("helper_hb_seq=2"));
+            assert!(records[1].contains("lease_ok=false"));
+            assert!(records
+                .iter()
+                .all(|record| !record.contains("synthetic-secret")));
         }
 
         #[test]
@@ -9300,7 +9678,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     &Arc::new(AtomicBool::new(false)),
                     None,
                     None,
-                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicU64::new(0)),
                     &mut cleanup,
                 );
                 let received = peer.join().unwrap();
@@ -9360,7 +9738,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 &Arc::new(AtomicBool::new(true)),
                 None,
                 None,
-                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicU64::new(0)),
                 &mut cleanup,
             );
             assert_eq!(peer.join().unwrap(), 0);
@@ -9400,7 +9778,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 &Arc::new(AtomicBool::new(false)),
                 None,
                 None,
-                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicU64::new(0)),
                 &mut cleanup,
             );
             assert_eq!(
@@ -9644,7 +10022,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     &Arc::new(AtomicBool::new(false)),
                     None,
                     None,
-                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicU64::new(0)),
                     &mut cleanup,
                 );
                 peer.join().unwrap();
