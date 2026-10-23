@@ -1,5 +1,12 @@
 # Windows RC001 / RC003 Preview 测试手册
 
+## 2026-10-23 菜单关闭交互复验
+
+- passed: 同机18:54用户确认Menu开/关后鼠标点击输入框不再唤回菜单, 输入与Back正常, 重开上下导航正常; 日志6次hide_completed与visible=false, 首Back直接map_fire, 无close blocked或下一按键清理残留。
+- 自动化passed: Controller边界确定性RED/GREEN、所属8项、scene84/1ignored、完整workspace core61+4、Windows619/21ignored、Host185/1ignored及fmt/check/runtime-simulation, 独立review通过。测试不以真实窗口激活验证前台恢复。
+- failed/未关闭: 同次自动目标焦点恢复6次window_operation_failed; 同App/Helper16:22:02–18:56:25有界日志29次ownership_timeout、1次rx_silence/断连, gate_write_failed和日志overflow均0。日志文件覆盖区间未观察到轮转缺口, 不能据用户感觉稳定宣布全按键持续性通过。
+- 被测setup为`8d77ffa8cf11098dfda5233bac048f83c6899dc23b112366992f548c12974ef0`, dirty fingerprint为`04cac8eb38673df07a56104c91159fa819101d4bc7ce66e81bde1db52820772b`;完整边界见[菜单令牌记录](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-23-菜单返回目标令牌校验)。
+
 ## 2026-10-22 连接续约会话代次候选
 
 针对用户报告的 Menu 偶发原生行为/恢复后重新映射，现有同会话日志已证实 Helper-Agent TCP 10053 断线、App 所有权缺失及后续恢复，最初断线原因仍 unknown。时间线和累计 STAT 的可信边界归 [原 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-22-接管瞬断的连接代次隔离与诊断候选)。候选仅修可重复的跨连接 renew fault/授权污染并补诊断，不宣称整体接管或实体反引号已修。

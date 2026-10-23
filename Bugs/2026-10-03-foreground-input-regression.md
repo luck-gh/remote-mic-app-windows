@@ -1,5 +1,13 @@
 # 主窗口前台时的菜单、按键链路与语音启动异常
 
+## 2026-10-23 菜单返回目标令牌校验
+
+- 修复范围: 菜单打开后的前台观察不再使原目标令牌因“不是最后观察窗口”而被拒绝; 保留公开 IsWindow/owner PID 校验、前台激活读回和动作发送的前台约束。未增加同进程 HWND 复用的完整生命周期保证。
+- 验证: 真实 Controller/TokenState 的确定性 RED 为 StaleToken/calls=0, 修复后边界恰调用一次; 所属8项、scene84项通过(1 ignored), 完整workspace core61+4、Windows619/21ignored、Host185/1ignored及fmt/check/runtime-simulation通过, 独立review通过。早期message-only窗口激活结果不稳定的完整测试失败已保留, 后续窗口测试仅validation, 不实际激活。
+- 本机2026-10-23北京时间18:54用户确认开菜单、再次关闭、鼠标点击输入框不再重现、正常输入/Back、重新打开上下导航均正常。日志6次hide_completed随后visible=false, 首个Back直接map_fire, 无残留菜单取消兜底或close blocked, 此交互验收passed。
+- 独立限制: 同窗口6次自动恢复目标焦点返回window_operation_failed, 未区分SetForegroundWindow返回失败与即时读回不同, 不宣称自动焦点恢复API已通过。同App/Helper的16:22:02–18:56:25有界日志有29次ownership_timeout、1次rx_silence/断连、0次gate_write_failed、0次日志overflow; 当前文件覆盖该区间且未观察到轮转缺口, 异步日志仍不保证无缺项。持续接管稳定性仍failed, 与本令牌修复分开。
+- 被测安装包SHA-256为`8d77ffa8cf11098dfda5233bac048f83c6899dc23b112366992f548c12974ef0`, fingerprint为`04cac8eb38673df07a56104c91159fa819101d4bc7ce66e81bde1db52820772b`, local/dirty/included; 安装包还包含其他未提交改动, 本独立提交不是整包快照。
+
 - 发现日期：2026-10-03。
 - 状态：部分修复、剩余边界调查中；历史菜单、音频队列、助手误退及状态界面修复和验证各归下文对应候选。2026-10-12 用户重启后，0.8.6 来源修复候选已实际加载新 Agent，菜单完整链与用户确认的菜单、实体键盘恢复通过。同日修复音频端点名称识别与语音键 UI 反馈耦合，经用户明确选择新同线通道、正常安装后，四次语音会话及用户确认的按键反馈/语音输入通过；原声卡 Code 10 原因、显式连发开启、完整双型号矩阵及历史三轮/单击退格异常仍未全部闭合。
 - 影响范围：Windows 本地 0.5.0 候选；用户报告在无线麦主窗口为当前激活窗口时较易发生。不是“始终置顶”功能。RC003 统一捕获链与原 ATVV 语音路径；不外推 RC001。

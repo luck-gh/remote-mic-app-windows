@@ -206,14 +206,15 @@ impl ApplicationController {
     }
 
     pub fn restore_foreground(&self, token: &WindowToken) -> Result<(), ApplicationControlError> {
-        lock(&self.state)
-            .current
-            .as_ref()
-            .filter(|identity| {
-                identity.process_id == token.process_id && identity.window_id == token.window_id
-            })
-            .ok_or(ApplicationControlError::StaleToken)?;
-        platform::restore_foreground(token)
+        self.restore_foreground_with(token, platform::restore_foreground)
+    }
+
+    fn restore_foreground_with(
+        &self,
+        token: &WindowToken,
+        restore: impl FnOnce(&WindowToken) -> Result<(), ApplicationControlError>,
+    ) -> Result<(), ApplicationControlError> {
+        restore(token)
     }
 }
 
@@ -342,7 +343,9 @@ mod platform {
             .map_err(|_| ApplicationControlError::WindowOperationFailed)
     }
 
-    pub(super) fn restore_foreground(token: &WindowToken) -> Result<(), ApplicationControlError> {
+    pub(super) fn validate_restore_target(
+        token: &WindowToken,
+    ) -> Result<HWND, ApplicationControlError> {
         let hwnd = HWND(token.window_id as usize as *mut _);
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(ApplicationControlError::StaleToken);
@@ -352,6 +355,11 @@ mod platform {
         if owner != token.process_id {
             return Err(ApplicationControlError::StaleToken);
         }
+        Ok(hwnd)
+    }
+
+    pub(super) fn restore_foreground(token: &WindowToken) -> Result<(), ApplicationControlError> {
+        let hwnd = validate_restore_target(token)?;
         if unsafe { SetForegroundWindow(hwnd) }.as_bool()
             && unsafe { GetForegroundWindow() } == hwnd
         {
@@ -435,6 +443,107 @@ mod tests {
         let token = state.observe(identity("one", 10));
         state.invalidate();
         assert!(!state.accepts(&token, &identity("one", 10)));
+    }
+
+    #[cfg(windows)]
+    struct MessageWindow(windows::Win32::Foundation::HWND);
+
+    #[cfg(windows)]
+    impl MessageWindow {
+        fn new() -> Self {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+            };
+            Self(unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    windows::core::w!("STATIC"),
+                    windows::core::w!(""),
+                    WINDOW_STYLE::default(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+        }
+
+        fn identity(&self) -> ForegroundIdentity {
+            let mut target = identity("test", self.0 .0 as usize as u64);
+            target.process_id = std::process::id();
+            target
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for MessageWindow {
+        fn drop(&mut self) {
+            unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0).unwrap() };
+        }
+    }
+
+    #[test]
+    fn restore_original_target_after_menu_observation_calls_boundary_once() {
+        for same_process in [false, true] {
+            let controller = ApplicationController::new();
+            let token = lock(&controller.state).observe(identity("target", 2));
+            let mut menu = identity("menu", 1);
+            if !same_process {
+                menu.process_id += 1;
+            }
+            lock(&controller.state).observe(menu);
+            let calls = std::cell::Cell::new(0);
+            let result = controller.restore_foreground_with(&token, |received| {
+                calls.set(calls.get() + 1);
+                assert_eq!(received, &token);
+                Ok(())
+            });
+            assert!(
+                result.is_ok() && calls.get() == 1,
+                "same_process={same_process} result={result:?} calls={}",
+                calls.get()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_live_restore_target_without_activation() {
+        let target = MessageWindow::new();
+        let token = TokenState::default().observe(target.identity());
+        assert_eq!(platform::validate_restore_target(&token).unwrap(), target.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_destroyed_window_remains_stale() {
+        let controller = ApplicationController::new();
+        let target = MessageWindow::new();
+        let token = lock(&controller.state).observe(target.identity());
+        drop(target);
+        assert!(matches!(
+            platform::validate_restore_target(&token),
+            Err(ApplicationControlError::StaleToken)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_window_with_wrong_owner_remains_stale() {
+        let controller = ApplicationController::new();
+        let target = MessageWindow::new();
+        let mut wrong_owner = target.identity();
+        wrong_owner.process_id = 0;
+        let token = lock(&controller.state).observe(wrong_owner);
+        assert!(matches!(
+            platform::validate_restore_target(&token),
+            Err(ApplicationControlError::StaleToken)
+        ));
     }
 
     #[test]
