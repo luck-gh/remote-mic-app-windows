@@ -50,6 +50,7 @@
 //! | `R <t_ms> <usages>` | 助手 → app | 全部普通按键的物理观察，仅供界面 |
 //! | `S -` / `A -` | app → 助手 / 助手 → app | 固定关闭报告语音合成及回执 |
 //! | `P <t_ms>` | 助手 → app | 心跳（每 1s） |
+//! | `R <1|0>` | 助手 → app | 设备节点恢复进行中/结束（绝对状态；期间暂缓 capture_recover） |
 //! | `BYE <reason>` | 助手 → app | 助手收尾，按键即将释放 |
 //!
 //! 边沿是**绝对状态**（与 agent 侧一致，只在变化时才发），主程序侧做差分转成
@@ -471,6 +472,9 @@ fn clear_ownership(shared: &Arc<Mutex<BridgeShared>>) {
     if let Some(mapping) = mapping {
         mapping.set_capture_owned(0);
     }
+    // 门禁必须跟所有权一起落下：所有权是"报告层还归我们"的唯一证据，租约一丢
+    // 报告层合成就不可能再生效。少这一行，按下的路径选择会继续指向已经死掉的
+    // 报告层（issue #264 现场形态）。
     if had_ownership {
         note("enhanced_capture event=ownership_released native=passthrough".to_owned());
     }
@@ -1175,7 +1179,12 @@ fn handle_connection(
                             let mut state = lock(shared);
                             state.phase = BridgePhase::Connected;
                             state.helper_pid = helper_pid;
+                            // 新助手会话不继承上一实例的恢复窗口。
                         }
+                        // 上一代连接的租约不属于这一代助手：不清掉的话快照会对外
+                        // 谎报"已接管"（对账据此判 active，门禁也会被旧回执抬起），
+                        // 而新会话其实还没回执任何东西（issue #264 同型）。
+                        clear_ownership(shared);
                         note(format!(
                             "rc003_bridge event=helper_authenticated helper_pid={helper_pid} version={version} transport={} auth={}",
                             writer.transport(),
@@ -1209,6 +1218,10 @@ fn handle_connection(
                             "rc003_bridge event=voice_synth_sent to=off scope=hello await=ack local_voice=send_input write_ok={}",
                             synth_sent_at.is_some()
                         ));
+                        note(
+                            "rc003_bridge event=voice_synth_gate active=false reason=hello"
+                                .to_owned(),
+                        );
                     }
                     _ => {
                         // 未鉴权前只接受 HELLO。这不是防攻击（同用户进程挡不住），
@@ -1397,6 +1410,9 @@ fn handle_connection(
                 .unwrap_or(false);
             if ownership_expired {
                 clear_ownership(shared);
+                // 租约没了 ⇒ 上一份 `A` 行不再代表"现在会改写"：作废回执，逼
+                // 重发 S 行重新确认（新 agent 会话只能靠新的 `A` 行证明）。
+                synth_confirmed = false;
                 note(format!(
                     "enhanced_capture event=ownership_timeout timeout_ms={} native=passthrough",
                     OWNERSHIP_TIMEOUT.as_millis()
@@ -2046,6 +2062,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (sender, _receiver) = channel();
         let bridge = Rc003Bridge::start_in(dir.clone(), sender);
+        // 所有权只在目标集非空时成立：先给一个真实目标（三键恒在，见模块文档）。
+        bridge.set_capture_targets(true, mask(&[RemoteButton::Back]));
 
         let text = std::fs::read_to_string(dir.join(BRIDGE_FILE_NAME)).expect("描述文件");
         let pipe = text
@@ -2398,10 +2416,18 @@ mod tests {
         // 热更新为主页键：主程序先撤销旧所有权，再下发新一代目标；主页边沿
         // 此后应走同一条 GateEdge 通道，而不是全局物理键盘钩子。
         bridge.set_capture_targets(true, mask(&[RemoteButton::Home]));
+        // 所有权租约到期时桥接会先写一行 `S -` 之类的通知；热更新行 `T ...` 可能排在
+        // 它后面。读到 `T ` 为止，不要把通知误判成热更新失败（2026-10-25 全量测试偶发）。
         let mut target_line = String::new();
-        reader
-            .read_line(&mut target_line)
-            .expect("必须收到 T 热更新");
+        for _ in 0..8 {
+            target_line.clear();
+            reader
+                .read_line(&mut target_line)
+                .expect("必须收到 T 热更新");
+            if target_line.starts_with("T ") {
+                break;
+            }
+        }
         assert!(target_line.starts_with("T "), "实际收到 {target_line:?}");
         assert!(target_line.trim().ends_with("4a"));
         stream.write_all(b"E 3 4a\n").unwrap();
@@ -2599,5 +2625,17 @@ mod tests {
 
         drop(bridge);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 轮询等待（桥接线程是异步的，断言不能靠固定 sleep 压时序）。
+    fn wait_until(limit: Duration, mut probe: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if probe() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 }

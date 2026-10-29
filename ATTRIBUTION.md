@@ -543,6 +543,12 @@
 
 来源归因与验收分开：f7安装版新启动common、后续菜单手选后恢复是旧契约造成，不能写为0.8.6随机覆盖；旧17:56同运行问题保留未知。本次回归先红后绿，冻结前端407/Rust workspace728/Host158/Helper58等及身份/载荷门禁passed；18步隔离模拟未支持手选API，不作为模板记忆验收。d884候选上用户确认两处使用正常、编辑不变；其成功提示闪动通过删除提示最小修正，最终静默候选fp `8a38c43cce592fff5636e0aa9aafa06abd38f0b6092b21e73e34cff1cc774007` 实际安装运行匹配。正常退出前记忆browser且安装五配置保持，新启动source remembered/generation2/动作可用证明恢复；之后generation3 buttons_page切Agent已由用户确认是手动使用，用户确认再次切换不闪动。不声称用户亲眼确认启动初始browser，也不外推双型号或未验硬件边界；完整身份和分层证据归既有Bug与Preview，capture租约/驻留换代继续暂停。
 
+### 2026-10-29 本地回眸、界面语言与语音恢复源码整合
+
+固定来源为 [GetSayAll/remote-mic-app-windows@96dbe78e0bca9442e457e17e073ab33c71377f81](https://github.com/GetSayAll/remote-mic-app-windows/tree/96dbe78e0bca9442e457e17e073ab33c71377f81), 共同基线为 `ab9aa197e59c65b6c7b22e51a968cd0cb4312446`, 保留上游历史和 GPL-3.0-only 许可。吸收本地回眸及默认关闭的原音记录、界面语言、音频端点失效恢复、会话结束后的输入法恢复和鉴权渐进退避; 保留个人品牌、模板草稿保存、临时麦克风事务、RecoveryTicket、按放清理与独立组件身份。
+
+本次是源码融合, 未安装或改变当前运行实例。组合工作区自动化不等于纯索引独立验证; 旧 held 内双切输入法反例、G1/G2 和真实硬件验收仍未解决, 不把上游实验或本次源码检查当作这些功能修复通过。
+
 ### 2026-10-20 上游组合动作与启动能力整合
 
 本轮固定输入为 `GetSayAll/remote-mic-app-windows` 的 `upstream/main@ab9aa197e59c65b6c7b22e51a968cd0cb4312446`（PR #265），实际共同基线为 `05c37cf5f740db7f34cc2d9a4270dca7bd2c2e6d`；此前 `df0d3a4316f02594f30129216693b73ac2058e88` 只作为捕获规则候选的历史参考。按用户最新顺序先在既有任务分支做真实三方整合，再处理接管和实体键盘来源故障，不以源码拷贝或上游通过记录替代合并与本地验证。
@@ -560,3 +566,19 @@
 自定义快捷方式只在新名不存在时复制单个已核对 .lnk，再用公开 COM 更新图标/修改版说明，保存后重读目标、图标和扩展属性。按 [Microsoft System.AppUserModel.ID](https://learn.microsoft.com/en-us/windows/win32/properties/props-system-appusermodel-id) 与 [IPropertyStore::SetValue/Commit](https://learn.microsoft.com/en-us/windows/win32/api/propsys/nf-propsys-ipropertystore-setvalue) 的公开属性契约，实际 fixture 设置并重读 AppUserModelID，证明新链接仍保留该值；新名冲突不覆盖，失败不回收原链接。此测试仅自建文件，不读取第三方私有配置。
 
 同日真实桌面发现任务栏仍有旧图，但公开 `WM_GETICON` 大/小图、EXE 资源和 Shell EXE 图像均已新；普通应用正常重开与 `SHCNE_UPDATEITEM` 通知不能修复。按微软 [SHUpdateImageW](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shupdateimagew) 的现有图像键契约，从当前 EXE 的 `IExtractIconW::GetIconLocation` 读取真实 location/index/flags，并用 [SHGetFileInfoW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shgetfileinfow) 获取该项系统图像 index，仅通知这个 EXE 项后实际任务栏出现新个人图。启动正式接入复用已有 `windows` crate 与 Tauri blocking runtime，后台查询避免阻塞 UI；COM/PIDL 成功、失败均按所有权配对释放，不改变 AppID/pin/顺序，不清全局缓存、不重启 Explorer。日志区分请求、submitted 与失败，submitted 不能表述为显示通过。具体候选与真实像素范围归既有安装验收专项。
+
+- 主窗口有界恢复与相关策略测试改编自本仓库提交 `c89b587bfef1947a7bbde76c353632fa27ca3af0`，作者 **GuoHowe**；上游移植只涉及 `src-tauri/src/lib.rs` 的 WebView2 故障处理，按上游已有退出标记适配，不改 IME、语音或安装器流程。同一作者在其 fork 提交 `adddb0cc210885aff4ba19dec6684d199aa8e31e`（PR #202）中另带一次性原生提示（窗口标题改写、托盘 tooltip、`MessageBoxW`）：该实现未采纳（写标题的判据是 `Reload` 的返回值而非界面是否真的没回来，且写出后没有恢复路径）；本仓库改用心跳判据的标题提示（页面恢复报到即还原），设计见 Bug 记录的 2026-10-07 节。
+- 官方行为参考：[Microsoft WebView2 process-related events](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-related-events)。使用公开 `ProcessFailed`/`Reload` API；浏览器进程退出只能重建控件，本实现只落结构化日志，不伪造恢复；控件重建、托盘 tooltip 与系统对话框未实现；真实故障恢复验收不在已验证范围。
+- 直接依赖复用 Tauri/Wry 已锁定的 `webview2-com 0.38.2`，来源 [wravery/webview2-rs](https://github.com/wravery/webview2-rs)，许可 MIT；没有复制其示例实现。验证边界见 [2026-09-12 Bug 记录的增量节](Bugs/2026-09-12-voice-chord-focused-webview-reload.md#2026-10-05独立的-webview2-故障恢复贡献候选)。
+
+## 2026-10-24 英文界面词条来源
+
+- 语义与文案参考（未复制代码）：`HD838A/remote-mic-app` 的 `Resources/en.lproj/Localizable.strings`（提交 `c1840de92be4e74dd4404d6592e8e72b7b9278ff`）与 `sayall-private-platform` 组合动作包 `packages/macos-button-profiles/Sources/SayAllButtonProfiles/Resources/en.lproj/Localizable.strings`（提交 `e5f6cf23fd8f41eec4df7825bbe7715d29650eb5`）。
+- Windows 端以中文原文为 key 自建 `src/lib/i18n/en/*.ts`，沿用 Mac 术语（Routines、Doubao、WeType、App Language、System Default 等）；未复制 Swift/SwiftUI 代码或资源文件，平台差异（托盘、Win32 语言解析、Full-key support）由本仓库实现。
+
+## 2026-10-25「回眸」文字版来源
+
+- 语义与产品行为参考（未复制 Swift/SwiftUI 代码或资源）：`HD838A/remote-mic-app` 的 `Sources/RemoteMic/TranscriptHistorySection.swift`、`TranscriptArchiveStore.swift`、`TranscriptCaptureCoordinator.swift`、`BridgeAppModel.swift`，以及 `Tests/RemoteMicTests/TranscriptCaptureCoordinatorTests.swift`、`TranscriptArchiveStoreTests.swift`、`feature/local-transcript-history/README.md`（参考时 HEAD `c1840de92be4e74dd4404d6592e8e72b7b9278ff`）。
+- 复用的产品语义：默认关闭；只记录语音新增文字；按应用与日期组织；全部应用最近 7 天、单应用全部历史；删除单条/应用/全部；单条上限 8000 字符；捕获失败静默跳过。
+- Windows 实现差异：文本读取使用 UI Automation（`ValuePattern` / `TextPattern`）而非 macOS Accessibility；图标使用 `PrivateExtractIconsW` 提取 64×64 PNG 并按应用键缓存；删除使用 Windows 回收站；入口为侧栏独立页面；存储根为 `%LOCALAPPDATA%\SayAll\transcripts\v1`，不承诺与 Mac 历史互通。
+- 不采用 Mac 的原始录音、本机 Agent/MCP 访问与跨端迁移能力；这些能力不在本次范围内。

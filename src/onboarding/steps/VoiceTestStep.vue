@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { t } from "../../lib/i18n";
 import type { VoiceAttemptState } from "../voice-attempt";
 
 const props = defineProps<{
@@ -20,15 +21,15 @@ const box = ref<HTMLInputElement | null>(null);
 const statusText = computed(() => {
   switch (props.phase) {
     case "streaming":
-      return "正在接收你说的话…";
+      return t("正在接收你说的话…");
     case "waiting_end":
-      return "正在收尾…";
+      return t("正在收尾…");
     case "waiting_transcript":
-      return "正在等文字出现…";
+      return t("正在等文字出现…");
     case "terminal":
       return "";
     default:
-      return "等待你按住遥控器语音键。";
+      return t("等待你按住遥控器语音键。");
   }
 });
 
@@ -48,9 +49,9 @@ defineExpose({ focusBox, clearBox, hasText });
 
 <template>
   <section class="onboarding-step">
-    <h1>按住遥控器语音键，试一句话</h1>
+    <h1>{{ t("按住遥控器语音键，试一句话") }}</h1>
     <p class="onboarding-lede">
-      点一下下面的输入框，按住遥控器上的语音键说一句话，然后松开。文字应该会出现在输入框里。
+      {{ t("点一下下面的输入框，按住遥控器上的语音键说一句话，然后松开。文字应该会出现在输入框里。") }}
     </p>
 
     <div class="onboarding-card warn">
@@ -65,14 +66,14 @@ defineExpose({ focusBox, clearBox, hasText });
           <span>工具里的语音键和这次设置一致（{{ hotkeyText }}）。</span>
         </li>
       </ul>
-      <p>本次设置快捷键：{{ hotkeyText }}（“本次设置”）；语音设备：{{ audioText }}。</p>
+      <p>{{ t("本次设置快捷键：{hotkey}（“本次设置”）；语音设备：{audio}。", { hotkey: hotkeyText, audio: audioText }) }}</p>
     </div>
 
     <input
       ref="box"
       class="onboarding-voice-input"
       type="text"
-      placeholder="你说的话会出现在这里"
+      :placeholder="t('你说的话会出现在这里')"
       autocomplete="off"
       spellcheck="false"
       @input="$emit('input')"
@@ -83,19 +84,19 @@ defineExpose({ focusBox, clearBox, hasText });
     <p v-if="statusText" class="onboarding-status-line">
       <span class="onboarding-wave-mark" aria-hidden="true">▍▍▍</span>{{ statusText }}
     </p>
-    <p v-if="!focused" class="onboarding-muted">先点一下输入框，再按住遥控器语音键。</p>
+    <p v-if="!focused" class="onboarding-muted">{{ t("先点一下输入框，再按住遥控器语音键。") }}</p>
 
     <div v-if="result === 'passed'" class="onboarding-card success">
       <p class="onboarding-success">
         <span class="ok-mark" aria-hidden="true">✓</span>
-        <span>成功：文字已经出现在输入框里，这一步通过了。</span>
+        <span>{{ t("成功：文字已经出现在输入框里，这一步通过了。") }}</span>
       </p>
     </div>
     <div v-else-if="result === 'failed'" class="onboarding-card warn">
       <p>{{ failureMessage }}</p>
       <div class="onboarding-chips">
         <button class="onboarding-chip strong" type="button" @click="$emit('retry')">
-          重新测试
+          {{ t("重新测试") }}
         </button>
       </div>
     </div>

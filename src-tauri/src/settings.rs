@@ -1,6 +1,7 @@
 use sayall_core::{
-    merge_library, normalize_gain_db, validate_library, AppSettings, MacroLibraryDocument,
-    ThemePreference, UsageStatistics, VoiceInputTool, MACRO_LIBRARY_FORMAT_VERSION,
+    export_portable_library, import_portable_library, merge_library, normalize_gain_db,
+    validate_library, AppLanguage, AppSettings, MacroLibraryDocument, ThemePreference,
+    UsageStatistics, VoiceInputTool, MACRO_LIBRARY_FORMAT_VERSION, PORTABLE_MAX_BYTES,
 };
 use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord, KeyCode};
 use sayall_windows::templates::{
@@ -165,9 +166,39 @@ impl SettingsStore {
             settings.open_window_at_launch = enabled;
         })
     }
+    /// 「回眸」文字记录开关（默认关闭）。关闭只停止新增，不删除已有记录。
+    pub fn load_local_transcript_history_enabled(&self) -> Result<bool, String> {
+        self.load()
+            .map(|settings| settings.local_transcript_history_enabled)
+    }
+
+    pub fn save_local_transcript_history_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存回眸记录设置", move |settings| {
+            settings.local_transcript_history_enabled = enabled;
+        })
+    }
+
+    /// 「回眸」原始录音开关（默认关闭；只在回眸文字开关开启时生效）。
+    pub fn load_local_original_audio_recording_enabled(&self) -> Result<bool, String> {
+        self.load()
+            .map(|settings| settings.local_original_audio_recording_enabled)
+    }
+
+    pub fn save_local_original_audio_recording_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存回眸原始录音设置", move |settings| {
+            settings.local_original_audio_recording_enabled = enabled;
+        })
+    }
     pub fn save_theme_preference(&self, preference: ThemePreference) -> Result<(), String> {
         self.update("保存外观设置", move |settings| {
             settings.theme_preference = preference;
+        })
+    }
+
+    /// 应用语言（设置页「通用 > 应用语言」）。与 Mac `ApplicationLanguage` 同值域。
+    pub fn save_application_language(&self, language: AppLanguage) -> Result<(), String> {
+        self.update("保存应用语言设置", move |settings| {
+            settings.application_language = language;
         })
     }
 
@@ -449,28 +480,6 @@ impl SettingsStore {
         state.staged = None;
         self.write_onboarding_state(&state)?;
         Ok(true)
-    }
-
-    pub fn record_usage(
-        &self,
-        local_date: String,
-        button_presses: u64,
-        voice_sessions: u64,
-        voice_seconds: f64,
-    ) -> Result<(), String> {
-        if button_presses == 0 && voice_sessions == 0 && voice_seconds <= 0.0 {
-            return Ok(());
-        }
-        self.update("保存本机使用统计", move |settings| {
-            settings
-                .usage_statistics
-                .record_button_presses(&local_date, button_presses);
-            settings.usage_statistics.record_voice_sessions(
-                &local_date,
-                voice_sessions,
-                voice_seconds,
-            );
-        })
     }
 
     pub fn load_button_mappings(&self) -> Result<ButtonMappings, String> {
@@ -1062,6 +1071,48 @@ impl SettingsStore {
             ));
         }
         let incoming = incoming.normalized();
+        let current = self.load_combined_actions()?;
+        let merged = merge_library(&current, incoming).map_err(|issue| issue.code())?;
+        self.save_combined_actions(merged)
+    }
+
+    /// 导出 macOS 可导入的 `.sayall`（`sayall-transfer 1.0`）。
+    ///
+    /// 内部 `combined-actions.json` 保持不变；这里只做交换格式转换。
+    pub fn export_combined_actions_sayall(
+        &self,
+        path: &Path,
+        document: MacroLibraryDocument,
+    ) -> Result<(), String> {
+        let document = document.normalized();
+        validate_library(&document).map_err(|issues| {
+            format!(
+                "组合动作无效：{}",
+                issues
+                    .iter()
+                    .map(|issue| issue.code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })?;
+        let text = export_portable_library(&document)
+            .map_err(|error| format!("导出组合动作失败：{error}"))?;
+        fs::write(path, text).map_err(|error| format!("写入组合动作文件失败：{error}"))
+    }
+
+    /// 导入 macOS `.sayall`，转换为内部库并按不可变版本规则合并。
+    pub fn import_combined_actions_sayall(
+        &self,
+        path: &Path,
+    ) -> Result<MacroLibraryDocument, String> {
+        let metadata =
+            fs::metadata(path).map_err(|error| format!("读取组合动作文件失败：{error}"))?;
+        if metadata.len() > PORTABLE_MAX_BYTES as u64 {
+            return Err("组合动作文件过大".to_owned());
+        }
+        let contents = fs::read(path).map_err(|error| format!("读取组合动作文件失败：{error}"))?;
+        let incoming = import_portable_library(&contents)
+            .map_err(|error| format!("解析组合动作文件失败：{error}"))?;
         let current = self.load_combined_actions()?;
         let merged = merge_library(&current, incoming).map_err(|issue| issue.code())?;
         self.save_combined_actions(merged)
@@ -2283,6 +2334,26 @@ mod tests {
         let _ = std::fs::remove_file(store.path.with_file_name("other-voice-hotkey.json"));
     }
 
+    #[test]
+    fn transcript_history_defaults_off_and_round_trips() {
+        let path = std::env::temp_dir().join("sayall-transcript-history-toggle-test.json");
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert!(!store.load_local_transcript_history_enabled().unwrap());
+        store.save_local_transcript_history_enabled(true).unwrap();
+        assert!(store.load_local_transcript_history_enabled().unwrap());
+
+        // 老配置没有该字段时保持关闭，不被迁移成开启。
+        std::fs::write(
+            &path,
+            r#"{"schema_version":5,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+        assert!(!store.load_local_transcript_history_enabled().unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 「锁定当前按键」持久化（2026-10-18）：默认开启；关闭后写盘、读回保持关闭；
     /// 老配置（无此字段）回落默认。
     #[test]
@@ -2553,6 +2624,66 @@ mod tests {
         assert_eq!(store.load_combined_actions().unwrap().definitions.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 组合动作用户导出/导入走 macOS `.sayall`；内部文件仍是本地库。
+    #[test]
+    fn portable_combined_actions_round_trip() {
+        use sayall_core::{
+            MacroAction, MacroParameters, MacroStep, MACRO_LIBRARY_FORMAT_VERSION,
+            MACRO_SCHEMA_VERSION,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "sayall-test-combined-sayall-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let definition = sayall_core::MacroDefinition {
+            schema_version: MACRO_SCHEMA_VERSION.to_owned(),
+            macro_id: "macro.sayall1".to_owned(),
+            version: "1.0.0".to_owned(),
+            name: "跨端动作".to_owned(),
+            summary: None,
+            steps: vec![MacroStep {
+                step_id: "step.01".to_owned(),
+                action: MacroAction::OpenApplication,
+                timeout_ms: None,
+                parameters: MacroParameters {
+                    target: Some("chrome".to_owned()),
+                    ..MacroParameters::default()
+                },
+            }],
+        };
+        let library = sayall_core::MacroLibraryDocument {
+            format_version: MACRO_LIBRARY_FORMAT_VERSION,
+            definitions: vec![definition],
+        };
+        store.save_combined_actions(library.clone()).unwrap();
+        let path = dir.join("combined.sayall");
+        store
+            .export_combined_actions_sayall(&path, library)
+            .unwrap();
+        let exported = std::fs::read_to_string(&path).unwrap();
+        assert!(exported.contains("\"format\": \"sayall-transfer\""));
+        assert!(exported.contains("\"type\": \"personalBackup\""));
+        assert!(exported.contains("\"schemaVersion\": \"1.0\""));
+
+        store
+            .save_combined_actions(sayall_core::MacroLibraryDocument::default())
+            .unwrap();
+        let imported = store.import_combined_actions_sayall(&path).unwrap();
+        assert_eq!(imported.definitions.len(), 1);
+        assert_eq!(imported.definitions[0].macro_id, "macro.sayall1");
+        assert_eq!(
+            imported.definitions[0].steps[0]
+                .parameters
+                .target
+                .as_deref(),
+            Some("chrome")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn retired_icon_choice_does_not_reset_saved_settings() {
         let path = std::env::temp_dir().join(format!(
@@ -2627,6 +2758,30 @@ mod tests {
         assert_eq!(
             store.load().unwrap().theme_preference,
             ThemePreference::Dark
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn application_language_defaults_to_system_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-language-preference-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert_eq!(
+            store.load().unwrap().application_language,
+            AppLanguage::System
+        );
+        store
+            .save_application_language(AppLanguage::English)
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().application_language,
+            AppLanguage::English
         );
 
         let _ = std::fs::remove_file(path);

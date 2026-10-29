@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
+import { t } from "../lib/i18n";
 
 /** Every explicit enable requires confirmation; this component never changes capture state. */
 const emit = defineEmits<{ confirm: []; close: [] }>();
@@ -19,22 +20,22 @@ onMounted(() => {
     aria-labelledby="capture-confirm-title"
     @cancel.prevent="emit('close')"
   >
-    <h3 id="capture-confirm-title">开启“全按键支持”？</h3>
+    <h3 id="capture-confirm-title">{{ t("开启“全按键支持”？") }}</h3>
     <p class="capture-confirm-intro">
-      开启后，无线麦会直接读取遥控器上已配置的按键，用于统一执行已配置的按键动作。每次开启都会弹出 Windows 授权窗口，请选择“是”；关闭时会等待按键释放并停止接管。
+      {{ t("开启后，无线麦会直接读取遥控器上已配置的按键，用于统一执行已配置的按键动作。每次开启都会弹出 Windows 授权窗口，请选择“是”；关闭时会等待按键释放并停止接管。") }}
     </p>
     <p class="capture-confirm-note">
-      个别杀毒软件可能把这个功能当成风险，拦截或关闭它，导致按键失灵、开启失败。
+      {{ t("个别杀毒软件可能把这个功能当成风险，拦截或关闭它，导致按键失灵、开启失败。") }}
     </p>
     <p class="capture-confirm-note">
-      个别游戏带有防作弊保护，可能和这个功能合不来：表现为按键失灵、游戏打不开等。玩这类游戏前，建议先把全按键支持关掉。
+      {{ t("个别游戏带有防作弊保护，可能和这个功能合不来：表现为按键失灵、游戏打不开等。玩这类游戏前，建议先把全按键支持关掉。") }}
     </p>
     <p class="capture-confirm-privacy">
-      按键数据仅在本机处理，不会上传；可随时关闭。
+      {{ t("按键数据仅在本机处理，不会上传；可随时关闭。") }}
     </p>
     <footer class="capture-confirm-footer">
-      <button type="button" class="secondary-button" @click="emit('close')">取消</button>
-      <button type="button" class="primary-button" @click="emit('confirm')">开启</button>
+      <button type="button" class="secondary-button" @click="emit('close')">{{ t("取消") }}</button>
+      <button type="button" class="primary-button" @click="emit('confirm')">{{ t("开启") }}</button>
     </footer>
   </dialog>
 </template>

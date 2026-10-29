@@ -126,6 +126,10 @@ unsafe extern "system" fn power_callback(
             Some(WorkerMessage::SystemSuspended)
         }
         PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMECRITICAL | PBT_APMRESUMESUSPEND => {
+            // 唤醒代次在这里发布，而不是在 BLE 工作线程消费消息时发布（issue #264）：
+            // 常驻对账在应用侧，需要的是"操作系统已经说我们醒了"这件事本身；工作线程
+            // 若正忙或通道已关，消费路径可能迟迟不落，而计数器是原子的、随时可读。
+            crate::wake_signal::note_system_resume();
             Some(WorkerMessage::SystemResumed)
         }
         _ => None,
@@ -151,6 +155,7 @@ mod tests {
         };
         let context_pointer = (&context as *const CallbackContext).cast::<c_void>();
 
+        let resume_before = crate::wake_signal::resume_generation();
         unsafe {
             power_callback(context_pointer, PBT_APMSUSPEND, std::ptr::null());
             power_callback(context_pointer, PBT_APMRESUMEAUTOMATIC, std::ptr::null());
@@ -165,5 +170,12 @@ mod tests {
             receiver.recv().unwrap(),
             WorkerMessage::SystemResumed
         ));
+        // 常驻对账靠这一代信号立刻醒来重查（issue #264）：挂接点在这里，
+        // 所以断言必须钉在回调上，而不是消费消息那一侧。
+        assert_eq!(
+            crate::wake_signal::resume_generation(),
+            resume_before + 1,
+            "唤醒回调必须发布一代唤醒信号"
+        );
     }
 }

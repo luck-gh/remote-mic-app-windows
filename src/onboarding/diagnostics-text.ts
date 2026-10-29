@@ -3,9 +3,10 @@
  *
  * 目标：onboarding 过不去时，用户一次复制即可给出定位所需的环境与状态，而不必
  * 教他导出日志。**内容一律英文**（2026-10-05 二次要求）；界面按钮与状态提示仍是
- * 中文（那是应用 UI）。分三段：
- * - 环境：App 版本 / Build（源码修订）/ 构建通道 / Windows 版本 / 进程架构 ——
- *   都来自 Rust `get_diagnostic_report`（真实读回，不是前端拼装）；
+ * 中文（那是应用 UI）。分四段：
+ * - 环境：App 版本 / Build（源码修订）/ 构建通道 / Windows 版本 / 进程架构 /
+ *   开机上下文（`Boot:` 行的引导类型与快速启动开关，2026-10-20）—— 都来自
+ *   Rust `get_diagnostic_report`（真实读回，不是前端拼装）；
  * - 向导：当前步骤（英文 token + 序号）、门禁码、是否被阻断；
  * - 运行状态：连接 / 音频 / 输入工具 / 全按键支持 / Vokie / 普通按键观察。
  *
@@ -60,6 +61,10 @@ function yesNo(value: boolean): string {
   return value ? "yes" : "no";
 }
 
+function threeState(value: boolean | null): string {
+  return value === null ? "unknown" : yesNo(value);
+}
+
 export function formatOnboardingDiagnostics(
   report: DiagnosticReport,
   snapshot: OnboardingDiagnosticsSnapshot,
@@ -74,6 +79,11 @@ export function formatOnboardingDiagnostics(
     `Build channel: ${report.buildChannel}`,
     `Windows version: ${report.windowsVersion}`,
     `Architecture: ${report.processArchitecture}`,
+    // 开机上下文（2026-10-20）：快速启动（hiberboot）断连现场的第一个分流问题。
+    // 两项必须并列：开关开着但用户这次点的是「重启」时，`bootType` 仍是 `full`
+    // ——只记其中一项会把两种情形成因混在一起。三态用 yes/no/unknown，读不到时
+    // 不写成 no（那会把"读不到"伪装成"没开"）。
+    `Boot: type=${report.bootType} fast_startup=${threeState(report.fastStartupEnabled)}`,
     `Wizard step: ${snapshot.step} (${stepIndex}/7)`,
   ];
   if (snapshot.gateCode) {

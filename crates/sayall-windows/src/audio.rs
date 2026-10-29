@@ -1,7 +1,7 @@
 use crate::{AudioEndpoint, AudioPhase, AudioSnapshot, PlatformError};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicU8, Ordering},
     mpsc::{self, Receiver, Sender, SyncSender},
     Arc, Mutex, MutexGuard,
 };
@@ -20,6 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_MUTE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+const PUMP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 static AUDIO_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
@@ -163,6 +164,12 @@ impl AudioBeginGuard {
 /// 0x8889000A = AUDCLNT_E_DEVICE_IN_USE。
 const WASAPI_DEVICE_IN_USE: i32 = 0x8889_000A_u32 as i32;
 
+/// 0x88890004 = AUDCLNT_E_DEVICE_INVALIDATED。
+///
+/// WTS 会话断开/重连会关闭音频会话，旧 `IAudioClient` 从此失效；微软文档要求
+/// 释放旧客户端并在同一端点上重新 Activate，而不是继续复用或重试旧对象。
+const WASAPI_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
+
 /// 端点初始化重试档位（毫秒；0 = 首次尝试，其后为失败后的等待）。
 ///
 /// 为什么需要（2026-10-02 现场，VB-CABLE 16 Ch 端点）：选择「CABLE In 16 Ch
@@ -173,10 +180,59 @@ const WASAPI_DEVICE_IN_USE: i32 = 0x8889_000A_u32 as i32;
 /// 音频引擎，再按档重试。总预算 3.05s，显著小于 IPC 请求超时（10s）。
 const OPEN_RETRY_DELAYS_MS: [u64; 5] = [0, 150, 400, 900, 1600];
 
+const DISCONNECT_REASON_NONE: u8 = 0;
 fn is_endpoint_in_use(error: &wasapi::WasapiError) -> bool {
     matches!(error, wasapi::WasapiError::Windows(inner) if inner.code().0 == WASAPI_DEVICE_IN_USE)
 }
 
+fn is_device_invalidated(error: &wasapi::WasapiError) -> bool {
+    matches!(error, wasapi::WasapiError::Windows(inner) if inner.code().0 == WASAPI_DEVICE_INVALIDATED)
+}
+
+/// WASAPI 错误分类：只有 `AUDCLNT_E_DEVICE_INVALIDATED` 需要重建客户端，
+/// 其它失败继续保持原有的 `Audio(_)` 形状，避免把真实错误掩盖成“可恢复”。
+fn wasapi_audio_error(operation: &'static str, error: wasapi::WasapiError) -> PlatformError {
+    if is_device_invalidated(&error) {
+        PlatformError::AudioDeviceInvalidated
+    } else {
+        audio_error(operation, error)
+    }
+}
+
+fn windows_audio_error(operation: &'static str, error: windows::core::Error) -> PlatformError {
+    if error.code().0 == WASAPI_DEVICE_INVALIDATED {
+        PlatformError::AudioDeviceInvalidated
+    } else {
+        audio_error(operation, error)
+    }
+}
+
+fn disconnect_reason_code(reason: wasapi::DisconnectReason) -> u8 {
+    use wasapi::DisconnectReason;
+    match reason {
+        DisconnectReason::DeviceRemoval => 1,
+        DisconnectReason::ServerShutdown => 2,
+        DisconnectReason::FormatChanged => 3,
+        DisconnectReason::SessionLogoff => 4,
+        DisconnectReason::SessionDisconnected => 5,
+        DisconnectReason::ExclusiveModeOverride => 6,
+        DisconnectReason::Unknown => 7,
+    }
+}
+
+/// 断开原因只落了稳定英文 token；不记录端点名称、ID 或用户身份。
+fn disconnect_reason_name(code: u8) -> &'static str {
+    match code {
+        1 => "device_removal",
+        2 => "server_shutdown",
+        3 => "format_changed",
+        4 => "session_logoff",
+        5 => "session_disconnected",
+        6 => "exclusive_mode_override",
+        7 => "unknown",
+        _ => "none",
+    }
+}
 pub struct AudioRuntime {
     pub(crate) capture: crate::capture_input::CaptureInputRuntime,
     sender: SyncSender<AudioMessage>,
@@ -579,57 +635,8 @@ fn worker_loop(
                     crate::ble::gatt_note(format!(
                         "audio_session generation={generation} action=begin phase=requested"
                     ));
-                    let reopen = |id: &str, name: &str, attempt_id: u64| {
-                        let endpoints = list_endpoints().map_err(|error| {
-                            crate::ble::gatt_note(format!("audio_endpoint attempt_id={attempt_id} action=rebuild phase=enumerate result=failed error_code=enumeration_failed"));
-                            error
-                        })?;
-                        if validate_restored_endpoint(&endpoints, id, name).is_err() {
-                            crate::ble::gatt_note(format!("audio_endpoint attempt_id={attempt_id} action=rebuild phase=identity_validation result=failed error_code=endpoint_identity_mismatch endpoint_present={}", endpoints.iter().any(|endpoint| endpoint.id == id)));
-                            return Err(PlatformError::AudioSinkUnavailable);
-                        }
-                        let opened = AudioSink::open(id, attempt_id)?;
-                        // Enumeration and opening can straddle a device change.
-                        if opened.name != name {
-                            crate::ble::gatt_note(format!("audio_endpoint attempt_id={attempt_id} action=rebuild phase=identity_validation result=failed error_code=opened_endpoint_identity_changed"));
-                            return Err(PlatformError::AudioSinkUnavailable);
-                        }
-                        Ok(opened)
-                    };
-                    let had_sink = sink.is_some();
-                    let result = (|| {
-                        if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
-                            return Err(PlatformError::AudioSessionInterrupted);
-                        }
-                        rebuild_selected_sink(&mut sink, &state, reopen)?;
-                        if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
-                            return Err(PlatformError::AudioSessionInterrupted);
-                        }
-                        let first = begin_session(&mut sink, &mut queue, &state, generation);
-                        if had_sink && matches!(first, Err(PlatformError::Audio(_))) {
-                            // A still-present client can become invalid during sleep.
-                            // Retire it fully, then try the same identity once on this
-                            // new request; no retry can survive a release/cancellation.
-                            fail_audio(
-                                &mut sink,
-                                &mut queue,
-                                &state,
-                                first.clone().unwrap_err(),
-                                &mut pending_drain,
-                            );
-                            interrupt(&mut sink, &mut queue, &state)?;
-                            if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
-                                return Err(PlatformError::AudioSessionInterrupted);
-                            }
-                            rebuild_selected_sink(&mut sink, &state, reopen)?;
-                            if guard.as_ref().is_some_and(AudioBeginGuard::cancelled) {
-                                return Err(PlatformError::AudioSessionInterrupted);
-                            }
-                            begin_session(&mut sink, &mut queue, &state, generation)
-                        } else {
-                            first
-                        }
-                    })();
+                    let result =
+                        begin_session(&mut sink, &mut queue, &state, generation, guard.as_ref());
                     let result = if result.is_ok()
                         && guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
                     {
@@ -646,14 +653,16 @@ fn worker_loop(
                     } else {
                         result
                     };
-                    if let Err(error @ PlatformError::Audio(_)) = &result {
-                        fail_audio(
-                            &mut sink,
-                            &mut queue,
-                            &state,
-                            error.clone(),
-                            &mut pending_drain,
-                        );
+                    if let Err(error) = &result {
+                        if is_audio_pipeline_failure(error) {
+                            fail_audio(
+                                &mut sink,
+                                &mut queue,
+                                &state,
+                                error.clone(),
+                                &mut pending_drain,
+                            );
+                        }
                     }
                     crate::ble::gatt_note(match &result {
                         Ok(snapshot) => format!(
@@ -708,14 +717,16 @@ fn worker_loop(
                     }
                     let result = interrupt(&mut sink, &mut queue, &state);
                     let accepted_samples = queue.accepted();
-                    if let Err(error @ PlatformError::Audio(_)) = &result {
-                        fail_audio(
-                            &mut sink,
-                            &mut queue,
-                            &state,
-                            error.clone(),
-                            &mut pending_drain,
-                        );
+                    if let Err(error) = &result {
+                        if is_audio_pipeline_failure(error) {
+                            fail_audio(
+                                &mut sink,
+                                &mut queue,
+                                &state,
+                                error.clone(),
+                                &mut pending_drain,
+                            );
+                        }
                     }
                     crate::ble::gatt_note(match &result {
                         Ok(snapshot) => format!(
@@ -773,14 +784,16 @@ fn worker_loop(
             match drained {
                 Ok(true) => {
                     let result = finish_drain(&mut sink, &mut queue, &state, generation);
-                    if let Err(error @ PlatformError::Audio(_)) = &result {
-                        fail_audio(
-                            &mut sink,
-                            &mut queue,
-                            &state,
-                            error.clone(),
-                            &mut pending_drain,
-                        );
+                    if let Err(error) = &result {
+                        if is_audio_pipeline_failure(error) {
+                            fail_audio(
+                                &mut sink,
+                                &mut queue,
+                                &state,
+                                error.clone(),
+                                &mut pending_drain,
+                            );
+                        }
                     }
                     crate::ble::gatt_note(match &result {
                         Ok(snapshot) => format!(
@@ -796,15 +809,10 @@ fn worker_loop(
                 }
                 Ok(false) => pending_drain = Some((generation, reply)),
                 Err(error) => {
-                    let platform_error = audio_error("读取 WASAPI 排空状态", error);
-                    let _ = reply.send(Err(platform_error.clone()));
-                    fail_audio(
-                        &mut sink,
-                        &mut queue,
-                        &state,
-                        platform_error,
-                        &mut pending_drain,
-                    );
+                    // `is_drained` 已经返回带分类的 PlatformError；再包一层会丢掉
+                    // device_invalidated 等 error_code，日志就无法据此判读。
+                    let _ = reply.send(Err(error.clone()));
+                    fail_audio(&mut sink, &mut queue, &state, error, &mut pending_drain);
                 }
             }
         }
@@ -829,6 +837,17 @@ fn endpoint_kind(endpoint_id: &str, name: &str) -> &'static str {
     }
 }
 
+/// 需要释放 sink 并结束当前方案的音频失败。
+///
+/// `AudioDeviceInvalidated` 也必须走这条收尾路径：`finish_drain` 在 reset 时收到它
+/// 会提前返回，如果不清理就会停留在 `Draining`，下一次 begin 被 `AudioBusy` 永久拒绝。
+fn is_audio_pipeline_failure(error: &PlatformError) -> bool {
+    matches!(
+        error,
+        PlatformError::Audio(_) | PlatformError::AudioDeviceInvalidated
+    )
+}
+
 fn audio_error_code(error: &PlatformError) -> &'static str {
     match error {
         PlatformError::AudioEndpointNotSelected => "endpoint_not_selected",
@@ -839,6 +858,7 @@ fn audio_error_code(error: &PlatformError) -> &'static str {
         PlatformError::AudioOperationTimedOut => "operation_timed_out",
         PlatformError::AudioSessionMismatch => "session_mismatch",
         PlatformError::AudioSessionInterrupted => "session_interrupted",
+        PlatformError::AudioDeviceInvalidated => "device_invalidated",
         PlatformError::Audio(_) => "wasapi_failure",
         _ => "platform_failure",
     }
@@ -857,7 +877,7 @@ fn audio_phase_name(phase: AudioPhase) -> &'static str {
 
 fn list_endpoints() -> Result<Vec<AudioEndpoint>, PlatformError> {
     let enumerator =
-        DeviceEnumerator::new().map_err(|error| audio_error("创建端点枚举器", error))?;
+        DeviceEnumerator::new().map_err(|error| wasapi_audio_error("创建端点枚举器", error))?;
     let collection = enumerator
         .get_device_collection(&Direction::Render)
         .map_err(|error| audio_error("枚举输出端点", error))?;
@@ -883,6 +903,51 @@ fn list_endpoints() -> Result<Vec<AudioEndpoint>, PlatformError> {
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
     Ok(endpoints)
+}
+
+/// 默认录音设备的探测结果缓存（2026-10-27）。
+///
+/// 为什么缓存：探测要 CoCreateInstance + 打开端点属性，毫秒级；它挂在**语音键按下**
+/// 这条延迟敏感的路径上，不能每次按键都跑一遍。30 s 足够——用户在设置里换设备之后，
+/// 最多隔一次按键就能在日志里看到变化。
+static CAPTURE_PROBE_CACHE: std::sync::Mutex<Option<(Instant, String, bool)>> =
+    std::sync::Mutex::new(None);
+
+/// 系统默认**录音**设备的名字，以及它是不是 CABLE Output（2026-10-27）。
+///
+/// 为什么需要：用户把输入法的麦克风从「自动检测」改成 `CABLE Output` 之后准确率
+/// 立刻正常——「自动检测」跟的是系统默认录音设备，而默认设备可能还是内置麦克风阵列
+/// 或「立体声混音」。那种情况下按键链路、报告层合成、录音时长全都正常，
+/// 只有识别结果不对（录到的是环境声/系统声），日志里此前**没有任何证据**。
+///
+/// 返回 `None` 表示枚举失败（不改任何行为，只少一行日志）。
+pub fn capture_input_diagnosis() -> Option<(String, bool)> {
+    const CACHE_TTL: Duration = Duration::from_secs(30);
+    let mut cache = CAPTURE_PROBE_CACHE.lock().ok()?;
+    if let Some((probed_at, name, is_cable)) = cache.as_ref() {
+        if probed_at.elapsed() < CACHE_TTL {
+            return Some((name.clone(), *is_cable));
+        }
+    }
+    let probe = probe_default_capture();
+    *cache = probe
+        .as_ref()
+        .map(|(name, is_cable)| (Instant::now(), name.clone(), *is_cable));
+    probe
+}
+
+fn probe_default_capture() -> Option<(String, bool)> {
+    let enumerator = DeviceEnumerator::new().ok()?;
+    let device = enumerator.get_default_device(&Direction::Capture).ok()?;
+    let name = device.get_friendlyname().ok()?;
+    let is_cable_output = is_cable_capture_name(&name);
+    Some((name, is_cable_output))
+}
+
+/// 录音端点名是否就是虚拟线的输出端（`CABLE Output`，16 通道驱动同名前缀）。
+fn is_cable_capture_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("cable") && lower.contains("output")
 }
 
 fn render_endpoint_inactive_counts() -> windows::core::Result<(u32, u32, u32)> {
@@ -1014,6 +1079,37 @@ fn configured_failure_snapshot(
     }
 }
 
+/// 语音键按下时需要重建客户端的两种情形。
+///
+/// `MissingSink`：上一次流失败后 `fail_audio` 已释放客户端，但用户选择仍在内存里。
+/// `InvalidatedSink`：收到了 `OnSessionDisconnected`，旧客户端已不可复用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeginRecovery {
+    MissingSink,
+    InvalidatedSink,
+}
+
+fn begin_recovery(has_sink: bool, invalidated: bool) -> Option<BeginRecovery> {
+    if !has_sink {
+        Some(BeginRecovery::MissingSink)
+    } else if invalidated {
+        Some(BeginRecovery::InvalidatedSink)
+    } else {
+        None
+    }
+}
+
+fn selected_endpoint(state: &Arc<Mutex<AudioSnapshot>>) -> Option<(String, String)> {
+    let snapshot = lock(state);
+    match (
+        snapshot.selected_endpoint_id.clone(),
+        snapshot.selected_endpoint_name.clone(),
+    ) {
+        (Some(id), Some(name)) => Some((id, name)),
+        _ => None,
+    }
+}
+
 // Only the audio worker mutates this state. Rebuild resources on a new begin
 // request after the failed session was interrupted; never restart its stream.
 // The closure is the existing WASAPI open/identity check, replaceable by a
@@ -1028,7 +1124,7 @@ fn rebuild_selected_sink<T>(
     }
     let before = lock(state).clone();
     if matches!(before.phase, AudioPhase::Streaming | AudioPhase::Draining)
-        || before.generation != 0
+        || (before.phase != AudioPhase::Ready && before.generation != 0)
     {
         return Err(PlatformError::AudioBusy);
     }
@@ -1088,8 +1184,79 @@ fn clear_selected_sink<T>(
     *lock(state) = snapshot.clone();
     Ok(snapshot)
 }
+fn reopen_selected_endpoint(
+    sink: &mut Option<AudioSink>,
+    state: &Arc<Mutex<AudioSnapshot>>,
+    trigger: &'static str,
+    disconnect_reason: Option<&'static str>,
+) -> Result<(), PlatformError> {
+    let before = lock(state).clone();
+    if matches!(before.phase, AudioPhase::Streaming | AudioPhase::Draining)
+        || (before.phase != AudioPhase::Ready && before.generation != 0)
+    {
+        return Err(PlatformError::AudioBusy);
+    }
+    *sink = None;
+    crate::ble::gatt_note(format!(
+        "audio_endpoint action=recover trigger={trigger} disconnect_reason={}",
+        disconnect_reason.unwrap_or("none")
+    ));
+    rebuild_selected_sink(sink, state, |id, name, attempt_id| {
+        let endpoints = list_endpoints()?;
+        if validate_restored_endpoint(&endpoints, id, name).is_err() {
+            return Err(PlatformError::AudioSinkUnavailable);
+        }
+        let opened = AudioSink::open(id, attempt_id)?;
+        if opened.endpoint_id != id || opened.name != name {
+            return Err(PlatformError::AudioSinkUnavailable);
+        }
+        Ok(opened)
+    })
+}
 
 fn begin_session(
+    sink: &mut Option<AudioSink>,
+    queue: &mut PcmBuffer,
+    state: &Arc<Mutex<AudioSnapshot>>,
+    generation: u64,
+    guard: Option<&AudioBeginGuard>,
+) -> Result<AudioSnapshot, PlatformError> {
+    if guard.is_some_and(AudioBeginGuard::cancelled) {
+        return Err(PlatformError::AudioSessionInterrupted);
+    }
+    if matches!(
+        lock(state).phase,
+        AudioPhase::Streaming | AudioPhase::Draining
+    ) {
+        return Err(PlatformError::AudioBusy);
+    }
+
+    let disconnect_reason = sink.as_ref().and_then(AudioSink::invalidated_reason);
+    if let Some(recovery) = begin_recovery(sink.is_some(), disconnect_reason.is_some()) {
+        let trigger = match recovery {
+            BeginRecovery::MissingSink => "begin_sink_missing",
+            BeginRecovery::InvalidatedSink => "begin_device_invalidated",
+        };
+        reopen_selected_endpoint(sink, state, trigger, disconnect_reason)?;
+    }
+    if guard.is_some_and(AudioBeginGuard::cancelled) {
+        return Err(PlatformError::AudioSessionInterrupted);
+    }
+
+    match try_begin_session(sink, queue, state, generation) {
+        Err(PlatformError::AudioDeviceInvalidated) => {
+            // 事件订阅失败或断开发生在订阅之前：释放旧客户端再试一次。
+            reopen_selected_endpoint(sink, state, "begin_retry", None)?;
+            if guard.is_some_and(AudioBeginGuard::cancelled) {
+                return Err(PlatformError::AudioSessionInterrupted);
+            }
+            try_begin_session(sink, queue, state, generation)
+        }
+        other => other,
+    }
+}
+
+fn try_begin_session(
     sink: &mut Option<AudioSink>,
     queue: &mut PcmBuffer,
     state: &Arc<Mutex<AudioSnapshot>>,
@@ -1102,16 +1269,10 @@ fn begin_session(
             PlatformError::AudioEndpointNotSelected
         });
     };
-    if matches!(
-        lock(state).phase,
-        AudioPhase::Streaming | AudioPhase::Draining
-    ) {
-        return Err(PlatformError::AudioBusy);
-    }
     active_sink.ensure_unmuted("begin_session")?;
     active_sink
         .reset()
-        .map_err(|error| audio_error("重置 WASAPI 会话", error))?;
+        .map_err(|error| wasapi_audio_error("重置 WASAPI 会话", error))?;
     queue.clear();
     active_sink.session_started_at = Instant::now();
     active_sink.first_nonzero_submit = None;
@@ -1148,7 +1309,7 @@ fn finish_drain(
     };
     active_sink
         .reset()
-        .map_err(|error| audio_error("结束 WASAPI 会话", error))?;
+        .map_err(|error| wasapi_audio_error("结束 WASAPI 会话", error))?;
     queue.clear();
     let mut snapshot = lock(state);
     if snapshot.generation != generation {
@@ -1176,7 +1337,7 @@ fn interrupt(
     if let Some(active_sink) = sink.as_mut() {
         active_sink
             .reset()
-            .map_err(|error| audio_error("中断 WASAPI 会话", error))?;
+            .map_err(|error| wasapi_audio_error("中断 WASAPI 会话", error))?;
     }
     let mut snapshot = lock(state);
     snapshot.phase = if sink.is_some() {
@@ -1283,6 +1444,44 @@ struct AudioSink {
     max_space_query: Duration,
     max_write: Duration,
     max_mute_check: Duration,
+    /// `pump` 调用与“端点无可写空间”的次数；只在 1s 进度日志里聚合输出。
+    pump_calls: u64,
+    zero_space_polls: u64,
+    last_pump_progress: Instant,
+    /// `OnSessionDisconnected` 写入的原因码；0 = 未断开。
+    disconnected_reason: Arc<AtomicU8>,
+    /// 持有订阅注册；drop 时自动 `UnregisterAudioSessionNotification`。
+    _session_events: Option<wasapi::EventRegistration>,
+}
+
+fn register_session_events(
+    control: wasapi::AudioSessionControl,
+    attempt_id: u64,
+    disconnected_reason: Arc<AtomicU8>,
+) -> Option<wasapi::EventRegistration> {
+    let mut callbacks = wasapi::EventCallbacks::new();
+    callbacks.set_disconnected_callback(move |reason| {
+        let code = disconnect_reason_code(reason);
+        disconnected_reason.store(code, Ordering::SeqCst);
+        crate::ble::gatt_note(format!(
+            "audio_session attempt_id={attempt_id} event=disconnected reason={} retryable=true",
+            disconnect_reason_name(code)
+        ));
+    });
+    match control.register_session_notification(callbacks) {
+        Ok(registration) => {
+            crate::ble::gatt_note(format!(
+                "audio_session attempt_id={attempt_id} event=disconnect_subscribe result=passed"
+            ));
+            Some(registration)
+        }
+        Err(_) => {
+            crate::ble::gatt_note(format!(
+                "audio_session attempt_id={attempt_id} event=disconnect_subscribe result=failed error_domain=wasapi retryable=true"
+            ));
+            None
+        }
+    }
 }
 
 /// MMCSS registration belongs to this render thread; its handle is not a kernel
@@ -1339,13 +1538,13 @@ impl AudioSink {
 
     fn open(endpoint_id: &str, attempt_id: u64) -> Result<Self, PlatformError> {
         let enumerator =
-            DeviceEnumerator::new().map_err(|error| audio_error("创建端点枚举器", error))?;
+            DeviceEnumerator::new().map_err(|error| wasapi_audio_error("创建端点枚举器", error))?;
         let device = enumerator
             .get_device(endpoint_id)
-            .map_err(|error| audio_error("打开所选输出端点", error))?;
+            .map_err(|error| wasapi_audio_error("打开所选输出端点", error))?;
         let name = device
             .get_friendlyname()
-            .map_err(|error| audio_error("读取所选端点名称", error))?;
+            .map_err(|error| wasapi_audio_error("读取所选端点名称", error))?;
         let is_virtual_cable = crate::is_virtual_cable_output_name(&name);
         crate::ble::gatt_note(format!(
             "audio_endpoint attempt_id={attempt_id} action=open phase=properties_read result=passed endpoint_kind={} virtual_cable={is_virtual_cable}",
@@ -1359,7 +1558,7 @@ impl AudioSink {
             }
             let mut candidate = device
                 .get_iaudioclient()
-                .map_err(|error| audio_error("创建 WASAPI 客户端", error))?;
+                .map_err(|error| wasapi_audio_error("创建 WASAPI 客户端", error))?;
             // 预热：读一次设备混音格式会把端点音频引擎拉起来；现场实证冷引擎
             // 直接 Initialize 会拿到 0x8889000A，读过之后同一参数即可成功。
             let mix_rate = candidate
@@ -1368,7 +1567,7 @@ impl AudioSink {
                 .map(|format| format.get_samplespersec());
             let (default_period, _) = candidate
                 .get_device_period()
-                .map_err(|error| audio_error("读取 WASAPI 设备周期", error))?;
+                .map_err(|error| wasapi_audio_error("读取 WASAPI 设备周期", error))?;
             let format = WaveFormat::new(
                 16,
                 16,
@@ -1417,23 +1616,48 @@ impl AudioSink {
                 }
             }
         }
-        let (mut client, _) = opened.ok_or_else(|| {
+        let (client, _) = opened.ok_or_else(|| {
             PlatformError::Audio(format!(
                 "初始化 16 kHz WASAPI 输出失败（{name}，重试后仍未取得音频客户端）"
             ))
         })?;
+        // 会话控制用于两件事：CABLE 的 ducking 选择，以及 OnSessionDisconnected 诊断。
+        // 非 CABLE 端点拿不到控制对象时不影响打开；事件订阅只是尽力而为。
+        let session_control = match client.get_audiosessioncontrol() {
+            Ok(control) => Some(control),
+            Err(error) => {
+                if is_virtual_cable {
+                    return Err(wasapi_audio_error("访问 CABLE Input 的音频会话控制", error));
+                }
+                None
+            }
+        };
         if is_virtual_cable {
-            client
-                .get_audiosessioncontrol()
-                .and_then(|control| control.set_ducking_preference(true))
-                .map_err(|error| audio_error("关闭 SayAll 会话的系统通信自动静音", error))?;
+            let control = session_control.as_ref().ok_or_else(|| {
+                PlatformError::Audio("无法访问 CABLE Input 的音频会话控制".to_owned())
+            })?;
+            control
+                .set_ducking_preference(true)
+                .map_err(|error| wasapi_audio_error("关闭 SayAll 会话的系统通信自动静音", error))?;
             crate::ble::gatt_note(
                 "session_ducking_optout checkpoint=open result=ok enabled=true".to_owned(),
             );
         }
         let render_client = client
             .get_audiorenderclient()
-            .map_err(|error| audio_error("创建 WASAPI 渲染客户端", error))?;
+            .map_err(|error| wasapi_audio_error("创建 WASAPI 渲染客户端", error))?;
+        let disconnected_reason = Arc::new(AtomicU8::new(DISCONNECT_REASON_NONE));
+        let session_events = match session_control {
+            Some(control) => {
+                register_session_events(control, attempt_id, Arc::clone(&disconnected_reason))
+            }
+            None => {
+                crate::ble::gatt_note(format!(
+                    "audio_session attempt_id={attempt_id} event=disconnect_subscribe result=skipped reason=session_control_unavailable"
+                ));
+                None
+            }
+        };
         let buffer_frames = client.get_buffer_size().unwrap_or(0);
         let mut sink = Self {
             endpoint_id: endpoint_id.to_owned(),
@@ -1459,9 +1683,19 @@ impl AudioSink {
             max_space_query: Duration::ZERO,
             max_write: Duration::ZERO,
             max_mute_check: Duration::ZERO,
+            pump_calls: 0,
+            zero_space_polls: 0,
+            last_pump_progress: Instant::now(),
+            disconnected_reason,
+            _session_events: session_events,
         };
         sink.ensure_session_unmuted("open", true)?;
         Ok(sink)
+    }
+
+    fn invalidated_reason(&self) -> Option<&'static str> {
+        let code = self.disconnected_reason.load(Ordering::SeqCst);
+        (code != DISCONNECT_REASON_NONE).then(|| disconnect_reason_name(code))
     }
 
     fn ensure_unmuted(&mut self, checkpoint: &'static str) -> Result<(), PlatformError> {
@@ -1481,7 +1715,7 @@ impl AudioSink {
         self.last_session_mute_check = started;
         if self.session_volumes.is_empty() {
             self.session_volumes = process_audio_session_volumes(&self.endpoint_id)
-                .map_err(|error| audio_error("查找 SayAll 音频会话", error))?;
+                .map_err(|error| windows_audio_error("查找 SayAll 音频会话", error))?;
         }
         if self.session_volumes.is_empty() {
             crate::ble::gatt_note(format!(
@@ -1496,19 +1730,19 @@ impl AudioSink {
         let mut minimum_level = 1.0_f32;
         for volume in &self.session_volumes {
             let was_muted = unsafe { volume.GetMute() }
-                .map_err(|error| audio_error("读取 SayAll 会话静音状态", error))?
+                .map_err(|error| windows_audio_error("读取 SayAll 会话静音状态", error))?
                 .as_bool();
             minimum_level = minimum_level.min(
                 unsafe { volume.GetMasterVolume() }
-                    .map_err(|error| audio_error("读取 SayAll 会话音量", error))?,
+                    .map_err(|error| windows_audio_error("读取 SayAll 会话音量", error))?,
             );
             if was_muted {
                 muted_before += 1;
                 unsafe { volume.SetMute(false, std::ptr::null()) }
-                    .map_err(|error| audio_error("解除 SayAll 会话静音", error))?;
+                    .map_err(|error| windows_audio_error("解除 SayAll 会话静音", error))?;
             }
             if unsafe { volume.GetMute() }
-                .map_err(|error| audio_error("确认 SayAll 会话静音状态", error))?
+                .map_err(|error| windows_audio_error("确认 SayAll 会话静音状态", error))?
                 .as_bool()
             {
                 muted_after += 1;
@@ -1561,6 +1795,17 @@ impl AudioSink {
             }
         }
         self.last_pump = Some(entered);
+        // 事件回调已经知道客户端失效时，立即按真实原因收尾；不要等 PCM 队列涨到 2 秒
+        // 才以 queue_overflow 报错，否则日志会把“端点失效”误读成“队列太小”。
+        if let Some(reason) = self.invalidated_reason() {
+            crate::ble::gatt_note(format!(
+                "audio_pump event=invalidated reason={reason} queued_samples={} pump_calls={} zero_space_polls={}",
+                queue.len(),
+                self.pump_calls,
+                self.zero_space_polls
+            ));
+            return Err(PlatformError::AudioDeviceInvalidated);
+        }
         if self.started && self.last_session_mute_check.elapsed() >= SESSION_MUTE_WATCH_INTERVAL {
             let started = Instant::now();
             let result = self.ensure_session_unmuted("stream_watch", false);
@@ -1574,7 +1819,7 @@ impl AudioSink {
         let available_result = self
             .client
             .get_available_space_in_frames()
-            .map_err(|error| audio_error("读取 WASAPI 可写空间", error));
+            .map_err(|error| wasapi_audio_error("读取 WASAPI 可写空间", error));
         self.max_space_query = self.max_space_query.max(query_started.elapsed());
         let available = available_result? as usize;
         if self.started && !queue.is_empty() && available == self.buffer_frames as usize {
@@ -1585,6 +1830,20 @@ impl AudioSink {
             self.zero_available_since.get_or_insert_with(Instant::now);
         } else if let Some(since) = self.zero_available_since.take() {
             self.zero_available_elapsed += since.elapsed();
+        }
+        self.pump_calls = self.pump_calls.saturating_add(1);
+        if available == 0 {
+            self.zero_space_polls = self.zero_space_polls.saturating_add(1);
+        }
+        if self.last_pump_progress.elapsed() >= PUMP_PROGRESS_INTERVAL {
+            self.last_pump_progress = Instant::now();
+            crate::ble::gatt_note(format!(
+                "audio_pump phase=progress available_frames={available} queued_samples={} pump_calls={} zero_space_polls={} stream_started={} draining={draining}",
+                queue.len(),
+                self.pump_calls,
+                self.zero_space_polls,
+                self.started
+            ));
         }
         let frames = available.min(queue.len());
         if frames == 0 {
@@ -1600,13 +1859,13 @@ impl AudioSink {
         self.max_write = self.max_write.max(write_elapsed);
         write_result.map_err(|error| {
             note_audio_stage_failure(generation, "write", write_elapsed);
-            audio_error("写入 WASAPI 音频", error)
+            wasapi_audio_error("写入 WASAPI 音频", error)
         })?;
         if !self.started {
             let start_started = Instant::now();
             self.client.start_stream().map_err(|error| {
                 note_audio_stage_failure(generation, "start", start_started.elapsed());
-                audio_error("启动 WASAPI 音频流", error)
+                wasapi_audio_error("启动 WASAPI 音频流", error)
             })?;
             let start_elapsed = start_started.elapsed();
             self.started = true;
@@ -1644,7 +1903,7 @@ impl AudioSink {
         self.client
             .get_current_padding()
             .map(|padding| padding == 0)
-            .map_err(|error| audio_error("读取 WASAPI 当前填充量", error))
+            .map_err(|error| wasapi_audio_error("读取 WASAPI 当前填充量", error))
     }
 
     fn reset(&mut self) -> Result<(), wasapi::WasapiError> {
@@ -1653,6 +1912,9 @@ impl AudioSink {
         }
         self.client.reset_stream()?;
         self.started = false;
+        self.pump_calls = 0;
+        self.zero_space_polls = 0;
+        self.last_pump_progress = Instant::now();
         Ok(())
     }
 }
@@ -1739,11 +2001,13 @@ fn ensure_cable_endpoint_unmuted(
             Ok(())
         }
         Err(error) => {
+            let platform_error = windows_audio_error("检查并恢复 CABLE Input 静音状态", error);
             crate::ble::gatt_note(format!(
-                "endpoint_unmute checkpoint={checkpoint} result=failed error_domain=wasapi error_code=endpoint_volume_failed reason=mute_state_unavailable retryable=true elapsed_ms={}",
+                "endpoint_unmute checkpoint={checkpoint} result=failed error_domain=wasapi error_code=endpoint_volume_failed classified_code={} reason=mute_state_unavailable retryable=true elapsed_ms={}",
+                audio_error_code(&platform_error),
                 started.elapsed().as_millis()
             ));
-            Err(audio_error("检查并恢复 CABLE Input 静音状态", error))
+            Err(platform_error)
         }
     }
 }
@@ -1814,6 +2078,32 @@ impl Drop for WasapiApartment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 录音端点名的判定（2026-10-27）：`voice_capture_input` 靠它区分"默认设备是不是
+    /// 虚拟线的输出端"。判错方向都会误导——把内置麦克风当成 CABLE Output 就永远不会
+    /// 报警，反过来会把正常的 CABLE 端点报成异常。
+    #[test]
+    fn cable_capture_name_recognises_only_the_virtual_output() {
+        assert!(is_cable_capture_name(
+            "CABLE Output (VB-Audio Virtual Cable)"
+        ));
+        assert!(is_cable_capture_name("CABLE Output"));
+        // 16 通道驱动在录音端的名字仍是 CABLE Output，但大小写/后缀可能变。
+        assert!(is_cable_capture_name(
+            "cable output (2- vb-audio virtual cable)"
+        ));
+        // 阳性对照：内置麦克风、立体声混音、以及"只有 cable 没有 output"的渲染端都不是。
+        assert!(!is_cable_capture_name("麦克风阵列 (Realtek(R) Audio)"));
+        assert!(!is_cable_capture_name("立体声混音 (Realtek(R) Audio)"));
+        assert!(!is_cable_capture_name(
+            "CABLE In 16 Ch (VB-Audio Virtual Cable)"
+        ));
+        assert!(!is_cable_capture_name(""));
+    }
+
+    /// 同一 CABLE 端点的硬件用例互斥：它们会临时改写端点/会话静音并在 Drop 中恢复。
+    #[cfg(windows)]
+    static CABLE_ENDPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(windows)]
     struct RestoreEndpointMute {
@@ -2307,6 +2597,39 @@ mod tests {
     }
 
     #[test]
+    fn audio_rebuild_accepts_retired_ready_generation_but_rejects_live_sessions() {
+        let state = Arc::new(Mutex::new(ready_snapshot(
+            "selected".into(),
+            "saved".into(),
+        )));
+        lock(&state).generation = 7;
+        let mut queue = PcmBuffer::default();
+        queue.begin(7);
+        queue.clear();
+        let mut sink: Option<()> = None;
+        rebuild_selected_sink(&mut sink, &state, |_, _, _| Ok(())).unwrap();
+        queue.begin(8);
+        assert_eq!(
+            queue.enqueue(7, vec![1]),
+            Err(PlatformError::AudioSessionMismatch)
+        );
+        assert!(queue.enqueue(8, vec![1]).is_ok());
+        for phase in [
+            AudioPhase::Failed,
+            AudioPhase::Streaming,
+            AudioPhase::Draining,
+        ] {
+            lock(&state).phase = phase;
+            lock(&state).generation = 8;
+            sink = None;
+            assert_eq!(
+                rebuild_selected_sink(&mut sink, &state, |_, _, _| panic!("live generation")),
+                Err(PlatformError::AudioBusy)
+            );
+        }
+    }
+
+    #[test]
     fn audio_rebuild_failure_retains_selection_for_a_later_new_session() {
         let state = Arc::new(Mutex::new(configured_failure_snapshot(
             "selected".into(),
@@ -2629,6 +2952,9 @@ mod tests {
     #[test]
     #[ignore = "requires SAYALL_TEST_CABLE_ENDPOINT_ID and mutates that endpoint's mute state"]
     fn cable_endpoint_unmutes_on_open_and_each_session() {
+        let _endpoint_guard = CABLE_ENDPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let endpoint_id = std::env::var("SAYALL_TEST_CABLE_ENDPOINT_ID")
             .expect("set SAYALL_TEST_CABLE_ENDPOINT_ID to the CABLE Input render endpoint");
         wasapi::initialize_mta()
@@ -2748,5 +3074,291 @@ mod tests {
             total <= 4_000,
             "重试总预算必须显著小于 IPC 请求超时（10s），实际 {total}ms"
         );
+    }
+    // ---- 2026-10-21 issue #276：会话重连后 WASAPI 客户端失效，不能把用户永久卡在
+    // `endpoint_not_selected`。以下用例先钉住判定与错误分类，真实设备重开见 ignored 用例。
+
+    #[test]
+    fn begin_recovery_only_covers_missing_or_invalidated_sinks() {
+        assert_eq!(
+            begin_recovery(false, false),
+            Some(BeginRecovery::MissingSink)
+        );
+        assert_eq!(
+            begin_recovery(true, true),
+            Some(BeginRecovery::InvalidatedSink)
+        );
+        assert_eq!(begin_recovery(true, false), None);
+    }
+
+    #[test]
+    fn selected_endpoint_survives_a_failed_stream() {
+        // fail_audio 只清队列与 sink，不清用户选择；恢复必须还能拿到同一个 id + name。
+        let state = Arc::new(Mutex::new(AudioSnapshot {
+            phase: AudioPhase::Failed,
+            selected_endpoint_id: Some("endpoint-id".to_owned()),
+            selected_endpoint_name: Some("CABLE Input".to_owned()),
+            last_error: Some("WASAPI failed".to_owned()),
+            ..AudioSnapshot::default()
+        }));
+
+        assert_eq!(
+            selected_endpoint(&state),
+            Some(("endpoint-id".to_owned(), "CABLE Input".to_owned()))
+        );
+    }
+
+    #[test]
+    fn begin_without_a_selection_keeps_the_existing_rejection() {
+        let state = Arc::new(Mutex::new(AudioSnapshot::default()));
+        let mut sink = None;
+        let mut queue = PcmBuffer::default();
+
+        assert_eq!(
+            begin_session(&mut sink, &mut queue, &state, 1, None),
+            Err(PlatformError::AudioEndpointNotSelected)
+        );
+    }
+
+    #[test]
+    fn device_invalidated_has_a_dedicated_error_code() {
+        assert_eq!(
+            audio_error_code(&PlatformError::AudioDeviceInvalidated),
+            "device_invalidated"
+        );
+    }
+
+    #[test]
+    fn both_audio_error_shapes_trigger_pipeline_cleanup() {
+        // finish_drain 的 reset 可能返回任一形状；漏掉 AudioDeviceInvalidated 会把
+        // phase 留在 Draining，之后 begin 永远 AudioBusy。
+        assert!(is_audio_pipeline_failure(&PlatformError::Audio(
+            "failed".to_owned()
+        )));
+        assert!(is_audio_pipeline_failure(
+            &PlatformError::AudioDeviceInvalidated
+        ));
+        assert!(!is_audio_pipeline_failure(&PlatformError::AudioBusy));
+    }
+
+    #[test]
+    fn invalidated_failure_leaves_no_draining_or_streaming_state() {
+        // issue #276 的永久卡死形态：Draining 阶段 reset 返回 0x88890004。
+        // fail_audio 必须释放 sink、清队列、回 Failed，下一次 begin 才不会被 AudioBusy 拒绝。
+        let state = Arc::new(Mutex::new(AudioSnapshot {
+            phase: AudioPhase::Draining,
+            selected_endpoint_id: Some("endpoint-id".to_owned()),
+            selected_endpoint_name: Some("CABLE Input".to_owned()),
+            generation: 7,
+            ..AudioSnapshot::default()
+        }));
+        let mut sink = None;
+        let mut queue = PcmBuffer::default();
+        queue.begin(7);
+        queue.enqueue(7, vec![1, 2, 3]).expect("queue audio");
+        let (reply, response) = mpsc::channel();
+        let mut pending_drain = Some((7, reply));
+
+        fail_audio(
+            &mut sink,
+            &mut queue,
+            &state,
+            PlatformError::AudioDeviceInvalidated,
+            &mut pending_drain,
+        );
+
+        let snapshot = lock(&state).clone();
+        assert_eq!(snapshot.phase, AudioPhase::Failed);
+        assert!(!matches!(
+            snapshot.phase,
+            AudioPhase::Streaming | AudioPhase::Draining
+        ));
+        assert!(queue.is_empty());
+        assert!(pending_drain.is_none());
+        assert!(matches!(
+            response.recv().expect("pending drain reply"),
+            Err(PlatformError::AudioDeviceInvalidated)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn device_invalidated_hresult_is_classified_without_masking_other_errors() {
+        // 0x88890004 = AUDCLNT_E_DEVICE_INVALIDATED；0x8889000A = AUDCLNT_E_DEVICE_IN_USE，
+        // 后者仍走打开重试，不能被误判为“需要重建客户端”。
+        assert!(is_device_invalidated(&wasapi_error(0x8889_0004)));
+        assert!(!is_device_invalidated(&wasapi_error(0x8889_000A)));
+        assert_eq!(
+            wasapi_audio_error("读取 WASAPI 可写空间", wasapi_error(0x8889_0004)),
+            PlatformError::AudioDeviceInvalidated
+        );
+        assert!(matches!(
+            wasapi_audio_error("读取 WASAPI 可写空间", wasapi_error(0x8889_000A)),
+            PlatformError::Audio(_)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_device_invalidated_is_classified_too() {
+        // 会话静音检查走 windows::core::Error 而不是 wasapi::WasapiError；
+        // 同一个 HRESULT 必须得到同一个分类。
+        let error =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8889_0004_u32 as i32));
+        assert_eq!(
+            windows_audio_error("读取会话静音状态", error),
+            PlatformError::AudioDeviceInvalidated
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disconnect_reasons_have_stable_log_tokens() {
+        for (reason, token) in [
+            (wasapi::DisconnectReason::DeviceRemoval, "device_removal"),
+            (wasapi::DisconnectReason::ServerShutdown, "server_shutdown"),
+            (wasapi::DisconnectReason::FormatChanged, "format_changed"),
+            (wasapi::DisconnectReason::SessionLogoff, "session_logoff"),
+            (
+                wasapi::DisconnectReason::SessionDisconnected,
+                "session_disconnected",
+            ),
+            (
+                wasapi::DisconnectReason::ExclusiveModeOverride,
+                "exclusive_mode_override",
+            ),
+            (wasapi::DisconnectReason::Unknown, "unknown"),
+        ] {
+            assert_eq!(
+                disconnect_reason_name(disconnect_reason_code(reason)),
+                token
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires SAYALL_TEST_CABLE_ENDPOINT_ID and mutates that endpoint's mute state"]
+    fn invalidated_sink_is_replaced_before_begin() {
+        // 现场 2026-10-20：WTS 会话重连后旧 IAudioClient 被作废（0x88890004），
+        // 但端点仍可被新客户端打开。这里把 sink 标记为已断开，验证 begin 会重开同一端点。
+        let _endpoint_guard = CABLE_ENDPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let endpoint_id = std::env::var("SAYALL_TEST_CABLE_ENDPOINT_ID")
+            .expect("set SAYALL_TEST_CABLE_ENDPOINT_ID to the CABLE Input render endpoint");
+        wasapi::initialize_mta()
+            .ok()
+            .expect("initialize test COM apartment");
+        let _apartment = WasapiApartment;
+        let original_mute = endpoint_muted(&endpoint_id).expect("read initial endpoint mute");
+        let _restore = RestoreEndpointMute {
+            endpoint_id: endpoint_id.clone(),
+            muted: original_mute,
+        };
+
+        let endpoint = list_endpoints()
+            .expect("list render endpoints")
+            .into_iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+            .expect("configured endpoint must be active");
+        let state = Arc::new(Mutex::new(ready_snapshot(
+            endpoint.id.clone(),
+            endpoint.name.clone(),
+        )));
+        let mut sink = Some(AudioSink::open(&endpoint_id, 0).expect("open test endpoint"));
+        sink.as_ref()
+            .expect("opened sink")
+            .disconnected_reason
+            .store(
+                disconnect_reason_code(wasapi::DisconnectReason::SessionDisconnected),
+                Ordering::SeqCst,
+            );
+
+        let mut queue = PcmBuffer::default();
+        let snapshot = begin_session(&mut sink, &mut queue, &state, 1, None)
+            .expect("an invalidated sink should be replaced automatically");
+
+        assert_eq!(snapshot.phase, AudioPhase::Streaming);
+        assert!(sink.is_some(), "recovery must leave a usable sink");
+        let _ = interrupt(&mut sink, &mut queue, &state);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires SAYALL_TEST_CABLE_ENDPOINT_ID and mutates that endpoint's mute state"]
+    fn invalidated_sink_pump_fails_before_prebuffer() {
+        // 队列溢出前应先看到真实的 invalidated 原因，而不是等 PCM 队列涨到 2 秒。
+        // 旧的 pump 在 !started 且队列为空时直接返回 Ok(0)，会把这个原因拖到 overflow。
+        let _endpoint_guard = CABLE_ENDPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let endpoint_id = std::env::var("SAYALL_TEST_CABLE_ENDPOINT_ID")
+            .expect("set SAYALL_TEST_CABLE_ENDPOINT_ID to the CABLE Input render endpoint");
+        wasapi::initialize_mta()
+            .ok()
+            .expect("initialize test COM apartment");
+        let _apartment = WasapiApartment;
+        let original_mute = endpoint_muted(&endpoint_id).expect("read initial endpoint mute");
+        let _restore = RestoreEndpointMute {
+            endpoint_id: endpoint_id.clone(),
+            muted: original_mute,
+        };
+
+        let mut sink = AudioSink::open(&endpoint_id, 0).expect("open test endpoint");
+        sink.disconnected_reason.store(
+            disconnect_reason_code(wasapi::DisconnectReason::SessionDisconnected),
+            Ordering::SeqCst,
+        );
+        let mut queue = PcmBuffer::default();
+
+        let error = sink
+            .pump(&mut queue, false, 1)
+            .expect_err("invalidated sink must fail before waiting for prebuffer");
+
+        assert_eq!(error, PlatformError::AudioDeviceInvalidated);
+        let _ = sink.reset();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires SAYALL_TEST_CABLE_ENDPOINT_ID and mutates that endpoint's mute state"]
+    fn missing_sink_is_reopened_from_the_saved_selection() {
+        // 现场 19:05:35：pump 失败后 fail_audio 把 sink take 走，phase=Failed、
+        // 选择仍在；下一次 begin 不能直接返回 endpoint_not_selected。
+        let _endpoint_guard = CABLE_ENDPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let endpoint_id = std::env::var("SAYALL_TEST_CABLE_ENDPOINT_ID")
+            .expect("set SAYALL_TEST_CABLE_ENDPOINT_ID to the CABLE Input render endpoint");
+        wasapi::initialize_mta()
+            .ok()
+            .expect("initialize test COM apartment");
+        let _apartment = WasapiApartment;
+        let original_mute = endpoint_muted(&endpoint_id).expect("read initial endpoint mute");
+        let _restore = RestoreEndpointMute {
+            endpoint_id: endpoint_id.clone(),
+            muted: original_mute,
+        };
+
+        let endpoint = list_endpoints()
+            .expect("list render endpoints")
+            .into_iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+            .expect("configured endpoint must be active");
+        let state = Arc::new(Mutex::new(configured_failure_snapshot(
+            endpoint.id.clone(),
+            endpoint.name.clone(),
+            "WASAPI failed: 0x88890004".to_owned(),
+        )));
+        let mut sink = None;
+        let mut queue = PcmBuffer::default();
+
+        let snapshot = begin_session(&mut sink, &mut queue, &state, 1, None)
+            .expect("a saved selection should reopen the endpoint");
+
+        assert_eq!(snapshot.phase, AudioPhase::Streaming);
+        assert!(sink.is_some(), "recovery must leave a usable sink");
+        let _ = interrupt(&mut sink, &mut queue, &state);
     }
 }

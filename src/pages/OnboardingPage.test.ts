@@ -8,6 +8,7 @@ import type {
   DiagnosticReport,
   RawInputPhase,
   RuntimeSnapshot,
+  VoiceAudioHealth,
   VoiceSessionState,
 } from "../lib/bridge";
 import OnboardingPage from "./OnboardingPage.vue";
@@ -123,6 +124,9 @@ function runtimeWith(
     queuedSamples?: number;
     audioLastError?: string | null;
     connectionGeneration?: number;
+    remoteModel?: "rc001" | "rc003" | "unknown";
+    staleRemoteEventCount?: number;
+    voiceAudioHealth?: VoiceAudioHealth;
   } = {},
 ): RuntimeSnapshot {
   return {
@@ -143,6 +147,8 @@ function runtimeWith(
         capabilities: null,
         voiceState: patch.voiceState ?? "idle",
         decodedSamples: patch.decodedSamples ?? 0,
+        voiceAudioHealth: patch.voiceAudioHealth ?? "unknown",
+        voiceAudioRateHz: null,
         generation: patch.connectionGeneration ?? 0,
         reconnectAttempt: patch.reconnectAttempt ?? 0,
         powerNotificationsAvailable: false,
@@ -209,6 +215,8 @@ function diagnosticReport(): DiagnosticReport {
     buildChannel: "local-test",
     windowsVersion: "10.0.26100",
     processArchitecture: "x86_64",
+    bootType: "full",
+    fastStartupEnabled: false,
     platform: "windows",
     verificationStatus: "真机验证中",
     capabilities: {
@@ -277,6 +285,7 @@ async function mountWizard(
   await flushPromises();
   return wrapper;
 }
+
 
 function resetWizardMocks(): void {
   mocks.reportFrontendEvent.mockReset();
@@ -488,12 +497,7 @@ describe("Onboarding wizard shell", () => {
     expect(mocks.connectRemote).toHaveBeenCalledWith("dev-1");
     expect(wrapper.text()).toContain("正在确认语音功能");
 
-    await wrapper
-      .findAll("button")
-      .find((button) => button.text().includes("打开蓝牙设置"))!
-      .trigger("click");
-    await flushPromises();
-    expect(mocks.openWindowsSettings).toHaveBeenCalledWith("bluetooth");
+    expect(wrapper.findAll("button").some(button => button.text().includes("打开蓝牙设置"))).toBe(false);
   });
 
   it("corrects a mistaken voice-key press while waiting for a control button", async () => {
@@ -1239,6 +1243,36 @@ describe("Onboarding voice test step", () => {
     wrapper.unmount();
   });
 
+  it("no_transcript 失败 + 音频降级：给蓝牙共存提示", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
+    mocks.getVoiceInputTool.mockResolvedValue("doubao");
+    mocks.endKeyObservation.mockResolvedValue(0);
+    queueSnapshots(
+      runtimeWith(),
+      streamingFrame({ decodedSamples: 120, submittedSamples: 320 }),
+      runtimeWith({
+        connectionPhase: "ready",
+        bleVoiceReady: true,
+        rawInputPhase: "ready",
+        audioPhase: "ready",
+        decodedSamples: 160,
+        submittedSamples: 640,
+        queuedSamples: 0,
+        voiceAudioHealth: "degraded",
+      }),
+    );
+
+    const wrapper = await mountWizard(connectedRuntime(), { attach: true });
+    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(3_200);
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("声音没有完整送到输入工具");
+    expect(wrapper.text()).toContain("关闭或移开同时连接的其他蓝牙设备");
+    expect(wrapper.text()).not.toContain("语音链路正常");
+    wrapper.unmount();
+  });
   it("clears the box and re-arms a fresh attempt on retry", async () => {
     mocks.getOnboardingState.mockResolvedValue(activeState("voice_test"));
     mocks.getVoiceInputTool.mockResolvedValue("wechat");

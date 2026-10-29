@@ -1,3 +1,14 @@
+<script setup lang="ts">
+/**
+ * 第①步：首次配对说明（2026-10-13 现场定稿文案）。
+ * 「打开蓝牙设置」入口放在第 2 条下方（Andy 指定位置）：点击只唤起系统设置页，
+ * 不写"已打开…"提示（由父级 `openBluetoothSettingsFromWelcome` 保证）。
+ */
+import { t } from "../../lib/i18n";
+
+defineEmits<{ openBluetoothSettings: [] }>();
+</script>
+
 <template>
   <section class="onboarding-step">
     <h1>欢迎使用无线麦</h1>

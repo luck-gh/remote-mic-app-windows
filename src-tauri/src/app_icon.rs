@@ -218,6 +218,7 @@ fn icon_bitmap_from_image(image: &Image<'_>) -> window_icons::IconBitmap {
 ///
 /// 通知区域由系统按任务栏所在显示器绘制，这里用主窗口 DPI 近似；预生成的四档
 /// 尺寸覆盖 100%–200%，偏差最多一档，不影响可读性。
+///
 fn window_dpi(app: &AppHandle) -> u32 {
     app.get_webview_window("main")
         .and_then(|window| window.scale_factor().ok())

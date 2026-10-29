@@ -6,6 +6,7 @@ import {
   loadPersistedPage,
   navigationItems,
   persistActivePage,
+  publicNavigationItems,
   touchLiveness,
 } from "./navigation";
 
@@ -17,13 +18,14 @@ describe("Windows navigation", () => {
       "templates",
       "macros",
       "connection",
+      "reflections",
       "permissions",
       "settings",
+      "profile",
     ]);
-    // 2026-10-02 用户指定：末位页从「关于」改名「设置」，图标换成 Mac 同款齿轮。
-    expect(navigationItems.at(-1)?.label).toBe("设置");
-    expect(navigationItems.at(-1)?.icon).toBe("gear");
-    expect(navigationItems.every((item) => item.label.length > 0)).toBe(true);
+    expect(navigationItems.find(item => item.id === "settings")?.icon).toBe("gear");
+    expect(navigationItems.at(-1)?.id).toBe("profile");
+    expect(navigationItems.every(item => item.label.length > 0)).toBe(true);
   });
 
   it("shows the combination actions entry after the buttons page", () => {
@@ -44,6 +46,8 @@ describe("active page persistence (webview reload recovery)", () => {
     expect(loadPersistedPage()).toBe("connection");
     persistActivePage("settings");
     expect(loadPersistedPage()).toBe("settings");
+    persistActivePage("profile");
+    expect(loadPersistedPage()).toBe("profile");
   });
 
   it("ignores stored values that are no longer valid page ids", () => {

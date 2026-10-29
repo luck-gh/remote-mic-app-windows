@@ -4,6 +4,7 @@ import SceneOverlay from "./components/SceneOverlay.vue";
 import { isTauriRuntime } from "./lib/bridge";
 import { initializeAccentColor } from "./lib/accent";
 import { initializeTheme } from "./lib/theme";
+import { initializeLanguage } from "./lib/language";
 import { installFrontendDiagnostics, reportFrontendEvent } from "./lib/frontend-diagnostics";
 import { installFocusModalityTracking } from "./lib/focus-modality";
 import "./styles.css";
@@ -13,6 +14,7 @@ installFrontendDiagnostics();
 // 初始化调用在 Vue 挂载前同步应用首帧主题；异步读取设置不阻塞主界面。
 if (!sceneOverlay) {
   void initializeTheme();
+  void initializeLanguage();
   void initializeAccentColor();
 }
 try {
@@ -41,7 +43,11 @@ try {
     reason: "root_component_mount_failed",
   });
   const root = document.querySelector<HTMLElement>("#app");
-  if (root) root.textContent = "无线麦启动失败。请将诊断日志发送给技术支持。";
+  if (root) {
+    root.textContent = navigator.language.toLowerCase().startsWith("zh")
+      ? "无线麦启动失败。请将诊断日志发送给技术支持。"
+      : "SayAll failed to start. Send the diagnostic log to technical support.";
+  }
 }
 
 // 桌面应用内禁用 WebView 默认右键菜单（浏览器预览保留原生菜单，便于调试）。

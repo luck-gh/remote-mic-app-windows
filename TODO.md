@@ -51,6 +51,24 @@
 
 - [ ] 2026-09-27 主页面滚动槽稳定：普通页面滚动收敛到视口内main，原生scrollbar-gutter稳定预留宽度；按键页外层不重复留槽，复用独立正文滚动并让固定操作行同宽，侧栏/浮层不加槽。仅CSS，现有页面/导航54项与生产构建通过，14:27:19包926a9848已正常安装，Explorer普通App41980/提权Helper27176、载荷与最新三文件配置保持已核；溢出前后实际宽度和底栏视觉仍待自然观察，不外推设备动作。
 
+## 语音识别"能出字但对不上"的定位链（2026-10-27 用户报障，已定位为配置问题）
+
+- [ ] 现象：遥控器语音键正常、豆包能出字，但识别内容与实际说的出入较大；链路日志全绿
+  （`path=report_layer` + `result=replaced` + 录音时长正常）。
+- 根因：输入法麦克风选的是「自动检测」，跟随**系统默认录音设备**；本机默认不是 `CABLE Output`，
+  而系统里还活跃着「立体声混音」与「麦克风阵列」，于是录到的是环境声/系统声。用户把输入法麦克风
+  改成 `CABLE Output` 后准确率立刻恢复。
+- 本次只补证据（不改行为）：`voice_capture_input default="<默认录音设备>" is_cable_output=<bool>`
+  （每次语音键按下，结果缓存 30 s）与 `voice_level session=… reason=… frames=… samples=…
+  peak_dbfs=… rms_dbfs=… clipped=…`（每次会话收尾，只记数字不碰音频内容）。
+  自动化：`cargo test -p sayall-windows --lib` **475 passed / 16 ignored**（新增 5 条：
+  电平的空帧/静音区分、满幅削波、半幅 -6 dBFS、取走后复位、端点名判定）。
+- **待产品决定**：v1 决策写的是"应用不修改系统默认录音设备，由用户设置"，但目前界面与向导
+  没有任何地方提示这件事（onboarding 的「音频检查」只验端点存在性）。建议在连接页「语音设备」
+  卡片或向导第 ② 步加一句「把系统默认录音设备或输入法的麦克风设为 CABLE Output，不要用自动检测」。
+- 真机 `deferred`：需一次真实语音会话确认两行日志都出现、`is_cable_output=true`。
+  记录见 `Bugs/2026-10-27-voice-accuracy-input-device-auto-detect.md`。
+
 ## v1 决策（2026-09-04）
 
 - 第一版只做微信输入法听写：按住说话快捷键默认 左Ctrl+左Win（适配微信输入法默认语音热键）；语音可用 = 按住语音键 → 注入快捷键 → ATVV 音频经 CABLE Input → 微信输入法麦克风（CABLE Output）→ 云端识别 → 文字上屏。端到端链路音频段已本机实证（调查报告 evidence/n）；注入段配方约束已本机实证（evidence/p：WeType 拒绝单批零间隔和弦，须逐事件注入；间隔 20/40/60ms 均 4/4 触发、零间隔 0/2，~~默认取 20ms 压低按键延迟~~（2026-09-05 更正：20ms 为热态验证结论，冷/节流态必失败已实证并回退 80ms，见下方"性能已知项"与提交 86e5314——延迟优化必须以成功率保证为前提），Bugs\2026-09-04-wetype-zero-gap-injection.md）；**延迟账目已量化（2026-09-05，evidence/p 端点预热对照实验）**：注入→WeType 开麦固定 ~163ms（冷/热端点中位数差 0.3ms，预热无效；WeType 内部处理，第三方边界不可干预），两型号实际均直接 0x04 推流（无开麦往返可并行），0x04 早于 HID F5 60-90ms（触发点已最早），全链 ≈215-245ms 其中应用侧仅和弦 20ms 可控——**应用侧延迟优化到此收敛**；RC001 遥控器端到端真机 passed（2026-09-04，用户确认文字上屏；用户侧前提=输出端点选 CABLE Input + 系统默认录音设备切 CABLE Output，应用不修改系统默认设备）；RC003 真机待验。豆包（注入判死四层闭环）与 WinUHid 增强轨延后，见 ADR 0002 与 docs/investigations/2026-09-04-avoid-driver-signing-input-paths-final.md。
@@ -136,6 +154,8 @@
 - [ ] 使用真实 RC003 验证型号识别、BLE 配对、连接、断开、重连和首次语音。
 - [ ] 验证 `STREAM_START → AUDIO → STREAM_STOP` 首次会话完整可用。
 - [ ] 在 Windows 真机验证 WASAPI 端点初始化、VB-CABLE 回环、欠载恢复与完整尾音。
+- [ ] WASAPI 客户端在 WTS 会话断开/重连后自动释放并重开同一端点（issue #276）：自动化与本机 VB-CABLE 真实端点重开 passed；2026-10-21 安装版用 Audiosrv 重启触发 `server_shutdown`，下一次按键 `action=recover ... terminal_result=passed`（66 ms），随后 `begin`/`finish` 均 passed；RDP 受控复现、RC003 长时间实际语音与睡眠唤醒回归 deferred，见 `Bugs/2026-10-21-rdp-audio-session-invalidation-stuck.md`。
+- [ ] 定位 WASAPI PCM `queue_overflow`：已加失效早检与 1 秒 `audio_pump` 进度日志（`available_frames` / `queued_samples` / `pump_calls` / `zero_space_polls`），待现场日志区分端点停止排空或 worker 阻塞；未改队列上限/丢弃策略，见 `Bugs/2026-10-21-wasapi-pcm-queue-overflow-diagnostics.md`。
 - [x] CABLE Input 双层静音自愈：端点主静音使用 `IAudioEndpointVolume`；音量合成器里的 SayAll 应用会话静音使用 `ISimpleAudioVolume`，只匹配当前进程在已选 CABLE 端点上的会话。初始化、会话开始、流启动后检查，推流期间每 100ms 低频检查，必要时解除静音并读回；两层均不修改音量。2026-09-07 Windows 真实 CABLE Input 受控复现 passed：端点 open/begin 两检查点，以及应用会话 begin/after_start/stream_watch 三检查点均成功从 muted 恢复到 unmuted；随后真实 RC001 连续 9 次语音均复现“流启动约半秒后会话被外部重新静音”，监视路径 9/9 捕获并恢复为 unmuted（2765 个音频包），9 次开始/停止与快捷键按下/释放均成对；修复版 NSIS 本地包由用户复测确认 RC001 语音功能 passed。边界：完整 RC003 → CABLE → 输入法语音链仍按上一项真机验收。
 - [x] 生产诊断日志默认持久化到 LocalAppData：覆盖进程/Tauri/前端/Vue/首次 IPC 启动链，音频端点枚举与 `virtual_cable|bluetooth|other` 脱敏分类、WASAPI 打开/自动转换/推流/排空/中止/失败，以及按键映射和按住说话快捷键的加载、保存、重置；禁止原始音频包、端点名称/ID、自定义应用路径和异常正文进入生产日志。2026-09-08 自动化验证 passed；真实蓝牙耳机故障复现与安装包白屏现场日志验收 deferred。
 - [x] 正常退出显式清理：Raw Input 监督线程不再以永久强 `Arc` 保活平台，托盘退出、Tauri `ExitRequested` 与更新安装前退出复用幂等清理；后台依次停止监督线程、同步取消按住映射/场景状态、停止 Raw Input、断开 BLE，并按阶段记录脱敏终态和耗时。生命周期定向 2 项、映射按住/监听停止既有用例、host check 与排除诊断 sink 隔离用例后的 workspace lib 均 passed；最终 NSIS 已构建。安装准备中旧版公开断开和停止监听 passed，持久配置未变；托盘“退出”精确 Invoke 后超过 60 秒进程仍存活，旧版正常退出 failed，故安装 blocked。含修复新包的进程消失、日志阶段顺序与连接中/按住中退出仍 deferred；旧实例当前为断开且监听停止。

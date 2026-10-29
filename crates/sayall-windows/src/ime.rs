@@ -251,6 +251,27 @@ pub enum ImeActivation {
     NotRequired,
 }
 
+impl ImeActivation {
+    /// 诊断日志用的稳定标记（与 `ime_activation outcome=` 同词表）。
+    pub(crate) fn log_token(&self) -> &'static str {
+        match self {
+            ImeActivation::AlreadyActive => "already_active",
+            ImeActivation::Switched => "switched",
+            ImeActivation::SkippedSelfForeground => "skipped_self_foreground",
+            ImeActivation::NotRequired => "not_required",
+        }
+    }
+}
+
+/// 是否需要真的调用 `ActivateProfile`（纯判定，单测覆盖）。
+///
+/// `force = true` 用于救回路径（2026-10-28）：`GetActiveProfile` 在新 STA 线程上
+/// 读到的是**本进程**会话，看不见目标窗口（Windows 按应用记忆输入法），
+/// `active_is_target` 是假阳性；此时必须无视它强制切一次。
+fn should_activate(active_is_target: bool, force: bool) -> bool {
+    force || !active_is_target
+}
+
 /// 前台窗口是否属于 SayAll 自身进程。
 ///
 /// 会话级 TSF 激活作用于焦点窗口——焦点落在自己的 WebView 时，把微信
@@ -417,6 +438,8 @@ pub(crate) enum ImeSwitchScope {
     VoicePress,
     /// 用户刚在连接页选中输入工具后的一次性对齐（2026-10-03，离开自身窗口焦点后执行）。
     ToolSelect,
+    /// 按下确认未响应后的救回对齐（2026-10-28，强制切一次）。
+    VoiceHeal,
 }
 
 impl ImeSwitchScope {
@@ -424,6 +447,7 @@ impl ImeSwitchScope {
         match self {
             ImeSwitchScope::VoicePress => "voice_press",
             ImeSwitchScope::ToolSelect => "tool_select",
+            ImeSwitchScope::VoiceHeal => "voice_heal",
         }
     }
 }
@@ -442,6 +466,13 @@ pub fn ensure_session_ime(
     scope: ImeSwitchScope,
 ) -> Result<ImeActivation, String> {
     ensure_session_ime_at(tool, scope, recovery_epoch())
+}
+
+pub(crate) fn heal_target_ime(
+    tool: VoiceInputTool,
+    ticket: RecoveryTicket,
+) -> Result<ImeActivation, String> {
+    ensure_session_ime_for_target(tool, ImeSwitchScope::VoiceHeal, Some(ticket))
 }
 
 pub(crate) fn ensure_session_ime_at(
@@ -787,6 +818,13 @@ mod press_context_tests {
         assert_eq!(mic_marker_for(None), None);
     }
 
+    #[test]
+    fn forced_align_ignores_a_false_positive_active_query() {
+        assert!(!super::should_activate(true, false));
+        assert!(super::should_activate(true, true));
+        assert!(super::should_activate(false, false));
+        assert!(super::should_activate(false, true));
+    }
     /// 诊断：枚举 TSF 键盘配置（clsid/guid/hkl/flags）并读当前活动配置，
     /// 用于"直达切换"方案选型（2026-10-10）：
     /// `cargo test -p sayall-windows --lib -- --ignored --nocapture dump_tsf_profiles`
@@ -868,6 +906,7 @@ fn sta_ensure_ime(
     scope: ImeSwitchScope,
     ticket: RecoveryTicket,
 ) -> Result<ImeActivation, String> {
+    let force = scope == ImeSwitchScope::VoiceHeal;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
@@ -895,15 +934,15 @@ fn sta_ensure_ime(
             };
             // 功能点日志：只记录冷/热判定，不落盘输入法 GUID 或前台应用身份。
             crate::ble::gatt_note(format!(
-                "ime_query tool={} ok={} active_is_target={active_is_target} active_profile_present={}",
+                "ime_query tool={} ok={} active_is_target={active_is_target} active_profile_present={} forced={force}",
                 target.label,
                 query.is_ok(),
                 profile.clsid != GUID::from_u128(0),
             ));
-            if active_is_target {
+            if !should_activate(active_is_target, force) {
                 return Ok(ImeActivation::AlreadyActive);
             }
-            if !ticket.current() || (scope == ImeSwitchScope::ToolSelect && !ticket.can_recover()) {
+            if !ticket.current() || (scope != ImeSwitchScope::VoicePress && !ticket.can_recover()) {
                 crate::ble::gatt_note(
                     "ime_activation outcome=cancelled reason=stale_or_active_session".into(),
                 );
@@ -930,7 +969,9 @@ fn sta_ensure_ime(
             let mut verified = query_active_is_target(&manager, target);
             let mut attempts = 1u32;
             if !verified {
-                if !ticket.current() {
+                if !ticket.current()
+                    || (scope != ImeSwitchScope::VoicePress && !ticket.can_recover())
+                {
                     crate::ble::gatt_note(
                         "ime_activation outcome=cancelled reason=stale_before_retry".into(),
                     );

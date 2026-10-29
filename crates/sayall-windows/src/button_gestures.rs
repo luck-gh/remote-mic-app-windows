@@ -3,7 +3,7 @@
 //! 口径扩展：「按住连续触发」支持自动、明确关闭和显式槽位（每键至多一个）。
 //!
 //! - 双击窗口 300ms、长按阈值 550ms、连续触发起始 350ms（逐键间隔：
-//!   返回 50ms、方向/音量 100ms，见 `RemoteButton::repeat_interval`）。
+//!   返回 50ms、其余按键 100ms，见 `RemoteButton::repeat_interval`）。
 //! - 开关取值与行为（`ButtonActions::hold_repeat`）：
 //!   - 自动（缺省）→ 没有长按动作且单击可重复时，按单击连发规则执行；
 //!   - 关闭 → 单击在按下沿立即触发（无双击/长按时）或经双击窗确认；按住不连续；
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn back_repeats_at_50ms_and_non_repeat_buttons_do_not_repeat() {
+    fn back_repeats_at_50ms_and_other_buttons_at_100ms() {
         let t0 = Instant::now();
         let mut mappings = mappings_with_repeat(
             RemoteButton::Back,
@@ -571,7 +571,7 @@ mod tests {
             None,
             Some(HoldRepeat::Single),
         );
-        // OK 无连发区间：即便手改文件给上开关也不连续（引擎按无区间降级）。
+        // 2026-10-23 起所有按键都有连发区间；OK 配置可连续动作后也会重复。
         mappings.actions.insert(
             RemoteButton::Ok,
             ButtonActions {
@@ -595,10 +595,16 @@ mod tests {
             recognizer.press(RemoteButton::Ok, t0),
             vec![ButtonTrigger::Single]
         );
-        // 返回键 50ms 起连续触发；OK 无区间 → 永不重复。
+        // 返回键 50ms、OK 100ms 起连续触发。
         let t1 = t0 + REPEAT_START_DELAY + Duration::from_millis(500);
         let fired = recognizer.advance(t1);
-        assert_eq!(fired, vec![(RemoteButton::Back, ButtonTrigger::Single)]);
+        assert_eq!(
+            fired,
+            vec![
+                (RemoteButton::Back, ButtonTrigger::Single),
+                (RemoteButton::Ok, ButtonTrigger::Single),
+            ]
+        );
     }
 
     #[test]

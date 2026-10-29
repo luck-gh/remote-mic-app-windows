@@ -25,6 +25,48 @@ pub fn is_registered_target(target: &str) -> bool {
     })
 }
 
+/// Known AppsFolder entries whose process has no AUMID.
+///
+/// WPS Office launches a shared `wps.exe` host and distinguishes modules by
+/// window contents; matching only the executable would give the WPP profile to
+/// Writer as well. A blank WPP window is `PP12FrameClass`; an opened `.pptx`
+/// keeps the generic `OpusApp` top-level class but contains `PPTFrameClass`.
+pub fn known_window_class_prefix(app_user_model_id: &str) -> Option<&'static str> {
+    match app_user_model_id.to_ascii_lowercase().as_str() {
+        "kingsoft.office.wpp" => Some("PP12"),
+        _ => None,
+    }
+}
+
+/// Descendant window class that identifies a WPS module whose top-level class
+/// is shared with another module (WPP editor vs Writer both use `OpusApp`).
+pub fn known_descendant_window_class_prefix(app_user_model_id: &str) -> Option<&'static str> {
+    match app_user_model_id.to_ascii_lowercase().as_str() {
+        "kingsoft.office.wpp" => Some("PPT"),
+        "kingsoft.office.wps" => Some("_Ww"),
+        _ => None,
+    }
+}
+
+/// 只读判断某个 AppsFolder AUMID 是否已安装（2026-10-22：ChatGPT 等
+/// Microsoft Store 包没有 App Paths / 开始菜单 .lnk，必须走 AppsFolder）。
+#[cfg(windows)]
+pub fn registered_target_is_installed(app_user_model_id: &str) -> bool {
+    let target = format!("{REGISTERED_PREFIX}{app_user_model_id}");
+    if !is_registered_target(&target) {
+        return false;
+    }
+    // 命令线程可能已经以 MTA 初始化 COM；Shell 解析放到独立 STA 线程，
+    // 避免 CoInitializeEx(COINIT_APARTMENTTHREADED) 返回 RPC_E_CHANGED_MODE
+    // 被误判成“未安装”。
+    std::thread::Builder::new()
+        .name("sayall-appsfolder-probe".to_owned())
+        .spawn(move || resolve_registered_identity(&target).is_ok())
+        .ok()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or(false)
+}
+
 pub fn normalize_library(apps: Vec<AppLibraryEntry>) -> Result<Vec<AppLibraryEntry>, String> {
     if apps.len() > 2000 {
         return Err("应用列表最多支持 2000 项".into());
@@ -184,7 +226,7 @@ fn classify_registered_launch(submitted: bool, foreground_observed: bool) -> Res
 }
 
 #[cfg(windows)]
-pub(crate) fn resolve_registered_executable_path(target: &str) -> Option<String> {
+pub fn resolve_registered_executable_path(target: &str) -> Option<String> {
     if !is_registered_target(target) {
         return None;
     }
@@ -603,6 +645,23 @@ mod tests {
         let activation =
             crate::app_launcher::tests::with_foreground_lock(|| launch_registered_app(&target));
         activation.expect("registered app should reach foreground after lock retry");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_appsfolder_aumid_is_not_installed() {
+        assert!(!registered_target_is_installed(
+            "SayAll.Definitely.Missing_0000000000000!App"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an installed ChatGPT Store package on this machine"]
+    fn chatgpt_store_package_is_detected_on_this_machine() {
+        assert!(registered_target_is_installed(
+            "OpenAI.Codex_2p2nqsd0c76g0!App"
+        ));
     }
 
     #[test]

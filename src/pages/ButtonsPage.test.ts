@@ -116,6 +116,70 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       shortcutCaptureHandler = handler;
       return () => {};
     }),
+    // 三键捕获：默认「未授权，开启会触发 UAC」；个别用例用 mockResolvedValue 覆盖。
+    // authorizationRequired 与 Rust enable_capture 的授权判定同源
+    // （任务未注册，或安装/升级写下了重授权标记）。
+    getRc003TaskStatus: vi.fn(async () => ({
+      installed: false,
+      authorizationRequired: true,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    })),
+    enableRc003Capture: vi.fn(async () => ({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    })),
+    disableRc003Capture: vi.fn(async () => ({
+      // 关闭不移除任务：授权保留（与真实语义一致）。
+      installed: true,
+      authorizationRequired: false,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    })),
+    getRc003BridgeSnapshot: vi.fn(async () => ({
+      phase: "stopped",
+      port: 0,
+      helperPid: 0,
+      acceptedTotal: 0,
+      deniedTotal: 0,
+      replacedTotal: 0,
+      edgesApplied: 0,
+      usagesDropped: 0,
+      malformedTotal: 0,
+      watchdogReleaseTotal: 0,
+      pressedUsages: [],
+      lastRxAgeMs: null,
+      targetGeneration: 0,
+      targetUsages: [],
+      ownedUsages: [],
+      captureHealth: "off",
+      captureUnavailable: "none",
+      captureRevoked: "none",
+    })),
+    // 遥控器信息卡片上的「重新连接」：扫描已配对设备 + 连接（默认空列表，用例内按需覆盖）。
+    scanPairedRemotes: vi.fn(async () => []),
+    connectRemote: vi.fn(async () => runtime.platform.connection),
+    // 本机对「全按键支持」的支持情况：默认可用（x64 真机 / 受支持的平台），
+    // 不可用的分支由「全按键支持在本机不可用（issue #206）」用例覆盖。
+    getCaptureSupport: vi.fn(async () => ({
+      nativeArch: "x64" as const,
+      helperExpected: "sayall-helper.exe",
+      available: true,
+      reason: null,
+    })),
+    // 常用语组件可用性：默认不可用（公开构建口径）；可用分支由专门用例覆盖。
+    getCommonPhrasePanelSnapshot: vi.fn(async () => ({
+      available: false,
+      access: "unavailable" as const,
+      canUse: false,
+      notice: null,
+      entries: [],
+    })),
   };
 });
 
@@ -124,6 +188,7 @@ import {
   selectCurrentTemplate,
   getMappingConfiguration,
   getButtonMappingSnapshot,
+  getCombinedActions,
   getTemplateCatalog,
   saveMappingConfiguration,
   setMenuTemplateSwitchEnabled,
@@ -248,7 +313,6 @@ beforeEach(() => {
   vi.mocked(saveButtonMappingTemplate).mockClear();
   vi.mocked(updateButtonMappingTemplate).mockClear();
 });
-
 describe("buttons mapping page", () => {
   it("shows a received voice key before audio is ready and retains the failure after release", async () => {
     const wrapper = await mountPage();
@@ -789,6 +853,20 @@ describe("buttons mapping page", () => {
     intervalSpy.mockRestore();
   });
 
+  it("keeps the switches rendered while combined actions are still loading", async () => {
+    // 2026-10-28：`getCombinedActions` 曾在映射赋值之前被 `await`，`listPresetApps`
+    // 也挤在同一条 Promise.all 里（实测 379 ms 探测已安装应用）——两者一起把开关与
+    // 配置内容推迟到一两秒之后。这条用例把它挂在"永不返回"：开关仍必须已经渲染出来，
+    // 否则就是把非首帧数据又塞回首帧链上了。
+    vi.mocked(getCombinedActions).mockReturnValueOnce(new Promise(() => {}) as never);
+
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.findAll('input[type="checkbox"]').length).toBeGreaterThan(0);
+    wrapper.unmount();
+  });
+
   it("immediately releases a listener that resolves after the page is unmounted", async () => {
     let resolveUnlisten!: (unlisten: () => void) => void;
     const pendingUnlisten = new Promise<() => void>((resolve) => {
@@ -1039,7 +1117,22 @@ describe("buttons mapping page", () => {
       await flushPromises();
     };
     await choose("滚轮向下");
-    await wrapper.get('input[aria-label="每次滚动格数"]').setValue("5");
+    let wheelInput = wrapper.get('input[aria-label="每次滚动格数"]');
+    // 普通文本框，不再带数字框的上下加减按钮；默认 20。
+    expect(wheelInput.attributes("type")).toBe("text");
+    expect((wheelInput.element as HTMLInputElement).value).toBe("20");
+    // 保存说明只跟在「每次移动…像素」后面；滚轮状态不显示。
+    expect(wrapper.find(".mouse-amount-hint").exists()).toBe(false);
+
+    // 2026-10-22 现场回归：App 每秒刷新运行状态会触发重渲染，正在输入的值
+    // 不得被配置值覆盖回默认 20。
+    await wheelInput.setValue("77");
+    await wrapper.setProps({ runtime: { ...runtime, appVersion: "0.1.1" } });
+    await flushPromises();
+    wheelInput = wrapper.get('input[aria-label="每次滚动格数"]');
+    expect((wheelInput.element as HTMLInputElement).value).toBe("77");
+    await wheelInput.setValue("5");
+    await wheelInput.trigger("blur");
     await flushPromises();
     expect(saveButtonMappings).not.toHaveBeenCalled();
     await saveDraft();
@@ -1048,18 +1141,126 @@ describe("buttons mapping page", () => {
       direction: "down",
       steps: 5,
     });
-
-    const saveCount = vi.mocked(saveButtonMappings).mock.calls.length;
-    await wrapper.get('input[aria-label="每次滚动格数"]').setValue("101");
+    // Enter提交到草稿；只有显式保存按钮才写入配置。
+    const savesBeforeEnter = vi.mocked(saveButtonMappings).mock.calls.length;
+    await wheelInput.setValue("100");
+    await wheelInput.trigger("keydown", { key: "Enter" });
     await flushPromises();
-    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(saveCount);
-    expect(wrapper.text()).toContain("请输入 1 到 100 之间的整数");
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(savesBeforeEnter);
+    // Enter后失焦不应重复修改草稿或触发IPC。
+    await wheelInput.trigger("blur");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(savesBeforeEnter);
+    await saveDraft();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "scroll",
+      direction: "down",
+      steps: 100,
+    });
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(savesBeforeEnter + 1);
+
+    // 0 与 101 无效：不保存，并提示 1–100。
+    const saveCount = vi.mocked(saveButtonMappings).mock.calls.length;
+    for (const invalid of ["0", "101"]) {
+      await wheelInput.setValue(invalid);
+      await wheelInput.trigger("keydown", { key: "Enter" });
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(saveCount);
+      // 错误提示贴在输入框下方，不再出现在页面最下方。
+      expect(wrapper.get(".mouse-amount-error").text()).toBe("请输入 1 到 100 之间的整数");
+      const bottom = wrapper.find(".mapping-status");
+      expect(bottom.exists() ? bottom.text() : "").not.toContain("请输入 1 到 100 之间的整数");
+    }
+
+    // 鼠标移动沿用同一口径：1–100、默认 20，Enter/失焦只更新草稿。
+    await wrapper
+      .find('.mapping-editor button[aria-label="鼠标向右"]')
+      .trigger("click");
+    await flushPromises();
+    let moveInput = wrapper.get('input[aria-label="每次移动像素"]');
+    expect(moveInput.attributes("type")).toBe("text");
+    expect((moveInput.element as HTMLInputElement).value).toBe("20");
+    expect(wrapper.get(".mouse-amount-hint").text()).toBe(
+      "Enter 或失焦确认数值，保存当前配置后生效。",
+    );
+    await moveInput.setValue("77");
+    await wrapper.setProps({ runtime: { ...runtime, appVersion: "0.1.2" } });
+    await flushPromises();
+    moveInput = wrapper.get('input[aria-label="每次移动像素"]');
+    expect((moveInput.element as HTMLInputElement).value).toBe("77");
+    await moveInput.setValue("100");
+    await moveInput.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(savesBeforeEnter + 1);
+    await moveInput.trigger("blur");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(savesBeforeEnter + 1);
+    await saveDraft();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "mouse_move",
+      direction: "right",
+      distance: 100,
+    });
+    expect(wrapper.find(".mouse-amount-error").exists()).toBe(false);
+    const movesBeforeInvalid = vi.mocked(saveButtonMappings).mock.calls.length;
+    await moveInput.setValue("101");
+    await moveInput.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(movesBeforeInvalid);
+    expect(wrapper.get(".mouse-amount-error").text()).toBe("请输入 1 到 100 之间的整数");
+    const bottom = wrapper.find(".mapping-status");
+    expect(bottom.exists() ? bottom.text() : "").not.toContain("请输入 1 到 100 之间的整数");
+    // 再次点击输入框：错误提示收回，恢复输入提示。
+    moveInput = wrapper.get('input[aria-label="每次移动像素"]');
+    await moveInput.trigger("focus");
+    expect(wrapper.find(".mouse-amount-error").exists()).toBe(false);
+    expect(wrapper.get(".mouse-amount-hint").text()).toBe(
+      "Enter 或失焦确认数值，保存当前配置后生效。",
+    );
 
     await choose("左键双击");
     await saveDraft();
     expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
       type: "mouse_click",
       kind: "double_left",
+    });
+    wrapper.unmount();
+  });
+
+  it("legacy scroll action without steps: explicitly entering 20 persists it (2026-10-22)", async () => {
+    const configuration = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({
+      ...configuration,
+      commonMappings: {
+        ...configuration.commonMappings,
+        actions: {
+          power: {
+            single: { type: "scroll", direction: "down" },
+            double: { type: "disabled" },
+            long: { type: "disabled" },
+          },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+    const input = wrapper.get('input[aria-label="每次滚动格数"]');
+    expect((input.element as HTMLInputElement).value).toBe("20");
+    await input.setValue("20");
+    await input.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "scroll",
+      direction: "down",
+      steps: 20,
     });
     wrapper.unmount();
   });
@@ -1129,6 +1330,63 @@ describe("buttons mapping page", () => {
     await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
     await flushPromises();
     expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power?.single).toEqual({type: "shortcut", chord: {keys: ["left_windows", "l"]}});
+    wrapper.unmount();
+  });
+
+  it("records Ctrl+[ from the native capture edge", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+
+    shortcutCaptureHandler!({ key: "left_control", isPressed: true });
+    shortcutCaptureHandler!({ key: "oem4", isPressed: true });
+    await vi.waitFor(() => expect(wrapper.text()).toContain("已录入 左 Ctrl + [，松开全部按键后完成"));
+    shortcutCaptureHandler!({ key: "oem4", isPressed: false });
+    shortcutCaptureHandler!({ key: "left_control", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：左 Ctrl + ["));
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0] as ButtonMappings;
+    expect(saved.actions.power?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["left_control", "oem4"] },
+    });
+    wrapper.unmount();
+  });
+
+  it("records Ctrl+] from the native capture edge", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+
+    shortcutCaptureHandler!({ key: "left_control", isPressed: true });
+    shortcutCaptureHandler!({ key: "oem6", isPressed: true });
+    await vi.waitFor(() => expect(wrapper.text()).toContain("已录入 左 Ctrl + ]，松开全部按键后完成"));
+    shortcutCaptureHandler!({ key: "oem6", isPressed: false });
+    shortcutCaptureHandler!({ key: "left_control", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0] as ButtonMappings;
+    expect(saved.actions.power?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["left_control", "oem6"] },
+    });
     wrapper.unmount();
   });
 
@@ -1245,7 +1503,7 @@ describe("buttons mapping page", () => {
     expect(texts).toContain("Ctrl + C");
     expect(texts).toContain("Alt + Tab");
     expect(texts).toContain("Backspace");
-    expect(texts).toContain("左 Win + Shift + S");
+    expect(texts).toContain("Win + Shift + S");
     expect(texts).not.toContain("复制");
     expect(texts).not.toContain("退格");
     expect(texts).not.toContain("截图");
@@ -1292,7 +1550,7 @@ describe("buttons mapping page", () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "电源", 2);
     expect(chipState(wrapper, "Esc")).toBe(false);
-    expect(chipState(wrapper, "左 Win + Shift + S")).toBe(false);
+    expect(chipState(wrapper, "Win + Shift + S")).toBe(false);
     expect(chipState(wrapper, "录入自定义快捷键")).toBe(false);
     expect(chipState(wrapper, "＋ 添加应用")).toBe(false);
     expect(wrapper.find(".mapping-editor").text()).not.toContain("它原本的按键效果");
@@ -1372,7 +1630,8 @@ describe("hold repeat and OK click in local editing drafts", () => {
       expect(wrapper.findAll('.repeat-group button').find(button => button.text() === '自动（默认）')!.classes()).toContain('selected');
       const menu = wrapper.findAll('.mapping-card').find(card => card.find('strong').text() === '菜单')!;
       await menu.findAll('.mapping-cell')[0]!.trigger('click');
-      expect(wrapper.find('.repeat-group').exists()).toBe(false);
+      expect(wrapper.find('.repeat-group').exists()).toBe(true);
+      expect(wrapper.find('.repeat-auto-hint').text()).toContain('未设置单击动作');
       expect(wrapper.get('.voice-card').find('.repeat-group').exists()).toBe(false);
       expect(saveButtonMappings).not.toHaveBeenCalled();
     } finally { wrapper.unmount(); }

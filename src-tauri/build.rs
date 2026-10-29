@@ -92,6 +92,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs");
     println!("cargo:rerun-if-changed=../.git/packed-refs");
+    println!("cargo:rerun-if-env-changed=SAYALL_SOURCE_REVISION");
     println!("cargo:rerun-if-env-changed=SAYALL_BUILD_CHANNEL");
     println!("cargo:rerun-if-env-changed=SAYALL_SOURCE_FINGERPRINT");
     println!("cargo:rerun-if-env-changed=SAYALL_SOURCE_STATE");

@@ -1,25 +1,81 @@
-export type PageId = "drivers" | "buttons" | "templates" | "macros" | "connection" | "permissions" | "settings";
+import { privateFeaturePages, type PrivateFeaturePage } from "./private/feature-pages";
 
-export type NavIcon = "driver" | "keyboard" | "template" | "layers" | "link" | "shield" | "gear";
+export type PageId =
+  | "buttons"
+  | "drivers"
+  | "templates"
+  | "macros"
+  | "connection"
+  | "reflections"
+  | "permissions"
+  | "settings"
+  | "profile";
+
+export type NavIcon =
+  | "driver"
+  | "template"
+  | "keyboard"
+  | "layers"
+  | "link"
+  | "shield"
+  | "gear"
+  | "member"
+  | "textbubble"
+  | "person";
 
 export interface NavigationItem {
-  id: PageId;
+  id: string;
   label: string;
   /** 侧栏图标（形状对齐 macOS SF Symbols：keyboard/link/shield.lefthalf.filled/gearshape）。 */
   icon: NavIcon;
 }
 
-export const navigationItems: NavigationItem[] = [
+export const publicNavigationItems: NavigationItem[] = [
   { id: "drivers", label: "驱动", icon: "driver" },
   { id: "buttons", label: "按键", icon: "keyboard" },
   { id: "templates", label: "模板", icon: "template" },
   { id: "macros", label: "组合动作", icon: "layers" },
   { id: "connection", label: "连接与语音", icon: "link" },
+  { id: "reflections", label: "回眸", icon: "textbubble" },
   { id: "permissions", label: "权限", icon: "shield" },
   // 2026-10-02 用户指定：原「关于」页改名「设置」，图标对齐 Mac main
   // SettingsSection.about 的 "gearshape"。
   { id: "settings", label: "设置", icon: "gear" },
+  // 2026-10-24 个人中心（对齐 Mac statistics）：固定渲染在侧栏最底部；
+  // 未登录文案是「个人中心」，已登录由 App 传入邮箱前缀。
+  { id: "profile", label: "个人中心", icon: "person" },
 ];
+
+/**
+ * 合并公开页面与私有注册的页面（2026-10-15）。
+ *
+ * 抽成纯函数是为了能直接测「接入点真的接通了」——不必给整个应用打桩。
+ * 公开构建传入空数组，结果必须与 `publicNavigationItems` 逐项相同
+ * （仓库规则：未实现的页面不显示空入口）。
+ */
+export function mergeNavigationItems(
+  base: NavigationItem[],
+  extra: readonly PrivateFeaturePage[],
+): NavigationItem[] {
+  const merged = [...base];
+  for (const page of extra) {
+    const item = { id: page.id, label: page.label, icon: page.icon };
+    const anchor = page.after
+      ? merged.findIndex((entry) => entry.id === page.after)
+      : -1;
+    if (anchor >= 0) {
+      merged.splice(anchor + 1, 0, item);
+    } else {
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+
+export const navigationItems: NavigationItem[] = mergeNavigationItems(
+  publicNavigationItems,
+  privateFeaturePages,
+);
 
 const ACTIVE_PAGE_STORAGE_KEY = "sayall.activePage";
 const LIVENESS_STORAGE_KEY = "sayall.livenessHeartbeat";
@@ -30,18 +86,18 @@ const LIVENESS_FRESH_MS = 5_000;
 /** WebView 渲染进程崩溃重载会把整个应用重置回默认页（Bugs/2026-09-12），
  * 当前页持久化让恢复后停在用户离开时的页面。存储不可用时静默放弃：
  * 回到默认页不比重载前更差。 */
-export function loadPersistedPage(): PageId | null {
+export function loadPersistedPage(): string | null {
   try {
     const stored = localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY);
     return navigationItems.some((item) => item.id === stored)
-      ? (stored as PageId)
+      ? stored
       : null;
   } catch {
     return null;
   }
 }
 
-export function persistActivePage(page: PageId): void {
+export function persistActivePage(page: string): void {
   try {
     localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, page);
   } catch {

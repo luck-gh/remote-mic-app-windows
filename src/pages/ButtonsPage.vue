@@ -3,11 +3,31 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useCurrentTemplate } from "../lib/current-template";
 import ButtonActionEditor from "../components/ButtonActionEditor.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
+import MembershipRequiredButton from "../components/MembershipRequiredButton.vue";
 import SettingsDialog from "../components/SettingsDialog.vue";
-import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+import { reportFrontendEvent, reasonToken } from "../lib/frontend-diagnostics";
+import { t, tPage } from "../lib/i18n";
+import { effectiveLanguage } from "../lib/language-state";
 import { useUiPreference } from "../lib/ui-preferences";
+import { COMBINATION_ACTIONS_ENABLED } from "../lib/feature-flags";
+import {
+  FOCUS_STRATEGY_OPTIONS,
+  effectiveFocusProfile,
+  presetFocusDefault,
+} from "../lib/focus-defaults";
+import {
+  captureFailureText,
+  captureInactiveText,
+  captureRevokedText,
+  captureSwitchState as captureSwitchStateFn,
+  normalizeCaptureRevoked,
+  normalizeCaptureUnavailable,
+  shouldShowCaptureInactive,
+  shouldShowCaptureRevoked,
+} from "../lib/capture-switch";
 import {
   actionSummary,
+  activateAppForLearning,
   buttonLabel,
   buttonLabels,
   buttonTriggerLabel,
@@ -16,7 +36,24 @@ import {
   getButtonMappingSnapshot,
   getMappingConfiguration,
   getTemplateCatalog,
+  getCombinedActions,
+  disableRc003Capture,
+  enableRc003Capture,
+  getCaptureSupport,
+  getCommonPhrasePanelSnapshot,
+  getRc003BridgeSnapshot,
+  getRc003TaskStatus,
+  focusLearnErrorLabel,
+  focusPointErrorLabel,
+  learnFocusPoint,
+  learnFocusTarget,
   listPresetApps,
+  mouseClickLabels,
+  mouseMoveLabels,
+  openAppLabel,
+  openCommonPhraseExample,
+  pickCustomApp,
+  registerCommonPhraseAvailability,
   registerPresetAppNames,
   remoteModelLabel,
   saveButtonMappings,
@@ -38,17 +75,29 @@ import {
   type MappingConfiguration,
   type TemplateCatalogEntry,
   type ButtonTrigger,
+  type CaptureSupport,
+  type CommonPhraseAccess,
+  type CustomAppPick,
   type FiredGesture,
   type KeyCode,
   type PresetAppInfo,
   type RawInputPhase,
+  type MacroDefinition,
+  type PairedRemote,
+  type Rc003BridgePhase,
+  type Rc003CaptureHealth,
+  type Rc003CaptureRevoked,
+  type Rc003CaptureUnavailable,
+  type Rc003TaskStatus,
   type RemoteButton,
   type RemoteModel,
   type RuntimeSnapshot,
+  type ShortcutCaptureEdge,
 } from "../lib/bridge";
 
 const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
 const READONLY_ICON = "M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3";
+const emit = defineEmits<{ navigate: [page: string] }>();
 
 /** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 640，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
@@ -116,8 +165,24 @@ const remoteModel = computed<RemoteModel>(
 
 const deviceLabel = computed(() => {
   if (remoteModel.value !== "unknown") return remoteModelLabel(remoteModel.value);
-  return connectionInfo.value?.remoteName ?? "未连接遥控器";
+  return connectionInfo.value?.remoteName ?? t("未连接遥控器");
 });
+
+/**
+ * 操作失败文案：中文界面保留既有原始错误（既有行为与测试口径）；英文界面只给
+ * 一句短的用户语言，原始错误写进控制台/诊断，不把中文原文摊到英文 UI 上。
+ */
+function operationErrorText(
+  context: string,
+  error: unknown,
+  englishFallback: string,
+): string {
+  console.warn(context, error);
+  if (effectiveLanguage.value === "zh-Hans") {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return t(englishFallback);
+}
 
 interface ImageFrame { left: number; top: number; width: number; height: number }
 const remoteImageFrame = ref<ImageFrame>({
@@ -234,7 +299,43 @@ const buttonIcons: Record<RemoteButton, string[]> = {
 const VOICE_ICON_FILLED = "M12 2.8a3.4 3.4 0 0 1 3.4 3.4v5.6a3.4 3.4 0 0 1-6.8 0V6.2A3.4 3.4 0 0 1 12 2.8z";
 const VOICE_ICON_STROKES = ["M6.3 11.5a5.7 5.7 0 0 0 11.4 0", "M12 17.2v3.8"];
 
-const mappings = ref<ButtonMappings>({ enabled: true, actions: {} });
+/**
+ * 两个总开关的上次已知值（2026-10-28）。
+ *
+ * 为什么要单独缓存：这两只开关的值来自 IPC，而 IPC 必然异步——首帧只能先渲染占位，
+ * 等数据回来再挂开关本体，用户看到的就是"先空白、再跳出来"（2026-10-28 反馈）。
+ * 把上次的值同步写进 localStorage，首帧就能直接渲染成正确状态；IPC 返回的权威值
+ * 通常与缓存一致，于是没有可见跳变。首次安装没有缓存时开关仍会从默认值改成真实值，
+ * 那一次跳变无法避免。
+ *
+ * 只存两个布尔值，不含任何用户数据。
+ */
+const SWITCH_CACHE_KEY = "sayall.buttons.switches.v1";
+
+function readSwitchCache(): { enabled: boolean; lockSelection: boolean } | null {
+  try {
+    const raw = localStorage.getItem(SWITCH_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { enabled?: unknown; lockSelection?: unknown };
+    if (typeof parsed.enabled !== "boolean" || typeof parsed.lockSelection !== "boolean") {
+      return null;
+    }
+    return { enabled: parsed.enabled, lockSelection: parsed.lockSelection };
+  } catch {
+    return null;
+  }
+}
+
+function writeSwitchCache(enabled: boolean, lockSelection: boolean): void {
+  try {
+    localStorage.setItem(SWITCH_CACHE_KEY, JSON.stringify({ enabled, lockSelection }));
+  } catch {
+    // 存储不可用时只是少一次首帧加速，不影响功能与保存。
+  }
+}
+
+const switchCache = readSwitchCache();
+const mappings = ref<ButtonMappings>({ enabled: switchCache?.enabled ?? true, actions: {} });
 /** 映射是否已从设置读回：「启用自定义按键功能」开关就绪前用占位符顶位（防滑入）。 */
 const savedSnapshot = ref<ButtonMappings>({ enabled: true, actions: {} });
 type EditingSource = "common" | `template:${string}`;
@@ -375,6 +476,11 @@ function releasePageResources(): void {
   resizeObserver = null;
 }
 
+/** 连续执行分组的「关闭」选项：同一中文原文在编辑面板里是 Close，这里需要 Off。 */
+const repeatOffLabel = computed(() =>
+  effectiveLanguage.value === "zh-Hans" ? "关闭" : "Off",
+);
+
 const activeTemplateEntry = computed(() => editingSource.value === "common" ? null : templateCatalog.value.find(t => t.id === editingSource.value.slice("template:".length)) ?? null);
 const dirty = computed(() => JSON.stringify(mappings.value) !== JSON.stringify(savedSnapshot.value));
 
@@ -488,6 +594,14 @@ function actionOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction {
   return actionsOf(button)[trigger];
 }
 
+/** 卡片格子的悬停标题：随界面语言实时生成（含全角冒号的原文作为字典 key）。 */
+function actionCellTitle(button: RemoteButton, trigger: ButtonTrigger): string {
+  return t("{button} · {trigger}：{summary}", {
+    button: buttonLabels[button],
+    trigger: buttonTriggerLabel(trigger),
+    summary: actionSummary(actionOf(button, trigger)),
+  });
+}
 function selectButton(button: RemoteButton): void {
   if (busy.value || menuReserved(button)) return;
   selectedButton.value = button;
@@ -533,10 +647,7 @@ function actionAllowsRepeat(action: ButtonAction): boolean {
 const repeatGroupVisible = computed(() => {
   const target = editingTarget.value;
   if (!target) return false;
-  return (
-    REPEAT_CAPABLE_BUTTONS.includes(target.button) &&
-    (target.trigger === "single" || target.trigger === "long")
-  );
+  return target.trigger === "single" || target.trigger === "long";
 });
 
 type HoldRepeatChoice = "auto" | "off" | "single" | "long";
@@ -547,22 +658,22 @@ function holdRepeatBlockedReason(
   slot: "single" | "long",
 ): string | null {
   if (slot === "long") {
-    if (actions.long.type === "disabled") return "先给这个按键配置长按动作";
+    if (actions.long.type === "disabled") return t("先给这个按键配置长按动作");
     if (!actionAllowsRepeat(actions.long)) {
-      return "“长按”的动作只执行一次（组合快捷键、打开应用等），不能连续执行；把它改成单个按键后可选";
+      return t("“长按”的动作只执行一次（组合快捷键、打开应用等），不能连续执行；把它改成单个按键后可选");
     }
     return null;
   }
-  if (actions.single.type === "disabled") return "先给这个按键配置单击动作";
+  if (actions.single.type === "disabled") return t("先给这个按键配置单击动作");
   if (!actionAllowsRepeat(actions.single)) {
-    return "“单击”的动作只执行一次（组合快捷键、打开应用等），不能连续执行；改成单个按键后可选";
+    return t("“单击”的动作只执行一次（组合快捷键、打开应用等），不能连续执行；改成单个按键后可选");
   }
   if (actions.long.type !== "disabled") {
     // 指路前先确认「重复长按动作」真的可选：长按动作只执行一次时它同样是
     // 灰的，原句会指向一个点不到的选项（2026-10-05 用户反馈）。
     return holdRepeatBlockedReason(actions, "long") === null
-      ? "这个按键已有长按动作，按住会先执行长按；要连续执行，请选“重复长按动作”"
-      : "这个按键已有长按动作：按住会执行长按。要连续执行单击动作，请先清除长按动作";
+      ? t("这个按键已有长按动作，按住会先执行长按；要连续执行，请选“重复长按动作”")
+      : t("这个按键已有长按动作：按住会执行长按。要连续执行单击动作，请先清除长按动作");
   }
   return null;
 }
@@ -604,7 +715,7 @@ const repeatPageReason = computed<string | null>(() => {
   return null;
 });
 
-/** 当前编辑按键是否配置了双击（单击页说明句与「重复单击动作」悬停据此切换口径）。 */
+/** 当前编辑按键是否配置了双击（「重复单击动作」悬停据此切换口径）。 */
 const doubleConfiguredOnEditingButton = computed(() => {
   const target = editingTarget.value;
   return !!target && actionsOf(target.button).double.type !== "disabled";
@@ -614,13 +725,13 @@ const doubleConfiguredOnEditingButton = computed(() => {
 const repeatSingleTitle = computed(() => {
   if (repeatSingleReason.value) return repeatSingleReason.value;
   return doubleConfiguredOnEditingButton.value
-    ? "按住超过约 0.3 秒开始，单击动作会不断重复，直到松手"
-    : "按住不放，单击动作会不断重复，直到松手";
+    ? t("按住超过约 0.3 秒开始，单击动作会不断重复，直到松手")
+    : t("按住不放，单击动作会不断重复，直到松手");
 });
 
 /** 「重复长按动作」的悬停说明（不可选时为原因）。 */
 const repeatLongTitle = computed(
-  () => repeatLongReason.value ?? "按住约 0.55 秒后，长按动作会不断重复，直到松手",
+  () => repeatLongReason.value ?? t("按住约 0.55 秒后，长按动作会不断重复，直到松手"),
 );
 
 /**
@@ -652,8 +763,8 @@ function toggleOkContextClick(): void {
   reportFrontendEvent({ event: "button_mapping_ok_click", phase: "draft_changed", result: "passed", reason: actions.okContextClick ? "enabled" : "disabled" });
   statusMessage.value = (
     actions.okContextClick
-      ? "已开启：用遥控器移动光标后，按 OK 会点击光标位置"
-      : "已关闭：移动光标后按 OK 点击"
+      ? t("已开启：用遥控器移动光标后，按 OK 会点击光标位置")
+      : t("已关闭：移动光标后按 OK 点击")
   );
 }
 
@@ -663,24 +774,21 @@ function toggleOkContextClick(): void {
  * 提示经 `persist(message)` 展示，避免被 persist 的清理逻辑覆盖。
  */
 function reconcileHoldRepeat(
-  button: RemoteButton,
   actions: ButtonActions,
 ): { actions: ButtonActions; notice: string | null } {
   const hold = actions.holdRepeat;
   if (!hold || hold === "off") return { actions, notice: null };
   const slot = hold === "long" ? "long" : "single";
-  const valid =
-    REPEAT_CAPABLE_BUTTONS.includes(button) && holdRepeatBlockedReason(actions, slot) === null;
-  if (valid) return { actions, notice: null };
+  if (holdRepeatBlockedReason(actions, slot) === null) return { actions, notice: null };
   const next = { ...actions };
   next.holdRepeat = "off";
   // 自动关闭的提示同样不得指向灰掉的选项（长按动作只执行一次时它不可选）。
   const notice =
     slot === "single" && actions.long.type !== "disabled"
       ? holdRepeatBlockedReason(actions, "long") === null
-        ? "这个按键已配置长按动作：按住会先执行长按，“按住时连续执行”已关闭（要连续执行，请选“重复长按动作”）"
-        : "这个按键已配置长按动作：按住会执行长按，而它只执行一次，“按住时连续执行”已关闭"
-      : "动作已变更，“按住时连续执行”已关闭";
+        ? t("这个按键已配置长按动作：按住会先执行长按，“按住时连续执行”已关闭（要连续执行，请选“重复长按动作”）")
+        : t("这个按键已配置长按动作：按住会执行长按，而它只执行一次，“按住时连续执行”已关闭")
+      : t("动作已变更，“按住时连续执行”已关闭");
   return { actions: next, notice };
 }
 
@@ -740,7 +848,7 @@ function applyAction(action: ButtonAction): void {
   };
   const actions = { ...actionsOf(target.button) };
   actions[target.trigger] = action;
-  const reconciled = reconcileHoldRepeat(target.button, actions);
+  const reconciled = reconcileHoldRepeat(actions);
   next.actions[target.button] = reconciled.actions;
   if (reconciled.notice) statusMessage.value = reconciled.notice;
   mappings.value = next;
@@ -795,6 +903,14 @@ async function persist(message?: string): Promise<boolean> {
   }
 }
 
+// 页面底部的快照错误只显示固定一句用户语言；原始错误留在控制台/后端日志。
+watch(
+  () => mappingSnapshot.value?.lastError,
+  (raw) => {
+    if (raw) console.warn("button mapping snapshot error", raw);
+  },
+);
+
 async function restoreDefaults(): Promise<void> {
   if (busy.value) return;
   const template = activeTemplateEntry.value;
@@ -815,7 +931,7 @@ async function restoreDefaults(): Promise<void> {
 }
 
 async function saveConfiguration(): Promise<void> {
-  await persist("配置已保存并生效");
+  await persist(t("配置已保存并生效"));
 }
 
 function openSaveTemplateDialog(): void {
@@ -892,19 +1008,19 @@ async function selectEditingSource(event: Event): Promise<void> {
 function phaseLabel(phase: RawInputPhase | undefined): string {
   switch (phase) {
     case "ready":
-      return "按键监听已就绪";
+      return t("按键监听已就绪");
     case "starting":
-      return "正在启动监听";
+      return t("正在启动监听");
     case "failed":
-      return "监听启动失败（自动重试中）";
+      return t("监听启动失败（自动重试中）");
     case "stopped":
-      return "监听已停止";
+      return t("监听已停止");
     case "awaiting":
-      return "等待遥控器连接";
+      return t("等待遥控器连接");
     case "unsupported":
-      return "当前环境暂不支持";
+      return t("当前环境暂不支持");
     default:
-      return "正在读取状态";
+      return t("正在读取状态");
   }
 }
 
@@ -915,13 +1031,17 @@ async function toggleListener(): Promise<void> {
   try {
     if (rawInput.value?.phase === "ready") {
       await stopRawInput();
-      statusMessage.value = "监听已停止；映射与高亮暂停（按住说话不受影响）";
+      statusMessage.value = t("监听已停止；映射与高亮暂停（按住说话不受影响）");
     } else {
       await startRawInput();
-      statusMessage.value = "监听已启动";
+      statusMessage.value = t("监听已启动");
     }
   } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
+    statusMessage.value = operationErrorText(
+      "toggle raw input listener failed",
+      error,
+      "没能切换按键监听状态，请重试。",
+    );
   } finally {
     busy.value = false;
   }
@@ -1105,7 +1225,7 @@ onUnmounted(() => {
       </svg>
 
       <figure ref="remotePhotoEl" class="remote-photo" :style="{ left: `${remoteLeft}px`, top: `${REMOTE_TOP}px` }">
-        <img ref="remoteImageEl" src="/RC003-remote-photo@2x.png" alt="小米蓝牙语音遥控器 2 Pro（RC003）示意图" draggable="false" @load="measureRemoteImageFrame" />
+        <img ref="remoteImageEl" src="/RC003-remote-photo@2x.webp" alt="小米蓝牙语音遥控器 2 Pro（RC003）示意图" draggable="false" @load="measureRemoteImageFrame" />
       </figure>
       <span
         v-for="placement in PLACEMENTS"
@@ -1217,7 +1337,7 @@ onUnmounted(() => {
           </svg>
           <span class="badge pending voice-badge" :class="{ active: voiceButtonPressed }">{{ voiceActive ? '语音进行中' : voiceButtonPressed ? '已收到按键' : '按住说话' }}</span>
         </div>
-        <p class="voice-note">按下开始、松开结束；不参与自定义映射，不加双击/长按延迟。</p>
+        <p class="voice-note">{{ t("按下开始、松开结束；不参与自定义映射，不加双击/长按延迟。") }}</p>
       </article>
     </div>
 
@@ -1231,7 +1351,7 @@ onUnmounted(() => {
       <div class="card-title-row">
         <div>
           <h2>{{ buttonLabel(editingTarget.button) }} · {{ buttonTriggerLabel(editingTarget.trigger) }}</h2>
-          <p class="muted">当前：{{ actionSummary(actionOf(editingTarget.button, editingTarget.trigger)) }}</p>
+          <p class="muted">{{ t("当前：{summary}", { summary: actionSummary(actionOf(editingTarget.button, editingTarget.trigger)) }) }}</p>
         </div>
         <div class="button-row">
           <button
@@ -1239,10 +1359,10 @@ onUnmounted(() => {
             :class="{ 'is-active': actionOf(editingTarget.button, editingTarget.trigger).type === 'disabled' }"
             type="button"
             :disabled="busy"
-            title="只禁用当前格子的映射，此按键恢复原始行为"
+            :title="t('只禁用当前格子的映射，此按键恢复原始行为')"
             @click="applyAction({ type: 'disabled' })"
           >
-            禁用按键
+            {{ t("禁用按键") }}
           </button>
           <button class="secondary-button" type="button" :disabled="busy" @click="editingTarget = null">关闭</button>
         </div>
@@ -1308,8 +1428,8 @@ onUnmounted(() => {
         <p v-if="repeatChoice === 'auto'" class="muted repeat-hint repeat-auto-hint">{{ repeatAutoHint }}</p>
         <p v-if="repeatPageReason" class="muted repeat-hint">{{ repeatPageReason }}</p>
       </div>
-      <label v-if="okClickVisible" class="toggle-row ok-click-toggle" title="刚用遥控器移动过光标时，按 OK 会点击光标位置">
-        <span>移动光标后按 OK 点击</span>
+      <label v-if="okClickVisible" class="toggle-row ok-click-toggle" :title="t('刚用遥控器移动过光标时，按 OK 会点击光标位置')">
+        <span>{{ t("移动光标后按 OK 点击") }}</span>
         <input
           class="toggle-input"
           type="checkbox"
@@ -1341,7 +1461,7 @@ onUnmounted(() => {
           :disabled="busy"
           @click="toggleListener"
         >
-          {{ rawInput?.phase === "ready" ? "停止监听" : "启动监听" }}
+          {{ rawInput?.phase === "ready" ? t("停止监听") : t("启动监听") }}
         </button>
         <small v-if="mappingSnapshot && !mappings.enabled" class="muted"> · 总开关关闭（按键保持原样）</small>
         <small v-if="dirty" class="muted"> · 当前编辑目标有未保存更改</small>
@@ -1369,7 +1489,7 @@ onUnmounted(() => {
           保存为模板
         </button>
         <button class="secondary-button" type="button" :disabled="busy" @click="exportConfiguration">
-          导出配置…
+          {{ t("导出配置…") }}
         </button>
         <button class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
           {{ activeTemplateEntry?.builtIn ? "复位模板" : "恢复默认" }}
@@ -1490,5 +1610,4 @@ onUnmounted(() => {
 /* OK 键「移动光标后按 OK 点击」：按键级开关 + 常驻说明句（2026-10-06）。 */
 .ok-click-toggle { margin-top: 12px; }
 .ok-click-hint { margin: 6px 0 0; font-size: 12px; }
-
 </style>

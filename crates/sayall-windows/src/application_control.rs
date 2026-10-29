@@ -390,10 +390,14 @@ mod platform {
 
 fn application_identity_for_executable(executable: &str) -> (String, ApplicationAdapterKind) {
     let application_id = crate::app_launcher::application_identity_for_path(executable);
+    let is_edge = std::path::Path::new(executable)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("msedge.exe"));
     let adapter = match application_id.as_str() {
         "codex" => ApplicationAdapterKind::Codex,
         "edge" | "chrome" => ApplicationAdapterKind::Browser,
         "wechat" => ApplicationAdapterKind::WeChat,
+        _ if is_edge => ApplicationAdapterKind::Browser,
         _ => ApplicationAdapterKind::Generic,
     };
     (application_id, adapter)
@@ -562,10 +566,7 @@ mod tests {
             application_identity_for_executable(
                 r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2.3.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
             ),
-            (
-                r"c:\program files\windowsapps\openai.chatgpt-desktop_1.2.3.0_x64__2p2nqsd0c76g0\app\chatgpt.exe".to_owned(),
-                ApplicationAdapterKind::Generic,
-            )
+            ("chatgpt".to_owned(), ApplicationAdapterKind::Generic,)
         );
         assert_eq!(
             application_identity_for_executable("Weixin.exe"),

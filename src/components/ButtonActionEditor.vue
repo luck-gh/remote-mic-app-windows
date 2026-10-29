@@ -403,22 +403,26 @@ watch(capturingShortcut, (active) => {
 });
 
 const selectedAction = action;
-const scrollSteps = computed(() => selectedAction.value?.type === "scroll" ? selectedAction.value.steps ?? 1 : 1);
-const moveDistance = computed(() => selectedAction.value?.type === "mouse_move" ? selectedAction.value.distance : 30);
+const scrollSteps = computed(() => selectedAction.value?.type === "scroll" ? selectedAction.value.steps ?? 20 : 20);
+const moveDistance = computed(() => selectedAction.value?.type === "mouse_move" ? selectedAction.value.distance : 20);
+const mouseAmountDraft = ref("20");
+const mouseAmountError = ref("");
+watch(selectedAction, (action) => {
+  mouseAmountDraft.value = String(action?.type === "scroll" ? action.steps ?? 20 : action?.type === "mouse_move" ? action.distance : 20);
+  mouseAmountError.value = "";
+}, { immediate: true });
 const moveSymbols: Record<MoveDirection, string> = { up: "↑", down: "↓", left: "←", right: "→" };
 
-function updateMouseAmount(event: Event, kind: "scroll" | "mouse_move"): void {
-  const input = event.target as HTMLInputElement;
-  const value = input.valueAsNumber;
-  const maximum = kind === "scroll" ? 100 : 2000;
-  if (!Number.isInteger(value) || value < 1 || value > maximum) {
-    statusMessage.value = `请输入 1 到 ${maximum} 之间的整数`;
-    input.value = String(kind === "scroll" ? scrollSteps.value : moveDistance.value);
+function updateMouseAmount(kind: "scroll" | "mouse_move"): void {
+  const value = Number(mouseAmountDraft.value);
+  if (!/^\d+$/.test(mouseAmountDraft.value) || !Number.isInteger(value) || value < 1 || value > 100) {
+    mouseAmountError.value = "请输入 1 到 100 之间的整数";
     return;
   }
+  mouseAmountError.value = "";
   const action = selectedAction.value;
-  if (action?.type === "scroll" && kind === "scroll") void apply({ ...action, steps: value });
-  if (action?.type === "mouse_move" && kind === "mouse_move") void apply({ ...action, distance: value });
+  if (action?.type === "scroll" && kind === "scroll" && action.steps !== value) void apply({ ...action, steps: value });
+  if (action?.type === "mouse_move" && kind === "mouse_move" && action.distance !== value) void apply({ ...action, distance: value });
 }
 
 function isActiveScroll(direction: "up" | "down"): boolean {
@@ -508,7 +512,7 @@ onUnmounted(() => {
               :title="preset.label"
               @click="apply({ type: 'shortcut', chord: { keys: [...preset.keys] } })"
             >
-              {{ chordLabel({ keys: preset.keys }) }}
+              {{ chordLabel({ keys: preset.keys }).replace(/(左|右)\s+/g, "").replace(/(Left|Right)\s+/g, "") }}
             </button>
           </div>
         </section>
@@ -522,9 +526,10 @@ onUnmounted(() => {
           </div>
           <label v-if="selectedAction?.type === 'scroll'" class="mouse-amount">
             <span>每次滚动</span>
-            <input aria-label="每次滚动格数" type="number" min="1" max="100" step="1" :value="scrollSteps" @change="updateMouseAmount($event, 'scroll')" />
+            <input aria-label="每次滚动格数" type="text" inputmode="numeric" v-model="mouseAmountDraft" @focus="mouseAmountError = ''" @blur="updateMouseAmount('scroll')" @keydown.enter.prevent="updateMouseAmount('scroll')" />
             <span>格</span>
           </label>
+          <p v-if="selectedAction?.type === 'scroll' && mouseAmountError" class="mouse-amount-error" role="alert">{{ mouseAmountError }}</p>
         </section>
 
         <section v-if="!shortcutsOnly" class="action-section">
@@ -545,9 +550,11 @@ onUnmounted(() => {
           </div>
           <label v-if="selectedAction?.type === 'mouse_move'" class="mouse-amount">
             <span>每次移动</span>
-            <input aria-label="每次移动像素" type="number" min="1" max="2000" step="1" :value="moveDistance" @change="updateMouseAmount($event, 'mouse_move')" />
+            <input aria-label="每次移动像素" type="text" inputmode="numeric" v-model="mouseAmountDraft" @focus="mouseAmountError = ''" @blur="updateMouseAmount('mouse_move')" @keydown.enter.prevent="updateMouseAmount('mouse_move')" />
             <span>像素</span>
           </label>
+          <p v-if="selectedAction?.type === 'mouse_move'" class="mouse-amount-hint muted">Enter 或失焦确认数值，保存当前配置后生效。</p>
+          <p v-if="selectedAction?.type === 'mouse_move' && mouseAmountError" class="mouse-amount-error" role="alert">{{ mouseAmountError }}</p>
         </section>
 
         <section v-if="!shortcutsOnly" class="action-section">
