@@ -373,7 +373,8 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.getCaptureInput.mockResolvedValue({settings: {enabled: true, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output'}, phase: 'recovery_required', recoveryPending: true, lastError: null});
     const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
     expect(wrapper.get('details.windows-default-settings > summary').text()).toContain('上次会话未完整恢复');
-    expect(wrapper.get('.capture-input-feedback').text()).toContain('保留当前选择');
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
+    expect(wrapper.get('.capture-input-diagnostics').text()).toContain('保留当前选择');
     wrapper.unmount();
   });
 
@@ -381,6 +382,34 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.getDefaultCaptureInputs.mockRejectedValueOnce(new Error('read failed'));
     const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
     expect(wrapper.get('.windows-default-settings > summary').text()).toContain('读取失败');
+    wrapper.unmount();
+  });
+
+  it.each([false, true])('marks the entire restore row disabled only while automatic switching is off: %s', async enabled => {
+    mocks.getCaptureInput.mockResolvedValue({settings: {enabled, keepSelected: true, endpointId: 'capture', endpointName: 'CABLE Output'}, phase: enabled ? 'idle' : 'disabled', recoveryPending: false, lastError: null});
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(wrapper.get("label[for='capture-input-switch']").text()).toBe('语音开始时切换麦克风');
+    const restore = wrapper.get("label[for='capture-input-restore']");
+    expect(restore.text()).toBe('语音结束时恢复麦克风');
+    expect(restore.attributes('aria-disabled')).toBe(String(!enabled));
+    expect(restore.get<HTMLInputElement>('input').element.disabled).toBe(!enabled);
+    wrapper.unmount();
+  });
+
+  it('keeps feedback beside the settings and reveals complete recovery actions through diagnostics', async () => {
+    mocks.getCaptureInput.mockResolvedValue({settings: {enabled: true, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output'}, phase: 'recovery_required', recoveryPending: true, lastError: 'normal_roles_split'});
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(wrapper.find('.capture-input-behavior .capture-input-feedback').exists()).toBe(true);
+    expect(wrapper.find('.capture-input-settings > .capture-input-feedback').exists()).toBe(false);
+    expect(wrapper.get('.capture-feedback-text').text()).toContain('上次会话未完整恢复');
+    expect(wrapper.find('.capture-input-diagnostics').exists()).toBe(false);
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
+    expect(wrapper.get<HTMLDetailsElement>('.audio-advanced').element.open).toBe(true);
+    expect(wrapper.get('.capture-input-diagnostics').text()).toContain('普通输入的两个系统角色');
+    const keep = wrapper.findAll('.capture-input-diagnostics button').find(button => button.text() === '保留当前选择')!;
+    await keep.trigger('click'); await flushPromises();
+    expect(mocks.resolveCaptureRecovery).toHaveBeenCalledWith(false);
+    expect(mocks.setDefaultCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 
@@ -408,7 +437,7 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(connectionCard.find('.setup-card').exists()).toBe(false);
     expect(wrapper.get('.setup-card h2').text()).toBe("语音输入设置");
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
-    expect(wrapper.get(".capture-input-behavior").text()).toContain("输入法已选择目标麦克风时，无需开启。");
+    expect(wrapper.get(".capture-input-behavior").text()).toContain("输入法已指定麦克风时，无需启用");
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
     wrapper.unmount();
   });
@@ -602,7 +631,8 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.getCaptureInput.mockResolvedValue({ settings: { enabled: true, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output' }, phase: 'recovery_required', recoveryPending: true, lastError: null });
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
     expect(mocks.resolveCaptureRecovery).not.toHaveBeenCalled();
-    const keep = wrapper.findAll('.capture-input-settings button').find(b => b.text() === '保留当前选择')!;
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
+    const keep = wrapper.findAll('.capture-input-diagnostics button').find(b => b.text() === '保留当前选择')!;
     await keep.trigger('click'); await flushPromises(); expect(mocks.resolveCaptureRecovery).toHaveBeenCalledWith(false);
     wrapper.unmount();
   });
@@ -616,10 +646,10 @@ describe("VB-CABLE first-launch guidance", () => {
       const originalChildren = section.element.children.length;
       for (const phase of ["streaming", "draining", "ready", "streaming", "ready"] as const) {
         await wrapper.setProps({ runtime: { ...runtime, platform: { ...runtime.platform, audio: { ...emptyAudio, phase } } } });
-        expect(section.get(".capture-input-feedback").text()).toBe("本次说话正在使用所选输入设备");
+        expect(section.get(".capture-feedback-text").text()).toBe("本次说话正在使用所选输入设备");
         expect(section.element.children).toHaveLength(originalChildren);
         expect(section.text()).not.toContain("请松开语音键");
-        expect(section.get('.capture-input-feedback[aria-live="polite"]').text()).toBe("本次说话正在使用所选输入设备");
+        expect(section.get('.capture-input-feedback[aria-live="polite"] .capture-feedback-text').text()).toBe("本次说话正在使用所选输入设备");
         const busy = phase !== "ready";
         expect((section.get("select").element as HTMLSelectElement).disabled).toBe(busy);
         expect((section.get('input[type="checkbox"]').element as HTMLInputElement).disabled).toBe(busy);
@@ -636,7 +666,9 @@ describe("VB-CABLE first-launch guidance", () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } });
     await flushPromises();
     await wrapper.setProps({ runtime: { ...runtime, platform: { ...runtime.platform, audio: { ...emptyAudio, phase: "streaming" } } } });
-    const feedback = wrapper.get(".capture-input-feedback");
+    expect(wrapper.get('.capture-input-feedback').text()).toContain('上次会话未完整恢复');
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
+    const feedback = wrapper.get(".capture-input-diagnostics");
     expect(feedback.text()).toContain("普通输入的两个系统角色指向不同设备");
     expect(feedback.text()).toContain("保留当前选择");
     expect(feedback.text()).toContain("尝试恢复会话前设备");
@@ -686,6 +718,7 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.getAudioRouteSnapshot.mockResolvedValue({ phase: "unavailable", reason: "audio_unready", captureEndpointId: "capture", captureEndpointName: "CABLE Output", renderEndpointId: null, renderEndpointName: null });
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
     const retry = wrapper.findAll('button').find(button => button.text() === "重新连接声音通道");
     expect(retry).toBeDefined();
     await retry!.trigger('click'); await flushPromises();
@@ -2035,8 +2068,8 @@ describe("connection page interface language", () => {
     expect(wrapper.find(".gain-label").text()).not.toMatch(han);
     expect(wrapper.find(".gain-help").text()).not.toMatch(han);
     expect(wrapper.get(".capture-input-behavior").text()).not.toMatch(han);
-    expect(wrapper.get("label[for='capture-input-switch']").text()).toBe("Check and switch before speaking");
-    expect(wrapper.get("label[for='capture-input-restore']").text()).toBe("Restore the previous microphone on release");
+    expect(wrapper.get("label[for='capture-input-switch']").text()).toBe("Switch microphone at voice start");
+    expect(wrapper.get("label[for='capture-input-restore']").text()).toBe("Restore microphone at voice end");
     expect(wrapper.find(".usage-hint-details summary").text()).not.toMatch(han);
     for (const card of wrapper.findAll(".tool-card")) {
       expect(card.text()).not.toMatch(han);
@@ -2050,8 +2083,8 @@ describe("connection page interface language", () => {
 
     expect(wrapper.find(".setup-card h2").text()).toBe("语音输入设置");
     expect(wrapper.find(".gain-label").text()).toBe("增益");
-    expect(wrapper.get("label[for='capture-input-switch']").text()).toBe("说话前自动检查并切换");
-    expect(wrapper.get("label[for='capture-input-restore']").text()).toBe("松开后恢复原麦克风");
+    expect(wrapper.get("label[for='capture-input-switch']").text()).toBe("语音开始时切换麦克风");
+    expect(wrapper.get("label[for='capture-input-restore']").text()).toBe("语音结束时恢复麦克风");
     expect(wrapper.find(".usage-hint-details summary").text()).toBe("常见问题（点开查看）");
     wrapper.unmount();
   });
