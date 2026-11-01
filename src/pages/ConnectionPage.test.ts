@@ -236,7 +236,7 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.endpoints = [cableEndpoint];
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
     expect(wrapper.get('.audio-output-settings').text()).toContain('声音写入设备');
-    expect(wrapper.get('.capture-input-settings').text()).toContain('Windows 默认麦克风');
+    expect(wrapper.get('.windows-default-settings > summary').text()).toContain('Windows 默认麦克风');
     expect(wrapper.find('#audio-output-target').exists()).toBe(true);
     expect(wrapper.find('.audio-advanced #audio-output-target').exists()).toBe(false);
     expect(wrapper.find('.voice-device-columns').exists()).toBe(false);
@@ -349,6 +349,38 @@ describe("VB-CABLE first-launch guidance", () => {
     await wrapper.setProps({runtime: {...runtime, platform: {...runtime.platform, connection: {...emptyConnection, voiceState: 'streaming'}}}});
     expect(wrapper.get<HTMLButtonElement>('#set-windows-default-input').element.disabled).toBe(true);
     expect(mocks.setDefaultCaptureInput).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it('collapses optional Windows microphone settings without changing the saved policy', async () => {
+    mocks.getCaptureInput.mockResolvedValue({settings: {enabled: true, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output'}, phase: 'idle', recoveryPending: false, lastError: null});
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    const disclosure = wrapper.get<HTMLDetailsElement>('details.windows-default-settings');
+    expect(disclosure.element.open).toBe(false);
+    expect(disclosure.get('summary').text()).toContain('Windows 默认麦克风');
+    for (const open of [true, false, true]) {
+      disclosure.element.open = open;
+      await disclosure.trigger('toggle'); await flushPromises();
+      expect(wrapper.get<HTMLInputElement>('#capture-input-switch').element.checked).toBe(true);
+      expect(wrapper.get<HTMLInputElement>('#capture-input-restore').element.checked).toBe(true);
+    }
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+    expect(mocks.setDefaultCaptureInput).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it('keeps a recovery warning visible on the collapsed microphone summary', async () => {
+    mocks.getCaptureInput.mockResolvedValue({settings: {enabled: true, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output'}, phase: 'recovery_required', recoveryPending: true, lastError: null});
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(wrapper.get('details.windows-default-settings > summary').text()).toContain('上次会话未完整恢复');
+    expect(wrapper.get('.capture-input-feedback').text()).toContain('保留当前选择');
+    wrapper.unmount();
+  });
+
+  it('shows a default-device read failure even while the optional settings are collapsed', async () => {
+    mocks.getDefaultCaptureInputs.mockRejectedValueOnce(new Error('read failed'));
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(wrapper.get('.windows-default-settings > summary').text()).toContain('读取失败');
     wrapper.unmount();
   });
 

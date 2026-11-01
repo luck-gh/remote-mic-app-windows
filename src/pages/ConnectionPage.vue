@@ -144,6 +144,9 @@ let captureRevision = 0;
 const captureMessage = ref("");
 const defaultCaptureInputs = ref<DefaultCaptureInputs | null>(null);
 const defaultCaptureError = ref(false);
+const captureSummaryMessage = computed(() => captureInput.value.recoveryPending
+  ? t('上次会话未完整恢复，请选择如何处理')
+  : defaultCaptureError.value ? t('读取失败，请刷新设备列表') : captureMessage.value || captureInput.value.lastError || '');
 const captureChoice = ref<string>();
 const selectedCaptureId = computed(() => captureChoice.value ?? pendingCapture.value?.endpointId ?? captureInput.value.settings.endpointId ?? '');
 let defaultCaptureRequest = 0;
@@ -1496,8 +1499,9 @@ onUnmounted(() => {
         <p class="audio-output-feedback scan-summary muted" role="status" aria-live="polite" :tabindex="audioMessage || audio.lastError || routeError || audioRoute?.phase === 'unavailable' ? 0 : undefined">{{ audio.lastError ? audioDetail : routeError || audioRoute?.phase === 'unavailable' ? t(audioRouteDetail) : audioMessage }}</p>
         </section>
 
+        <details class="windows-default-settings" @toggle="reportFrontendEvent({ event: 'capture_settings_disclosure', phase: 'completed', result: 'passed', reason: ($event.target as HTMLDetailsElement).open ? 'opened' : 'closed' })">
+          <summary>{{ t("Windows 默认麦克风（可选）") }}<span class="capture-summary-feedback" aria-live="polite" :title="captureSummaryMessage">{{ captureSummaryMessage }}</span></summary>
         <section class="capture-input-settings" :aria-label="t('Windows 默认麦克风（可选）')">
-          <h4>{{ t("Windows 默认麦克风（可选）") }}</h4>
           <dl class="windows-default-inputs" aria-live="polite" tabindex="0" :aria-label="t('当前 Windows 默认麦克风')">
             <div><dt>{{ t('普通输入') }}</dt><dd>{{ defaultCaptureName('console') }}</dd></div>
             <div><dt>{{ t('媒体输入') }}</dt><dd>{{ defaultCaptureName('multimedia') }}</dd></div>
@@ -1545,6 +1549,7 @@ onUnmounted(() => {
           </div>
           </div>
         </section>
+        </details>
         <details class="audio-advanced" :open="showAdvancedAudio" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open">
           <summary>{{ t("高级：声音传输诊断") }}</summary>
           <template v-if="showAdvancedAudio">
@@ -1956,8 +1961,11 @@ onUnmounted(() => {
 .audio-output-feedback { height: 2.8em; margin: 4px 0 0; font-size: 12.5px; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
 .audio-output-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .audio-route-status { margin: 0; padding: 0; border: 0; background: transparent; min-width: 0; font-size: 12px; }
-.capture-input-settings { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--border); }
-.capture-input-settings > h4 { grid-column: 1 / -1; margin: 0; font-size: 14px; }
+.windows-default-settings { margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; }
+.windows-default-settings > summary { color: var(--muted); cursor: pointer; line-height: 1.4; }
+.windows-default-settings > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.capture-summary-feedback { float: right; max-width: 45%; height: 1.4em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.capture-input-settings { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
 .windows-default-inputs { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; height: 4.4em; margin: 0; font-size: 13px; overflow: auto; overflow-wrap: anywhere; }
 .windows-default-inputs dt { color: var(--muted); font-size: 12px; }
 .windows-default-inputs dd { margin: 3px 0 0; }
