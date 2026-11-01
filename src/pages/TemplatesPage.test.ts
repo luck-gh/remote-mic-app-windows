@@ -68,6 +68,24 @@ describe("templates page", () => {
     vi.mocked(listRunningApps).mockResolvedValue([{ applicationId: "edge", name: "Edge", preset: true }]);
   });
 
+  it("keeps one feedback region inside the header instead of reserving standalone rows", async () => {
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    expect(wrapper.findAll(".operation-message, .rule-feedback")).toHaveLength(1);
+    expect(wrapper.find(".page-header .operation-message").exists()).toBe(true);
+    expect(wrapper.find(".run-modes > .rule-feedback").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("presents template usage as three readable points without changing the rules", async () => {
+    const wrapper = mount(TemplatesPage, { global: { stubs } }); await flushPromises();
+    const help = wrapper.get(".template-help");
+    expect(help.findAll("li")).toHaveLength(3);
+    expect(help.text()).toContain("重启");
+    expect(help.text()).toContain("编辑草稿");
+    expect(help.text()).toContain("提示开关不影响按键动作");
+    wrapper.unmount();
+  });
+
   it("keeps initial loading feedback in place without a routine success explanation", async () => {
     let resolveRead!: (saved: MappingConfiguration) => void;
     vi.mocked(getMappingConfiguration).mockReturnValueOnce(new Promise(resolve => { resolveRead = resolve; }));
@@ -212,7 +230,7 @@ describe("templates page", () => {
     wrapper.unmount();
   });
 
-  it("keeps rule feedback local and the persisted checkbox value after a failed save", async () => {
+  it("shows rule failures in the shared feedback and preserves the persisted checkbox value", async () => {
     let rejectSave!: (reason: Error) => void;
     vi.mocked(setMappingNoticeEnabled).mockReturnValueOnce(new Promise((_, reject) => { rejectSave = reject; }));
     const wrapper = mount(TemplatesPage, { global: { stubs } });
@@ -230,12 +248,13 @@ describe("templates page", () => {
     expect(wrapper.get(".rule-feedback").element).toBe(feedback);
     expect(wrapper.get(".rule-feedback").text()).toContain("模板切换提示：写入被拒绝");
     expect((toggle.element as HTMLInputElement).checked).toBe(true);
-    expect(wrapper.get(".operation-message").text()).toBe(previousStatus);
+    expect(wrapper.get(".operation-message").text()).toContain("模板切换提示：写入被拒绝");
+    expect(wrapper.get(".operation-message").attributes("tabindex")).toBe("0");
     vi.mocked(setMappingNoticeEnabled).mockResolvedValueOnce({ ...structuredClone(configuration), mappingNoticeEnabled: false });
     await toggle.setValue(false);
     await flushPromises();
     expect((toggle.element as HTMLInputElement).checked).toBe(false);
-    expect(wrapper.get(".rule-feedback").text()).toBe("");
+    expect(wrapper.get(".rule-feedback").classes()).not.toContain("error-text");
     expect(wrapper.get(".operation-message").text()).toBe(previousStatus);
     wrapper.unmount();
   });

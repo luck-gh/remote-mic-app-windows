@@ -33,6 +33,10 @@ const ruleErrors = ref<Partial<Record<RuleField, string>>>({});
 const ruleError = computed(() => (Object.keys(ruleNames) as RuleField[])
   .filter(field => ruleErrors.value[field])
   .map(field => `${ruleNames[field]}：${ruleErrors.value[field]}`).join("；"));
+const feedbackError = computed(() => [
+  !editing.value ? error.value : null,
+  ruleError.value ? `保存失败：${ruleError.value}` : null,
+].filter(Boolean).join("；"));
 const loading = ref(false);
 const saving = ref(false);
 const associationBusy = ref(false);
@@ -323,9 +327,11 @@ onMounted(() => {
         <h1>模板</h1>
         <p>为程序选择按键模板，保存普通按键的实际动作。语音键始终按下开始、释放结束。</p>
       </div>
-      <button type="button" class="secondary-button" :disabled="loading || busy" @click="refresh(true)">刷新关联状态</button>
+      <div class="template-header-actions">
+        <button type="button" class="secondary-button" :disabled="loading || busy" @click="refresh(true)">刷新关联状态</button>
+        <p class="operation-message page-feedback rule-feedback" :class="{ 'error-text': feedbackError }" role="status" aria-live="polite" :tabindex="feedbackError ? 0 : undefined">{{ feedbackError || status }}</p>
+      </div>
     </header>
-    <p class="operation-message page-feedback" :class="{ 'error-text': error && !editing }" role="status" aria-live="polite" :tabindex="error && !editing ? 0 : undefined">{{ error && !editing ? error : status }}</p>
     <section v-if="loading && !configuration" class="card loading-card"><p class="muted">正在读取模板配置…</p></section>
     <section v-else-if="!configuration" class="card loading-card">
       <p class="error-text">模板配置加载失败。请重试。</p>
@@ -348,8 +354,14 @@ onMounted(() => {
           <input type="checkbox" aria-label="模板切换提示" aria-describedby="mapping-notice-help" :checked="configuration.mappingNoticeEnabled" :disabled="busy" :aria-busy="rulePending.mappingNoticeEnabled" :aria-disabled="busy || rulePending.mappingNoticeEnabled" @change="toggleMappingNotice">
           <span><strong>模板切换提示</strong><small id="mapping-notice-help">仅生效模板变化时短暂提示。</small></span>
         </label>
-        <details class="template-help"><summary>使用说明</summary><p class="muted">关闭自动加载后，手动选中的模板会记住并在重启后继续使用，切换程序不会清除；选择通用配置会清除这项记忆。开启自动加载后，按现有程序规则加载；再次关闭后从通用配置开始。菜单选择可选本次使用或保存为程序默认。模板列表和按键页的“当前使用”都会立即应用模板，与编辑草稿分开；不会开启自动加载或更改程序默认。关闭菜单选择后，菜单键按当前映射执行。提示开关不影响按键动作。</p></details>
-        <p class="rule-feedback error-text" role="status" aria-live="polite">{{ ruleError ? `保存失败：${ruleError}` : "" }}</p>
+        <details class="template-help">
+          <summary>使用说明</summary>
+          <ul class="muted">
+            <li><strong>自动加载：</strong>关闭后记住手选模板，切换程序和重启不清除；选择通用配置会清除记忆。开启后按程序规则加载，再次关闭从通用配置开始。</li>
+            <li><strong>手动选择：</strong>模板列表和按键页的“当前使用”会立即应用模板，与编辑草稿分开，不改变自动加载开关或程序默认；菜单中可选本次使用或保存为程序默认。</li>
+            <li><strong>菜单与提示：</strong>关闭菜单选择后，菜单键按当前映射执行。提示开关不影响按键动作。</li>
+          </ul>
+        </details>
       </section>
 
       <details class="card collapsible-card complete-template-panel" :open="templateExpansion.value.value" :aria-busy="templateExpansion.pending.value" @toggle="templateExpansion.toggleDetails">
@@ -451,8 +463,11 @@ onMounted(() => {
 
 <style scoped>
 .templates-page { display: grid; gap: 14px; }
-.templates-page > .page-header { margin-bottom: -2px; }
-.templates-page > .page-feedback { height: 2.8em; margin: 0; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
+.templates-page > .page-header { margin-bottom: 0; }
+.templates-page > .page-header > div:first-child { min-width: 0; }
+.template-header-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; width: 240px; flex-shrink: 0; }
+.template-header-actions > button { white-space: nowrap; }
+.template-header-actions > .page-feedback { box-sizing: border-box; width: 100%; height: 2.8em; margin: 0; font-size: 12px; line-height: 1.4; text-align: right; overflow: auto; overflow-wrap: anywhere; }
 .page-feedback.error-text { color: var(--error-text); }
 .page-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .loading-card { display: flex; align-items: center; justify-content: space-between; }
@@ -468,7 +483,11 @@ onMounted(() => {
 .mode-row input[type="checkbox"] { box-sizing: border-box; width: 18px; height: 18px; padding: 0; margin: 1px 0 0; accent-color: var(--accent); cursor: inherit; }
 .mode-row input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .mode-row:has(input:disabled) { cursor: default; opacity: .65; }
-.run-modes > .rule-feedback { height: 2.8em; line-height: 1.4; margin: 8px 0 0 30px; overflow: auto; overflow-wrap: anywhere; }
+.template-help { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; line-height: 1.6; }
+.template-help summary { width: fit-content; color: var(--muted); cursor: pointer; }
+.template-help summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.template-help ul { margin: 8px 0 0; padding-left: 20px; }
+.template-help li + li { margin-top: 6px; }
 .complete-template-panel { margin-top: 0; }
 .template-row { align-items: center; justify-content: space-between; border: 2px solid transparent; }
 .template-row.current-template { border-color: var(--accent); }
@@ -479,4 +498,10 @@ onMounted(() => {
 .action-detail { margin: 16px 0 0; }
 .name-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
 .delete-template-name { margin-top: 0; overflow-wrap: anywhere; }
+@media (max-width: 720px) {
+  .templates-page > .page-header { flex-direction: column; }
+  .template-header-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; }
+  .template-header-actions > button { grid-column: 2; grid-row: 1; }
+  .template-header-actions > .page-feedback { grid-column: 1; grid-row: 1; text-align: left; }
+}
 </style>
