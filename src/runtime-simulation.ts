@@ -95,30 +95,31 @@ async function openPage(label: string, heading = label): Promise<void> {
 
 async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   mark("journey_start");
-  // 驱动页允许已连接时重新扫描；连接页在自动连接后会禁用扫描入口。
-  await openPage("驱动", "驱动与配对");
+  await openPage("连接");
   const runtime = await getRuntimeSnapshot();
   assert(runtime.platform.platform === "windows-ci-simulation", "应用未使用 Windows CI 仿真后端");
   steps.push("Tauri WebView 通过真实 IPC 读取仿真运行快照");
 
   const pairing = await waitFor(
-    () => document.querySelector<HTMLDetailsElement>(".driver-guide .pairing-guide"),
+    () => document.querySelector<HTMLDetailsElement>(".remote-pairing"),
     "配对与重新连接区域",
   );
   const pairingSummary = pairing.querySelector<HTMLElement>("summary");
-  assert(pairingSummary?.textContent?.trim() === "配对与重新连接", "驱动页缺少配对展开入口");
+  assert(pairingSummary?.textContent?.trim() === "配对与重新连接", "连接页缺少配对展开入口");
   if (!pairing.open) pairingSummary.click();
   await waitFor(() => (pairing.open ? true : null), "配对与重新连接展开");
-  await clickButton("扫描已配对遥控器");
+  // 沿用连接页的会话保护；仿真中先正常断开，才通过真实扫描入口继续。
+  if(buttonWithText("断开"))await clickButton("断开");
+  await clickButton("扫描已配对设备");
   await waitFor(
-    () => (document.querySelectorAll(".driver-guide .device-list li").length === 2 ? true : null),
+    () => (document.querySelectorAll(".remote-connection-card > .device-list li").length === 2 ? true : null),
     "RC001/RC003 扫描结果",
   );
   const remotes = await scanPairedRemotes();
   assert(remotes.length === 2, "仿真扫描没有同时返回 RC001 和 RC003");
   assert(remotes.some((remote) => remote.model === "rc001"), "仿真扫描缺少 RC001");
   assert(remotes.some((remote) => remote.model === "rc003"), "仿真扫描缺少 RC003");
-  steps.push("驱动页展开配对区域，经扫描按钮渲染 RC001/RC003 结果");
+  steps.push("连接页展开配对区域，经扫描按钮渲染 RC001/RC003 结果");
 
   await openPage("连接");
   const rc001 = remotes.find((remote) => remote.model === "rc001");
@@ -244,10 +245,14 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   await saveButtonMappings(beforeMacroMappings);
   steps.push("组合动作库真实 IPC 保存/渲染、绑定引用与删除清理通过，个人模板保持；未执行系统快捷键");
 
-  mark("drivers_page");
-  await openPage("驱动", "驱动与配对");
-  assert(document.querySelector(".guide-grid") !== null, "驱动页缺少可选增强与配对引导");
-  steps.push("驱动页显示可选增强与配对引导，未启动提权 Helper");
+  mark("capture_and_components");
+  await openPage("按键", "按键映射");
+  assert(document.querySelector(".component-support") !== null, "按键页缺少全按键接管入口");
+  await openPage("连接");
+  const maintenance=await waitFor(()=>document.querySelector<HTMLDetailsElement>('.audio-advanced'),"高级维护入口");
+  maintenance.open=true;maintenance.dispatchEvent(new Event('toggle'));
+  await waitFor(()=>document.querySelector('.vb-cable-maintenance'),"VB-CABLE组件维护");
+  steps.push("按键页显示真实接管入口，连接页保留配对与组件维护；未启动提权Helper或官方向导");
 
   mark("permissions_page");
   await openPage("权限");

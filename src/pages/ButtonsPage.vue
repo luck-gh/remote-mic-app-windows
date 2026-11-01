@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useCurrentTemplate } from "../lib/current-template";
 import ButtonActionEditor from "../components/ButtonActionEditor.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
+import ComponentSupportPanel from "../components/ComponentSupportPanel.vue";
 import MembershipRequiredButton from "../components/MembershipRequiredButton.vue";
 import SettingsDialog from "../components/SettingsDialog.vue";
 import { reportFrontendEvent, reasonToken } from "../lib/frontend-diagnostics";
@@ -16,16 +17,6 @@ import {
   presetFocusDefault,
 } from "../lib/focus-defaults";
 import {
-  captureFailureText,
-  captureInactiveText,
-  captureRevokedText,
-  captureSwitchState as captureSwitchStateFn,
-  normalizeCaptureRevoked,
-  normalizeCaptureUnavailable,
-  shouldShowCaptureInactive,
-  shouldShowCaptureRevoked,
-} from "../lib/capture-switch";
-import {
   actionSummary,
   activateAppForLearning,
   buttonLabel,
@@ -37,12 +28,7 @@ import {
   getMappingConfiguration,
   getTemplateCatalog,
   getCombinedActions,
-  disableRc003Capture,
-  enableRc003Capture,
-  getCaptureSupport,
   getCommonPhrasePanelSnapshot,
-  getRc003BridgeSnapshot,
-  getRc003TaskStatus,
   focusLearnErrorLabel,
   focusPointErrorLabel,
   learnFocusPoint,
@@ -75,7 +61,6 @@ import {
   type MappingConfiguration,
   type TemplateCatalogEntry,
   type ButtonTrigger,
-  type CaptureSupport,
   type CommonPhraseAccess,
   type CustomAppPick,
   type FiredGesture,
@@ -84,11 +69,6 @@ import {
   type RawInputPhase,
   type MacroDefinition,
   type PairedRemote,
-  type Rc003BridgePhase,
-  type Rc003CaptureHealth,
-  type Rc003CaptureRevoked,
-  type Rc003CaptureUnavailable,
-  type Rc003TaskStatus,
   type RemoteButton,
   type RemoteModel,
   type RuntimeSnapshot,
@@ -1196,6 +1176,7 @@ onUnmounted(() => {
       <p v-if="voiceFeedback" class="voice-feedback" role="status">{{ voiceFeedback }}</p>
       <p v-else class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
     </header>
+    <article class="card capture-support-card"><ComponentSupportPanel /></article>
 
     <div id="global-mapping-panel">
     <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px`, '--mapping-card-height': `${CARD_HEIGHT}px` }">
@@ -1516,6 +1497,7 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.capture-support-card { margin-bottom: 16px; }
 .mapping-card { border-width: 2px; padding: 5px 8px; }
 .mapping-card.mapping-readonly { cursor: default; border-color: transparent; outline: none; box-shadow: none; }
 .mapping-card.mapping-readonly:not(.active):not(.flashed) { background: var(--pending-surface); }

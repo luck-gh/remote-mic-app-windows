@@ -2,7 +2,6 @@ import { privateFeaturePages, type PrivateFeaturePage } from "./private/feature-
 
 export type PageId =
   | "buttons"
-  | "drivers"
   | "templates"
   | "macros"
   | "connection"
@@ -12,7 +11,6 @@ export type PageId =
   | "profile";
 
 export type NavIcon =
-  | "driver"
   | "template"
   | "keyboard"
   | "layers"
@@ -31,7 +29,6 @@ export interface NavigationItem {
 }
 
 export const publicNavigationItems: NavigationItem[] = [
-  { id: "drivers", label: "驱动", icon: "driver" },
   { id: "buttons", label: "按键", icon: "keyboard" },
   { id: "templates", label: "模板", icon: "template" },
   { id: "macros", label: "组合动作", icon: "layers" },

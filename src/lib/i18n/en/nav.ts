@@ -2,7 +2,6 @@
 // 内容文案（如设备徽标「推荐」= Recommended）分开，避免一个中文 key 被迫
 // 同时对应两种英文语义。
 export default {
-  "nav.驱动": "Drivers",
   "nav.模板": "Templates",
   "nav.连接与语音": "Connection",
   "nav.按键": "Buttons",

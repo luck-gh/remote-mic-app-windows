@@ -144,6 +144,8 @@ const mocks = vi.hoisted(() => ({
   listAudioEndpoints: vi.fn(),
   selectAudioEndpoint: vi.fn(),
   openVbCableDownloadPage: vi.fn(),
+  openBluetoothSettings: vi.fn(),
+  getComponentStatus: vi.fn(), performComponentAction: vi.fn(),
   getVoiceHoldHotkey: vi.fn(),
   setVoiceHoldHotkey: vi.fn(),
   getVoiceInputTool: vi.fn(),
@@ -173,6 +175,8 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     listAudioEndpoints: mocks.listAudioEndpoints,
     selectAudioEndpoint: mocks.selectAudioEndpoint,
     openVbCableDownloadPage: mocks.openVbCableDownloadPage,
+    openBluetoothSettings: mocks.openBluetoothSettings,
+    getComponentStatus: mocks.getComponentStatus, performComponentAction: mocks.performComponentAction,
     getVoiceHoldHotkey: mocks.getVoiceHoldHotkey,
     setVoiceHoldHotkey: mocks.setVoiceHoldHotkey,
     getVoiceInputTool: mocks.getVoiceInputTool,
@@ -190,6 +194,8 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 
 describe("VB-CABLE first-launch guidance", () => {
   beforeEach(() => {
+    mocks.openBluetoothSettings.mockResolvedValue(undefined);
+    mocks.getComponentStatus.mockResolvedValue({component:'vb_cable',installation:'available',package:'download_available',installedVersion:null,serviceInstalled:true,loaded:true,bound:null,audioEndpointsReady:true,restartRequired:false,reason:'ready',blockers:['official_wizard_required'],allowedActions:['open_vendor_wizard']});
     mocks.getDefaultCaptureInputs.mockResolvedValue({console: {id: 'pc', name: 'PC microphone', isVirtualCableCandidate: false}, multimedia: {id: 'pc', name: 'PC microphone', isVirtualCableCandidate: false}, communications: null});
     mocks.setDefaultCaptureInput.mockResolvedValue({console: {id: 'capture', name: 'CABLE Output', isVirtualCableCandidate: true}, multimedia: {id: 'capture', name: 'CABLE Output', isVirtualCableCandidate: true}, communications: {id: 'capture', name: 'CABLE Output', isVirtualCableCandidate: true}});
     mocks.endpoints = [];
@@ -303,6 +309,20 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(wrapper.get('#audio-output-target').text()).toContain('请选择声音写入设备');
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
+  });
+
+  it('keeps pairing guidance and Windows Bluetooth settings available while connected', async () => {
+    const connected={...emptyConnection,phase:'ready' as const,remoteModel:'rc003' as const,remoteName:'遥控器',capabilities:{version:1,codecs:1,interaction:1,frameSize:20,selectedCodec:1,sampleRate:16000}};
+    mocks.getConnectionSnapshot.mockResolvedValue(connected);
+    const wrapper=mount(ConnectionPage,{props:{runtime:{...runtime,platform:{...runtime.platform,connection:connected}}}});await flushPromises();
+    const guide=wrapper.get('.remote-pairing');expect(guide.text()).toContain('菜单和主页');expect(mocks.openBluetoothSettings).not.toHaveBeenCalled();
+    await guide.get('button').trigger('click');await flushPromises();expect(mocks.openBluetoothSettings).toHaveBeenCalledOnce();
+    await expandAudioDiagnostics(wrapper);expect(wrapper.find('.vb-cable-maintenance').exists()).toBe(true);expect(mocks.performComponentAction).not.toHaveBeenCalled();wrapper.unmount();
+  });
+
+  it('reports a failed Windows Bluetooth settings request in the connection feedback', async () => {
+    mocks.openBluetoothSettings.mockRejectedValueOnce(new Error('settings failed'));
+    const wrapper=mount(ConnectionPage,{props:{runtime}});await flushPromises();await wrapper.get('.remote-pairing button').trigger('click');await flushPromises();expect(wrapper.text()).toContain('操作没有完成');wrapper.unmount();
   });
 
   it("reports a direct route read failure without referring to an optional microphone", async () => {

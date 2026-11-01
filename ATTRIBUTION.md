@@ -580,6 +580,11 @@
 - 语义与文案参考（未复制代码）：`HD838A/remote-mic-app` 的 `Resources/en.lproj/Localizable.strings`（提交 `c1840de92be4e74dd4404d6592e8e72b7b9278ff`）与 `sayall-private-platform` 组合动作包 `packages/macos-button-profiles/Sources/SayAllButtonProfiles/Resources/en.lproj/Localizable.strings`（提交 `e5f6cf23fd8f41eec4df7825bbe7715d29650eb5`）。
 - Windows 端以中文原文为 key 自建 `src/lib/i18n/en/*.ts`，沿用 Mac 术语（Routines、Doubao、WeType、App Language、System Default 等）；未复制 Swift/SwiftUI 代码或资源文件，平台差异（托盘、Win32 语言解析、Full-key support）由本仓库实现。
 
+## 2026-11-01 页面入口分工对照
+
+- 只读核对上游 `GetSayAll/remote-mic-app-windows` 的 `859833dd54b798d48ef034afeacac52433da4d5f`: [导航表](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/navigation.ts)、[按键页](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/pages/ButtonsPage.vue#L2362)、[连接页](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/pages/ConnectionPage.vue#L1360)。上游没有独立驱动页, 全按键主入口位于按键页, 连接页提供 VB-CABLE 官网安装提示及同一接管设置的语音别名。
+- 复用页面职责, 未复制上游控制时序: 个人版将原真实接管/恢复面板迁回按键页, 独有官方安装/卸载向导放连接页高级区域, 配对说明与系统设置放遥控器卡片。保留原模型/来源隔离、授权及清理契约; 本次对照不等于吸收该上游提交的 BLE 修改。
+
 ## 2026-10-25「回眸」文字版来源
 
 - 语义与产品行为参考（未复制 Swift/SwiftUI 代码或资源）：`HD838A/remote-mic-app` 的 `Sources/RemoteMic/TranscriptHistorySection.swift`、`TranscriptArchiveStore.swift`、`TranscriptCaptureCoordinator.swift`、`BridgeAppModel.swift`，以及 `Tests/RemoteMicTests/TranscriptCaptureCoordinatorTests.swift`、`TranscriptArchiveStoreTests.swift`、`feature/local-transcript-history/README.md`（参考时 HEAD `c1840de92be4e74dd4404d6592e8e72b7b9278ff`）。

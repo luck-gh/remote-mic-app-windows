@@ -41,7 +41,6 @@ describe("私有功能页接入点", () => {
     const merged = mergeNavigationItems(publicNavigationItems, injected);
 
     expect(merged.map((item) => item.id)).toEqual([
-      "drivers",
       "buttons",
       "templates",
       "macros",
@@ -54,7 +53,7 @@ describe("私有功能页接入点", () => {
     ]);
     expect(merged.at(-1)?.label).toBe("会员");
     // 合并函数必须是纯的：公开表不能被就地改写。
-    expect(publicNavigationItems).toHaveLength(9);
+    expect(publicNavigationItems).toHaveLength(8);
     expect(publicNavigationItems.map((item) => item.id)).not.toContain("membership");
   });
 
@@ -63,7 +62,6 @@ describe("私有功能页接入点", () => {
       { ...injected[0], after: "macros" },
     ]);
     expect(merged.map((item) => item.id)).toEqual([
-      "drivers",
       "buttons",
       "templates",
       "macros",

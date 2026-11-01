@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import EnhancedCaptureConfirmDialog from "../components/EnhancedCaptureConfirmDialog.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
+import VbCableMaintenance from "../components/VbCableMaintenance.vue";
 import { VOICE_HOTKEY_CUSTOM_CAPTURE_ENABLED } from "../lib/feature-flags";
 import { reasonToken, reportFrontendEvent } from "../lib/frontend-diagnostics";
 import { t, tPage } from "../lib/i18n";
@@ -66,6 +67,7 @@ import {
   isRecommendedVoiceEndpoint,
   listAudioEndpoints,
   openVbCableDownloadPage,
+  openBluetoothSettings,
   launchVokie,
   openVokieHomepage,
   remoteModelLabel,
@@ -268,6 +270,12 @@ const disconnecting = ref(false);
 const devices = ref<PairedRemote[]>([]);
 const scanMessage = ref("");
 const operationMessage = ref("");
+async function openSystemBluetoothSettings() {
+  try {
+    await openBluetoothSettings();
+    reportFrontendEvent({event:'bluetooth_settings_open',phase:'completed',result:'passed',reason:'request_submitted'});
+  } catch(error) { operationMessage.value=actionErrorText('open_bluetooth_settings',error); }
+}
 const audioEndpoints = ref<AudioEndpoint[]>([]);
 const scanningAudio = ref(false);
 const audioScanComplete = ref(false);
@@ -1455,8 +1463,12 @@ onUnmounted(() => {
           </span>
         </div>
 
-        <p v-if="scanMessage" class="muted scan-summary">{{ scanMessage }}</p>
-        <p v-if="operationMessage" class="operation-message">{{ operationMessage }}</p>
+        <details class="remote-pairing">
+          <summary>{{ t('配对与重新连接') }}</summary>
+          <p>{{ t('RC003：同时长按菜单和主页进入配对模式；RC001 请按随附说明书操作。') }}</p>
+          <button type="button" class="secondary-button" @click="openSystemBluetoothSettings">{{ t('打开 Windows 蓝牙设置') }}</button>
+        </details>
+        <p class="connection-feedback" role="status" aria-live="polite" tabindex="0">{{ [scanMessage, operationMessage].filter(Boolean).join(' · ') }}</p>
 
         <ul v-if="devices.length" class="device-list">
           <li v-for="device in devices" :key="device.id">
@@ -1595,6 +1607,7 @@ onUnmounted(() => {
             </button>
           </li>
         </ul>
+          <VbCableMaintenance />
           </template>
         </details>
 
@@ -1959,6 +1972,11 @@ onUnmounted(() => {
 
 <style scoped>
 .remote-connection-card { margin-bottom: 14px; }
+.remote-pairing { margin-top: 12px; font-size: 13px; }
+.remote-pairing summary { cursor: pointer; color: var(--muted); }
+.remote-pairing p { margin: 8px 0; }
+.connection-feedback { height: 1.4em; font-size: 13px; line-height: 1.4; margin: 8px 0; overflow: auto; overflow-wrap: anywhere; }
+.connection-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .voice-device-section { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
 .voice-device-section h3 { margin: 0; font-size: 16px; }
 .audio-output-settings { margin-top: 12px; min-width: 0; }

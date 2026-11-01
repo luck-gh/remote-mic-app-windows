@@ -11,9 +11,8 @@ import {
 } from "./navigation";
 
 describe("Windows navigation", () => {
-  it("puts the driver guide before settings pages without empty entries", () => {
+  it("starts with buttons and keeps capabilities on their existing pages", () => {
     expect(navigationItems.map((item) => item.id)).toEqual([
-      "drivers",
       "buttons",
       "templates",
       "macros",
@@ -55,6 +54,8 @@ describe("active page persistence (webview reload recovery)", () => {
     expect(loadPersistedPage()).toBeNull();
     // 旧版本持久化的 "about" 在改名后不再是合法页 id：回落默认页，不做迁移映射。
     localStorage.setItem("sayall.activePage", "about");
+    expect(loadPersistedPage()).toBeNull();
+    localStorage.setItem("sayall.activePage", "drivers");
     expect(loadPersistedPage()).toBeNull();
     localStorage.setItem("sayall.activePage", "");
     expect(loadPersistedPage()).toBeNull();

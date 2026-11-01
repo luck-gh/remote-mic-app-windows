@@ -34,9 +34,9 @@ describe("sidebar", () => {
       .findAll(".nav-item")
       .filter((item) => publicLabels.has(item.text()));
 
-    expect(items.map((item) => item.text())).toEqual(["驱动", "按键", "模板", "组合动作", "连接与语音", "回眸", "权限", "设置", "个人中心"]);
-    expect(items[3].get("svg").findAll("path")).toHaveLength(3);
-    const settingsIcon = items[7].get("svg");
+    expect(items.map((item) => item.text())).toEqual(["按键", "模板", "组合动作", "连接与语音", "回眸", "权限", "设置", "个人中心"]);
+    expect(items[2].get("svg").findAll("path")).toHaveLength(3);
+    const settingsIcon = items[6].get("svg");
     // 齿轮形状：外圈齿形 + 中央圆孔（区别于旧「关于」的 info.circle 单圆）。
     const paths = settingsIcon.findAll("path");
     expect(paths).toHaveLength(2);
@@ -81,7 +81,6 @@ describe("sidebar", () => {
     effectiveLanguage.value = "en";
     const wrapper = mount(Sidebar, { props: { activePage: "settings" } });
     const publicEnglishLabels = new Set([
-      "Drivers",
       "Buttons",
       "Templates",
       "Routines",
@@ -96,7 +95,6 @@ describe("sidebar", () => {
       .filter((item) => publicEnglishLabels.has(item.text()));
 
     expect(items.map((item) => item.text())).toEqual([
-      "Drivers",
       "Buttons",
       "Templates",
       "Routines",

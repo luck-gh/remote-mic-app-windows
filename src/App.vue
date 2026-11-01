@@ -28,7 +28,6 @@ import {
 import SettingsPage from "./pages/SettingsPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
-import DriverGuidePage from "./pages/DriverGuidePage.vue";
 import MacrosPage from "./pages/MacrosPage.vue";
 import OnboardingPage from "./pages/OnboardingPage.vue";
 import { onboardingExternalState } from "./onboarding/lifecycle";
@@ -127,7 +126,6 @@ function handleWindowKeydown(event: KeyboardEvent): void {
 
 /** 公开页面 + 私有页面（通常为空）的组件表。私有页面缺席时保持原行为。 */
 const pageComponents: Record<string, Component> = {
-  drivers: DriverGuidePage,
   buttons: ButtonsPage,
   templates: TemplatesPage,
   macros: MacrosPage,

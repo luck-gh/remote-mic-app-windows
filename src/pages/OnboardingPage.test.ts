@@ -1502,7 +1502,7 @@ describe("Onboarding skip and defer", () => {
     trackOnboardingExternalOperation(new Promise<typeof mocks.rc003Disabled>((done, fail) => { resolve = done; reject = fail; }));
     const wrapper = mount(App, { global: { stubs: {
       Sidebar: true, SettingsPage: true, ButtonsPage: true, ConnectionPage: true,
-      DriverGuidePage: true, PermissionsPage: true, TemplatesPage: true, OnboardingPage: true,
+      PermissionsPage: true, TemplatesPage: true, OnboardingPage: true,
     } } });
     try {
       await flushPromises();

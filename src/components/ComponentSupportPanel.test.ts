@@ -241,14 +241,11 @@ describe("unified button support and audio component", () => {
     expect(wrapper.get(".capture-help").attributes("open")).toBeUndefined();
     expect(wrapper.get(".capture-help").text()).toContain("Windows 管理员授权");
   });
-  it("keeps the audio wizard independent and does not restore the removed driver panel", async () => {
-    mocks.performComponentAction.mockResolvedValue({ component: "vb_cable", action: "open_vendor_wizard", outcome: "wizard_closed", reason: "wizard_closed", status });
+  it("owns capture support without audio component maintenance", async () => {
     const wrapper = await panel();
     expect(wrapper.text()).not.toContain("签名驱动组件");
-    expect(mocks.getComponentStatus).toHaveBeenCalledExactlyOnceWith("vb_cable");
-    expect(wrapper.text()).toContain("VB-CABLE 音频组件");
-    await button(wrapper, "打开官方安装/卸载向导").trigger("click"); await flushPromises();
-    expect(wrapper.text()).toContain("向导已关闭");
-    expect(mocks.getComponentStatus.mock.calls.every(args => args[0] === "vb_cable")).toBe(true);
+    expect(wrapper.text()).not.toContain("VB-CABLE");
+    expect(mocks.getComponentStatus).not.toHaveBeenCalled();
+    expect(mocks.performComponentAction).not.toHaveBeenCalled();
   });
 });

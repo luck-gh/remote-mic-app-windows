@@ -2,6 +2,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (command: string) =
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import ButtonsPage from "./ButtonsPage.vue";
+vi.mock('../components/ComponentSupportPanel.vue', () => ({ default: {name: 'ComponentSupportPanel', template: '<section class="capture-panel-stub">全按键支持</section>'} }));
 
 type EdgeHandler = (edge: { button: string; isPressed: boolean }) => void;
 type GestureHandler = (gesture: { button: string; trigger: string }) => void;
@@ -314,6 +315,12 @@ beforeEach(() => {
   vi.mocked(updateButtonMappingTemplate).mockClear();
 });
 describe("buttons mapping page", () => {
+  it('hosts the actual capture support entry separately from custom mapping', async () => {
+    const wrapper = await mountPage();
+    expect(wrapper.find('.capture-panel-stub').exists()).toBe(true);
+    expect(wrapper.text()).toContain('启用自定义按键功能');
+    wrapper.unmount();
+  });
   it("shows a received voice key before audio is ready and retains the failure after release", async () => {
     const wrapper = await mountPage();
     sceneHandler?.({ type: "snapshot", snapshot: voiceSnapshot(true) });
