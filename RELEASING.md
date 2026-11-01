@@ -55,6 +55,12 @@
 
 ## 版本号唯一来源（2026-09-30 收敛）
 
+个人修订规则（2026-11-01 用户确认）: 对外界面、安装包文件名及发布 Tag 统一为点分四段, 首次显示 `1.0.0.1`, Tag 为 `v1.0.0.1`; Windows 数值文件版本亦为四段。Tauri 唯一配置源内部使用可解析值 `1.0.0+1`, IPC、诊断、安装比较及更新 manifest.version 保留该内部值; Tag/资产/URL 在边界转换, 不将裸四段喂给 SemVer。构建原生包后使用 `scripts/normalize-personal-package.ps1` 规范成点号包名, 不改包字节或签名。个人修订为无前导零的 `1..65535`, 每批已完成交付或独立发布递增一次, 同一产物发布不重复递增, 失败/重编译不递增。吸收上游后前三段跟随其应用版本, 个人修订继续递增; 不引入第二版本来源。
+
+当前 Tauri updater、个人预览选择及固定 NSIS 比较插件均采用 Rust `semver::Version` 完整排序, 因此数值 `+9 < +10`, 原 `1.0.0 < 1.0.0+1`, 高上游基线优先; 这不是通用 SemVer precedence 保证。既有升级/防降级回归须在依赖升级时保留, 不以关闭防降级实现个人号。显示函数不改变协议版本, 本地测试包不因修订递增而获得发布授权。
+
+Windows 安装列表的 `DisplayVersion` 使用对外点号值, 专用内部注册值用于 SemVer 比较; 原已安装版本没有该内部值时才读取其原有三段 DisplayVersion, 已存在但非法的内部值不能回退掩盖。NSIS 安装器 FileVersion/ProductVersion 字符串使用点号。Tauri 主 EXE 的数值 FILEVERSION 为四段, 但框架生成的 FileVersion/ProductVersion 字符串仍保留内部 SemVer: 当前公开 WindowsAttributes 不支持替换这两个值, 本项目不因此重复 VERSIONINFO、补丁二进制或引入资源重写依赖。应用界面、原生标题、安装列表、安装包和 Release 名称仍统一点号; 不将内部机器元数据字符串宣称为已转换的公开显示。
+
 - 应用版本号**只写在** `src-tauri/tauri.conf.json` 的 `version`。安装包文件名、exe 的
   版本资源、关于页显示、更新器比较、诊断日志的 `app_version` 全部由它派生。
 - 改版本号 = 改这一行。`Cargo.lock` 里的 crate 版本是占位 `0.0.0`，不随应用版本变化，
@@ -64,7 +70,7 @@
   安装包/关于页与仓库里的数字重新漂移。
 - 守卫：`src-tauri` 的单元测试 `app_version_comes_from_tauri_config` 核对运行期
   `package_info().version` 与 config 一致（删掉 config 的 `version` 会同时丢掉 exe 的
-  版本资源并让测试失败）；`generate-updater-manifest.ps1` 继续强制 Tag 与 config 版本一致。
+  版本资源并让测试失败）；`generate-updater-manifest.ps1` 强制 Tag 与 config 派生的对外点号版本一致, manifest.version 仍使用内部值。
 
 ## 个人版交付（2026-10-06）
 

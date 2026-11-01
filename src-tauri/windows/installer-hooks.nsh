@@ -370,9 +370,48 @@ Var SayAllRestoreDesktopShortcut
 
   Push $R8
   Push $R9
+  Push $R7
   StrCpy $SayAllInstallStage version_check
-  ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"
+  ClearErrors
+  ReadRegStr $R8 SHCTX "${UNINSTKEY}" "SemverVersion"
+  ${If} ${Errors}
+    ; ReadRegStr also flags wrong types/oversized values. Only actual absence
+    ; permits using an older installation's DisplayVersion schema.
+    StrCpy $R7 0
+    ${Do}
+      ClearErrors
+      EnumRegValue $R9 SHCTX "${UNINSTKEY}" $R7
+      ${If} ${Errors}
+        StrCpy $R9 0
+        ReadRegStr $R8 SHCTX "${UNINSTKEY}" "DisplayVersion"
+        ${Break}
+      ${EndIf}
+      ${If} $R9 == "SemverVersion"
+        StrCpy $R8 ""
+        StrCpy $R9 1
+        ${Break}
+      ${EndIf}
+      IntOp $R7 $R7 + 1
+    ${Loop}
+  ${Else}
+    ; A present internal field is authoritative, including malformed/empty values.
+    StrCpy $R9 1
+  ${EndIf}
+  ClearErrors
   ${If} $R8 != ""
+  ${OrIf} $R9 == 1
+    ; The fixed plugin orders a valid Version above an invalid empty sentinel.
+    ; This verifies parsing before comparison, rather than accepting invalid input.
+    nsis_tauri_utils::SemverCompare $R8 ""
+    Pop $R9
+    ${If} $R9 != 1
+      ${IfNot} ${Silent}
+        MessageBox MB_ICONSTOP|MB_OK "Installed version metadata is invalid. Installation has stopped."
+      ${EndIf}
+      SetErrorLevel 1603
+      !insertmacro SayAllLogInstallResult a failed version_metadata
+      Quit
+    ${EndIf}
     nsis_tauri_utils::SemverCompare "${VERSION}" $R8
     Pop $R9
     ${If} $R9 = -1
@@ -384,6 +423,7 @@ Var SayAllRestoreDesktopShortcut
       Quit
     ${EndIf}
   ${EndIf}
+  Pop $R7
   Pop $R9
   Pop $R8
 

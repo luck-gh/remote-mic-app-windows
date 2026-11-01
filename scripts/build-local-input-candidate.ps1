@@ -21,4 +21,5 @@ $targetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
     Join-Path $root $env:CARGO_TARGET_DIR
 }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts/verify-frontend-embedded.ps1') -Executable (Join-Path $targetRoot 'release/sayall-windows-app.exe') -FrontendDirectory (Join-Path $root 'dist')
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& (Join-Path $root 'scripts/normalize-personal-package.ps1') -BundleDirectory (Join-Path $targetRoot 'release/bundle/nsis')

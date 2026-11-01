@@ -11,11 +11,17 @@ describe("sidebar", () => {
     effectiveLanguage.value = "zh-Hans";
   });
 
-  it("不显示版本号（版本号在窗口标题）", () => {
+  it("未读取版本时不编造版本号", () => {
     const wrapper = mount(Sidebar, { props: { activePage: "settings" } });
 
-    expect(wrapper.find(".sidebar-footer").exists()).toBe(false);
     expect(wrapper.text()).not.toContain("0.5.0");
+  });
+
+  it("底部显示运行期个人修订的第四段", () => {
+    const wrapper = mount(Sidebar, { props: { activePage: 'settings', appVersion: '1.0.0+10' } });
+    expect(wrapper.find('.sidebar-footer').text()).toBe('1.0.0.10');
+    expect(wrapper.props('appVersion')).toBe('1.0.0+10');
+    wrapper.unmount();
   });
 
   it("顶部页面顺序不变，个人中心固定在最后", () => {

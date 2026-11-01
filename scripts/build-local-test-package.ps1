@@ -135,6 +135,7 @@ $rawExe = Join-Path $targetRoot "release\sayall-windows-app.exe"
 if (-not (Test-Path $rawExe)) { throw "找不到裸构建产物：$rawExe" }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo "scripts\verify-frontend-embedded.ps1") -Executable $rawExe -FrontendDirectory (Join-Path $repo "dist")
 if ($LASTEXITCODE -ne 0) { throw "前端嵌入校验失败" }
+& (Join-Path $repo 'scripts/normalize-personal-package.ps1') -BundleDirectory (Join-Path $targetRoot 'release/bundle/nsis')
 $setup = Get-ChildItem (Join-Path $targetRoot "release\bundle\nsis") -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $setup) { throw "找不到 NSIS 产物" }
 $sha = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()

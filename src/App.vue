@@ -14,6 +14,7 @@ import {
 import { profileAccountLabel } from "./lib/profile";
 import { reportFrontendEvent } from "./lib/frontend-diagnostics";
 import { useAppUpdate } from "./lib/app-update";
+import { displayAppVersion } from "./lib/app-version";
 import { t } from "./lib/i18n";
 import { privatePageComponents } from "./private/feature-pages";
 import {
@@ -250,12 +251,12 @@ onUnmounted(() => {
     @completed="onOnboardingCompleted"
   />
   <div v-else class="app-shell">
-    <Sidebar :active-page="activePage" :profile-label="profileLabel" @select="activePage = $event" />
+    <Sidebar :active-page="activePage" :profile-label="profileLabel" :app-version="runtime?.appVersion" @select="activePage = $event" />
     <main class="content" :class="{ 'content-buttons': activePage === 'buttons' }">
       <div v-if="loadError" class="error-banner">{{ t(loadError) }}</div>
       <div v-if="onboardingReturnNotice" class="error-banner" role="status">{{ onboardingReturnNotice }}</div>
       <div v-if="updateBannerVisible" class="update-banner">
-        <span>{{ t("发现新版本 {version}", { version: updateInfo?.version ?? "" }) }}</span>
+        <span>{{ t("发现新版本 {version}", { version: displayAppVersion(updateInfo?.version ?? "") }) }}</span>
         <button type="button" class="link-button" @click="showUpdatePage">{{ t("查看") }}</button>
         <button type="button" class="link-button" :aria-label="t('忽略此提醒')" @click="dismissBanner">
           ×

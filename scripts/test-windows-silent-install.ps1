@@ -130,7 +130,8 @@ try {
     if ([string]::IsNullOrWhiteSpace($registeredInstallLocation)) {
         throw "SayAll uninstall entry has no InstallLocation"
     }
-    if ($installedVersion -ne $config.version) {
+    . (Join-Path $PSScriptRoot 'application-version.ps1')
+    if ($installedVersion -ne (ConvertTo-PublicAppVersion $config.version)) {
         throw "Installed SayAll version $installedVersion does not match $($config.version)"
     }
     if (

@@ -278,7 +278,8 @@ try {
     if ($afterInstallEntries.Count -ne 1) {
         throw "Expected one SayAll uninstall entry after over-install, found $($afterInstallEntries.Count)"
     }
-    if ([Version](Get-PropertyValue $afterInstallEntries[0] "DisplayVersion") -ne [Version]$config.version) {
+    . (Join-Path $PSScriptRoot 'application-version.ps1')
+    if ((ConvertTo-ComparableAppVersion (Get-PropertyValue $afterInstallEntries[0] "DisplayVersion")) -ne (ConvertTo-ComparableAppVersion $config.version)) {
         throw "Over-install left an unexpected installed version"
     }
     $appProcess = $null

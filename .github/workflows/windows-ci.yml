@@ -235,6 +235,8 @@ jobs:
       - name: Test retired-file recycling, overlay compile and write diagnostics
         shell: pwsh
         run: |
+          ./scripts/test-personal-version-strings.ps1
+          ./scripts/test-personal-version-installer.ps1
           powershell -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-retired-files.ps1 -RealRecycle
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/test-windows-overlay-compile.cjs
@@ -250,7 +252,9 @@ jobs:
 
       - name: Verify installer identity and create checksums
         shell: pwsh
-        run: ./scripts/verify-windows-bundle.ps1
+        run: |
+          ./scripts/normalize-personal-package.ps1
+          ./scripts/verify-windows-bundle.ps1
 
       - name: Test install upgrade downgrade and uninstall matrix
         shell: pwsh

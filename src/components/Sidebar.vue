@@ -5,6 +5,7 @@ import { navigationItems } from "../navigation";
 import CrownIcon from "./CrownIcon.vue";
 import { t, tNav } from "../lib/i18n";
 import { effectiveLanguage } from "../lib/language-state";
+import { displayAppVersion } from "../lib/app-version";
 
 /**
  * 侧栏文案：中文模式直接用原文；英文模式走导航专用词表（`nav.*`），避免与
@@ -20,6 +21,7 @@ const props = withDefaults(
     activePage: string;
     /** 个人中心入口文案：未登录「个人中心」，已登录为邮箱前缀。 */
     profileLabel?: string;
+    appVersion?: string;
   }>(),
   { profileLabel: "个人中心" },
 );
@@ -151,10 +153,19 @@ const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
         <span>{{ profileLabelText }}</span>
       </button>
     </nav>
+    <div class="sidebar-footer">{{ props.appVersion ? displayAppVersion(props.appVersion) : "" }}</div>
   </aside>
 </template>
 
 <style scoped>
+.sidebar-footer {
+  box-sizing: border-box;
+  height: 28px;
+  flex: 0 0 28px;
+  padding: 6px 4px;
+  font-variant-numeric: tabular-nums;
+}
+
 .sidebar-nav {
   display: flex;
   flex: 1 1 auto;

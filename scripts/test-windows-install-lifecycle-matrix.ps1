@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'application-version.ps1')
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repositoryRoot "src-tauri/tauri.conf.json"
@@ -8,7 +9,7 @@ $fixtureDirectory = Join-Path $repositoryRoot "target/upgrade-fixtures"
 $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json
 $productName = $config.productName
 $publisher = $config.bundle.publisher
-$currentVersion = [Version]$config.version
+$currentVersion = ConvertTo-ComparableAppVersion $config.version
 $startMenuFolderName = $config.bundle.windows.nsis.startMenuFolder
 $appConfigDirectory = Join-Path $env:APPDATA $config.identifier
 $settingsPath = Join-Path $appConfigDirectory "settings.json"
@@ -138,7 +139,7 @@ function Get-SingleInstallation([Version] $expectedVersion) {
         $entries = @(Get-SayAllUninstallEntries)
         if ($entries.Count -eq 1) {
             $entry = $entries[0]
-            $actualVersion = [Version](Get-PropertyValue $entry "DisplayVersion")
+            $actualVersion = ConvertTo-ComparableAppVersion (Get-PropertyValue $entry "DisplayVersion")
             if ($actualVersion -eq $expectedVersion) { break }
         }
         Start-Sleep -Milliseconds 250
@@ -186,7 +187,7 @@ $predecessorInstaller = $predecessorInstallers[0]
 if ($predecessorInstaller.BaseName -notmatch '^sayall-predecessor-(?<version>\d+\.\d+\.\d+)-setup$') {
     throw "Cannot read predecessor version from $($predecessorInstaller.Name)"
 }
-$predecessorVersion = [Version]$Matches.version
+$predecessorVersion = ConvertTo-ComparableAppVersion $Matches.version
 if ($predecessorVersion -ge $currentVersion) {
     throw "Predecessor version $predecessorVersion must be lower than current $currentVersion"
 }
@@ -240,7 +241,7 @@ try {
         $upgradeEntries = @(Get-SayAllUninstallEntries)
         $observedVersion = $null
         if ($upgradeEntries.Count -eq 1) {
-            $observedVersion = [Version](Get-PropertyValue $upgradeEntries[0] "DisplayVersion")
+            $observedVersion = ConvertTo-ComparableAppVersion (Get-PropertyValue $upgradeEntries[0] "DisplayVersion")
             if ($observedVersion -ne $lastObservedVersion) {
                 Write-Host "Upgrade convergence observation: DisplayVersion=$observedVersion"
                 $lastObservedVersion = $observedVersion

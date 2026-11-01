@@ -81,6 +81,7 @@ jobs:
       - name: Generate updater manifest and stage release assets
         shell: pwsh
         run: |
+          ./scripts/normalize-personal-package.ps1
           $installers = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one installer.' }
           ./scripts/verify-updater-signing.ps1 -Installer $installers[0].FullName

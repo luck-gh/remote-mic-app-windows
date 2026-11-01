@@ -16,6 +16,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'application-version.ps1')
 
 if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
     $RepositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -29,13 +30,13 @@ if ($Repository -ne "luck-gh/remote-mic-app-windows") {
     throw "Personal updates must be published from luck-gh/remote-mic-app-windows"
 }
 $version = [string]$config.version
+$publicVersion = ConvertTo-PublicAppVersion $version
 if ([string]::IsNullOrWhiteSpace($version)) {
     throw "tauri.conf.json 缺少 version，无法生成更新清单"
 }
 
 # Tag 与配置版本必须一致：防止用旧 tag 发布新构建或反之（fail fast）。
-$tagVersion = $Tag.TrimStart("v")
-if ($tagVersion -ne $version) {
+if ($Tag -ne ('v'+$publicVersion)) {
     throw "Tag $Tag 与 tauri.conf.json 版本 $version 不一致；版本发布前须先在 main 合入版本号变更"
 }
 
@@ -44,8 +45,8 @@ if ($installers.Count -ne 1) {
     throw "Expected exactly one NSIS installer in $bundleDirectory, found $($installers.Count)"
 }
 $installer = $installers[0]
-if ($installer.Name -notlike "*_$version`_x64-setup.exe") {
-    throw "NSIS installer $($installer.Name) does not carry version $version"
+if ($installer.Name -notlike "*_$publicVersion`_x64-setup.exe") {
+    throw "NSIS installer $($installer.Name) does not carry public version $publicVersion"
 }
 
 $signaturePath = "$($installer.FullName).sig"
@@ -57,7 +58,7 @@ if ([string]::IsNullOrWhiteSpace($signature)) {
     throw "Updater signature file is empty: $signaturePath"
 }
 
-$assetName = "SayAll-Windows-$version-x64-setup.exe"
+$assetName = "SayAll-Windows-$publicVersion-x64-setup.exe"
 $signatureAssetName = "$assetName.sig"
 $downloadUrl = "https://github.com/$Repository/releases/download/$Tag/$assetName"
 $pubDate = ([DateTimeOffset]::UtcNow).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")

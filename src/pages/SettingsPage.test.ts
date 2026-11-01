@@ -230,6 +230,24 @@ describe("settings page", () => {
     expect(setThemePreference).toHaveBeenCalledWith("dark");
   });
 
+  it("个人修订显示为第四段且保留运行期规范版本", () => {
+    const current = { ...runtime, appVersion: "1.0.0+10" };
+    const wrapper = mount(SettingsPage, { props: { runtime: current } });
+    expect(wrapper.get('.version-value').text()).toBe('1.0.0.10');
+    expect(current.appVersion).toBe('1.0.0+10');
+    wrapper.unmount();
+  });
+
+  it("个人更新提示将新旧修订显示为四段", () => {
+    phase.value = 'available';
+    info.value = { currentVersion: '1.0.0+9', available: true, version: '1.0.0+10', notes: null, date: null };
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    expect(wrapper.get('.update-status').text()).toContain('1.0.0.10');
+    expect(wrapper.get('.update-status').text()).toContain('1.0.0.9');
+    expect(info.value?.version).toBe('1.0.0+10');
+    wrapper.unmount();
+  });
+
   it("外观设置失败时显示就地错误", () => {
     themeError.value = "外观设置保存失败，请稍后重试。";
     const wrapper = mount(SettingsPage, { props: { runtime } });

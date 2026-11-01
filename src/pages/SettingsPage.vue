@@ -9,6 +9,7 @@ import {
   setOpenWindowAtLaunch,
 } from "../lib/bridge";
 import { appUpdateProgressText, useAppUpdate } from "../lib/app-update";
+import { displayAppVersion } from "../lib/app-version";
 import { useTheme } from "../lib/theme";
 import { useLanguage } from "../lib/language";
 import { effectiveLanguage } from "../lib/language-state";
@@ -55,7 +56,7 @@ const languageOptions: Array<{ value: AppLanguagePreference; label: string }> = 
   { value: "en", label: "English" },
 ];
 /** 版本号与安装包/更新器同源（package_info）；尚未读到时不编造版本。 */
-const version = computed(() => props.runtime?.appVersion ?? "—");
+const version = computed(() => displayAppVersion(props.runtime?.appVersion ?? "—"));
 
 /**
  * 页面标题按页面语境取词：中文原文「设置」同时是首次向导的阶段名（onboarding
@@ -329,7 +330,7 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
         <div class="update-panel" aria-live="polite">
           <template v-if="updateAvailable">
             <p class="update-status success">
-              {{ t("发现新版本") }} <strong>{{ info?.version }}</strong>{{ t("（当前 {current}）", { current: info?.currentVersion ?? "" }) }}
+              {{ t("发现新版本") }} <strong>{{ displayAppVersion(info?.version ?? "") }}</strong>{{ t("（当前 {current}）", { current: displayAppVersion(info?.currentVersion ?? "") }) }}
             </p>
             <p v-if="notes" class="muted update-notes">{{ notes }}</p>
             <div class="update-actions">

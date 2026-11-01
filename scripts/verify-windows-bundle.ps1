@@ -1,5 +1,6 @@
 ﻿param([string]$InstallerPath, [string]$ArtifactDirectory)
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'application-version.ps1')
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repositoryRoot "src-tauri/tauri.conf.json"
@@ -47,6 +48,7 @@ if (
 if (
     $installerHooks -notmatch '(?m)^!define SAYALL_DOWNGRADE_ERROR_LEVEL 1638\r?$' -or
     $installerHooks -notmatch 'ReadRegStr \$R8 SHCTX "\$\{UNINSTKEY\}" "DisplayVersion"' -or
+    $installerHooks -notmatch 'ReadRegStr \$R8 SHCTX "\$\{UNINSTKEY\}" "SemverVersion"' -or
     $installerHooks -notmatch 'nsis_tauri_utils::SemverCompare "\$\{VERSION\}" \$R8' -or
     $installerHooks -notmatch 'SetErrorLevel \$\{SAYALL_DOWNGRADE_ERROR_LEVEL\}'
 ) {
@@ -141,6 +143,8 @@ if ($installers.Count -ne 1) {
     throw "Expected exactly one NSIS installer, found $($installers.Count)"
 }
 $installer = $installers[0]
+$publicVersion=ConvertTo-PublicAppVersion ([string]$config.version)
+if ($installer.Name -ne "$($config.productName)_$($publicVersion)_x64-setup.exe") { throw 'Installer filename must carry the public application version' }
 if ($installer.Length -lt 1MB) {
     throw "NSIS installer is unexpectedly small: $($installer.Length) bytes"
 }
@@ -176,6 +180,7 @@ $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 $metadata = [ordered]@{
     productName = $config.productName
     version = $config.version
+    publicVersion = $publicVersion
     identifier = $config.identifier
     publisher = $config.bundle.publisher
     installer = $installer.Name

@@ -31,6 +31,44 @@ const PREVIEW_MANIFEST_NAME: &str = "latest.json";
 const RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/luck-gh/remote-mic-app-windows/releases/download/";
 static CHECK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 公开版本使用第四段修订, 内部配置和 updater 仍使用合法 SemVer.
+pub(crate) fn public_version(version: &semver::Version) -> String {
+    if version.pre.is_empty()
+        && version
+            .build
+            .as_str()
+            .parse::<u16>()
+            .is_ok_and(|revision| revision > 0 && revision.to_string() == version.build.as_str())
+    {
+        format!(
+            "{}.{}.{}.{}",
+            version.major, version.minor, version.patch, version.build
+        )
+    } else {
+        version.to_string()
+    }
+}
+
+fn parse_release_version(tag: &str) -> Option<semver::Version> {
+    let value = tag.strip_prefix('v').unwrap_or(tag);
+    if value.contains('+') {
+        return None;
+    }
+    if let Some((base, revision)) = value.rsplit_once('.') {
+        if let Ok(base) = semver::Version::parse(base) {
+            if base.pre.is_empty()
+                && revision
+                    .parse::<u16>()
+                    .is_ok_and(|number| number > 0 && number.to_string() == revision)
+            {
+                return semver::Version::parse(&format!("{base}+{revision}")).ok();
+            }
+        }
+    }
+    // 已发布的三段正式版/预览版仍属于有效的公开 Release 历史.
+    semver::Version::parse(value).ok()
+}
+
 /// Check both manifest discovery and its asset: an accepted manifest must never
 /// redirect installation back to the upstream product. Minisign remains mandatory.
 fn validate_download_source(url: &reqwest::Url) -> bool {
@@ -54,7 +92,7 @@ fn validate_download_source(url: &reqwest::Url) -> bool {
     let Some((tag, name)) = asset.split_once('/') else {
         return false;
     };
-    semver::Version::parse(tag.trim_start_matches('v')).is_ok()
+    parse_release_version(tag).is_some()
         && !name.contains('/')
         && name.starts_with("SayAll-Windows-")
         && name.ends_with("-x64-setup.exe")
@@ -188,9 +226,7 @@ fn preview_manifest_endpoint(
                 .trim_end_matches('/');
             let tag = href
                 .strip_prefix("https://github.com/luck-gh/remote-mic-app-windows/releases/tag/")?;
-            semver::Version::parse(tag.trim_start_matches('v'))
-                .ok()
-                .map(|version| (tag.to_owned(), version))
+            parse_release_version(tag).map(|version| (tag.to_owned(), version))
         })
         .max_by(|(_, left), (_, right)| left.cmp(right))
     else {
@@ -619,6 +655,82 @@ pub async fn install_app_update(app: AppHandle, state: State<'_, AppState>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_revision_keeps_the_configured_windows_build_in_range() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let version = semver::Version::parse(config["version"].as_str().unwrap()).unwrap();
+        let revision = version.build.as_str().parse::<u16>().unwrap();
+        assert!(revision > 0);
+        assert_eq!(version.build.as_str(), revision.to_string());
+        assert!(version.pre.is_empty());
+    }
+
+    #[test]
+    fn personal_revision_uses_existing_semver_total_order_for_updates() {
+        // updater 的 >、feed 的 cmp 与固定 NSIS 插件使用同一完整排序契约.
+        // 这不同于忽略 build metadata 的 SemVer cmp_precedence.
+        for (older, newer) in [
+            ("1.0.0", "1.0.0+1"),
+            ("1.0.0+1", "1.0.0+2"),
+            ("1.0.0+9", "1.0.0+10"),
+            ("1.0.0+65535", "1.0.1+1"),
+        ] {
+            let older = semver::Version::parse(older).unwrap();
+            let newer = semver::Version::parse(newer).unwrap();
+            assert!(newer > older);
+            assert_eq!(older.cmp(&newer), std::cmp::Ordering::Less);
+        }
+        assert!(semver::Version::parse("1.0.0.1").is_err());
+    }
+
+    #[test]
+    fn personal_public_version_feed_sorts_numeric_revision_and_keeps_dot_tag() {
+        let releases = feed(&["v1.0.0.9", "v1.0.0.10", "v1.0.0"]);
+        let (endpoint, tag) = preview_manifest_endpoint(&releases).unwrap().unwrap();
+        assert_eq!(tag, "v1.0.0.10");
+        assert_eq!(
+            endpoint.path(),
+            "/luck-gh/remote-mic-app-windows/releases/download/v1.0.0.10/latest.json"
+        );
+    }
+
+    #[test]
+    fn personal_public_version_source_accepts_dot_tag_without_exposing_internal_build() {
+        let good = "https://github.com/luck-gh/remote-mic-app-windows/releases/download/v1.0.0.10/SayAll-Windows-1.0.0.10-x64-setup.exe";
+        assert!(validate_download_source(&good.parse().unwrap()));
+        let internal = good.replace("v1.0.0.10/", "v1.0.0+10/");
+        assert!(!validate_download_source(&internal.parse().unwrap()));
+    }
+
+    #[test]
+    fn personal_public_version_display_retains_internal_canonical_value() {
+        for (canonical, public) in [
+            ("1.0.0+1", "1.0.0.1"),
+            ("1.0.0+10", "1.0.0.10"),
+            ("0.2.0", "0.2.0"),
+            ("0.2.0-rc.1", "0.2.0-rc.1"),
+        ] {
+            let version = semver::Version::parse(canonical).unwrap();
+            assert_eq!(public_version(&version), public);
+            assert_eq!(version.to_string(), canonical);
+            assert_eq!(parse_release_version(&format!("v{public}")), Some(version));
+        }
+    }
+
+    #[test]
+    fn personal_public_version_feed_rejects_invalid_revisions_and_keeps_legacy_releases() {
+        let releases = feed(&[
+            "v1.0.0.0",
+            "v1.0.0.01",
+            "v1.0.0.65536",
+            "v1.0.0+10",
+            "v0.2.0",
+        ]);
+        let (_, tag) = preview_manifest_endpoint(&releases).unwrap().unwrap();
+        assert_eq!(tag, "v0.2.0");
+    }
 
     #[test]
     fn personal_asset_source_rejects_upstream_and_spoofed_urls() {

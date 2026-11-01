@@ -18,6 +18,13 @@ describe("update completed dialog", () => {
     expect(wrapper.get("button").text()).toBe("好");
   });
 
+  it("个人修订以第四段展示", () => {
+    const wrapper = mount(UpdateCompletedDialog, { props: { version: '1.0.0+10' } });
+    expect(wrapper.get('.update-completed-message').text()).toContain('1.0.0.10');
+    expect(wrapper.props('version')).toBe('1.0.0+10');
+    wrapper.unmount();
+  });
+
   it("点「好」发出关闭事件（父级负责清掉版本号）", async () => {
     const wrapper = mount(UpdateCompletedDialog, { props: { version: "1.0.0" } });
 
