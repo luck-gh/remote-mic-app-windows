@@ -23,6 +23,7 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         sayall_windows::audio_route::snapshot(
             &self.capture_input_snapshot().settings,
             &self.audio_snapshot(),
+            || self.list_audio_endpoints(),
         )
     }
     fn resolve_audio_pair(
@@ -43,6 +44,18 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         Ok(())
     }
     fn list_capture_inputs(&self) -> Result<Vec<AudioEndpoint>, String> {
+        Err("capture_routing_unsupported".into())
+    }
+    fn default_capture_inputs(
+        &self,
+    ) -> Result<sayall_windows::capture_input::DefaultCaptureInputs, String> {
+        Err("capture_routing_unsupported".into())
+    }
+    fn set_default_capture_input(
+        &self,
+        _id: String,
+        _name: String,
+    ) -> Result<sayall_windows::capture_input::DefaultCaptureInputs, String> {
         Err("capture_routing_unsupported".into())
     }
     fn configure_capture_input(
@@ -312,6 +325,18 @@ impl PlatformRuntime for WindowsPlatform {
     }
     fn list_capture_inputs(&self) -> Result<Vec<AudioEndpoint>, String> {
         self.list_capture_inputs()
+    }
+    fn default_capture_inputs(
+        &self,
+    ) -> Result<sayall_windows::capture_input::DefaultCaptureInputs, String> {
+        self.default_capture_inputs()
+    }
+    fn set_default_capture_input(
+        &self,
+        id: String,
+        name: String,
+    ) -> Result<sayall_windows::capture_input::DefaultCaptureInputs, String> {
+        self.set_default_capture_input(id, name)
     }
     fn configure_capture_input(
         &self,

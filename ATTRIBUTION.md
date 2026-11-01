@@ -6,6 +6,8 @@
 
 2026-11-01 个人修订采用 `1.0.0+1` 规范值和 `1.0.0.1` 展示。参考官方 [Tauri CLI v2.11.4 NSIS 实现](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/windows/nsis/mod.rs) 的数值 build metadata 到第四段转换, 以及固定 [NSIS 工具 v0.5.3 比较器](https://github.com/tauri-apps/nsis-tauri-utils/blob/nsis_tauri_utils-v0.5.3/crates/nsis-semvercompare/src/lib.rs) 的 `Version::cmp`。现有 `tauri-plugin-updater 2.11.0` 与个人预览选择同用完整排序; [semver 1.0.28 文档](https://docs.rs/semver/1.0.28/semver/struct.Version.html#method.cmp_precedence) 区分忽略 metadata 的 precedence。只复用现有依赖和原生转换, 不复制比较器或新增依赖; 此排序约束限当前栈, 不是所有 SemVer 消费端的保证。
 
+同日显式一次性默认麦克风入口扩展既有受限 Capture 功能, 复用原 worker、角色读回、IPolicyConfig 事务及 journal; 原系统角色读取依据 [IMMDeviceEnumerator::GetDefaultAudioEndpoint](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-getdefaultaudioendpoint)。只读 API 与 setter 的已授权非公开 ABI 例外分别表述, 不把 IPolicyConfig 宣称为公开 Windows setter; 不扩展第三方应用私有接口、默认输出或自动系统改选。
+
 ## 统一上游全按键支持（2026-10-03）
 
 2026-10-20 驻留归属与模块快照修复采用 Microsoft [Module32NextW](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-module32nextw) 返回契约：FALSE 后立即读取 GetLastError，只有 `ERROR_NO_MORE_FILES` 表示正常结束，其他错误不得用局部列表决定注入。路径归属使用 Rust 标准库真实规范路径和路径组件边界，不新增来源固定偏移/系统 DLL 散列。独立 Helper 单测与自有 loopback 验证不证明旧驻留组件已经交接，真实边界见同主题 Bug。

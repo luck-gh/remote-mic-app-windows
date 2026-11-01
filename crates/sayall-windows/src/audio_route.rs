@@ -236,8 +236,31 @@ pub fn resolve_capture_pair(
     result
 }
 
-pub fn snapshot(settings: &CaptureInputSettings, audio: &AudioSnapshot) -> AudioRouteSnapshot {
-    match inventory() {
+pub fn snapshot(
+    settings: &CaptureInputSettings,
+    audio: &AudioSnapshot,
+    list_writers: impl FnOnce() -> Result<Vec<AudioEndpoint>, crate::PlatformError>,
+) -> AudioRouteSnapshot {
+    snapshot_with_sources(settings, audio, list_writers, inventory)
+}
+
+fn snapshot_with_sources(
+    settings: &CaptureInputSettings,
+    audio: &AudioSnapshot,
+    list_writers: impl FnOnce() -> Result<Vec<AudioEndpoint>, crate::PlatformError>,
+    list_pairs: impl FnOnce() -> Result<Vec<Endpoint>, AudioRouteReason>,
+) -> AudioRouteSnapshot {
+    if !settings.enabled {
+        return match list_writers() {
+            Ok(writers) => direct_snapshot(&writers, settings, audio),
+            Err(_) => AudioRouteSnapshot {
+                phase: AudioRoutePhase::Unavailable,
+                reason: Some(AudioRouteReason::EnumerationFailed),
+                ..base_snapshot(settings, audio)
+            },
+        };
+    }
+    match list_pairs() {
         Ok(endpoints) => snapshot_from(&endpoints, settings, audio),
         Err(reason) => AudioRouteSnapshot {
             phase: AudioRoutePhase::Unavailable,
@@ -245,6 +268,37 @@ pub fn snapshot(settings: &CaptureInputSettings, audio: &AudioSnapshot) -> Audio
             ..base_snapshot(settings, audio)
         },
     }
+}
+
+fn direct_snapshot(
+    writers: &[AudioEndpoint],
+    settings: &CaptureInputSettings,
+    audio: &AudioSnapshot,
+) -> AudioRouteSnapshot {
+    let mut result = base_snapshot(settings, audio);
+    let preferred = audio
+        .selected_endpoint_id
+        .as_deref()
+        .zip(audio.selected_endpoint_name.as_deref());
+    match preferred {
+        Some((id, name))
+            if writers
+                .iter()
+                .any(|writer| writer.id == id && writer.name == name)
+                && matches!(
+                    audio.phase,
+                    AudioPhase::Ready | AudioPhase::Streaming | AudioPhase::Draining
+                ) =>
+        {
+            result.phase = AudioRoutePhase::Manual
+        }
+        None if audio.selected_endpoint_id.is_none() && audio.selected_endpoint_name.is_none() => {}
+        _ => {
+            result.phase = AudioRoutePhase::Unavailable;
+            result.reason = Some(AudioRouteReason::AudioUnready);
+        }
+    }
+    result
 }
 
 fn base_snapshot(settings: &CaptureInputSettings, audio: &AudioSnapshot) -> AudioRouteSnapshot {
@@ -681,10 +735,11 @@ mod tests {
     }
 
     #[test]
-    fn route_readiness_describes_the_actual_writer_even_when_default_switching_is_disabled() {
+    fn route_readiness_checks_the_pair_when_default_switching_is_enabled() {
         let endpoints = standard();
         let settings = CaptureInputSettings {
-            enabled: false,
+            enabled: true,
+            keep_selected: false,
             endpoint_id: Some("mic".into()),
             endpoint_name: Some("CABLE Output".into()),
         };
@@ -730,6 +785,94 @@ mod tests {
         assert_eq!(
             snapshot_from(&endpoints, &settings, &AudioSnapshot::default()).phase,
             AudioRoutePhase::Unconfigured
+        );
+    }
+
+    #[test]
+    fn direct_audio_ignores_inactive_capture_but_checks_the_writer() {
+        let endpoints = standard();
+        let mut settings = CaptureInputSettings {
+            endpoint_id: Some("missing-capture".into()),
+            endpoint_name: Some("old microphone".into()),
+            ..Default::default()
+        };
+        let mut audio = AudioSnapshot {
+            phase: AudioPhase::Ready,
+            selected_endpoint_id: Some("writer".into()),
+            selected_endpoint_name: Some("CABLE Input".into()),
+            ..Default::default()
+        };
+        let direct = |settings: &CaptureInputSettings, audio: &AudioSnapshot| {
+            snapshot_with_sources(
+                settings,
+                audio,
+                || {
+                    Ok(endpoints
+                        .iter()
+                        .filter(|endpoint| endpoint.direction == Direction::Render)
+                        .map(|endpoint| endpoint.endpoint.clone())
+                        .collect())
+                },
+                || panic!("inactive capture must not be enumerated"),
+            )
+        };
+        assert_eq!(direct(&settings, &audio).phase, AudioRoutePhase::Manual);
+        settings.endpoint_name = None;
+        assert_eq!(direct(&settings, &audio).phase, AudioRoutePhase::Manual);
+        audio.selected_endpoint_name = Some("wrong name".into());
+        assert_eq!(
+            direct(&settings, &audio).reason,
+            Some(AudioRouteReason::AudioUnready)
+        );
+        audio.selected_endpoint_name = Some("CABLE Input".into());
+        audio.phase = AudioPhase::Failed;
+        assert_eq!(
+            direct(&settings, &audio).reason,
+            Some(AudioRouteReason::AudioUnready)
+        );
+        assert_eq!(
+            direct(&settings, &AudioSnapshot::default()).phase,
+            AudioRoutePhase::Unconfigured
+        );
+    }
+
+    #[test]
+    fn direct_audio_enabled_snapshot_retains_pair_inventory_and_rejects_render_mismatch() {
+        let settings = CaptureInputSettings {
+            enabled: true,
+            endpoint_id: Some("mic".into()),
+            endpoint_name: Some("CABLE Output".into()),
+            ..Default::default()
+        };
+        let mut audio = AudioSnapshot {
+            phase: AudioPhase::Ready,
+            selected_endpoint_id: Some("writer".into()),
+            selected_endpoint_name: Some("CABLE Input".into()),
+            ..Default::default()
+        };
+        let paired = |audio: &AudioSnapshot| {
+            snapshot_with_sources(
+                &settings,
+                audio,
+                || panic!("enabled mode uses paired inventory"),
+                || Ok(standard()),
+            )
+        };
+        assert_eq!(paired(&audio).phase, AudioRoutePhase::Paired);
+        audio.selected_endpoint_id = Some("wrong-writer".into());
+        assert_eq!(
+            paired(&audio).reason,
+            Some(AudioRouteReason::RenderMismatch)
+        );
+        assert_eq!(
+            snapshot_with_sources(
+                &CaptureInputSettings::default(),
+                &audio,
+                || Err(crate::PlatformError::UnsupportedPlatform),
+                || panic!("inactive input queried")
+            )
+            .reason,
+            Some(AudioRouteReason::EnumerationFailed)
         );
     }
 

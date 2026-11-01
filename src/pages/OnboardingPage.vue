@@ -919,6 +919,7 @@ async function chooseEndpoint(endpoint: AudioEndpoint, automatic = false): Promi
   try {
     const capture = await mutate(setCaptureInput({
       enabled: captureInput.value?.settings.enabled ?? false,
+      keepSelected: captureInput.value?.settings.keepSelected ?? false,
       endpointId: endpoint.id,
       endpointName: endpoint.name,
     }));
@@ -965,12 +966,14 @@ async function setTemporaryCaptureSwitch(enabled: boolean): Promise<void> {
   try {
     const snapshot = await mutate(setCaptureInput({
       enabled,
+      keepSelected: false,
       endpointId: current.settings.endpointId,
       endpointName: current.settings.endpointName,
     }));
     if (!isCurrent(generation)) return;
     if (
       snapshot.settings.enabled !== enabled
+      || snapshot.settings.keepSelected
       || snapshot.settings.endpointId !== current.settings.endpointId
       || snapshot.settings.endpointName !== current.settings.endpointName
     ) {

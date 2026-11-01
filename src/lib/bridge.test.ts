@@ -13,6 +13,8 @@ import {
   openAppLabel,
   openLogDirectory,
   setCaptureInput,
+  getDefaultCaptureInputs,
+  setDefaultCaptureInput,
   openVokieHomepage,
   getOpenWindowAtLaunch,
   latestMacroDefinitions,
@@ -69,6 +71,16 @@ describe("learning input bridge", () => {
   afterEach(() => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     vi.mocked(invoke).mockReset();
+  });
+
+  it('reads system capture defaults and explicitly sets a verified target via separate IPC', async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const defaults = {console: null, multimedia: null, communications: null};
+    vi.mocked(invoke).mockResolvedValue(defaults);
+    expect(await getDefaultCaptureInputs()).toEqual(defaults);
+    expect(invoke).toHaveBeenLastCalledWith('get_default_capture_inputs');
+    expect(await setDefaultCaptureInput('target', 'Target microphone')).toEqual(defaults);
+    expect(invoke).toHaveBeenLastCalledWith('set_default_capture_input', {endpointId: 'target', endpointName: 'Target microphone'});
   });
 
   it("opens the target app before starting the learning window", async () => {
@@ -389,7 +401,7 @@ describe("explicit capture and writer transaction", () => {
   });
   it("submits both explicit endpoint choices in one IPC request", async () => {
     (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-    const config = { enabled: true, endpointId: 'capture', endpointName: 'CABLE Output' };
+    const config = { enabled: true, keepSelected: true, endpointId: 'capture', endpointName: 'CABLE Output' };
     await setCaptureInput(config, 'render-16');
     expect(invoke).toHaveBeenCalledExactlyOnceWith('set_capture_input', { config, writerEndpointId: 'render-16' });
   });

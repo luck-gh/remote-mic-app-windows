@@ -22,6 +22,7 @@ pub enum ThemePreference {
 #[serde(default, rename_all = "camelCase")]
 pub struct CaptureInputSettings {
     pub enabled: bool,
+    pub keep_selected: bool,
     pub endpoint_id: Option<String>,
     pub endpoint_name: Option<String>,
 }
@@ -304,6 +305,32 @@ mod tests {
 #[cfg(test)]
 mod enhancement_default_tests {
     use super::AppSettings;
+    #[test]
+    fn capture_input_existing_settings_keep_temporary_restore() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "capture_input": {"enabled": true, "endpointId": "capture-test"}
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(settings).unwrap();
+        assert_eq!(encoded["capture_input"]["keepSelected"], false);
+    }
+
+    #[test]
+    fn capture_input_keep_selected_round_trips() {
+        for keep_selected in [false, true] {
+            let settings: AppSettings = serde_json::from_value(serde_json::json!({
+                "capture_input": {
+                    "enabled": true,
+                    "keepSelected": keep_selected,
+                    "endpointId": "capture-test"
+                }
+            }))
+            .unwrap();
+            let encoded = serde_json::to_value(settings).unwrap();
+            assert_eq!(encoded["capture_input"]["keepSelected"], keep_selected);
+        }
+    }
+
     #[test]
     fn retired_app_icon_is_ignored_without_resetting_preferences() {
         for icon in [

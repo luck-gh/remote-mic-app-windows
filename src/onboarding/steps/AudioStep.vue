@@ -35,11 +35,12 @@ const emit = defineEmits<{
 function requestTemporaryCaptureSwitch(event: Event): void {
   const input = event.target as HTMLInputElement;
   const requested = input.checked;
-  input.checked = props.capture?.settings.enabled ?? false;
+  input.checked = temporarySwitchEnabled.value;
   emit("setTemporaryCaptureSwitch", requested);
 }
 
 const recommended = computed(() => props.endpoints.filter(endpoint => endpoint.isVirtualCableCandidate));
+const temporarySwitchEnabled = computed(() => props.capture !== null && props.capture.settings.enabled && !props.capture.settings.keepSelected);
 const selectedId = computed(() => props.capture?.settings.endpointId ?? null);
 const selectedEndpointAvailable = computed(() =>
   Boolean(selectedId.value && props.endpoints.some(endpoint => endpoint.id === selectedId.value)),
@@ -129,7 +130,7 @@ const fixTitle = computed(() => {
         <span>遥控器说话时临时切换麦克风输入</span>
         <input
           type="checkbox"
-          :checked="capture.settings.enabled"
+          :checked="temporarySwitchEnabled"
           :disabled="temporaryCaptureSwitchDisabled || temporaryCaptureSwitchBusy || !selectedEndpointAvailable"
           @change="requestTemporaryCaptureSwitch"
         />

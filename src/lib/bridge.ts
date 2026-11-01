@@ -359,6 +359,7 @@ export interface ButtonMappings {
 
 export interface CaptureInputSettings {
   enabled: boolean;
+  keepSelected: boolean;
   endpointId: string | null;
   endpointName: string | null;
 }
@@ -395,8 +396,21 @@ export interface CaptureInputSnapshot {
   recoveryPending: boolean;
   lastError: string | null;
 }
+export interface DefaultCaptureInputs {
+  console: AudioEndpoint | null;
+  multimedia: AudioEndpoint | null;
+  communications: AudioEndpoint | null;
+}
+export async function getDefaultCaptureInputs(): Promise<DefaultCaptureInputs> {
+  if (!isTauriRuntime()) throw new Error('请在 Windows 应用中读取默认麦克风');
+  return invoke<DefaultCaptureInputs>('get_default_capture_inputs');
+}
+export async function setDefaultCaptureInput(endpointId: string, endpointName: string): Promise<DefaultCaptureInputs> {
+  if (!isTauriRuntime()) throw new Error('请在 Windows 应用中设置默认麦克风');
+  return invoke<DefaultCaptureInputs>('set_default_capture_input', {endpointId, endpointName});
+}
 export async function getCaptureInput(): Promise<CaptureInputSnapshot> {
-  if (!isTauriRuntime()) return { settings: { enabled: false, endpointId: null, endpointName: null }, phase: "unsupported", recoveryPending: false, lastError: null };
+  if (!isTauriRuntime()) return { settings: { enabled: false, keepSelected: false, endpointId: null, endpointName: null }, phase: "unsupported", recoveryPending: false, lastError: null };
   return invoke<CaptureInputSnapshot>("get_capture_input");
 }
 export async function listCaptureInputs(): Promise<AudioEndpoint[]> {

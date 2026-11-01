@@ -1721,6 +1721,7 @@ mod tests {
         let mut expected = store.load().unwrap();
         let capture = sayall_core::CaptureInputSettings {
             enabled: true,
+            keep_selected: true,
             endpoint_id: Some("capture-test".into()),
             endpoint_name: Some("capture-test".into()),
         };

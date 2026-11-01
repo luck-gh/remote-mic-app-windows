@@ -876,6 +876,7 @@ impl WindowsPlatform {
         audio_route::snapshot(
             &self.capture_input_snapshot().settings,
             &self.audio_snapshot(),
+            || self.list_audio_endpoints(),
         )
     }
 
@@ -940,6 +941,40 @@ impl WindowsPlatform {
         #[cfg(not(windows))]
         {
             Err("仅 Windows 支持输入设备切换".into())
+        }
+    }
+    pub fn default_capture_inputs(&self) -> Result<capture_input::DefaultCaptureInputs, String> {
+        #[cfg(windows)]
+        {
+            self.audio.capture.defaults()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("capture_routing_unsupported".into())
+        }
+    }
+    pub fn set_default_capture_input(
+        &self,
+        id: String,
+        name: String,
+    ) -> Result<capture_input::DefaultCaptureInputs, String> {
+        #[cfg(windows)]
+        {
+            // The caller owns capture_config_gate across this one-shot operation.
+            if self.connection_snapshot().voice_state != sayall_core::VoiceSessionState::Idle
+                || matches!(
+                    self.audio_snapshot().phase,
+                    AudioPhase::Streaming | AudioPhase::Draining
+                )
+            {
+                return Err("voice_session_active".into());
+            }
+            self.audio.capture.set_default(id, name)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (id, name);
+            Err("capture_routing_unsupported".into())
         }
     }
     pub fn configure_capture_input(

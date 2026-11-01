@@ -1,4 +1,7 @@
-use super::{apply, restore, CaptureInputSnapshot, Roles, RouteBackend, Transaction};
+use super::{
+    prepare_route, restore, CaptureInputSnapshot, Roles, RouteBackend, RoutePreparation,
+    Transaction,
+};
 use crate::{audio::AudioBeginGuard, AudioEndpoint};
 use sayall_core::CaptureInputSettings;
 use std::{
@@ -108,6 +111,7 @@ struct Native {
     // Only finish() in this process can own automatic zero-write completion.
     // A journal loaded at startup never acquires this ownership.
     normal_recovery: Option<Transaction>,
+    manual_operation_id: Option<u64>,
 }
 impl Native {
     fn new() -> Result<Self, String> {
@@ -122,6 +126,7 @@ impl Native {
             generation: 0,
             prepare_io: PrepareIo::default(),
             normal_recovery: None,
+            manual_operation_id: None,
         })
     }
     fn ensure_policy(&mut self) -> Result<(), String> {
@@ -178,6 +183,9 @@ impl Native {
 }
 impl RouteBackend for Native {
     fn observe(&mut self, stage: &str, tx: &Transaction, actual: &Roles) {
+        if let Some(operation_id) = self.manual_operation_id {
+            crate::gatt_note(format!("capture_input scope=manual operation_id={operation_id} phase=transaction stage={stage}"));
+        }
         let mask = |matches: &dyn Fn(usize) -> bool| -> u8 {
             (0..3).fold(0, |bits, i| bits | if matches(i) { 1 << i } else { 0 })
         };
@@ -353,6 +361,8 @@ impl MutationGuard {
 enum Command {
     #[cfg(test)]
     DelayTargetRead(String, Duration, Sender<Result<(), String>>),
+    #[cfg(test)]
+    HoldVoice(Begin, Sender<Result<(), String>>),
     Initialize(PathBuf, CaptureInputSettings, Sender<Result<(), String>>),
     Configure(
         CaptureInputSettings,
@@ -361,6 +371,14 @@ enum Command {
         Sender<Result<(), String>>,
     ),
     List(Sender<Result<Vec<AudioEndpoint>, String>>),
+    Defaults(Sender<Result<super::DefaultCaptureInputs, String>>),
+    SetDefault(
+        String,
+        String,
+        MutationGuard,
+        Arc<AtomicBool>,
+        Sender<Result<super::DefaultCaptureInputs, String>>,
+    ),
     Begin(Begin, Sender<Result<(), String>>),
     End,
     Reconcile,
@@ -374,6 +392,7 @@ pub(crate) struct CaptureInputRuntime {
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     pub(crate) config_gate: Arc<Mutex<()>>,
     configuration_uncertain: AtomicBool,
+    manual_pending: Arc<AtomicBool>,
 }
 impl CaptureInputRuntime {
     pub(crate) fn new() -> Self {
@@ -397,6 +416,7 @@ impl CaptureInputRuntime {
             worker: Mutex::new(worker),
             config_gate: Arc::new(Mutex::new(())),
             configuration_uncertain: AtomicBool::new(false),
+            manual_pending: Arc::new(AtomicBool::new(false)),
         }
     }
     pub(crate) fn snapshot(&self) -> CaptureInputSnapshot {
@@ -466,6 +486,33 @@ impl CaptureInputRuntime {
     pub(crate) fn list(&self) -> Result<Vec<AudioEndpoint>, String> {
         self.request(Command::List)
     }
+    pub(crate) fn defaults(&self) -> Result<super::DefaultCaptureInputs, String> {
+        self.request(Command::Defaults)
+    }
+    pub(crate) fn set_default(
+        &self,
+        id: String,
+        name: String,
+    ) -> Result<super::DefaultCaptureInputs, String> {
+        if self.manual_pending.swap(true, Ordering::SeqCst) {
+            return Err("manual_default_pending".into());
+        }
+        let guard = MutationGuard::new();
+        let pending = self.manual_pending.clone();
+        let request_guard = guard.clone();
+        let result =
+            self.request(|reply| Command::SetDefault(id, name, request_guard, pending, reply));
+        if result.is_err() {
+            guard.cancelled.store(true, Ordering::SeqCst);
+        }
+        if result
+            .as_ref()
+            .is_err_and(|e| e == "route_worker_busy" || e == "route_worker_unavailable")
+        {
+            self.manual_pending.store(false, Ordering::SeqCst);
+        }
+        result
+    }
     pub(crate) fn recover(&self, restore: bool) -> Result<(), String> {
         self.mutate(|g, r| Command::Recover(restore, g, r))
     }
@@ -483,13 +530,17 @@ impl CaptureInputRuntime {
         if self.configuration_uncertain.load(Ordering::SeqCst) {
             return Err("capture_configuration_pending".into());
         }
+        if self.manual_pending.load(Ordering::SeqCst) {
+            return Err("manual_default_pending".into());
+        }
         if !self.snapshot().settings.enabled {
             return Ok(None);
         }
         let guard = guard.ok_or("route_guard_missing")?;
         let epoch = self.epoch.load(Ordering::SeqCst);
         let timeout = Arc::new(AtomicBool::new(false));
-        let deadline = Instant::now() + REQUEST_BOUND;
+        let started = Instant::now();
+        let deadline = started + REQUEST_BOUND;
         let request = Begin {
             generation,
             guard,
@@ -501,6 +552,15 @@ impl CaptureInputRuntime {
         let result = self.request(|r| Command::Begin(request, r));
         // A queued successful reply still must pass the absolute deadline and source guard.
         let result = caller.confirm_reply(&self.epoch, Instant::now(), result);
+        note_for(
+            generation,
+            "begin_reply",
+            result
+                .as_ref()
+                .map(|_| "passed")
+                .unwrap_or_else(|error| error.as_str()),
+            started.elapsed(),
+        );
         if result.is_err() {
             timeout.store(true, Ordering::SeqCst);
             let _ = self.sender.try_send(Command::Reconcile);
@@ -552,6 +612,26 @@ impl Drop for Apartment {
     fn drop(&mut self) {
         unsafe { CoUninitialize() };
     }
+}
+fn read_defaults(io: &mut Native) -> Result<super::DefaultCaptureInputs, String> {
+    let roles = io.roles()?;
+    let mut endpoints: [Option<AudioEndpoint>; 3] = [None, None, None];
+    for (index, id) in roles.into_iter().enumerate() {
+        if let Some(id) = id {
+            let name = io.active_name(&id)?;
+            endpoints[index] = Some(AudioEndpoint {
+                id,
+                name,
+                is_virtual_cable_candidate: false,
+            });
+        }
+    }
+    let [console, multimedia, communications] = endpoints;
+    Ok(super::DefaultCaptureInputs {
+        console,
+        multimedia,
+        communications,
+    })
 }
 fn publish(
     state: &Mutex<CaptureInputSnapshot>,
@@ -692,7 +772,21 @@ fn run(
         }
     };
     let mut active: Option<(Transaction, Begin)> = None;
+    let mut held: Option<Begin> = None;
+    let mut manual_operation_id = 0u64;
     loop {
+        if held
+            .as_ref()
+            .is_some_and(|begin| begin.end_requested(&epoch))
+        {
+            let begin = held.take().unwrap();
+            note_for(
+                begin.generation,
+                "voice_ownership",
+                "released",
+                Duration::ZERO,
+            );
+        }
         // A public default-role read is the arbiter. No notification actor/time-window
         // inference. Polling is confined to an active lease and also catches missed events.
         if let Some((tx, b)) = active.as_ref() {
@@ -739,6 +833,11 @@ fn run(
                 io.target_read_delay = Some((id, delay));
                 let _ = reply.send(Ok(()));
             }
+            #[cfg(test)]
+            Command::HoldVoice(begin, reply) => {
+                held = Some(begin);
+                let _ = reply.send(Ok(()));
+            }
             Command::Initialize(path, config, reply) => {
                 let result = if io.journal.is_some() {
                     Err("already_initialized".into())
@@ -771,11 +870,83 @@ fn run(
             Command::List(reply) => {
                 let _ = reply.send(io.list());
             }
+            Command::Defaults(reply) => {
+                let started = Instant::now();
+                let result = read_defaults(&mut io);
+                note(
+                    "read_defaults",
+                    if result.is_ok() { "passed" } else { "failed" },
+                    started.elapsed(),
+                );
+                let _ = reply.send(result);
+            }
+            Command::SetDefault(id, name, request, pending, reply) => {
+                let started = Instant::now();
+                manual_operation_id += 1;
+                io.generation = manual_operation_id;
+                io.manual_operation_id = Some(manual_operation_id);
+                crate::gatt_note(format!(
+                    "capture_input scope=manual operation_id={manual_operation_id} phase=requested"
+                ));
+                let result = (|| {
+                    request.check()?;
+                    if held.is_some() {
+                        return Err("voice_session_active".into());
+                    }
+                    if state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .recovery_pending
+                        || io.load_journal()?.is_some()
+                    {
+                        return Err("recovery_required".into());
+                    }
+                    let roles = io.roles()?;
+                    if !roles
+                        .iter()
+                        .all(|role| role.as_deref() == Some(id.as_str()))
+                    {
+                        io.ensure_policy()?;
+                    }
+                    let result =
+                        super::manual_default(manual_operation_id, &mut io, id, name, || {
+                            request.check()
+                        });
+                    if result.is_err() {
+                        match io.load_journal() {
+                            Ok(None) => {}
+                            Ok(Some(_)) | Err(_) => publish(
+                                &state,
+                                "recovery_required",
+                                result.as_ref().err().cloned(),
+                                true,
+                            ),
+                        }
+                    }
+                    result?;
+                    read_defaults(&mut io)
+                })();
+                note(
+                    "manual_default",
+                    result
+                        .as_ref()
+                        .map(|_| "passed")
+                        .unwrap_or_else(|error: &String| error.as_str()),
+                    started.elapsed(),
+                );
+                crate::gatt_note(format!("capture_input scope=manual operation_id={manual_operation_id} phase=completed result={} elapsed_ms={}", result.as_ref().map(|_| "passed").unwrap_or_else(|error| error.as_str()), started.elapsed().as_millis()));
+                io.manual_operation_id = None;
+                pending.store(false, Ordering::SeqCst);
+                let _ = reply.send(result);
+            }
             Command::Configure(config, restoring, request, reply) => {
                 let result = (|| {
                     request.check()?;
+                    if !config.enabled && config.keep_selected {
+                        return Err("capture_keep_selected_requires_enabled".into());
+                    }
                     // No controller-side restore while the voice owner's hotkey is DOWN.
-                    if active.is_some() {
+                    if held.is_some() {
                         return Err("voice_session_active_release_before_configuring".into());
                     }
                     if config.enabled && !restoring {
@@ -831,7 +1002,13 @@ fn run(
             Command::Begin(b, reply) => {
                 // A duplicate/new START must not restore an existing lease before
                 // BLE releases its old chord through the common abort path.
-                if active.is_some() {
+                if held.is_some() {
+                    note_for(
+                        b.generation,
+                        "prepare",
+                        "route_voice_session_busy",
+                        Duration::ZERO,
+                    );
                     let _ = reply.send(Err("route_voice_session_busy".into()));
                     continue;
                 }
@@ -868,15 +1045,25 @@ fn run(
                     if io.active_name(&target)? != target_name {
                         return Err("capture_target_changed".into());
                     }
-                    io.ensure_policy()?;
                     if cancelled() {
                         return Err("cancelled".into());
                     }
                     let original = io.roles()?;
+                    let already_default = original.iter().all(|id| id.as_deref() == Some(&target));
+                    if !already_default {
+                        io.ensure_policy()?;
+                    }
+                    if cancelled() {
+                        return Err("cancelled".into());
+                    }
                     let mut original_names = [None, None, None];
-                    for i in 0..3 {
-                        if let Some(id) = &original[i] {
-                            original_names[i] = Some(io.active_name(id)?);
+                    if already_default {
+                        original_names = std::array::from_fn(|_| Some(target_name.clone()));
+                    } else {
+                        for i in 0..3 {
+                            if let Some(id) = &original[i] {
+                                original_names[i] = Some(io.active_name(id)?);
+                            }
                         }
                     }
                     tx = Some(Transaction {
@@ -890,7 +1077,19 @@ fn run(
                         changed: [false; 3],
                         transition: None,
                     });
-                    apply(&mut io, tx.as_mut().unwrap(), cancelled)
+                    let preparation =
+                        prepare_route(&mut io, &mut tx, config.keep_selected, cancelled)?;
+                    note_for(
+                        b.generation,
+                        "route",
+                        match preparation {
+                            RoutePreparation::AlreadyDefault => "already_default",
+                            RoutePreparation::Temporary => "temporary",
+                            RoutePreparation::Preserved => "preserved",
+                        },
+                        started.elapsed(),
+                    );
+                    Ok(())
                 })();
                 io.prepare_io.note(b.generation, &result, started.elapsed());
                 note_for(
@@ -905,13 +1104,22 @@ fn run(
                 result = b.confirm_reply(&epoch, Instant::now(), result);
                 match result {
                     Ok(()) => {
-                        active = Some((tx.unwrap(), b));
-                        publish(&state, "active", None, false);
+                        held = Some(b.clone());
+                        if let Some(tx) = tx {
+                            active = Some((tx, b));
+                            publish(&state, "active", None, false);
+                        } else {
+                            publish(&state, "idle", None, false);
+                        }
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
                         if e == "external_change" {
-                            let cleared = io.persist(None);
+                            let cleared = if tx.is_some() {
+                                io.persist(None)
+                            } else {
+                                Ok(())
+                            };
                             publish(
                                 &state,
                                 "relinquished",
@@ -939,7 +1147,7 @@ fn run(
             Command::Recover(should_restore, request, reply) => {
                 let result = (|| {
                     request.check()?;
-                    if active.is_some() {
+                    if held.is_some() {
                         return Err("voice_session_active".into());
                     }
                     if !should_restore {
@@ -1014,6 +1222,92 @@ mod tests {
         (b, release, epoch)
     }
     #[test]
+    fn manual_pending_blocks_new_voice_even_when_automatic_switching_is_disabled() {
+        let runtime = CaptureInputRuntime::new();
+        runtime.manual_pending.store(true, Ordering::SeqCst);
+        assert!(matches!(runtime.begin(1, None), Err(error) if error == "manual_default_pending"));
+        runtime.manual_pending.store(false, Ordering::SeqCst);
+        runtime.shutdown().unwrap();
+    }
+    #[test]
+    fn manual_default_does_not_bypass_pending_recovery_or_modify_settings() {
+        let runtime = CaptureInputRuntime::new();
+        let before = runtime.snapshot().settings;
+        runtime.state.lock().unwrap().recovery_pending = true;
+        assert_eq!(
+            runtime
+                .set_default("target".into(), "target".into())
+                .unwrap_err(),
+            "recovery_required"
+        );
+        assert_eq!(runtime.snapshot().settings, before);
+        assert!(!runtime.manual_pending.load(Ordering::SeqCst));
+        assert_eq!(runtime.shutdown(), Err("route_restore_unconfirmed".into()));
+    }
+    #[test]
+    fn held_voice_without_route_lease_blocks_mutation_until_end_in_real_worker() {
+        let runtime = CaptureInputRuntime::new();
+        let (begin, _, _) = pending();
+        runtime
+            .request(|reply| Command::HoldVoice(begin.clone(), reply))
+            .unwrap();
+        let settings = CaptureInputSettings {
+            endpoint_id: Some("next-configuration".into()),
+            ..Default::default()
+        };
+        let configured = runtime.configure(settings.clone());
+        let recovered = runtime.recover(true);
+        let manual = runtime.set_default("target".into(), "target".into());
+        let restarted = runtime.request(|reply| Command::Begin(begin, reply));
+        runtime.end();
+        let after_end = runtime.configure(settings.clone());
+        runtime.shutdown().unwrap();
+        assert_eq!(
+            configured,
+            Err("voice_session_active_release_before_configuring".into())
+        );
+        assert_eq!(recovered, Err("voice_session_active".into()));
+        assert_eq!(manual.unwrap_err(), "voice_session_active");
+        assert_eq!(restarted, Err("route_voice_session_busy".into()));
+        assert!(after_end.is_ok());
+        assert_eq!(runtime.snapshot().settings, settings);
+    }
+
+    #[test]
+    fn cancelled_held_voice_without_lease_releases_configuration_in_real_worker() {
+        let runtime = CaptureInputRuntime::new();
+        let (begin, _, _) = pending();
+        let timeout = begin.timeout.clone();
+        runtime
+            .request(|reply| Command::HoldVoice(begin, reply))
+            .unwrap();
+        timeout.store(true, Ordering::SeqCst);
+        runtime.sender.try_send(Command::Reconcile).unwrap();
+        let settings = CaptureInputSettings {
+            endpoint_id: Some("after-timeout".into()),
+            ..Default::default()
+        };
+        let result = runtime.configure(settings.clone());
+        runtime.shutdown().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(runtime.snapshot().settings, settings);
+    }
+
+    #[test]
+    fn keep_selected_without_switch_authorization_is_rejected_by_real_worker() {
+        let runtime = CaptureInputRuntime::new();
+        let previous = runtime.snapshot().settings;
+        let result = runtime.configure(CaptureInputSettings {
+            enabled: false,
+            keep_selected: true,
+            ..Default::default()
+        });
+        runtime.shutdown().unwrap();
+        assert_eq!(result, Err("capture_keep_selected_requires_enabled".into()));
+        assert_eq!(runtime.snapshot().settings, previous);
+    }
+
+    #[test]
     fn cancelled_or_expired_restore_never_overwrites_configuration_in_real_worker() {
         let runtime = CaptureInputRuntime::new();
         let committed = CaptureInputSettings {
@@ -1035,6 +1329,7 @@ mod tests {
                 Command::Configure(
                     CaptureInputSettings {
                         enabled: true,
+                        keep_selected: false,
                         endpoint_id: Some("old-target".into()),
                         endpoint_name: Some("old".into()),
                     },
@@ -1054,6 +1349,7 @@ mod tests {
         let runtime = CaptureInputRuntime::new();
         let next = CaptureInputSettings {
             enabled: false,
+            keep_selected: false,
             endpoint_id: Some("new-target".into()),
             endpoint_name: Some("new".into()),
         };
@@ -1069,6 +1365,7 @@ mod tests {
             .unwrap();
         let previous = CaptureInputSettings {
             enabled: true,
+            keep_selected: false,
             endpoint_id: Some("old-target".into()),
             endpoint_name: Some("old".into()),
         };
@@ -1089,6 +1386,7 @@ mod tests {
         let runtime = CaptureInputRuntime::new();
         let config = CaptureInputSettings {
             enabled: true,
+            keep_selected: false,
             endpoint_id: Some("isolated-missing-endpoint".into()),
             endpoint_name: Some("missing".into()),
         };

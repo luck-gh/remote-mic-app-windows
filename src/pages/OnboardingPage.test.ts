@@ -344,7 +344,7 @@ function resetWizardMocks(): void {
     } satisfies AudioSnapshot);
     mocks.getCaptureInput.mockImplementation(async () => {
       const audio = await mocks.getAudioSnapshot();
-      return { settings: { enabled: false, endpointId: audio.selectedEndpointId ? `capture-${audio.selectedEndpointId}` : null, endpointName: "CABLE Output" }, phase: "idle", recoveryPending: false, lastError: null };
+      return { settings: { enabled: false, keepSelected: false, endpointId: audio.selectedEndpointId ? `capture-${audio.selectedEndpointId}` : null, endpointName: "CABLE Output" }, phase: "idle", recoveryPending: false, lastError: null };
     });
     mocks.getAudioRouteSnapshot.mockImplementation(async () => {
       const audio = await mocks.getAudioSnapshot();
@@ -562,7 +562,7 @@ describe("Onboarding wizard shell", () => {
     expect(mocks.openVbCableDownloadPage).toHaveBeenCalledTimes(1);
   });
 
-  it("reads the saved temporary microphone switch choice without rewriting it", async () => {
+  it.each([false, true])("reads the saved temporary microphone switch choice without rewriting it, keepSelected=%s", async (keepSelected) => {
     mocks.getOnboardingState.mockResolvedValue(activeState("audio"));
     mocks.listCaptureInputs.mockResolvedValue([cableEndpoint]);
     mocks.getAudioSnapshot.mockResolvedValue({
@@ -575,7 +575,7 @@ describe("Onboarding wizard shell", () => {
       lastError: null,
     } satisfies AudioSnapshot);
     mocks.getCaptureInput.mockResolvedValue({
-      settings: { enabled: true, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      settings: { enabled: true, keepSelected, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
       phase: "idle",
       recoveryPending: false,
       lastError: null,
@@ -593,7 +593,7 @@ describe("Onboarding wizard shell", () => {
 
     const toggle = wrapper.find(".onboarding-capture-switch input");
     expect(toggle.exists()).toBe(true);
-    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    expect((toggle.element as HTMLInputElement).checked).toBe(!keepSelected);
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
   });
 
@@ -610,7 +610,7 @@ describe("Onboarding wizard shell", () => {
       lastError: null,
     } satisfies AudioSnapshot);
     mocks.getCaptureInput.mockResolvedValue({
-      settings: { enabled: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      settings: { enabled: false, keepSelected: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
       phase: "idle",
       recoveryPending: false,
       lastError: null,
@@ -639,6 +639,7 @@ describe("Onboarding wizard shell", () => {
 
     expect(mocks.setCaptureInput).toHaveBeenCalledExactlyOnceWith({
       enabled: true,
+      keepSelected: false,
       endpointId: cableEndpoint.id,
       endpointName: "CABLE Output",
     });
@@ -659,7 +660,7 @@ describe("Onboarding wizard shell", () => {
       lastError: null,
     } satisfies AudioSnapshot);
     mocks.getCaptureInput.mockResolvedValue({
-      settings: { enabled: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      settings: { enabled: false, keepSelected: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
       phase: "idle",
       recoveryPending: false,
       lastError: null,
@@ -696,7 +697,7 @@ describe("Onboarding wizard shell", () => {
       lastError: null,
     } satisfies AudioSnapshot);
     mocks.getCaptureInput.mockResolvedValue({
-      settings: { enabled: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      settings: { enabled: false, keepSelected: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
       phase: "idle",
       recoveryPending: false,
       lastError: null,
@@ -709,7 +710,7 @@ describe("Onboarding wizard shell", () => {
       renderEndpointId: cableEndpoint.id,
       renderEndpointName: "CABLE Input",
     });
-    let finishSave!: (snapshot: { settings: { enabled: boolean; endpointId: string; endpointName: string }; phase: string; recoveryPending: boolean; lastError: null }) => void;
+    let finishSave!: (snapshot: { settings: { enabled: boolean; keepSelected: boolean; endpointId: string; endpointName: string }; phase: string; recoveryPending: boolean; lastError: null }) => void;
     mocks.setCaptureInput.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
 
     const wrapper = await mountWizard(runtimeWith());
@@ -721,7 +722,7 @@ describe("Onboarding wizard shell", () => {
     expect(mocks.setCaptureInput).toHaveBeenCalledOnce();
 
     finishSave({
-      settings: { enabled: true, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
+      settings: { enabled: true, keepSelected: false, endpointId: cableEndpoint.id, endpointName: "CABLE Output" },
       phase: "idle",
       recoveryPending: false,
       lastError: null,
@@ -746,7 +747,7 @@ describe("Onboarding wizard shell", () => {
     const wrapper = await mountWizard(runtimeWith());
 
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
-    expect(mocks.setCaptureInput).toHaveBeenCalledWith({ enabled: false, endpointId: `capture-${cableEndpoint.id}`, endpointName: "CABLE Output" });
+    expect(mocks.setCaptureInput).toHaveBeenCalledWith({ enabled: false, keepSelected: false, endpointId: `capture-${cableEndpoint.id}`, endpointName: "CABLE Output" });
     const continueButton = wrapper.find(".onboarding-actions .primary-button");
     expect(continueButton.attributes("data-gate-ready")).toBe("true");
     expect(continueButton.attributes("disabled")).toBeUndefined();
