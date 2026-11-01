@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import EnhancedCaptureConfirmDialog from "../components/EnhancedCaptureConfirmDialog.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
 import { VOICE_HOTKEY_CUSTOM_CAPTURE_ENABLED } from "../lib/feature-flags";
@@ -153,14 +153,7 @@ const captureErrorText = computed(() => (captureMessage.value || captureInput.va
 const captureRestoreDisabled = computed(() => captureBusy.value || audioBusy.value || !props.runtime?.platform.windowsApiAvailable || !captureInput.value.settings.endpointId || !captureInput.value.settings.enabled || captureInput.value.recoveryPending);
 const captureFeedbackText = computed(() => captureInput.value.recoveryPending
   ? t('上次会话未完整恢复，请选择如何处理')
-  : captureErrorText.value || (pendingCapture.value ? t('所选麦克风尚未保存，请查看详情。') : capturePhase.value ? t(capturePhase.value) : ''));
-const captureDiagnostics = ref<HTMLElement | null>(null);
-async function openCaptureDiagnostics() {
-  showAdvancedAudio.value = true;
-  await nextTick();
-  captureDiagnostics.value!.focus();
-  reportFrontendEvent({event: 'capture_settings_details', phase: 'completed', result: 'passed', reason: 'opened'});
-}
+  : captureErrorText.value || (pendingCapture.value ? t('所选麦克风尚未保存，请查看高级诊断。') : capturePhase.value ? t(capturePhase.value) : ''));
 const captureChoice = ref<string>();
 const selectedCaptureId = computed(() => captureChoice.value ?? pendingCapture.value?.endpointId ?? captureInput.value.settings.endpointId ?? '');
 let defaultCaptureRequest = 0;
@@ -1545,7 +1538,6 @@ onUnmounted(() => {
           </label>
           <div class="capture-input-feedback capture-input-status" aria-live="polite">
             <p class="capture-feedback-text muted" role="status" :title="captureFeedbackText">{{ captureFeedbackText }}</p>
-            <button type="button" class="capture-feedback-details secondary-button" @click="openCaptureDiagnostics">{{ t('详情') }}</button>
           </div>
           </div>
         </section>
@@ -1553,7 +1545,7 @@ onUnmounted(() => {
         <details class="audio-advanced" :open="showAdvancedAudio" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open">
           <summary>{{ t("高级：声音传输诊断") }}</summary>
           <template v-if="showAdvancedAudio">
-          <div ref="captureDiagnostics" class="capture-input-diagnostics" tabindex="0">
+          <div class="capture-input-diagnostics" tabindex="0">
           <button v-if="captureInput.settings.enabled && audioRoute?.phase === 'unavailable' && captureInput.settings.endpointId" type="button" class="secondary-button" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending" @click="changeCaptureInput(captureInput.settings.enabled)">{{ t("重新连接声音通道") }}</button>
           <p v-if="captureErrorText" role="status">{{ captureErrorText }}</p>
           <p v-else-if="capturePhase">{{ t(capturePhase) }}</p>
@@ -1998,9 +1990,8 @@ onUnmounted(() => {
 .capture-input-behavior .capture-input-restore { margin-top: 8px; }
 .capture-input-behavior .setting-row[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
 .capture-input-settings p { margin: 10px 0 0; font-size: 13px; }
-.capture-input-feedback { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px; min-width: 0; margin-top: 8px; height: 1.4em; line-height: 1.4; }
+.capture-input-feedback { min-width: 0; margin-top: 8px; height: 1.4em; line-height: 1.4; }
 .capture-input-feedback .capture-feedback-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin: 0; font-size: 13px; }
-.capture-feedback-details { padding: 0; min-height: 0; border: 0; background: transparent; color: var(--accent-text); font-size: 12px; line-height: 1.5; }
 .capture-input-diagnostics { overflow-wrap: anywhere; }
 .capture-input-diagnostics:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .audio-advanced { margin-top: 14px; font-size: 13px; }
