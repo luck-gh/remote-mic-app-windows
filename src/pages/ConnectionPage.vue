@@ -153,7 +153,7 @@ const captureErrorText = computed(() => (captureMessage.value || captureInput.va
 const captureRestoreDisabled = computed(() => captureBusy.value || audioBusy.value || !props.runtime?.platform.windowsApiAvailable || !captureInput.value.settings.endpointId || !captureInput.value.settings.enabled || captureInput.value.recoveryPending);
 const captureFeedbackText = computed(() => captureInput.value.recoveryPending
   ? t('上次会话未完整恢复，请选择如何处理')
-  : captureErrorText.value || (pendingCapture.value ? t('所选麦克风尚未保存，请查看详情。') : capturePhase.value ? t(capturePhase.value) : t('输入法已指定麦克风时，无需启用；切换可能增加启动耗时。')));
+  : captureErrorText.value || (pendingCapture.value ? t('所选麦克风尚未保存，请查看详情。') : capturePhase.value ? t(capturePhase.value) : ''));
 const captureDiagnostics = ref<HTMLElement | null>(null);
 async function openCaptureDiagnostics() {
   showAdvancedAudio.value = true;
@@ -214,11 +214,7 @@ async function applyWindowsDefaultInput() {
   } finally { captureBusy.value = false; }
   if (!succeeded) await refreshDefaultCaptureInputs();
 }
-const capturePhase = computed(() => ({ active: "本次说话正在使用所选输入设备", relinquished: "检测到外部改选，本次已让出控制", recovery_required: "上次会话未完整恢复，请选择如何处理", failed: "输入设备服务不可用", unsupported: "仅 Windows 应用支持" }[captureInput.value.phase] ?? (captureInput.value.settings.enabled
-  ? captureInput.value.settings.keepSelected
-    ? "松开后保留为 Windows 默认麦克风；已是默认时可直接开始。"
-    : "松开后恢复原麦克风；已是默认时可直接开始。"
-  : "")));
+const capturePhase = computed(() => ({ active: "本次说话正在使用所选输入设备", relinquished: "检测到外部改选，本次已让出控制", recovery_required: "上次会话未完整恢复，请选择如何处理", failed: "输入设备服务不可用", unsupported: "仅 Windows 应用支持" }[captureInput.value.phase] ?? ''));
 async function refreshCaptureInput() {
   if (captureBusy.value) return;
   const revision = captureRevision;
@@ -285,6 +281,7 @@ const audioScanComplete = ref(false);
 const selectingEndpointId = ref("");
 const openingVbCablePage = ref(false);
 const audioMessage = ref("");
+const audioActionError = ref('');
 /**
  * 语音增益（dB，0–24；对齐 Mac 设置页「增益」滑块）：0 = 原始音量。
  *
@@ -1198,7 +1195,7 @@ async function refreshAudio() {
     audio.value = await getAudioSnapshot();
     return true;
   } catch (error) {
-    audioMessage.value = actionErrorText("get_audio_snapshot", error);
+    audioActionError.value = actionErrorText("get_audio_snapshot", error);
     return false;
   }
 }
@@ -1262,13 +1259,14 @@ async function detectAudioEndpoints() {
   } catch (error) {
     audioEndpoints.value = [];
     audioScanComplete.value = false;
-    audioMessage.value = actionErrorText("list_audio_endpoints", error);
+    audioActionError.value = actionErrorText("list_audio_endpoints", error);
   } finally {
     scanningAudio.value = false;
   }
 }
 
 async function scanAudio() {
+  audioActionError.value = '';
   await Promise.all([detectAudioEndpoints(), scanCaptureInputs(), refreshCaptureInput(), refreshAudio(), refreshAudioRoute()]);
   await refreshDefaultCaptureInputs();
 }
@@ -1279,7 +1277,7 @@ async function changeAudioOutput(event: Event) {
   control.value = audio.value.selectedEndpointId ?? "";
   const endpoint = audioEndpoints.value.find(item => item.id === requested);
   if (!endpoint) {
-    audioMessage.value = t("所选声音写入设备当前不可用");
+    audioActionError.value = t("所选声音写入设备当前不可用");
     reportFrontendEvent({ event: "audio_output_select", phase: "completed", result: "failed", reason: "endpoint_unavailable" });
     return;
   }
@@ -1290,6 +1288,7 @@ async function chooseAudioEndpoint(endpoint: AudioEndpoint) {
   if (captureBusy.value || selectingEndpointId.value || audioBusy.value || captureInput.value.recoveryPending) return;
   selectingEndpointId.value = endpoint.id;
   audioMessage.value = t("正在打开语音设备…");
+  audioActionError.value = '';
   try {
     if (pendingCapture.value) {
       captureBusy.value = true;
@@ -1306,7 +1305,7 @@ async function chooseAudioEndpoint(endpoint: AudioEndpoint) {
     }
     await refreshAudioRoute();
   } catch (error) {
-    audioMessage.value = actionErrorText("select_audio_endpoint", error);
+    audioActionError.value = actionErrorText("select_audio_endpoint", error);
     await refreshAudio();
     try { captureInput.value = await getCaptureInput(); } catch { /* keep last confirmed state */ }
   } finally {
@@ -1317,13 +1316,14 @@ async function chooseAudioEndpoint(endpoint: AudioEndpoint) {
 
 async function openVbCablePage() {
   openingVbCablePage.value = true;
+  audioActionError.value = '';
   try {
     await openVbCableDownloadPage();
     audioMessage.value = t(
       "已打开 VB-CABLE 官方下载页面；安装时需要管理员权限，完成后请重启电脑",
     );
   } catch (error) {
-    audioMessage.value = actionErrorText("open_vb_cable_page", error);
+    audioActionError.value = actionErrorText("open_vb_cable_page", error);
   } finally {
     openingVbCablePage.value = false;
   }
@@ -1509,20 +1509,17 @@ onUnmounted(() => {
           <option v-if="audio.selectedEndpointId && !audioEndpoints.some(endpoint => endpoint.id === audio.selectedEndpointId)" :value="audio.selectedEndpointId" disabled>{{ audio.selectedEndpointName }}</option>
           <option v-for="endpoint in audioEndpoints" :key="endpoint.id" :value="endpoint.id">{{ endpoint.name }}</option>
         </select>
-        <p class="muted audio-output-help">{{ t("上游方式：选择声音写入端，不改变 Windows 默认麦克风。VB-CABLE 选 CABLE Input，输入工具选 CABLE Output。") }}</p>
-        <p class="audio-output-feedback scan-summary muted" role="status" aria-live="polite" :tabindex="audioMessage || audio.lastError || routeError || audioRoute?.phase === 'unavailable' ? 0 : undefined">{{ audio.lastError ? audioDetail : routeError || audioRoute?.phase === 'unavailable' ? t(audioRouteDetail) : audioMessage }}</p>
+        <p class="audio-output-feedback scan-summary muted" role="status" aria-live="polite" :tabindex="audioActionError || audioMessage || audio.lastError || routeError || audioRoute?.phase === 'unavailable' ? 0 : undefined">{{ audioActionError || (audio.lastError ? audioDetail : routeError || audioRoute?.phase === 'unavailable' ? t(audioRouteDetail) : audioMessage) }}</p>
         </section>
 
         <details class="windows-default-settings" @toggle="reportFrontendEvent({ event: 'capture_settings_disclosure', phase: 'completed', result: 'passed', reason: ($event.target as HTMLDetailsElement).open ? 'opened' : 'closed' })">
           <summary>{{ t("Windows 默认麦克风（可选）") }}<span class="capture-summary-feedback" aria-live="polite" :title="captureSummaryMessage">{{ captureSummaryMessage }}</span></summary>
         <section class="capture-input-settings" :aria-label="t('Windows 默认麦克风（可选）')">
-          <dl class="windows-default-inputs" aria-live="polite" tabindex="0" :aria-label="t('当前 Windows 默认麦克风')">
-            <div><dt>{{ t('普通输入') }}</dt><dd>{{ defaultCaptureName('console') }}</dd></div>
-            <div><dt>{{ t('媒体输入') }}</dt><dd>{{ defaultCaptureName('multimedia') }}</dd></div>
-            <div><dt>{{ t('通信输入') }}</dt><dd>{{ defaultCaptureName('communications') }}</dd></div>
-          </dl>
           <div class="capture-input-target">
-          <label for="capture-input-target">{{ t("目标麦克风输入") }}</label>
+          <div class="capture-target-heading">
+            <label for="capture-input-target">{{ t("目标麦克风输入") }}</label>
+            <small class="capture-target-help muted" :title="t('立即生效，自动切换设置不变')">{{ t('立即生效，自动切换设置不变') }}</small>
+          </div>
           <div class="button-row">
             <select id="capture-input-target" :value="selectedCaptureId" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending"
               @change="selectCaptureTarget">
@@ -1532,7 +1529,6 @@ onUnmounted(() => {
             </select>
             <button id="set-windows-default-input" type="button" class="secondary-button" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || connection.voiceState !== 'idle' || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending || !captureEndpoints.some(endpoint => endpoint.id === selectedCaptureId)" @click="applyWindowsDefaultInput">{{ t('设为 Windows 默认') }}</button>
           </div>
-          <p class="capture-target-help muted">{{ t("立即设为系统默认，不启用自动切换。") }}</p>
           </div>
           <div class="capture-input-behavior">
           <label class="setting-row" for="capture-input-switch">
@@ -1560,7 +1556,7 @@ onUnmounted(() => {
           <div ref="captureDiagnostics" class="capture-input-diagnostics" tabindex="0">
           <button v-if="captureInput.settings.enabled && audioRoute?.phase === 'unavailable' && captureInput.settings.endpointId" type="button" class="secondary-button" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending" @click="changeCaptureInput(captureInput.settings.enabled)">{{ t("重新连接声音通道") }}</button>
           <p v-if="captureErrorText" role="status">{{ captureErrorText }}</p>
-          <p v-else>{{ capturePhase ? t(capturePhase) : t('输入法已指定麦克风时，无需启用；切换可能增加启动耗时。') }}</p>
+          <p v-else-if="capturePhase">{{ t(capturePhase) }}</p>
           <p v-if="pendingCapture" role="status">{{ t("所选麦克风尚未保存。请在高级诊断中明确选择同一条音频线的声音写入端，两端将一起保存。") }}</p>
           <div v-if="captureInput.recoveryPending" class="info-callout warning">
             <p>{{ t("上次退出未能确认输入设备恢复。如果此后改过麦克风，请保留当前选择。恢复只处理仍符合原会话记录的设备。") }}</p>
@@ -1570,11 +1566,14 @@ onUnmounted(() => {
             </div>
           </div>
           </div>
-          <p class="muted">{{ t("手动写入端只用于诊断或已有特殊配置。它决定遥控器声音写到哪里，不改变 Windows 默认扬声器；选择扬声器可能直接播放声音，不能代表目标麦克风已收到声音。") }}</p>
-          <p class="muted">{{ t("当前写入端") }}：{{ audio.selectedEndpointName ?? audioPhaseLabel(audio.phase) }}</p>
-          <p class="muted">{{ t(audioRouteDetail) }}</p>
+          <dl class="windows-default-inputs" aria-live="polite" tabindex="0" :aria-label="t('当前 Windows 默认麦克风')">
+            <div><dt>{{ t('普通输入') }}</dt><dd :title="defaultCaptureName('console')">{{ defaultCaptureName('console') }}</dd></div>
+            <div><dt>{{ t('媒体输入') }}</dt><dd :title="defaultCaptureName('multimedia')">{{ defaultCaptureName('multimedia') }}</dd></div>
+            <div><dt>{{ t('通信输入') }}</dt><dd :title="defaultCaptureName('communications')">{{ defaultCaptureName('communications') }}</dd></div>
+          </dl>
+          <p v-if="routeError || audioRoute?.phase === 'unavailable'" data-audio-route-error role="status">{{ t(audioRouteDetail) }}</p>
           <button type="button" class="secondary-button" :disabled="captureBusy || !runtime?.platform.windowsApiAvailable" @click="scanCaptureInputs">{{ t("读取输入设备") }}</button>
-          <p v-if="audioMessage || audio.lastError" role="status">{{ audioMessage || audio.lastError }}</p>
+          <p v-if="audioActionError || audio.lastError" role="status">{{ audioActionError || audioDetail }}</p>
         <ul v-if="audioEndpoints.length" class="device-list endpoint-list">
           <li v-for="endpoint in audioEndpoints" :key="endpoint.id">
             <div>
@@ -1974,8 +1973,7 @@ onUnmounted(() => {
 .audio-output-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
 .audio-output-heading > label { font-size: 13px; font-weight: 600; }
 .audio-output-settings > select { width: 100%; min-width: 0; min-height: 34px; }
-.audio-output-help { margin: 6px 0 0; font-size: 12.5px; }
-.audio-output-feedback { height: 2.8em; margin: 4px 0 0; font-size: 12.5px; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
+.audio-output-feedback { height: 1.4em; margin: 4px 0 0; font-size: 12.5px; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
 .audio-output-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .audio-route-status { margin: 0; padding: 0; border: 0; background: transparent; min-width: 0; font-size: 12px; }
 .windows-default-settings { margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; }
@@ -1983,12 +1981,14 @@ onUnmounted(() => {
 .windows-default-settings > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .capture-summary-feedback { float: right; max-width: 45%; height: 1.4em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .capture-input-settings { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
-.windows-default-inputs { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; height: 4.4em; margin: 0; font-size: 13px; overflow: auto; overflow-wrap: anywhere; }
+.windows-default-inputs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; height: 4.4em; margin: 10px 0; font-size: 13px; overflow: auto; overflow-wrap: anywhere; }
 .windows-default-inputs dt { color: var(--muted); font-size: 12px; }
-.windows-default-inputs dd { margin: 3px 0 0; }
+.windows-default-inputs dd { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 3px 0 0; }
 .windows-default-inputs:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .capture-input-target, .capture-input-behavior { min-width: 0; }
-.capture-input-target > label { display: block; margin-bottom: 8px; font-weight: 600; }
+.capture-target-heading { display: flex; align-items: baseline; gap: 8px; min-height: 22px; margin-bottom: 8px; }
+.capture-target-heading > label { flex-shrink: 0; font-weight: 600; }
+.capture-target-help { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }
 .capture-input-target select { min-height: 36px; }
 .capture-input-target .button-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 .capture-input-target select { min-width: 0; width: 100%; }
@@ -1998,9 +1998,8 @@ onUnmounted(() => {
 .capture-input-behavior .capture-input-restore { margin-top: 8px; }
 .capture-input-behavior .setting-row[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
 .capture-input-settings p { margin: 10px 0 0; font-size: 13px; }
-.capture-input-target .capture-target-help { line-height: 1.4; }
-.capture-input-feedback { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px; min-width: 0; margin-top: 10px; height: 2.8em; line-height: 1.4; }
-.capture-input-feedback .capture-feedback-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin: 0; font-size: 13px; }
+.capture-input-feedback { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px; min-width: 0; margin-top: 8px; height: 1.4em; line-height: 1.4; }
+.capture-input-feedback .capture-feedback-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin: 0; font-size: 13px; }
 .capture-feedback-details { padding: 0; min-height: 0; border: 0; background: transparent; color: var(--accent-text); font-size: 12px; line-height: 1.5; }
 .capture-input-diagnostics { overflow-wrap: anywhere; }
 .capture-input-diagnostics:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

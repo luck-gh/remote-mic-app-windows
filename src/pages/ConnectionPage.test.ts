@@ -266,11 +266,34 @@ describe("VB-CABLE first-launch guidance", () => {
     wrapper.unmount();
   });
 
+  it('keeps an output selection failure visible alongside an unavailable route', async () => {
+    mocks.endpoints = [cableEndpoint, {id: 'second-output', name: 'Second cable input', isVirtualCableCandidate: true}];
+    mocks.getAudioSnapshot.mockResolvedValue({...emptyAudio, phase: 'ready', selectedEndpointId: cableEndpoint.id, selectedEndpointName: cableEndpoint.name});
+    mocks.getAudioRouteSnapshot.mockResolvedValue({phase: 'unavailable', reason: 'render_missing', captureEndpointId: null, captureEndpointName: null, renderEndpointId: cableEndpoint.id, renderEndpointName: cableEndpoint.name});
+    mocks.selectAudioEndpoint.mockRejectedValueOnce(new Error('output selection failed'));
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    await wrapper.get('#audio-output-target').setValue('second-output'); await flushPromises();
+    expect(wrapper.get('.audio-output-feedback').text()).toContain('操作没有完成');
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
+    expect(wrapper.get('.audio-advanced').text()).toContain('操作没有完成');
+    expect(wrapper.find('.audio-advanced [data-audio-route-error]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('does not erase an audio snapshot failure when device enumeration succeeds', async () => {
+    mocks.getAudioSnapshot.mockRejectedValue(new Error('snapshot failed'));
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(mocks.listAudioEndpoints).toHaveBeenCalled();
+    expect(wrapper.get('.audio-output-feedback').text()).toContain('操作没有完成');
+    wrapper.unmount();
+  });
+
   it("guides direct routing without requiring an optional microphone", async () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
     (wrapper.get('.audio-advanced').element as HTMLDetailsElement).open = true;
     await wrapper.get('.audio-advanced').trigger('toggle'); await flushPromises();
-    expect(wrapper.get('.audio-advanced').text()).toContain('请选择声音写入设备');
+    expect(wrapper.get('#audio-output-target').text()).toContain('请选择声音写入设备');
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 
@@ -281,9 +304,26 @@ describe("VB-CABLE first-launch guidance", () => {
     wrapper.unmount();
   });
 
+  it('keeps routine copy compact and puts actual Windows roles in diagnostics', async () => {
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(wrapper.find('.audio-output-help').exists()).toBe(false);
+    expect(wrapper.find('.capture-input-settings .windows-default-inputs').exists()).toBe(false);
+    expect(wrapper.get('.capture-target-heading .capture-target-help').text()).toBe('立即生效，自动切换设置不变');
+    expect(wrapper.get('.capture-feedback-text').text()).toBe('');
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
+    const advanced = wrapper.get('.audio-advanced');
+    expect(advanced.get('.windows-default-inputs').text()).toContain('PC microphone');
+    expect(advanced.text()).not.toContain('手动写入端只用于诊断或已有特殊配置');
+    expect(advanced.text()).not.toContain('当前写入端');
+    expect(mocks.setDefaultCaptureInput).not.toHaveBeenCalled();
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it('shows actual Windows defaults separately from the saved target', async () => {
     mocks.getCaptureInput.mockResolvedValue({settings: {enabled: false, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output'}, phase: 'disabled', recoveryPending: false, lastError: null});
     const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
     expect(wrapper.get('.windows-default-inputs').text()).toContain('PC microphone');
     expect(wrapper.get('.windows-default-inputs').text()).toContain('未设置');
     expect(wrapper.get<HTMLSelectElement>('#capture-input-target').element.value).toBe('capture');
@@ -299,6 +339,7 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(mocks.setDefaultCaptureInput).toHaveBeenCalledExactlyOnceWith('capture', 'CABLE Output');
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
     expect(wrapper.get('.windows-default-inputs').text()).toContain('CABLE Output');
     expect(wrapper.get<HTMLInputElement>('#capture-input-switch').element.checked).toBe(false);
     wrapper.unmount();
@@ -310,6 +351,7 @@ describe("VB-CABLE first-launch guidance", () => {
     await wrapper.get('#capture-input-target').setValue('capture'); await flushPromises();
     await wrapper.get('#set-windows-default-input').trigger('click'); await flushPromises();
     expect(wrapper.get('.capture-input-feedback').text()).toContain('操作没有完成');
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
     expect(wrapper.get('.windows-default-inputs').text()).toContain('PC microphone');
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
@@ -322,6 +364,7 @@ describe("VB-CABLE first-launch guidance", () => {
     await wrapper.get('#capture-input-target').setValue('capture'); await flushPromises();
     await wrapper.get('#set-windows-default-input').trigger('click'); await flushPromises();
     finishRead({console: {id: 'old', name: 'Stale microphone'}, multimedia: null, communications: null}); await flushPromises();
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
     expect(wrapper.get('.windows-default-inputs').text()).not.toContain('Stale microphone');
     expect(wrapper.get('.windows-default-inputs').text()).toContain('CABLE Output');
     wrapper.unmount();
@@ -330,6 +373,7 @@ describe("VB-CABLE first-launch guidance", () => {
   it('shows a default read failure instead of displaying the saved target as current', async () => {
     mocks.getDefaultCaptureInputs.mockRejectedValueOnce(new Error('read failed'));
     const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    await wrapper.get('.capture-feedback-details').trigger('click'); await flushPromises();
     expect(wrapper.get('.windows-default-inputs').text()).toContain('读取失败');
     expect(wrapper.get('.windows-default-inputs').text()).not.toContain('CABLE Output');
     wrapper.unmount();
@@ -437,7 +481,7 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(connectionCard.find('.setup-card').exists()).toBe(false);
     expect(wrapper.get('.setup-card h2').text()).toBe("语音输入设置");
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
-    expect(wrapper.get(".capture-input-behavior").text()).toContain("输入法已指定麦克风时，无需启用");
+    expect(wrapper.get(".capture-feedback-text").text()).toBe('');
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
     wrapper.unmount();
   });
@@ -521,7 +565,7 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(wrapper.get<HTMLInputElement>("#capture-input-restore").element.checked).toBe(restore);
     expect(wrapper.get<HTMLInputElement>("#capture-input-restore").element.disabled).toBe(!enabled);
     expect(wrapper.get(".capture-input-target").text()).not.toContain("已关闭");
-    if (enabled && keepSelected) expect(wrapper.get(".capture-input-status").text()).toContain("保留为 Windows 默认麦克风");
+    expect(wrapper.get('.capture-feedback-text').text()).toBe('');
     wrapper.unmount();
   });
 
