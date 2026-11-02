@@ -270,6 +270,21 @@ describe("VB-CABLE first-launch guidance", () => {
     wrapper.unmount();
   });
 
+  it('uses a section heading for advanced options and keeps a truthful audio callout after gain', async () => {
+    mocks.endpoints = [cableEndpoint];
+    mocks.getAudioSnapshot.mockResolvedValue({...emptyAudio, phase: 'ready', selectedEndpointId: cableEndpoint.id, selectedEndpointName: cableEndpoint.name});
+    mocks.getAudioRouteSnapshot.mockResolvedValue({phase: 'manual', reason: null, captureEndpointId: null, captureEndpointName: null, renderEndpointId: cableEndpoint.id, renderEndpointName: cableEndpoint.name});
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    expect(wrapper.get('.audio-advanced > summary h2').text()).toBe('高级选项与驱动');
+    expect(wrapper.get('.gain-help + .audio-output-feedback').text()).toBe('语音设备已就绪。');
+    expect(wrapper.get('.audio-output-feedback').classes()).toContain('info-callout');
+    mocks.getAudioSnapshot.mockResolvedValue({...emptyAudio, phase: 'failed', selectedEndpointId: cableEndpoint.id, selectedEndpointName: cableEndpoint.name});
+    await wrapper.findAll('button').find(button => button.text() === '刷新设备列表')!.trigger('click'); await flushPromises();
+    expect(wrapper.get('.audio-output-feedback').text()).toContain('语音设备出现问题');
+    expect(wrapper.get('.audio-output-feedback').text()).not.toContain('已就绪');
+    wrapper.unmount();
+  });
+
   it("selects the upstream output without configuring the Windows microphone", async () => {
     mocks.endpoints = [cableEndpoint];
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
@@ -414,7 +429,8 @@ describe("VB-CABLE first-launch guidance", () => {
     await expandAudioDiagnostics(wrapper);
     expect(wrapper.get('.windows-default-inputs').text()).toContain('CABLE Output');
     expect(wrapper.get('.advanced-right').text()).not.toContain('已设为 Windows 默认麦克风');
-    expect(wrapper.get('.capture-summary-feedback').text()).toContain('已设为 Windows 默认麦克风');
+    expect(wrapper.get('.capture-summary-feedback').text()).not.toContain('已设为 Windows 默认麦克风');
+    expect(wrapper.get('.capture-feedback-text').text()).not.toContain('已设为 Windows 默认麦克风');
     expect(wrapper.get<HTMLInputElement>('#capture-input-switch').element.checked).toBe(false);
     wrapper.unmount();
   });
@@ -1976,8 +1992,8 @@ describe("connection page audio gain", () => {
     await slider.setValue("18");
     await flushPromises();
 
-    expect(wrapper.find('[role="alert"]').text()).toContain("增益没有保存");
-    expect(wrapper.find('[role="alert"]').text()).not.toContain("磁盘只读");
+    expect(wrapper.get('.audio-output-feedback').text()).toContain("增益没有保存");
+    expect(wrapper.get('.audio-output-feedback').text()).not.toContain("磁盘只读");
     expect(slider.element.value).toBe("6");
     expect(wrapper.text()).toContain("6 dB");
     wrapper.unmount();

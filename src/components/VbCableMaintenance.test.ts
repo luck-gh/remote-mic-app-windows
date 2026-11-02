@@ -35,6 +35,8 @@ describe('VB-CABLE maintenance',()=>{
   mocks.getComponentStatus.mockResolvedValueOnce(status).mockRejectedValue(new Error('read failed'));
   mocks.performComponentAction.mockResolvedValue({component:'vb_cable',action:'open_vendor_wizard',outcome,reason,status});const wrapper=await panel();await wizard(wrapper).trigger('click');await flushPromises();
   expect(wrapper.get('.component-message').text()).toContain(message);expect(wrapper.get('.component-message').text()).toContain('暂时无法读取组件状态');expect(wizard(wrapper).attributes('disabled')).toBeDefined();
+  expect(wrapper.get('.component-message').attributes('title')).toBe(wrapper.get('.component-message').text());
+  expect(wrapper.get('.component-message').attributes('tabindex')).toBe('0');
  });
  it('does not repeat a busy request or refresh a component that was left',async()=>{
   let finish!:(value:unknown)=>void;mocks.performComponentAction.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));

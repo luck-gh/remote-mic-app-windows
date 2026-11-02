@@ -206,7 +206,6 @@ async function applyWindowsDefaultInput() {
     defaultCaptureInputs.value = await setDefaultCaptureInput(target.id, target.name);
     defaultCaptureError.value = false;
     succeeded = true;
-    captureMessage.value = t('已设为 Windows 默认麦克风');
     reportFrontendEvent({event: 'default_capture_set', phase: 'completed', result: 'passed', reason: 'defaults_confirmed'});
   } catch (error) {
     captureMessage.value = actionErrorText('set_default_capture_input', error);
@@ -1129,7 +1128,7 @@ const connectionTitle = computed(() => {
 });
 
 const audioTone = computed(() => {
-  if (routeError.value || audioRoute.value?.phase === "unavailable") return "error";
+  if (audio.value.phase === 'failed' || audio.value.lastError || routeError.value || audioRoute.value?.phase === "unavailable") return "error";
   if (audio.value.phase === "streaming") return "active";
   if (!captureInput.value.settings.enabled && audioRoute.value?.phase === "manual" && ["ready", "draining"].includes(audio.value.phase)) return "success";
   if (audioRoute.value?.phase !== "paired") return "pending";
@@ -1175,6 +1174,16 @@ const audioRouteDetail = computed(() => {
     enumeration_failed: "无法读取音频设备列表，请刷新后重试。",
   };
   return reasons[route.reason ?? ""] ?? (route.phase === "unconfigured" ? "选择目标麦克风后，程序会自动连接对应的声音通道。" : "尚未确认声音通道，请刷新状态或检查高级设置。");
+});
+const audioStatusText = computed(() => {
+  const problems = [audioActionError.value, audio.value.lastError ? audioDetail.value : audio.value.phase === 'failed' ? t('语音设备出现问题，请稍后重试。') : '', routeError.value || audioRoute.value?.phase === 'unavailable' ? t(audioRouteDetail.value) : '', gainError.value].filter(Boolean);
+  if (problems.length) return problems.join(' · ');
+  if (scanningAudio.value) return t('正在检测 VB-CABLE…');
+  if (selectingEndpointId.value) return t('正在打开语音设备…');
+  if (audio.value.phase === 'unsupported') return t('仅 Windows 应用支持');
+  const routeReady = audioRoute.value?.phase === 'paired' || (!captureInput.value.settings.enabled && audioRoute.value?.phase === 'manual');
+  return routeReady && audio.value.selectedEndpointId && ['ready', 'streaming', 'draining'].includes(audio.value.phase)
+    ? t('语音设备已就绪。') : t(audioRouteDetail.value);
 });
 
 async function refreshAudioRoute() {
@@ -1501,12 +1510,11 @@ onUnmounted(() => {
               <small>{{ t(audioRouteTitle) }}</small>
             </div>
           </div>
-          <p class="scan-summary muted">{{ audioMessage }}</p>
+          <p class="scan-summary muted" tabindex="0" :title="audioMessage">{{ audioMessage }}</p>
           <div class="button-row audio-device-actions">
             <button type="button" class="secondary-button" :aria-expanded="showAudioDevices" @click="toggleAudioDevices">{{ showAudioDevices ? t("收起列表") : t("更换设备") }}</button>
             <small class="muted">{{ t("共 {count} 个设备可选", { count: audioEndpoints.length }) }}</small>
           </div>
-          <p class="audio-output-feedback" role="status" aria-live="polite" tabindex="0">{{ audioActionError || (audio.lastError ? audioDetail : routeError || audioRoute?.phase === 'unavailable' ? t(audioRouteDetail) : '') }}</p>
         <ul v-if="showAudioDevices && audioEndpoints.length" class="device-list endpoint-list">
           <li v-for="endpoint in audioEndpoints" :key="endpoint.id">
             <div>
@@ -1559,7 +1567,7 @@ onUnmounted(() => {
         <p class="muted gain-help">
           {{ t("0 dB 保持原始音量；数值越大声音越响，也会放大环境噪声。建议先从 6–12 dB 开始。") }}
         </p>
-        <p v-if="gainError" class="error-text" role="alert">{{ gainError }}</p>
+        <p class="info-callout audio-output-feedback" :class="{ warning: audioTone === 'error' || audio.phase === 'failed' || Boolean(audioActionError || gainError) }" role="status" aria-live="polite" tabindex="0" :title="audioStatusText">{{ audioStatusText }}</p>
 
         <div v-if="audioScanComplete && !virtualCableInstalled" class="info-callout warning vb-cable-callout">
           <div>
@@ -1580,7 +1588,7 @@ onUnmounted(() => {
     </div>
 
     <details class="card audio-advanced windows-default-settings" :open="showAdvancedAudio" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open; reportFrontendEvent({ event: 'capture_settings_disclosure', phase: 'completed', result: 'passed', reason: showAdvancedAudio ? 'opened' : 'closed' })">
-      <summary>{{ t("高级选项与驱动") }}<span class="capture-summary-feedback" aria-live="polite" :title="captureSummaryMessage">{{ captureSummaryMessage }}</span></summary>
+      <summary><h2>{{ t("高级选项与驱动") }}</h2><span class="capture-summary-feedback" aria-live="polite" :title="captureSummaryMessage">{{ captureSummaryMessage }}</span></summary>
       <div class="advanced-columns">
         <div class="advanced-left">
           <VbCableMaintenance v-if="showAdvancedAudio" />
@@ -1978,12 +1986,12 @@ onUnmounted(() => {
 .advanced-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; margin-top: 16px; }
 .advanced-left, .advanced-right { min-width: 0; }
 .advanced-left h3, .advanced-right h3 { margin: 0 0 12px; font-size: 15px; }
-.windows-microphone-settings { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.windows-microphone-settings { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
 .advanced-right { padding-left: 24px; border-left: 1px solid var(--border); contain: size; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
 .advanced-right:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .advanced-right h4 { font-size: 13px; margin: 12px 0 6px; }
 .audio-advanced { margin-bottom: 16px; }
-.audio-device-actions { align-items: center; gap: 8px; }
+.audio-device-actions { justify-content: flex-start; align-items: center; gap: 8px; }
 @media (max-width: 1000px) { .device-columns, .advanced-columns { grid-template-columns: minmax(0, 1fr); } .advanced-right { padding-left: 0; padding-top: 16px; border-left: 0; border-top: 1px solid var(--border); contain: none; height: 18rem; } }
 .remote-pairing { margin-top: 12px; font-size: 13px; }
 .remote-pairing summary { cursor: pointer; color: var(--muted); }
@@ -1993,14 +2001,15 @@ onUnmounted(() => {
 .voice-device-section { margin-top: 0; }
 .voice-device-section h3 { margin: 0; font-size: 16px; }
 .audio-output-settings { margin-top: 12px; min-width: 0; }
-.audio-output-settings > .scan-summary { height: 2.8em; line-height: 1.4; margin: 8px 0; overflow: auto; overflow-wrap: anywhere; }
-.audio-output-feedback { height: 1.4em; margin: 4px 0 0; font-size: 12.5px; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
+.audio-output-settings > .scan-summary { height: 1.4em; line-height: 1.4; margin: 8px 0; overflow: auto; overflow-wrap: anywhere; }
+.audio-output-feedback { height: calc(1.45em + 18px); margin: 10px 0 0; overflow: auto; overflow-wrap: anywhere; }
 .audio-output-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .audio-route-status { min-width: 0; }
 .audio-route-status strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .audio-route-status .status-heading { min-width: 0; }
 .windows-default-settings { font-size: 13px; }
-.windows-default-settings > summary { color: var(--muted); cursor: pointer; line-height: 1.4; }
+.windows-default-settings > summary { color: var(--text-primary); cursor: pointer; line-height: 1.4; }
+.windows-default-settings > summary h2 { display: inline; margin: 0; color: var(--text-primary); }
 .windows-default-settings > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .capture-summary-feedback { float: right; max-width: 45%; height: 1.4em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .capture-input-settings { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin-top: 12px; }

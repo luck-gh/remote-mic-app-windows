@@ -66,18 +66,18 @@ onUnmounted(()=>{disposed=true;});
       <button type="button" class="secondary-button" :disabled="!wizardAvailable || busy || loading" @click="openVendorWizard">{{ t('打开官方安装/卸载向导') }}</button>
       <a href="https://vb-audio.com/Services/licensing.htm" target="_blank" rel="noreferrer">{{ t('许可与捐赠说明') }}</a>
     </div>
-    <p class="component-message" role="status" aria-live="polite" tabindex="0">{{ feedback }}</p>
+    <p class="component-message" role="status" aria-live="polite" tabindex="0" :title="feedback">{{ feedback }}</p>
   </section>
 </template>
 
 <style scoped>
-.vb-cable-maintenance { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.vb-cable-maintenance { margin: 0; }
 .maintenance-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
 .maintenance-heading h3 { margin: 0; font-size: 14px; }
 .maintenance-heading span { font-size: 12px; }
 .button-row { justify-content: flex-start; align-items: center; }
 .button-row button { white-space: normal; overflow-wrap: anywhere; }
 .button-row a { font-size: 12px; }
-.component-message { height: 2.8em; line-height: 1.4; font-size: 13px; margin: 8px 0 0; overflow: auto; overflow-wrap: anywhere; }
+.component-message { height: 1.4em; line-height: 1.4; font-size: 13px; margin: 4px 0 0; overflow: auto; overflow-wrap: anywhere; }
 .component-message:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>
