@@ -1570,6 +1570,7 @@ export async function resetButtonMappings(): Promise<ButtonMappings> {
 export type ButtonProfilesAccess =
   | { status: "unavailable" }
   | { status: "requiresPlus" }
+  | { status: "temporarilyOffline"; validUntil?: string | null }
   | { status: "allowed"; validUntil?: string | null };
 
 export async function getButtonProfilesAccess(): Promise<ButtonProfilesAccess> {

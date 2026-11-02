@@ -56,6 +56,14 @@ const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 /// 自愈逻辑也没有机会执行。所有连接关键路径的 WinRT 异步调用都必须有界。
 const DEVICE_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 const GATT_ASYNC_TIMEOUT: Duration = Duration::from_secs(5);
+/// 服务/特征发现的上限。Windows 对不可达 BLE 设备的 GATT 连接尝试要等
+/// **约 7.7 秒**才由系统自己放弃（2026-09-22 实测 7689/7697/7698 ms，见
+/// `docs/plan/2026-09-22-atvv-connection-fix-priority.md` P0-3）。5 秒超时
+/// 会在系统放弃前 `Cancel`，把未完成的系统队列项留给紧接着的重连；
+/// 2026-11-01 用户日志里每次重连都先耗 5 秒再失败，随后快速
+/// `gatt_unreachable`。10 秒覆盖系统自身的失败窗口，同时仍能兜住
+/// 2026-10-21 那种永不返回的调用。
+const GATT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// ATVV 麦克风会话延长节拍：遥控器固件对未续期的会话只推约 5-6 秒音频
@@ -3558,11 +3566,12 @@ impl BleSession {
                 .map(|name| name.to_string())
         })?;
         let inferred_model = remote_model_from_name(&name);
-        let model = if inferred_model == RemoteModel::Unknown {
-            read_remote_model(pending.device()).unwrap_or(RemoteModel::Unknown)
-        } else {
-            inferred_model
-        };
+        // 型号只用于界面显示：**不在 `service_discovery` 之前做 GATT 查询**。
+        // 2026-11-01 用户日志：断链状态下 Namespace 0x180A 的查询每次都要等满
+        // 5 秒超时，取消后紧接着发现 ATVV 服务，导致每次重连先白耗 5 秒，
+        // 更容易错过遥控器刚醒来的短窗口。型号改为 ATVV 会话完整建立后再
+        // best-effort 读取（见本函数末尾）。
+        let model = inferred_model;
         {
             let mut snapshot = lock(state);
             snapshot.phase = ConnectionPhase::Discovering;
@@ -3690,6 +3699,37 @@ impl BleSession {
                 battery_sender,
                 connection_generation,
             );
+        }
+        // 型号查询置于 ATVV 订阅及能力请求之后, 不阻塞服务发现。
+        // 未知型号仍须等待有界缓存查询结束才能返回 connect; 不宣称零延迟。
+        // 失败保持 Unknown, 日志只记录型号枚举和 API 错误码。
+        let link_status = match connected.device.ConnectionStatus() {
+            Ok(status) => Some(status),
+            Err(error) => {
+                gatt_note(format!(
+                    "ble_model phase=status_read terminal_result=failed connection_generation={connection_generation} hresult=0x{:08X}",
+                    error.code().0 as u32
+                ));
+                None
+            }
+        };
+        if should_read_model_number(connected.model, link_status) {
+            match read_remote_model(&connected.device) {
+                Some(model) => {
+                    connected.model = model;
+                    lock(state).remote_model = model;
+                    gatt_note(format!(
+                        "ble_model phase=completed terminal_result=passed source=gatt_2a24 model={model:?} connection_generation={connection_generation}"
+                    ));
+                }
+                None => gatt_note(format!(
+                    "ble_model phase=completed terminal_result=unavailable source=gatt_2a24 retryable=false connection_generation={connection_generation}"
+                )),
+            }
+        } else if connected.model == RemoteModel::Unknown {
+            gatt_note(format!(
+                "ble_model phase=skipped reason=link_not_connected status={link_status:?} retryable=false connection_generation={connection_generation}"
+            ));
         }
         Ok(connected)
     }
@@ -3820,6 +3860,37 @@ impl BleSession {
             return Ok(());
         }
         let retrying = self.cleanup_started;
+        // 三个特征共用同轮边界判定. 已观察的断链不能被迟到的 Connected 覆盖;
+        // 状态读取失败时跳过远端写入, 仍继续本地退订与 Close。
+        let disable_remote_notifications = if retrying {
+            false
+        } else {
+            let link_status = match self.device.ConnectionStatus() {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    gatt_note(format!(
+                        "ble_session_cleanup phase=status_read terminal_result=failed connection_generation={} hresult=0x{:08X}",
+                        self.connection_generation, error.code().0 as u32
+                    ));
+                    None
+                }
+            };
+            let allowed = should_disable_notifications(link_status, self.link_disconnected);
+            if !allowed {
+                let reason = if self.link_disconnected {
+                    "observed_disconnect"
+                } else if link_status.is_none() {
+                    "status_unavailable"
+                } else {
+                    "link_not_connected"
+                };
+                gatt_note(format!(
+                    "ble_session_cleanup phase=notify_disable_skipped reason={reason} status={link_status:?} connection_generation={} local_close_required=true",
+                    self.connection_generation
+                ));
+            }
+            allowed
+        };
         gatt_note(format!(
             "ble_session_cleanup phase=requested retrying={retrying} service_closed={} device_closed={}",
             self.service_closed, self.device_closed
@@ -3842,15 +3913,15 @@ impl BleSession {
             {
                 best_effort_failures += 1;
             }
-            let link_disconnected = self.link_disconnected
-                || self.device.ConnectionStatus().ok()
-                    == Some(BluetoothConnectionStatus::Disconnected);
-            if link_disconnected {
-                gatt_note("ble_cleanup phase=remote_cccd action=skipped reason=link_disconnected local_close_required=true".to_owned());
-            } else {
+            if self.close_params_monitor(false) {
+                best_effort_failures += 1;
+            }
+            if disable_remote_notifications {
                 let started = Instant::now();
                 let audio_result = disable_notifications(&self.audio);
                 let control_result = disable_notifications(&self.control);
+                best_effort_failures +=
+                    u32::from(audio_result.is_err()) + u32::from(control_result.is_err());
                 gatt_note(format!(
                     "ble_cleanup phase=remote_cccd action=attempted audio_ok={} control_ok={} elapsed_ms={}",
                     audio_result.is_ok(), control_result.is_ok(), started.elapsed().as_millis()
@@ -3895,7 +3966,7 @@ impl BleSession {
             }
         }
         if !self.battery_service_closed && self.battery_token.is_none() {
-            if !retrying && !self.link_disconnected {
+            if disable_remote_notifications {
                 if let Some(characteristic) = &self.battery_characteristic {
                     let result = disable_notifications(characteristic);
                     gatt_note(format!(
@@ -4529,7 +4600,7 @@ fn find_service(
     let operation = device
         .GetGattServicesForUuidWithCacheModeAsync(uuid, BluetoothCacheMode::Uncached)
         .map_err(windows_error)?;
-    let result = wait_async(operation, GATT_ASYNC_TIMEOUT, "gatt_find_atvv_service")?;
+    let result = wait_async(operation, GATT_DISCOVERY_TIMEOUT, "gatt_find_atvv_service")?;
     require_success(result.Status().map_err(windows_error)?, "发现 ATVV 服务")?;
     let services = result.Services().map_err(windows_error)?;
     if services.Size().map_err(windows_error)? != 1 {
@@ -4609,7 +4680,7 @@ fn find_characteristic(
         .map_err(windows_error)?;
     let result = wait_async(
         operation,
-        GATT_ASYNC_TIMEOUT,
+        GATT_DISCOVERY_TIMEOUT,
         "gatt_find_atvv_characteristic",
     )?;
     require_success(result.Status().map_err(windows_error)?, "发现 ATVV 特征")?;
@@ -4618,6 +4689,30 @@ fn find_characteristic(
         return Err(PlatformError::VoiceCharacteristicMissing(label));
     }
     characteristics.GetAt(0).map_err(windows_error)
+}
+
+/// 是否需要读取 2A24 型号（纯判定，便于单测）。
+///
+/// 型号只用于界面展示；只有名称无法区分型号**且链路已经 Connected** 时才值得
+/// 发起 GATT 查询。断链时查询会等到超时，2026-11-01 用户日志里正是它把每次
+/// 重连额外拖长 5 秒。
+fn should_read_model_number(
+    inferred: RemoteModel,
+    link_status: Option<BluetoothConnectionStatus>,
+) -> bool {
+    inferred == RemoteModel::Unknown && link_status == Some(BluetoothConnectionStatus::Connected)
+}
+
+/// 断链后是否还值得写 CCCD 关闭通知（纯判定）。
+///
+/// 物理断开后 CCCD 写不进去；继续尝试只会让清理多等两个 5 秒超时，并把
+/// 未完成的写入留给系统队列。只在链路仍 Connected 时写，其余情况直接
+/// 退订本地事件并 Close。
+fn should_disable_notifications(
+    link_status: Option<BluetoothConnectionStatus>,
+    observed_disconnect: bool,
+) -> bool {
+    !observed_disconnect && link_status == Some(BluetoothConnectionStatus::Connected)
 }
 
 fn read_remote_model(device: &BluetoothLEDevice) -> Option<RemoteModel> {
@@ -4909,6 +5004,52 @@ mod tests {
         assert!(should_log_voice_gain(Some((1, 0.0)), 1, 24.0));
         assert!(!should_log_voice_gain(Some((1, 24.0)), 1, 24.0));
         assert!(should_log_voice_gain(Some((1, 24.0)), 2, 24.0));
+    }
+
+    #[test]
+    fn model_number_is_only_read_after_the_link_is_connected() {
+        // 2026-11-01 用户日志：断链时 0x180A 查询每次等满 5 秒，随后取消并
+        // 立刻做 ATVV 发现。型号是纯展示信息，只允许在 Connected 后读。
+        assert!(should_read_model_number(
+            RemoteModel::Unknown,
+            Some(BluetoothConnectionStatus::Connected)
+        ));
+        assert!(!should_read_model_number(
+            RemoteModel::Unknown,
+            Some(BluetoothConnectionStatus::Disconnected)
+        ));
+        assert!(!should_read_model_number(RemoteModel::Unknown, None));
+        assert!(!should_read_model_number(
+            RemoteModel::Rc001,
+            Some(BluetoothConnectionStatus::Connected)
+        ));
+        assert!(!should_read_model_number(
+            RemoteModel::Rc003,
+            Some(BluetoothConnectionStatus::Connected)
+        ));
+    }
+
+    #[test]
+    fn cccd_disable_is_skipped_once_the_link_is_down() {
+        // 物理断开后写 CCCD 只会等到 5 秒超时；本地退订与 Close 仍是必需步骤。
+        assert!(should_disable_notifications(
+            Some(BluetoothConnectionStatus::Connected),
+            false
+        ));
+        assert!(!should_disable_notifications(
+            Some(BluetoothConnectionStatus::Disconnected),
+            false
+        ));
+        assert!(!should_disable_notifications(None, false));
+    }
+
+    #[test]
+    fn observed_disconnect_prevents_cccd_writes_when_status_is_stale() {
+        assert!(!should_disable_notifications(
+            Some(BluetoothConnectionStatus::Connected),
+            true
+        ));
+        assert!(!should_disable_notifications(None, true));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 export default {
   "nav.模板": "Templates",
   "nav.连接与语音": "Connection",
+  "nav.键位方案": "Button Profiles",
   "nav.按键": "Buttons",
   "nav.组合动作": "Routines",
   "nav.连接": "Connection",

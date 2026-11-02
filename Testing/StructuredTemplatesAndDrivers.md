@@ -1,5 +1,20 @@
 # 结构化模板、场景遥控与驱动本地验收手册
 
+## 2026-11-02 离线权益统计与蓝牙重连集成
+
+用户明确要求先保存当前1.0.0.11源码, 再完整吸收最新上游。先形成普通本地检查点 `198c5db2213245f45814a03e653917cbe2792ab3`, 保存51路径源码/配套测试/事实记录, 不包括三份仅本地维护规则或过程产物。检查点不代表未完成G1/G2、IME外部改选及过滤器候选已验收。随后在原任务分支以该检查点和 `upstream/main@859833dd54b798d48ef034afeacac52433da4d5f` 为双parent候选, 全部18个上游路径纳入, 个人版本规范值 `1.8.2+12`, 对外1.8.2.12。
+
+两处文本冲突逐块处理: 英文导航取并集; BLE清理保留本地资源成功释放后才清空、失败重试及epoch/回调代次, 同时吸收上游发现专用10秒、型号后置、断链CCCD跳过与首轮参数退订。三个CCCD共用同轮判定, 已观察断链优先于迟到Connected, 状态读取错误记录HRESULT/unknown而非伪装断链。型号后置仍可能延迟未知型号connect返回, 该限制保留。公开会员hook继续None, 没有真实登录/支付/上传服务, 个人模板与切麦不增加会员限制。
+
+- stale Connected反例实际RED, 最小修正后BLE定向36 passed; 独立BLE及非BLE源码审查均无本次新增P1/P2。
+- 首轮完整前端43文件通过、i18n一项failed: 新会员词条将相同产品名译为SayAll, 与个人版Wireless Mic冲突。只统一新增词条译名, 保留完整性测试; 定向5项及最终完整44文件707 passed / 10 skipped, vue-tsc passed。
+- 首轮受限环境的完整Rust在通信/临时文件边界失败并有握手用例无界等待, 保留日志后仅结束精确核实的仓库测试进程, 未触碰安装版或宿主。相同有界桥接用例在受限环境缺描述文件、正常Windows环境通过, 未为环境失败改生产或测试常量。正常环境完整工作区结果为core92 passed、场景4 passed、Windows748 passed / 1 failed / 26 ignored; 唯一失败是检查点已含且本轮实现未改的 `ime::cycle_profile_contract_tests::external_selection_after_alternative_must_not_be_overwritten`, 保留实际wetype覆盖new_user_selection的反例, 不据此称全套Rust通过。应用层另跑241 passed / 1 ignored; fmt、workspace check、runtime-simulation check passed。
+- 安装隔离/覆盖契约11 passed; 四段转换、包名/manifest及重复执行检查passed, 真实NSIS版本比较九场景passed, 没有通过关闭防降级适配1.8.2.12。上述安装器夹具不改变产品注册表或当前安装。
+- 最终release/Vite和真实9资源嵌入验证passed, runtimeSimulation=false; 未签名本地包 `无线麦个人版_1.8.2.12_x64-setup.exe`, SHA-256 `38ebe81783cef720d6d5feeae13ae6a0b13a1b20c3e4fd8f23da526a53178ae2`, 仅位于既有 `target/release/bundle/nsis/`。构建源码基线为检查点 `198c5db2213245f45814a03e653917cbe2792ab3`, 实际内容为待提交双parent工作树, dirty/included指纹 `db1e312d79713fc7ed19066846a98ae99e690e5f753fd1ec989f234891775196`; 不能把检查点单独当作新包完整源码。
+- 正常覆盖安装exit0、cleanup passed、Helper/Gadget与本轮载荷匹配, 八份配置哈希保持(运行统计排除); 安装主程序SHA-256 `f54c8ef565eaf92bd214ad19c0f84d6e0742f5600857c21bb8a93ffd28f1f7b9`。真实Explorer普通用户启动elevated=false, 实际运行指纹匹配; 原生UI确认个人顶栏/当前模板/目录只读刷新、双主卡和默认折叠高级区及八配置保持passed。未执行实际驱动维护、麦克风setter、模板改选、遥控断连或物理语音矩阵。
+
+真实两版交接恢复、冷态/闲置后首键、连续/快速语音及RC001/其他PC继续未验, 不因源码/构建通过标记G1/G2或旧BLE故障完成。过程复用 `target/dev/upstream-integration/`, 当前包与测试必要身份保留至验收收口, 临时暂存脚本收尾回收; 不推送或发布。
+
 ## 2026-11-02 按键示意区紧凑布局
 
 按用户对 `1.0.0.10` 的截图反馈收紧示意区, 不改变按键、语音、模板、监听或保存行为。画布由640降至580 CSS px, 语音卡顶部由8降至0, 六行普通卡按72px卡高与12px间距排列; 卡片/图片大小、字体和点击区不变。图片、连接线、热点与响应式缩放共用当前580px几何。另压缩顶部旧状态预留和header下边距, 不仅移动画布内部卡片。组合候选的状态区固定20px且可滚动/聚焦, 保留长错误及恢复操作, 不靠隐藏错误消除空白。

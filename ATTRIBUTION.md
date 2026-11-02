@@ -647,6 +647,13 @@
 - 只读核对上游 `GetSayAll/remote-mic-app-windows` 的 `859833dd54b798d48ef034afeacac52433da4d5f`: [导航表](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/navigation.ts)、[按键页](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/pages/ButtonsPage.vue#L2362)、[连接页](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/pages/ConnectionPage.vue#L1360)。上游没有独立驱动页, 全按键主入口位于按键页, 连接页提供 VB-CABLE 官网安装提示及同一接管设置的语音别名。
 - 复用页面职责, 未复制上游控制时序: 个人版将原真实接管/恢复面板迁回按键页, 独有官方安装/卸载向导放连接页高级区域, 配对说明与系统设置放遥控器卡片。保留原模型/来源隔离、授权及清理契约; 本次对照不等于吸收该上游提交的 BLE 修改。
 
+## 2026-11-02 离线权益、统计与蓝牙重连来源
+
+- 完整吸收 `GetSayAll/remote-mic-app-windows@859833dd54b798d48ef034afeacac52433da4d5f`, 相对既有 `96dbe78e0bca9442e457e17e073ab33c71377f81` 包含13个提交(10个非合并提交)、18个路径。保留原历史及作者, 不只摘取局部修复; 上游应用版本1.8.2, 个人规范值为 `1.8.2+12`。
+- 模块: core每日最长语音、usage上海统计日及文件替换、会员离线状态/支持码/空hook路径接线、英文词条, 以及 `7049b48186d668cc8af33e20bf06c823c9bb9579` 的BLE发现10秒上限、型号后置、断链跳过远端CCCD。公开hook仍为空, 不装配私有账号/支付/上传实现, 个人模板不增加会员门禁。
+- BLE适配保留本地已观察断链优先级、release/lifecycle代次、battery资源成功后才清除及失败重试; 三个CCCD采用同轮状态判定, 读取失败明确记录HRESULT并继续本地关闭。新增stale Connected反例先RED再修正。未知型号查询仍同步等待connect返回, 不将后置宣称为零延迟。个人产品名英文词条保持现有名称, 不以新会员词条覆盖。
+- 此次源码吸收不证明本机两版交接或其他PC兼容已修复, G1/G2及真实冷态/断链/语音验收仍归原任务。检查点与候选验证归 [布局与集成专项](Testing/StructuredTemplatesAndDrivers.md#2026-11-02-离线权益统计与蓝牙重连集成)。
+
 ## 2026-10-25「回眸」文字版来源
 
 - 语义与产品行为参考（未复制 Swift/SwiftUI 代码或资源）：`HD838A/remote-mic-app` 的 `Sources/RemoteMic/TranscriptHistorySection.swift`、`TranscriptArchiveStore.swift`、`TranscriptCaptureCoordinator.swift`、`BridgeAppModel.swift`，以及 `Tests/RemoteMicTests/TranscriptCaptureCoordinatorTests.swift`、`TranscriptArchiveStoreTests.swift`、`feature/local-transcript-history/README.md`（参考时 HEAD `c1840de92be4e74dd4404d6592e8e72b7b9278ff`）。
