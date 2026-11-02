@@ -80,6 +80,8 @@ Windows 安装列表的 `DisplayVersion` 使用对外点号值, 专用内部注�
 
 ## 本地安装与升级
 
+2026-10-20 本地对照候选按用户授权隔离个人版身份：产品/安装目录名为“无线麦个人版”，Tauri identifier 为 `app.luckgh.remote-mic.personal.windows`，厂商注册键为 `Software\LuckGH`；运行目录 `SayAllPersonal`、计划任务 `SayAll Personal RC003 Helper`、Helper 端口 47832 与上游分开。退出/激活事件和单实例锁也独立。此候选替代上一节保留历史技术身份的要求，不自动迁移或合并两版配置，不扩大为同时接管同一遥控器的支持。个人签名密钥默认位置同步改为 `%LOCALAPPDATA%\SayAllPersonal\personal-updater.key`，防止上游卸载清理共享目录时误删；不生成新密钥或改变公钥。安装/切换前正常退出旧实例并核对 Agent 身份，驻留模块不等于已经卸载。回归测试入口为 `node --test scripts/test-personal-install-isolation.cjs`。
+
 - 本地包构建明确设置 `SAYALL_BUILD_CHANNEL=local` 与 `SAYALL_BUNDLE_BUILD=1`；后一变量开启 staging 回执门禁，不能用 `GITHUB_SHA` 或仅设置通道替代。日常 Cargo check/test 不要求包载荷回执。
 - 当前本地 Tauri 前端输入目录为仓库根目录 `dist`。`scripts/build-local-input-candidate.ps1` 与 `scripts/build-local-test-package.ps1` 必须先构建当前 Vite 输出，再共用 `verify-frontend-embedded` 内容门禁：将 fresh HTML/资源回执与实际 EXE 的唯一压缩载荷、解压内容及 HTML 脚本引用逐字节核对。不要用旧 `dist-build`、检查配置路径字符串或旧回执代替内容核验；门禁失败时禁止继续把包当作当前前端候选。2026-10-13 B8 旧包因 `dist`/`dist-build` 输入不一致被新门禁以 `compiler_input_mismatch` 拒绝；门禁12项通过后新本地 NSIS 仍需单独完成安装和实际 Explorer 运行读回。
 - 身份记录区分 `sourceBaseCommit`、`sourceState`、`sourceFingerprint` 与 `sourceCommit`；dirty/unknown 的 `sourceCommit=null`。打包指纹纳入约定源码输入与本轮回执中实际载荷字节，不提交未提交修改，也不创建源码副本。安装后从实际进程日志读回五个身份字段，并对照 manifest、包 metadata、普通权限实例与安装载荷；具体字段契约见 [LOGGING](LOGGING.md#行格式与诊断头)。

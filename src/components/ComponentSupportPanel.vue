@@ -8,7 +8,6 @@ import {
   type CaptureSupport, type Rc003BridgeSnapshot, type Rc003TaskStatus,
 } from "../lib/bridge";
 
-const loading = ref(false);
 const captureTask = ref<Rc003TaskStatus | null>(null);
 const captureBridge = ref<Rc003BridgeSnapshot | null>(null);
 const captureBusy = ref(false);
@@ -29,13 +28,13 @@ const capturePresentation = computed(() => {
   }
   if (cleanupPending.value) return captureTask.value?.canRetryCleanup
     ? { state: "cleanup_pending", text: "关闭待完成", tone: "warning", icon: "◷", detail: "上一次关闭尚未完成。重试关闭会自动恢复残留的按键状态，完成后可再次开启。" }
-    : { state: "cleanup_blocked", text: "按键支持暂不可用", tone: "error", icon: "!", detail: "上一次关闭的完成状态尚未确认，当前无法继续开启。请刷新状态查看恢复结果。" };
-  if (captureReadError.value) return { state: "read_failed", text: "状态读取失败", tone: "error", icon: "!", detail: "暂时无法确认当前状态，请刷新后再操作。" };
+    : { state: "cleanup_blocked", text: "按键支持暂不可用", tone: "error", icon: "!", detail: "上一次关闭的完成状态尚未确认，当前无法继续开启，正在自动检查恢复结果。" };
+  if (captureReadError.value) return { state: "read_failed", text: "状态读取失败", tone: "error", icon: "!", detail: "暂时无法确认当前状态，正在自动重试。" };
   if (captureSupport.value?.available === false) return { state: "unsupported", text: "暂不可用", tone: "warning", icon: "!", detail: "这台电脑暂不支持全按键支持，其他按键不受影响。" };
   const task = captureTask.value;
   if (!task) return { state: "unknown", text: "正在读取状态", tone: "pending", icon: "◷", detail: "正在检查全按键支持。" };
-  if (captureError.value?.action === "disable") return { state: "failed", text: "关闭未完成", tone: "error", icon: "!", detail: task.lastError || "尚未确认关闭结果，请刷新状态。" };
-  if (captureError.value || task.lastError) return { state: "failed", text: task.enabled ? "运行异常" : "未能开启", tone: "error", icon: "!", detail: task.lastError || (task.enabled ? "全按键支持尚未恢复，请刷新状态或关闭后重试。" : "全按键支持未启动，请确认授权情况后再操作。") };
+  if (captureError.value?.action === "disable") return { state: "failed", text: "关闭未完成", tone: "error", icon: "!", detail: task.lastError || "尚未确认关闭结果，正在自动检查。" };
+  if (captureError.value || task.lastError) return { state: "failed", text: task.enabled ? "运行异常" : "未能开启", tone: "error", icon: "!", detail: task.lastError || (task.enabled ? "全按键支持尚未恢复，可关闭后重试或重新授权并启动。" : "全按键支持未启动，请再次开启并确认 Windows 授权。") };
   if (!task.enabled) return { state: "disabled", text: "已关闭", tone: "pending", icon: "—", detail: "开启后可使用 RC003 上已配置的按键；RC001 保持原有输入方式。" };
   const snapshot = captureBridge.value;
   if (snapshot?.phase === "failed") return { state: "failed", text: "运行异常", tone: "error", icon: "!", detail: "全按键支持启动失败，可重新授权并启动。" };
@@ -67,6 +66,9 @@ async function readCaptureState(force = false) {
       if (support) captureSupport.value = support;
       captureReadError.value = false;
       if (captureError.value?.action === "disable" && !task.enabled && !task.cleanupPending && !task.lastError) captureError.value = null;
+      if (captureError.value?.action === "enable" && task.enabled && !task.cleanupPending && !task.lastError
+        && bridge.phase === "connected" && bridge.targetUsages.length > 0
+        && bridge.targetUsages.every(usage => bridge.ownedUsages.includes(usage))) captureError.value = null;
     }
   } catch {
     if (!disposed && generation === captureGeneration && readGeneration === captureReadGeneration) captureReadError.value = true;
@@ -92,7 +94,7 @@ async function enableCapture() {
       if (!disposed) captureReadError.value = true;
     }
   } catch {
-    if (!disposed) captureError.value = { action: "enable", message: "未能开启全按键支持。请确认 Windows 授权已完成，再刷新状态。" };
+    if (!disposed) captureError.value = { action: "enable", message: "未能开启全按键支持。请再次开启并完成 Windows 授权。" };
     await readCaptureState(true);
   } finally { captureBusy.value = false; captureAction.value = null; }
 }
@@ -106,18 +108,22 @@ async function disableCapture() {
     const task = await disableRc003Capture();
     if (!disposed) { captureTask.value = task; captureReadError.value = false; }
   } catch {
-    if (!disposed) captureError.value = { action: "disable", message: "关闭未完成，请刷新状态后重试关闭。" };
+    if (!disposed) captureError.value = { action: "disable", message: "关闭未完成，正在自动检查释放结果；确认后可重试关闭。" };
     await readCaptureState(true);
   } finally { captureBusy.value = false; captureAction.value = null; }
 }
-async function refresh() {
-  loading.value = true;
-  captureError.value = null;
-  try { await readCaptureState(); }
-  finally { loading.value = false; }
+function toggleCapture(event: Event) {
+  const input = event.currentTarget as HTMLInputElement;
+  // The task readback owns the switch, including a cancelled authorization.
+  input.checked = captureTask.value?.enabled === true;
+  if (captureBusy.value || captureReadError.value || cleanupPending.value) return;
+  if (captureTask.value?.enabled) void disableCapture();
+  else requestCapture();
 }
+const showCaptureNotice = computed(() => !['active', 'disabled'].includes(capturePresentation.value.state));
+const captureToggleDisabled = computed(() => captureBusy.value || captureReadError.value || cleanupPending.value || !captureTask.value || (!captureTask.value.enabled && !captureCanEnable.value));
 onMounted(() => {
-  void refresh();
+  void readCaptureState();
   statusTimer = setInterval(() => {
     if (!captureBusy.value) void readCaptureState();
   }, 1000);
@@ -128,58 +134,41 @@ onUnmounted(() => { disposed = true; if (statusTimer !== null) clearInterval(sta
 <template>
   <section class="component-support">
     <div class="support-heading">
-      <div class="support-title">
-        <h2>全按键支持</h2>
-        <span class="support-status" :class="capturePresentation.tone" role="status" aria-live="polite"><span aria-hidden="true">{{ capturePresentation.icon }}</span> {{ capturePresentation.text }}</span>
-      </div>
-      <button type="button" class="secondary-button support-refresh" :disabled="loading || captureBusy" @click="() => refresh()">{{ loading ? "检测中…" : "刷新状态" }}</button>
+      <slot name="prefix" />
+      <label class="toggle-row capture-controls" :title="capturePresentation.text">
+        <span>全按键支持</span>
+        <input class="toggle-input" type="checkbox" aria-label="全按键支持" :checked="captureTask?.enabled === true" :disabled="captureToggleDisabled" :aria-busy="captureBusy" @change="toggleCapture" />
+      </label>
+      <slot />
+      <slot name="device" />
     </div>
-    <div class="capture-summary">
-      <div class="capture-state-copy" tabindex="0">
-        <p>{{ capturePresentation.detail }}</p>
+    <div class="capture-summary" tabindex="0">
+      <div v-show="showCaptureNotice" class="capture-state-copy" :class="capturePresentation.tone">
+        <span class="support-status" role="status" aria-live="polite">{{ capturePresentation.text }}</span>
+        <span> · {{ capturePresentation.detail }}</span>
         <p v-if="captureError && !cleanupPending && !captureTask?.lastError" role="alert" class="capture-error">{{ captureError.message }}</p>
+        <button v-if="cleanupPending && captureTask?.canRetryCleanup" type="button" class="capture-recovery" :disabled="captureBusy || captureReadError" @click="disableCapture">{{ captureBusy ? "正在恢复…" : "重试关闭" }}</button>
+        <button v-if="!cleanupPending && captureNeedsRestart" type="button" class="capture-recovery" :disabled="!captureCanEnable" @click="requestCapture">重新授权并启动</button>
       </div>
-      <div class="button-row capture-controls">
-        <template v-if="cleanupPending">
-          <button v-if="captureTask?.canRetryCleanup" type="button" class="secondary-button" :disabled="captureBusy || captureReadError" @click="disableCapture">{{ captureBusy ? "正在恢复…" : "重试关闭" }}</button>
-        </template>
-        <template v-else>
-          <button v-if="!captureTask?.enabled || captureNeedsRestart" type="button" class="primary-button" :disabled="!captureCanEnable" @click="requestCapture">{{ captureBusy ? "正在开启…" : captureTask?.enabled ? "重新授权并启动" : "开启全按键支持" }}</button>
-          <button v-if="captureTask?.enabled" type="button" class="secondary-button" :disabled="captureBusy || captureReadError" @click="disableCapture">{{ captureBusy ? "处理中…" : "关闭全按键支持" }}</button>
-        </template>
-      </div>
+      <slot name="feedback" />
     </div>
-    <details class="capture-help">
-      <summary>授权与自动恢复说明</summary>
-      <p>每次开启需确认 Windows 管理员授权；保持开启时，重新打开无线麦会自动恢复。关闭后不再自动恢复，重新开启需要再次授权。</p>
-    </details>
     <EnhancedCaptureConfirmDialog v-if="confirmCapture" @close="confirmCapture = false" @confirm="enableCapture" />
   </section>
 </template>
 
 <style scoped>
 .component-support { min-width: 0; }
-.support-heading, .support-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
-.support-heading { justify-content: space-between; }
-.support-title h2 { margin: 0; }
-.support-refresh { flex-shrink: 0; }
-.support-status { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 4px 9px; border: 1px solid currentColor; border-radius: 6px; font-size: 12px; font-weight: 600; line-height: 1.4; }
-.support-status.pending { color: var(--text-control); background: var(--pending-surface); }
-.support-status.warning { color: var(--warning-text); background: var(--warning-surface); }
-.support-status.success { color: var(--success-text); background: var(--success-surface); }
-.support-status.error { color: var(--error-text); background: var(--error-surface); }
-.capture-summary { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 20px; margin-top: 12px; }
-.capture-state-copy { flex: 1 1 260px; min-width: 0; height: 3.2em; overflow: auto; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; }
-.capture-state-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.capture-state-copy p { margin: 0; font-size: 13px; line-height: 1.6; }
-.capture-state-copy .capture-error { margin-top: 7px; color: var(--error-text); }
-.capture-controls { flex-shrink: 0; justify-content: flex-start; }
-.capture-help { margin-top: 12px; color: var(--text-secondary); font-size: 12px; }
-.capture-help summary { cursor: pointer; width: fit-content; max-width: 100%; }
-.capture-help p { margin: 8px 0 0; line-height: 1.6; }
-@media (max-width: 640px) {
-  .support-heading { align-items: flex-start; }
-  .support-title { gap: 7px; }
-  .capture-controls { width: 100%; }
-}
+.support-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.capture-controls { flex: 0 0 auto; gap: 6px; font-size: 12px; white-space: nowrap; }
+.capture-controls .toggle-input { width: 36px; height: 22px; }
+.capture-controls .toggle-input::after { width: 16px; height: 16px; }
+.capture-controls .toggle-input::after { top: 3px; }
+.capture-summary { height: 20px; overflow: auto; overflow-wrap: anywhere; margin-top: 0; font-size: 12px; line-height: 20px; }
+.capture-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.support-status { font-weight: 600; }
+.capture-state-copy { display: inline; }
+.capture-state-copy.warning { color: var(--warning-text); }
+.capture-state-copy.error, .capture-error { color: var(--error-text); }
+.capture-state-copy p { margin: 0; }
+.capture-recovery { display: inline; margin-left: 8px; padding: 0; border: 0; background: none; color: var(--accent); font-size: inherit; text-decoration: underline; }
 </style>

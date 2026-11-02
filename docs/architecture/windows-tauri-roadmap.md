@@ -6,6 +6,8 @@
 
 `mwlt/Voice_VibeCoding`、PR #249、ZSTDJan Windows 版本和 Vibe Flow 只作为带来源的架构、实现和故障经验参考。
 
+2026-10-20 用户确认按键捕获底层优先复用 Windows 上游的报告格式与动态 usage 规则，个人版差异集中于模板、程序关联、菜单等独立能力；不继续维护固定系统 DLL 哈希与 WDF/PDO 偏移适配。共享宿主的内容判定不保证同格式同 usage 设备隔离；此次替代关系见 [PLAN](../PLAN.md#当前整合windows-官方上游2026-09-27)，实现来源及实际验证分别归 [ATTRIBUTION](../../ATTRIBUTION.md#统一上游全按键支持2026-10-03) 与 [同主题 Bug](../../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-系统模块变化后恢复上游捕获规则)。
+
 Windows UI 的唯一产品设计基准是无线麦 macOS 原版。Windows 使用本地标题栏、Segoe UI Variable、系统 Accent 和 WebView2，不模拟 macOS 红黄绿窗口按钮或 Liquid Glass。
 
 ## 2. 产品范围

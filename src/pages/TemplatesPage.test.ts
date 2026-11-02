@@ -11,7 +11,7 @@ import {
   getMappingConfiguration, listPresetApps, saveMappingConfiguration,
   getSceneSnapshot, selectCurrentTemplate, subscribeSceneEvents,
   getTemplateCatalog, copyTemplateCatalogEntry, deleteMappingTemplate, resetBuiltinTemplate, setButtonMappingFollowEnabled, setMappingNoticeEnabled, setMenuTemplateSwitchEnabled, updateButtonMappingTemplate,
-  listRunningApps, removeApplicationBinding, upsertApplicationBinding,
+  listRunningApps, removeApplicationBinding, upsertApplicationBinding, updateApplicationBindings,
   type MappingConfiguration,
 } from "../lib/bridge";
 
@@ -24,7 +24,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     updateButtonMappingTemplate: vi.fn(), copyTemplateCatalogEntry: vi.fn(), deleteMappingTemplate: vi.fn(), resetBuiltinTemplate: vi.fn(), saveMappingConfiguration: vi.fn(),
     getTemplateCatalog: vi.fn(), setButtonMappingFollowEnabled: vi.fn(), setMappingNoticeEnabled: vi.fn(), setMenuTemplateSwitchEnabled: vi.fn(),
     listRunningApps: vi.fn(), removeApplicationBinding: vi.fn(),
-    upsertApplicationBinding: vi.fn(),
+    upsertApplicationBinding: vi.fn(), updateApplicationBindings: vi.fn(),
   };
 });
 
@@ -259,7 +259,7 @@ describe("templates page", () => {
     wrapper.unmount();
   });
 
-  it("keeps other controls enabled and stable during a rule save and guards repeated clicks", async () => {
+  it("keeps independent rules and refresh stable while blocking association writes during a rule save", async () => {
     let resolveSave!: (value: MappingConfiguration) => void;
     vi.mocked(setMappingNoticeEnabled).mockReturnValueOnce(new Promise(resolve => { resolveSave = resolve; }));
     const wrapper = mount(TemplatesPage); await flushPromises();
@@ -273,7 +273,7 @@ describe("templates page", () => {
     expect(notice.attributes("aria-busy")).toBe("true");
     expect(notice.attributes("aria-disabled")).toBe("true");
     expect(refresh.attributes("disabled")).toBeUndefined();
-    expect(add.attributes("disabled")).toBeUndefined();
+    expect(add.attributes("disabled")).toBeDefined();
     expect(wrapper.get(".run-modes").element).toBe(card);
     controls.forEach((control, index) => {
       expect(control.attributes("disabled")).toBeUndefined();
@@ -479,6 +479,55 @@ describe("templates page", () => {
     expect(wrapper.findAll(".association-row")).toHaveLength(1);
     expect(wrapper.text()).toContain("关联保存失败");
     expect(refresh.attributes("disabled")).toBeUndefined();
+  });
+
+  it.each([
+    ["按程序加载默认模板", setButtonMappingFollowEnabled],
+    ["菜单键选择完整模板", setMenuTemplateSwitchEnabled],
+    ["模板切换提示", setMappingNoticeEnabled],
+  ] as const)("blocks bulk changes while %s is pending and restores them after failure", async (label, command) => {
+    let rejectRule!: (reason: Error) => void;
+    vi.mocked(command).mockReturnValueOnce(new Promise((_, reject) => { rejectRule = reject; }));
+    const wrapper = mount(TemplatesPage); await flushPromises();
+    const child = wrapper.findComponent(ApplicationTemplateBindings);
+    await child.find(".association-row input").setValue(true);
+    await wrapper.get(`input[aria-label="${label}"]`).trigger("change");
+    expect(child.props("disabled")).toBe(true);
+    await child.find(".association-bulk-actions button").trigger("click");
+    expect(child.find("[role=dialog]").exists()).toBe(false);
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+    rejectRule(new Error("规则写入失败")); await flushPromises();
+    expect(child.props("disabled")).toBe(false);
+    await child.find(".association-bulk-actions button").trigger("click");
+    expect(child.find("[role=dialog]").exists()).toBe(true);
+    await child.find("[role=dialog]").trigger("keydown", { key: "Escape" });
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("blocks all rule writes while bulk save is pending and restores them after failure and cancellation", async () => {
+    let rejectBatch!: (reason: Error) => void;
+    vi.mocked(updateApplicationBindings).mockReturnValueOnce(new Promise((_, reject) => { rejectBatch = reject; }));
+    const wrapper = mount(TemplatesPage); await flushPromises();
+    const child = wrapper.findComponent(ApplicationTemplateBindings);
+    await child.find(".association-row input").setValue(true);
+    await child.findAll(".association-bulk-actions button")[1]!.trigger("click");
+    await child.find(".settings-dialog-actions .primary-button").trigger("click");
+    for (const control of wrapper.findAll(".mode-row input")) {
+      expect(control.attributes("disabled")).toBeDefined();
+      await control.trigger("change");
+    }
+    expect(setButtonMappingFollowEnabled).not.toHaveBeenCalled();
+    expect(setMenuTemplateSwitchEnabled).not.toHaveBeenCalled();
+    expect(setMappingNoticeEnabled).not.toHaveBeenCalled();
+    rejectBatch(new Error("批量写入失败")); await flushPromises();
+    expect(wrapper.findAll(".mode-row input").every(control => control.attributes("disabled") === undefined)).toBe(true);
+    await child.find("[role=dialog]").trigger("keydown", { key: "Escape" });
+    await wrapper.get('input[aria-label="按程序加载默认模板"]').setValue(true); await flushPromises();
+    expect(setButtonMappingFollowEnabled).toHaveBeenCalledExactlyOnceWith(true);
+    expect(child.props("configuration").buttonMappingFollowEnabled).toBe(true);
+    expect(updateApplicationBindings).toHaveBeenCalledOnce();
+    wrapper.unmount();
   });
 
   it("confirms the named template in the app dialog and cancels without writes", async () => {

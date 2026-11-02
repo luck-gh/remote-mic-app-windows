@@ -22,6 +22,8 @@ import {
   buttonLabel,
   buttonLabels,
   buttonTriggerLabel,
+  connectionPhaseLabel,
+  disconnectRemote,
   chordLabel,
   exportMappingConfiguration,
   getButtonMappingSnapshot,
@@ -329,6 +331,8 @@ const menuModeError = ref<string | null>(null);
 let menuConfigurationRevision = 0;
 const templateCatalog = ref<TemplateCatalogEntry[]>([]);
 const editingSource = ref<EditingSource>("common");
+const retainedDrafts = ref(new Map<EditingSource, { mappings: ButtonMappings; saved: ButtonMappings }>());
+let discardedSource: EditingSource | null = null;
 /** 已安装的预设应用（打开应用动作可选列表）。 */
 const presetApps = ref<PresetAppInfo[]>([]);
 /** 组合动作库（「组合动作」动作分组的候选；2026-10-15）。 */
@@ -345,6 +349,10 @@ const mappingSnapshot = ref<ButtonMappingSnapshot | null>(null);
 const busy = ref(false);
 const statusMessage = ref<string | null>(null);
 const saveTemplateDialogOpen = ref(false);
+const footerFeedbackOpen = ref(false);
+const displayedFooterFeedback = ref<string[]>([]);
+const selectionToggle = ref<HTMLInputElement | null>(null);
+let footerFeedbackTrigger: HTMLButtonElement;
 const templateNameDraft = ref("");
 const templateNameError = ref<string | null>(null);
 let unlistenEdges: (() => void) | null = null;
@@ -463,6 +471,44 @@ const repeatOffLabel = computed(() =>
 
 const activeTemplateEntry = computed(() => editingSource.value === "common" ? null : templateCatalog.value.find(t => t.id === editingSource.value.slice("template:".length)) ?? null);
 const dirty = computed(() => JSON.stringify(mappings.value) !== JSON.stringify(savedSnapshot.value));
+const editingAvailable = computed(() => !!currentTemplate.applied.value && mappingsForSource(editingSource.value) !== null);
+const editingBusy = computed(() => busy.value || currentTemplate.applying.value || !editingAvailable.value);
+const footerFeedback = computed(() => {
+  const messages: string[] = [];
+  if (selectionPreference.error.value) messages.push(selectionPreference.error.value);
+  if (statusMessage.value) messages.push(statusMessage.value);
+  if (mappingSnapshot.value?.lastError) messages.push(mappingSnapshot.value.lastError);
+  if (mappingSnapshot.value && !mappings.value.enabled) messages.push("总开关关闭（按键保持原样）");
+  if (dirty.value) messages.push("当前编辑目标有未保存更改");
+  return messages;
+});
+
+function openFooterFeedback(event: MouseEvent): void {
+  footerFeedbackTrigger = event.currentTarget as HTMLButtonElement;
+  displayedFooterFeedback.value = [...footerFeedback.value];
+  footerFeedbackOpen.value = true;
+  reportFrontendEvent({ event: "button_mapping_feedback", phase: "started", result: "passed", reason: "user_opened" });
+}
+
+async function closeFooterFeedback(): Promise<void> {
+  footerFeedbackOpen.value = false;
+  await nextTick();
+  (footerFeedbackTrigger.isConnected ? footerFeedbackTrigger : selectionToggle.value!).focus();
+  reportFrontendEvent({ event: "button_mapping_feedback", phase: "completed", result: "passed", reason: "user_dismissed" });
+}
+
+function trapFooterFeedbackFocus(event: KeyboardEvent): void {
+  const controls = (event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button, [tabindex="0"]');
+  const first = controls[0]!;
+  const last = controls[controls.length - 1]!;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 
 const enabled = computed({
   get: () => mappings.value.enabled,
@@ -470,14 +516,6 @@ const enabled = computed({
     mappings.value = { ...mappings.value, enabled: value };
   },
 });
-
-const editingSourceOptions = computed(() => [
-  { value: "common" as EditingSource, label: "通用配置" },
-  ...templateCatalog.value.map((entry) => ({
-    value: `template:${entry.id}` as EditingSource,
-    label: entry.name,
-  })),
-]);
 
 const activeTemplateOptions = computed(() => {
   const activeId = currentTemplate.templateId.value;
@@ -488,13 +526,59 @@ const activeTemplateOptions = computed(() => {
     ...templateCatalog.value.map(entry => ({ value: entry.id, label: entry.name })),
   ];
 });
+const templateRefreshError = ref('');
+let templateRefreshPending = false;
+let templateRefreshRequest = 0;
+async function refreshTemplateChoices(): Promise<void> {
+  if (templateRefreshPending || unmounted) return;
+  templateRefreshPending = true;
+  const request = ++templateRefreshRequest;
+  const catalogAtRequest = templateCatalog.value;
+  reportFrontendEvent({event: 'button_template_choices', phase: 'requested', result: 'unknown', reason: 'selector_opened'});
+  try {
+    const catalog = await getTemplateCatalog();
+    if (unmounted || request !== templateRefreshRequest) return;
+    if (templateCatalog.value !== catalogAtRequest) {
+      reportFrontendEvent({event: 'button_template_choices', phase: 'completed', result: 'unknown', reason: 'catalog_changed_while_reading'});
+      return;
+    }
+    templateCatalog.value = catalog;
+    templateRefreshError.value = '';
+    reportFrontendEvent({event: 'button_template_choices', phase: 'completed', result: 'passed', reason: 'read_completed'});
+  } catch {
+    if (!unmounted && request === templateRefreshRequest) templateRefreshError.value = '未能刷新模板列表，请重新打开下拉菜单重试。';
+    reportFrontendEvent({event: 'button_template_choices', phase: 'completed', result: 'failed', reason: 'read_failed'});
+  } finally { if (request === templateRefreshRequest) templateRefreshPending = false; }
+}
 
-function selectActiveTemplate(event: Event): void {
+async function selectActiveTemplate(event: Event): Promise<void> {
   const select = event.currentTarget as HTMLSelectElement;
   const requested = select.value === "common" ? null : select.value;
-  // The control always reflects the confirmed mapping; the API result/event moves it.
   select.value = currentTemplate.applied.value?.templateId ?? "common";
-  void currentTemplate.activate(requested);
+  if (busy.value || currentTemplate.applying.value || requested === currentTemplate.templateId.value) return;
+  reportFrontendEvent({ event: "button_mapping_template_switch", phase: "started", result: "passed", reason: dirty.value ? "unsaved_draft" : "saved_configuration" });
+  const source = editingSource.value;
+  if (dirty.value) {
+    if (window.confirm("当前配置有未保存更改。确定将先保存，再切换当前模板。")) {
+      if (!await persist("配置已保存")) {
+        reportFrontendEvent({ event: "button_mapping_template_switch", phase: "completed", result: "failed", reason: "save_failed" });
+        return;
+      }
+      if (editingSource.value !== source) {
+        reportFrontendEvent({ event: "button_mapping_template_switch", phase: "completed", result: "cancelled", reason: "external_template_changed" });
+        return;
+      }
+    } else if (!window.confirm("放弃当前未保存更改并切换当前模板？")) {
+      reportFrontendEvent({ event: "button_mapping_template_switch", phase: "completed", result: "cancelled", reason: "draft_retained" });
+      return;
+    } else {
+      discardedSource = source;
+    }
+  }
+  await currentTemplate.activate(requested);
+  await nextTick();
+  discardedSource = null;
+  reportFrontendEvent({ event: "button_mapping_template_switch", phase: "completed", result: currentTemplate.error.value ? "failed" : currentTemplate.templateId.value === requested ? "passed" : "skipped", reason: currentTemplate.error.value ? "engine_rejected" : currentTemplate.templateId.value === requested ? "engine_confirmed" : "superseded" });
 }
 
 function cloneMappings(value: ButtonMappings): ButtonMappings {
@@ -511,20 +595,40 @@ function mappingsForSource(source: EditingSource): ButtonMappings | null {
 
 function loadEditingSource(source: EditingSource): boolean {
   const selected = mappingsForSource(source);
+  editingSource.value = source;
+  editingTarget.value = null;
   if (!selected) {
-    editingSource.value = "common";
-    const common = configuration.value?.commonMappings ?? { enabled: true, actions: {} };
-    mappings.value = cloneMappings(common);
-    savedSnapshot.value = cloneMappings(common);
-    statusMessage.value = "所选模板已不存在，已返回通用配置";
+    mappings.value = { enabled: false, actions: {} };
+    savedSnapshot.value = cloneMappings(mappings.value);
+    statusMessage.value = "当前模板配置不可用；请选择其他模板后再编辑";
     return false;
   }
-  editingSource.value = source;
   mappings.value = cloneMappings(selected);
   savedSnapshot.value = cloneMappings(selected);
-  editingTarget.value = null;
+  statusMessage.value = null;
   return true;
 }
+
+watch([currentTemplate.applied, configuration], () => {
+  if (!currentTemplate.applied.value || !configuration.value) return;
+  const source: EditingSource = currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`;
+  if (source === editingSource.value) return;
+  if (dirty.value) {
+    if (discardedSource !== editingSource.value) {
+      retainedDrafts.value.set(editingSource.value, { mappings: cloneMappings(mappings.value), saved: cloneMappings(savedSnapshot.value) });
+    }
+    reportFrontendEvent({ event: "button_mapping_editor_draft", phase: "completed", result: "passed", reason: discardedSource === editingSource.value ? "discarded" : "retained" });
+  }
+  const draft = retainedDrafts.value.get(source);
+  const loaded = loadEditingSource(source);
+  if (loaded && draft) {
+    mappings.value = draft.mappings;
+    savedSnapshot.value = draft.saved;
+    retainedDrafts.value.delete(source);
+    statusMessage.value = "已恢复此模板的未保存草稿；保存后才会生效";
+  }
+  reportFrontendEvent({ event: "button_mapping_editor_target", phase: "completed", result: loaded ? "passed" : "failed", reason: !loaded ? "configuration_unavailable" : draft ? "retained_draft" : "applied_template" });
+});
 
 const voiceActive = computed(
   () => props.runtime?.platform.connection.voiceState === "streaming",
@@ -846,7 +950,7 @@ async function persist(message?: string): Promise<boolean> {
     const saved = source === "common"
       ? await saveButtonMappings(payload)
       : (await updateButtonMappingTemplate(source.slice("template:".length), payload)).mappings;
-    if (request !== saveSequence || editingSource.value !== source) return true;
+    if (request !== saveSequence) return true;
     if (configuration.value) {
       if (source === "common") {
         configuration.value = { ...configuration.value, commonMappings: saved };
@@ -867,12 +971,14 @@ async function persist(message?: string): Promise<boolean> {
         configuration.value.templates.push({id, name: templateCatalog.value.find(item => item.id === id)!.name, mappings: cloneMappings(saved)});
       }
     }
+    retainedDrafts.value.delete(source);
+    reportFrontendEvent({ event: "button_mapping_editor_save", phase: "completed", result: "passed", reason: source === "common" ? "common" : "template" });
+    if (editingSource.value !== source) return true;
     mappings.value = cloneMappings(saved);
     savedSnapshot.value = cloneMappings(saved);
     if (message) {
       statusMessage.value = message;
     }
-    reportFrontendEvent({ event: "button_mapping_editor_save", phase: "completed", result: "passed", reason: source === "common" ? "common" : "template" });
     return true;
   } catch (error) {
     statusMessage.value = error instanceof Error ? error.message : String(error);
@@ -893,17 +999,39 @@ watch(
 
 async function restoreDefaults(): Promise<void> {
   if (busy.value) return;
+  const source = editingSource.value;
   const template = activeTemplateEntry.value;
   if (template?.builtIn) {
     if (!window.confirm(`只复位“${template.name}”为当前版本默认按键？该模板修改和当前草稿将丢失，其它模板及关联保持不变。`)) return;
     busy.value = true;
+    reportFrontendEvent({ event: "button_mapping_template_reset", phase: "started", result: "passed", reason: "builtin" });
     try {
-      configuration.value = await resetBuiltinTemplate(template.id);
-      templateCatalog.value = await getTemplateCatalog();
-      const saved = templateCatalog.value.find(item => item.id === template.id)?.buttonMappings;
-      if (saved) { mappings.value = cloneMappings(saved); savedSnapshot.value = cloneMappings(saved); }
+      const reset = await resetBuiltinTemplate(template.id);
+      if (unmounted) return;
+      const catalog = await getTemplateCatalog();
+      if (unmounted) return;
+      const restored = catalog.find(item => item.id === template.id);
+      if (!restored?.buttonMappings) throw new Error("复位后未能读回当前模板配置");
+      configuration.value = {
+        ...configuration.value!,
+        templates: [
+          ...configuration.value!.templates.filter(item => item.id !== template.id),
+          ...reset.templates.filter(item => item.id === template.id),
+        ],
+      };
+      templateCatalog.value = templateCatalog.value.map(item => item.id === template.id ? restored : item);
+      retainedDrafts.value.delete(source);
+      reportFrontendEvent({ event: "button_mapping_template_reset", phase: "completed", result: "passed", reason: editingSource.value === source ? "current_template" : "previous_template" });
+      if (editingSource.value !== source) return;
+      mappings.value = cloneMappings(restored.buttonMappings);
+      savedSnapshot.value = cloneMappings(restored.buttonMappings);
       statusMessage.value = `已复位“${template.name}”`;
-    } catch (error) { statusMessage.value = String(error); } finally { busy.value = false; }
+    } catch (error) {
+      if (!unmounted && editingSource.value === source) statusMessage.value = String(error);
+      reportFrontendEvent({ event: "button_mapping_template_reset", phase: "completed", result: "failed", reason: "reset_failed" });
+    } finally {
+      if (!unmounted) busy.value = false;
+    }
     return;
   }
   mappings.value = { enabled: true, actions: {} };
@@ -961,28 +1089,6 @@ async function exportConfiguration(): Promise<void> {
   finally { busy.value = false; }
 }
 
-async function selectEditingSource(event: Event): Promise<void> {
-  const select = event.target as HTMLSelectElement;
-  const requested = select.value as EditingSource;
-  if (requested === editingSource.value) return;
-  if (dirty.value) {
-    if (window.confirm("当前配置有未保存更改。确定将先保存，再切换编辑目标。")) {
-      const saved = await persist("配置已保存");
-      if (!saved) {
-        select.value = editingSource.value;
-        return;
-      }
-    } else if (!window.confirm("放弃当前未保存更改并切换编辑目标？")) {
-      select.value = editingSource.value;
-      return;
-    } else {
-      mappings.value = cloneMappings(savedSnapshot.value);
-    }
-  }
-  loadEditingSource(requested);
-  select.value = editingSource.value;
-}
-
 
 
 function phaseLabel(phase: RawInputPhase | undefined): string {
@@ -1029,6 +1135,28 @@ async function toggleListener(): Promise<void> {
 
 const rawInput = computed(() => props.runtime?.platform.rawInput);
 const connectionInfo = computed(() => props.runtime?.platform.connection);
+const remoteConnectionActive = computed(() => connectionInfo.value !== undefined && [
+  'connecting', 'discovering', 'awaiting_capabilities', 'ready',
+  'streaming', 'draining', 'reconnecting', 'suspended',
+].includes(connectionInfo.value.phase));
+const disconnectBusy = ref(false);
+const connectionFeedback = ref('');
+async function changeRemoteConnection() {
+  if (disconnectBusy.value) return;
+  if (!remoteConnectionActive.value) { emit('navigate', 'connection'); return; }
+  disconnectBusy.value = true;
+  connectionFeedback.value = '';
+  reportFrontendEvent({event: 'buttons_remote_disconnect', phase: 'requested', result: 'unknown', reason: 'explicit_user_request'});
+  try {
+    const actual = await disconnectRemote();
+    const released = actual.phase === 'disconnected';
+    connectionFeedback.value = released ? '遥控器连接已释放，本次运行已停止自动重连' : '断开请求已提交，正在等待连接释放';
+    reportFrontendEvent({event: 'buttons_remote_disconnect', phase: 'completed', result: released ? 'passed' : 'unknown', reason: released ? 'released' : 'awaiting_release'});
+  } catch {
+    connectionFeedback.value = '未能断开遥控器，请到连接与语音页查看状态后重试。';
+    reportFrontendEvent({event: 'buttons_remote_disconnect', phase: 'completed', result: 'failed', reason: 'request_failed'});
+  } finally { disconnectBusy.value = false; }
+}
 
 function refreshCanvasGeometry(width?: number): void {
   if (width !== undefined) canvasWidth.value = Math.max(CANVAS_MIN_WIDTH, Math.round(width));
@@ -1052,7 +1180,7 @@ onMounted(async () => {
   registerPresetAppNames(presetApps.value);
   configuration.value = loaded;
   templateCatalog.value = catalog;
-  loadEditingSource("common");
+  loadEditingSource(currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`);
   mappingSnapshot.value = snapshot;
   activeButtons.value = new Set(snapshot.observedButtons);
 
@@ -1142,41 +1270,44 @@ onUnmounted(() => {
   <section class="buttons-page">
     <div class="buttons-scroll">
     <header class="page-header mapping-header">
-      <div class="mapping-heading-row">
+      <ComponentSupportPanel>
+      <template #prefix>
         <h1>按键映射</h1>
         <label class="toggle-row mapping-toggle-slot" title="开启后，遥控器按键按本页配置执行动作；关闭时，遥控器保持原始按键行为。">
           <span>启用自定义按键功能</span>
-          <input v-model="enabled" type="checkbox" class="toggle-input" :disabled="busy" />
+          <input v-model="enabled" type="checkbox" class="toggle-input" :disabled="editingBusy" />
         </label>
+      </template>
+      <template #device>
         <div class="device-chip" :class="{ connected: connectionInfo?.phase === 'ready' || connectionInfo?.phase === 'streaming' }">
+          <strong class="remote-name">{{ deviceLabel }}</strong>
+          <div class="remote-status">
           <span class="status-dot" :class="connectionInfo?.phase === 'streaming' ? 'active' : connectionInfo?.phase === 'ready' ? 'success' : 'pending'"></span>
-          <span>{{ deviceLabel }}</span>
+          <span>{{ connectionInfo ? connectionPhaseLabel(connectionInfo.phase) : '未连接' }}</span>
           <BatteryIndicator :connection="connectionInfo" />
+          </div>
+          <button type="button" class="secondary-button remote-connection-action" :disabled="disconnectBusy" @click="changeRemoteConnection">{{ disconnectBusy ? '正在断开…' : remoteConnectionActive ? '断开' : '重新连接' }}</button>
         </div>
-      </div>
-      <div class="mapping-header-controls">
+      </template>
         <div class="current-template-display">
-          <span>当前使用</span>
-          <select aria-label="当前使用的按键模板" :value="!currentTemplate.applied.value ? '' : currentTemplate.templateId.value ?? 'common'" :disabled="busy || currentTemplate.applying.value || !currentTemplate.applied.value" :aria-busy="currentTemplate.applying.value" @change="selectActiveTemplate">
+          <span>当前模板</span>
+          <select aria-label="当前使用的按键模板" :value="!currentTemplate.applied.value ? '' : currentTemplate.templateId.value ?? 'common'" :disabled="busy || currentTemplate.applying.value || !currentTemplate.applied.value" :aria-busy="currentTemplate.applying.value" @pointerdown="refreshTemplateChoices" @focus="refreshTemplateChoices" @change="selectActiveTemplate">
             <option value="" disabled>正在确认当前模板…</option>
             <option v-for="option in activeTemplateOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
           </select>
         </div>
-        <label class="editing-source-picker">
-          <span>编辑配置</span>
-          <select :value="editingSource" :disabled="busy" @change="selectEditingSource">
-            <option v-for="option in editingSourceOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-          </select>
-        </label>
 
 
-      </div>
+      <template #feedback>
+      <p v-if="templateRefreshError" class="error-text" role="status">{{ templateRefreshError }}</p>
+      <p class="remote-connection-feedback" role="status" aria-live="polite">{{ connectionFeedback }}</p>
       <p v-if="currentTemplate.error.value" class="error-text" role="status">{{ currentTemplate.error.value }}</p>
       <p v-if="currentTemplate.persistenceMessage.value" class="mapping-header-status muted" role="status" aria-live="polite">{{ currentTemplate.persistenceMessage.value }}</p>
+      <p v-if="retainedDrafts.size" class="muted" role="status">已在本页保留其他模板的未保存草稿；切回可继续编辑，保存后才会生效。</p>
       <p v-if="voiceFeedback" class="voice-feedback" role="status">{{ voiceFeedback }}</p>
-      <p v-else class="mapping-header-status muted">所有模板只发送按键或组合键；内置推荐可复制后编辑。</p>
+      </template>
+      </ComponentSupportPanel>
     </header>
-    <article class="card capture-support-card"><ComponentSupportPanel /></article>
 
     <div id="global-mapping-panel">
     <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px`, '--mapping-canvas-height': `${CANVAS_HEIGHT}px`, '--mapping-card-height': `${CARD_HEIGHT}px` }">
@@ -1279,7 +1410,7 @@ onUnmounted(() => {
                 editingTarget?.button === placement.button && editingTarget?.trigger === trigger,
               flashed: firedFlash?.button === placement.button && firedFlash?.trigger === trigger,
             }"
-            :disabled="busy || menuReserved(placement.button)"
+            :disabled="editingBusy || menuReserved(placement.button)"
             :title="
               menuReserved(placement.button)
                 ? menuTemplateSwitchEnabled === true ? menuBehaviorDetail[trigger] : menuStateLabel
@@ -1339,13 +1470,13 @@ onUnmounted(() => {
             class="secondary-button editor-disable-btn"
             :class="{ 'is-active': actionOf(editingTarget.button, editingTarget.trigger).type === 'disabled' }"
             type="button"
-            :disabled="busy"
+            :disabled="editingBusy"
             :title="t('只禁用当前格子的映射，此按键恢复原始行为')"
             @click="applyAction({ type: 'disabled' })"
           >
             {{ t("禁用按键") }}
           </button>
-          <button class="secondary-button" type="button" :disabled="busy" @click="editingTarget = null">关闭</button>
+          <button class="secondary-button" type="button" :disabled="editingBusy" @click="editingTarget = null">关闭</button>
         </div>
       </div>
       <ButtonActionEditor
@@ -1353,7 +1484,7 @@ onUnmounted(() => {
         :shortcuts-only="editingSource !== 'common'"
         :mappings="mappings"
         :saved-mappings="savedSnapshot"
-        :busy="busy"
+        :busy="editingBusy"
         :button="editingTarget.button"
         :trigger="editingTarget.trigger"
         :preset-apps="presetApps"
@@ -1370,7 +1501,7 @@ onUnmounted(() => {
             :class="{ selected: repeatChoice === 'auto' }"
             type="button"
             title="未设置长按动作时，连续执行可重复的单击动作；设置长按后只执行一次"
-            :disabled="busy"
+            :disabled="editingBusy"
             @click="selectHoldRepeat('auto')"
           >
             自动（默认）
@@ -1380,7 +1511,7 @@ onUnmounted(() => {
             :class="{ selected: repeatChoice === 'off' }"
             type="button"
             title="按住不放只执行一次"
-            :disabled="busy"
+            :disabled="editingBusy"
             @click="selectHoldRepeat('off')"
           >
             关闭
@@ -1390,7 +1521,7 @@ onUnmounted(() => {
             :class="{ selected: repeatChoice === 'single' }"
             type="button"
             :title="repeatSingleTitle"
-            :disabled="busy || (!!repeatSingleReason && repeatChoice !== 'single')"
+            :disabled="editingBusy || (!!repeatSingleReason && repeatChoice !== 'single')"
             @click="selectHoldRepeat('single')"
           >
             重复单击动作
@@ -1400,7 +1531,7 @@ onUnmounted(() => {
             :class="{ selected: repeatChoice === 'long' }"
             type="button"
             :title="repeatLongTitle"
-            :disabled="busy || (!!repeatLongReason && repeatChoice !== 'long')"
+            :disabled="editingBusy || (!!repeatLongReason && repeatChoice !== 'long')"
             @click="selectHoldRepeat('long')"
           >
             重复长按动作
@@ -1415,7 +1546,7 @@ onUnmounted(() => {
           class="toggle-input"
           type="checkbox"
           :checked="okClickChecked"
-          :disabled="busy"
+          :disabled="editingBusy"
           @change="toggleOkContextClick"
         />
       </label>
@@ -1430,54 +1561,63 @@ onUnmounted(() => {
       </p>
     </article>
 
-    <div class="card mapping-footer">
-      <small class="muted">按下高亮只表示已收到按键；动作按当前程序的模板执行，未配置则不执行。</small>
-      <div class="mapping-footer-status">
-        <span class="status-dot" :class="rawInput?.phase === 'ready' ? 'success' : 'pending'"></span>
-        <span>{{ phaseLabel(rawInput?.phase) }}</span>
-        <button
-          v-if="rawInput?.phase === 'ready' || rawInput?.phase === 'stopped' || rawInput?.phase === 'failed'"
-          class="secondary-button footer-listener-toggle"
-          type="button"
-          :disabled="busy"
-          @click="toggleListener"
-        >
-          {{ rawInput?.phase === "ready" ? t("停止监听") : t("启动监听") }}
-        </button>
-        <small v-if="mappingSnapshot && !mappings.enabled" class="muted"> · 总开关关闭（按键保持原样）</small>
-        <small v-if="dirty" class="muted"> · 当前编辑目标有未保存更改</small>
-      </div>
-      <label class="toggle-row" title="开启后，操作实体遥控器不会切换正在编辑的按键。">
-        <span>锁定当前按键</span>
-        <input :checked="lockSelection" :aria-busy="selectionPreference.pending.value" :aria-disabled="!selectionPreference.loaded.value || selectionPreference.pending.value" @change="selectionPreference.toggleCheckbox" type="checkbox" class="toggle-input" />
-      </label>
-      <span class="muted lock-hint">按遥控器时保持当前编辑项</span>
-      <span v-if="selectionPreference.error.value" role="alert" class="error-text">{{ selectionPreference.error.value }}</span>
+    <p class="muted mapping-observation-hint">按下高亮只表示已收到按键；动作按当前程序的模板执行，未配置则不执行。</p>
     </div>
-    </div>
-
-    <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
-    <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
     </div>
 
     <footer class="mapping-actions" aria-label="按键配置操作">
-      <div class="button-row">
-        <button class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
-          保存当前配置
-        </button>
-
-        <button class="secondary-button" type="button" :disabled="busy" @click="openSaveTemplateDialog">
-          保存为模板
-        </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="exportConfiguration">
-          {{ t("导出配置…") }}
-        </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
-          {{ activeTemplateEntry?.builtIn ? "复位模板" : "恢复默认" }}
-        </button>
+      <div class="mapping-listener">
+        <div class="mapping-listener-controls">
+          <label class="toggle-row" title="开启后，操作实体遥控器不会切换正在编辑的按键。">
+            <span>锁定当前按键</span>
+            <input ref="selectionToggle" :checked="lockSelection" :aria-busy="selectionPreference.pending.value" :aria-disabled="!selectionPreference.loaded.value || selectionPreference.pending.value" @change="selectionPreference.toggleCheckbox" type="checkbox" class="toggle-input" />
+          </label>
+          <div class="mapping-listener-button-slot">
+            <button
+              v-if="rawInput?.phase === 'ready' || rawInput?.phase === 'stopped' || rawInput?.phase === 'failed'"
+              class="secondary-button footer-listener-toggle"
+              type="button"
+              :disabled="busy"
+              @click="toggleListener"
+            >
+              {{ rawInput?.phase === "ready" ? t("停止监听") : t("启动监听") }}
+            </button>
+          </div>
+        </div>
+        <div class="mapping-footer-status" :role="selectionPreference.error.value || mappingSnapshot?.lastError ? 'alert' : 'status'">
+          <button v-if="footerFeedback.length" class="mapping-feedback-summary" type="button" aria-haspopup="dialog" @click="openFooterFeedback">
+            <span>{{ footerFeedback.join(" · ") }}</span><span class="mapping-feedback-link">详情</span>
+          </button>
+          <template v-else>
+            <span class="status-dot" :class="rawInput?.phase === 'ready' ? 'success' : 'pending'"></span>
+            <span class="mapping-phase-label" :title="phaseLabel(rawInput?.phase)">{{ phaseLabel(rawInput?.phase) }}</span>
+          </template>
+        </div>
+      </div>
+      <div class="mapping-save-actions">
+        <div class="button-row">
+          <button class="secondary-button" type="button" :disabled="editingBusy" @click="saveConfiguration">
+            保存当前配置
+          </button>
+          <button class="secondary-button" type="button" :disabled="editingBusy" @click="openSaveTemplateDialog">
+            保存为模板
+          </button>
+          <button class="secondary-button" type="button" :disabled="editingBusy" @click="exportConfiguration">
+            {{ t("导出配置…") }}
+          </button>
+          <button class="secondary-button" type="button" :disabled="editingBusy" @click="restoreDefaults">
+            {{ activeTemplateEntry?.builtIn ? "复位模板" : "恢复默认" }}
+          </button>
+        </div>
       </div>
     </footer>
   </section>
+
+  <SettingsDialog v-if="footerFeedbackOpen" title="按键操作反馈" @close="closeFooterFeedback" @keydown.tab="trapFooterFeedbackFocus">
+    <div class="mapping-feedback-details" tabindex="0" aria-label="完整操作反馈">
+      <p v-for="(message, index) in displayedFooterFeedback" :key="index">{{ message }}</p>
+    </div>
+  </SettingsDialog>
 
   <SettingsDialog
     v-if="saveTemplateDialogOpen"
@@ -1486,11 +1626,11 @@ onUnmounted(() => {
     :busy="busy"
     @close="saveTemplateDialogOpen = false"
   >
-    <label class="save-template-field">模板名称<input v-model="templateNameDraft" :disabled="busy" @keyup.enter="saveAsTemplate" /></label>
+    <label class="save-template-field">模板名称<input v-model="templateNameDraft" :disabled="editingBusy" @keyup.enter="saveAsTemplate" /></label>
     <p v-if="templateNameError" class="error-text">{{ templateNameError }}</p>
     <template #actions>
-      <button type="button" :disabled="busy" @click="saveAsTemplate">{{ busy ? "正在保存…" : "保存模板" }}</button>
-      <button type="button" class="secondary-button" :disabled="busy" @click="saveTemplateDialogOpen = false">取消</button>
+      <button type="button" :disabled="editingBusy" @click="saveAsTemplate">{{ busy ? "正在保存…" : "保存模板" }}</button>
+      <button type="button" class="secondary-button" :disabled="editingBusy" @click="saveTemplateDialogOpen = false">取消</button>
     </template>
   </SettingsDialog>
 
@@ -1501,7 +1641,8 @@ onUnmounted(() => {
   --map-scale: min(1, (100vw - 152px) / 800px, 100vh / var(--mapping-canvas-height));
   margin-bottom: calc(-1 * var(--mapping-canvas-height) * (1 - var(--map-scale)));
 }
-.capture-support-card { margin-bottom: 16px; }
+.mapping-header p { margin: 0; }
+.remote-connection-feedback:empty { display: none; }
 .mapping-card { border-width: 2px; padding: 5px 8px; }
 .mapping-card.mapping-readonly { cursor: default; border-color: transparent; outline: none; box-shadow: none; }
 .mapping-card.mapping-readonly:not(.active):not(.flashed) { background: var(--pending-surface); }
@@ -1538,58 +1679,80 @@ onUnmounted(() => {
   scrollbar-gutter: stable;
 }
 .mapping-actions {
-  min-width: 0;
-  /* 与独立正文的槽位对齐；hidden 只预留空间，不显示第二条滚动条。 */
-  overflow: hidden;
-  scrollbar-gutter: stable;
-  padding: 12px var(--content-inline-padding) 16px;
-  border-top: 1px solid var(--border);
-  background: var(--surface-canvas);
-}
-.mapping-actions .button-row { justify-content: flex-end; }
-.mapping-actions button { max-width: 100%; white-space: normal; }
-.editing-source-picker, .current-template-display {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-.editing-source-picker > span, .current-template-display > span {
-  color: var(--text-muted);
-  font-size: 0.78rem;
-}
-.editing-source-picker select { min-height: 36px; min-width: 0; width: 100%; }
-.current-template-display select { min-height: 36px; min-width: 0; width: 100%; }
-.save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
-.mapping-header {
-  margin-bottom: 0;
-  display: grid;
-  gap: 10px;
-  align-items: start;
-}
-.mapping-heading-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 250px minmax(0, 1fr);
+  display: flex;
   align-items: center;
   gap: 16px;
   min-width: 0;
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  padding: 8px var(--content-inline-padding) 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-canvas);
 }
-.mapping-heading-row h1 { white-space: nowrap; }
-.mapping-toggle-slot { justify-self: start; }
+.mapping-listener { display: flex; align-items: center; gap: 10px; flex: 1 1 0; min-width: 0; }
+.mapping-listener-controls { display: flex; align-items: center; gap: 12px; min-height: 32px; }
+.mapping-listener-controls .toggle-row { margin: 0; gap: 8px; white-space: nowrap; }
+.mapping-listener-button-slot { width: 82px; min-height: 32px; flex: 0 0 auto; }
+.mapping-listener-button-slot button { width: 100%; min-height: 32px; padding: 4px 8px; font-size: 12px; }
+.mapping-footer-status { display: flex; align-items: center; gap: 7px; flex: 1 1 0; min-width: 0; height: 32px; font-size: 12px; line-height: 16px; }
+.mapping-footer-status .status-dot { flex: 0 0 auto; }
+.mapping-phase-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mapping-feedback-summary { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; min-height: 32px; padding: 0; border: 0; background: transparent; color: var(--accent-text); font-size: 12px; text-align: left; }
+.mapping-feedback-summary > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mapping-feedback-link { flex: 0 0 auto; text-decoration: underline; }
+.mapping-feedback-details { max-height: min(440px, 55vh); overflow: auto; overflow-wrap: anywhere; }
+.mapping-feedback-details p { margin: 0; }
+.mapping-feedback-details p + p { margin-top: 8px; }
+.mapping-feedback-details:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mapping-save-actions { flex: 0 0 auto; min-width: 0; }
+.mapping-observation-hint { margin: 10px 0 0; font-size: 12.5px; }
+.mapping-actions .button-row { justify-content: flex-end; flex-wrap: nowrap; }
+.mapping-actions button { max-width: 100%; white-space: nowrap; }
+@media (max-width: 800px) {
+  .mapping-actions { flex-wrap: wrap; gap: 8px; }
+  .mapping-listener, .mapping-save-actions { flex-basis: 100%; }
+  .mapping-actions .button-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mapping-actions .button-row button { min-height: 36px; }
+}
+.current-template-display {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+.current-template-display > span {
+  font-size: 13px;
+  white-space: nowrap;
+}
+.current-template-display select { min-height: 30px; min-width: 0; width: 140px; max-width: 100%; text-overflow: ellipsis; font-size: 12px; padding: 4px 6px; }
+.save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
+.mapping-header {
+  display: block;
+  margin-bottom: 0;
+}
+.mapping-header h1 { white-space: nowrap; margin: 0; font-size: 25px; }
+.mapping-toggle-slot { flex: 0 0 auto; gap: 6px; font-size: 12px; white-space: nowrap; }
 .mapping-toggle-slot.unavailable { color: var(--text-muted); }
-.mapping-heading-row .device-chip { justify-self: end; }
-.mapping-header-controls {
+.mapping-header .device-chip {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 240px));
-  justify-content: start;
-  gap: 12px;
-  width: 100%;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 3px 10px;
+  margin-left: auto;
+  width: 240px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+  white-space: normal;
 }
-.mapping-header-status { min-height: 20px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.voice-feedback { min-height: 20px; margin: 0; font-size: 13px; line-height: 20px; }
-@media (max-width: 620px) {
-  .mapping-heading-row { grid-template-columns: 1fr; gap: 8px; }
-  .mapping-heading-row .device-chip { justify-self: start; }
-}
+.remote-name { grid-column: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.remote-status { grid-row: 2; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; font-size: 11px; }
+.remote-connection-action { grid-column: 2; grid-row: 1 / 3; padding: 5px 9px; min-height: 30px; font-size: 12px; }
+.mapping-header-status, .voice-feedback { margin: 0; font-size: 12px; line-height: 1.6; }
+@media (max-width: 900px) { .mapping-header .device-chip { width: 220px; } }
 .repeat-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .repeat-label { font-size: 13px; }
 .repeat-options { display: flex; flex-wrap: wrap; gap: 8px; }

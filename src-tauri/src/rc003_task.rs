@@ -200,6 +200,51 @@ fn settle_pending_registration() -> Result<(), String> {
     Ok(())
 }
 
+fn current_task_user_sid() -> windows::core::Result<String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+    }
+    let token_owner = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut bytes = 0;
+    let probe = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut bytes) };
+    if probe.as_ref().err().map(|error| error.code())
+        != Some(windows::core::HRESULT::from_win32(122))
+    {
+        probe?;
+        return Err(windows::core::Error::from_hresult(
+            windows::core::HRESULT::from_win32(13),
+        ));
+    }
+    let mut storage = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(storage.as_mut_ptr().cast()),
+            bytes,
+            &mut bytes,
+        )?;
+    }
+    drop(token_owner);
+    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    let mut text = windows::core::PWSTR::null();
+    unsafe {
+        ConvertSidToStringSidW(user.User.Sid, &mut text)?;
+    }
+    let result = unsafe { text.to_string() }
+        .map_err(|_| windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(13)));
+    unsafe {
+        LocalFree(Some(HLOCAL(text.0.cast())));
+    }
+    result
+}
+
 pub fn task_install_elevated(helper: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
@@ -214,7 +259,11 @@ pub fn task_install_elevated(helper: &std::path::Path) -> Result<(), String> {
         .encode_wide()
         .chain(Some(0))
         .collect();
-    let parameters: Vec<u16> = "--install-task --hide-window"
+    let user_sid = current_task_user_sid().map_err(|error| {
+        sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=elevated_install outcome=user_identity_failed hresult={:?}", error.code()));
+        "无法确认当前用户身份, 未注册按键任务。".to_owned()
+    })?;
+    let parameters: Vec<u16> = format!("--install-task --hide-window --task-user-sid {user_sid}")
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -291,18 +340,14 @@ pub fn enable_capture(authorization_epoch: u64) -> Result<u64, String> {
     if AUTHORIZATION_REQUIRED_ON_EVERY_ENABLE {
         let before = task_registered_at();
         task_install_elevated(&helper)?;
-        let after = task_registered_at();
-        let verified = match (before.as_deref(), after.as_deref()) {
-            (_, None) => false,
-            (None, Some(_)) => true, // 之前无任务、之后有了 = 新建成功
-            (Some(b), Some(a)) => b != a,
-        };
-        if !verified {
-            return Err(
-                "授权未完成（UAC 未被确认，任务没有重新注册）。本次开启未完成，可再次打开重试。"
-                    .to_string(),
-            );
-        }
+        let after = task_xml();
+        let user_sid =
+            current_task_user_sid().map_err(|_| "无法确认任务用户身份, 本次未开启。".to_owned())?;
+        verify_task_registration(before.as_deref(), after.as_deref(), &user_sid).map_err(|reason| {
+            sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=register phase=verify terminal_result=failed reason={reason}"));
+            "任务注册结果不符合当前按键支持要求，本次未开启。请重新授权后重试。".to_owned()
+        })?;
+        sayall_windows::gatt_note("rc003 feature=enhanced-capture action=register phase=verify terminal_result=passed priority=4 battery_restricted=false execution_limit=none hard_terminate=false".into());
     }
     // Registration grants only the ability to run this fixed Helper. Recover
     // first even when a prior uninstall removed the task; never capture before
@@ -1001,6 +1046,90 @@ fn extract_task_date(xml: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
+#[derive(serde::Deserialize)]
+struct RegisteredTaskPolicy {
+    #[serde(rename = "Principals")]
+    principals: RegisteredTaskPrincipals,
+    #[serde(rename = "Settings")]
+    settings: RegisteredTaskSettings,
+    #[serde(rename = "Triggers", default)]
+    triggers: RegisteredTaskTriggers,
+}
+
+#[derive(serde::Deserialize)]
+struct RegisteredTaskPrincipals {
+    #[serde(rename = "Principal")]
+    principal: RegisteredTaskPrincipal,
+}
+
+#[derive(serde::Deserialize)]
+struct RegisteredTaskPrincipal {
+    #[serde(rename = "UserId")]
+    user_id: String,
+    #[serde(rename = "LogonType")]
+    logon_type: String,
+    #[serde(rename = "RunLevel")]
+    run_level: String,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct RegisteredTaskTriggers {
+    #[serde(rename = "$value", default)]
+    entries: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(serde::Deserialize)]
+struct RegisteredTaskSettings {
+    #[serde(rename = "Priority")]
+    priority: u8,
+    #[serde(rename = "DisallowStartIfOnBatteries")]
+    disallow_start_on_battery: bool,
+    #[serde(rename = "StopIfGoingOnBatteries")]
+    stop_on_battery: bool,
+    #[serde(rename = "ExecutionTimeLimit")]
+    execution_time_limit: String,
+    #[serde(rename = "AllowHardTerminate")]
+    allow_hard_terminate: bool,
+}
+
+fn task_policy_verdict(xml: &str, user_sid: &str) -> Result<bool, &'static str> {
+    let task: RegisteredTaskPolicy =
+        quick_xml::de::from_str(xml).map_err(|_| "task_policy_invalid_xml")?;
+    Ok(task.principals.principal.user_id == user_sid
+        && task.principals.principal.logon_type == "InteractiveToken"
+        && task.principals.principal.run_level == "HighestAvailable"
+        && task.settings.priority == 4
+        && !task.settings.disallow_start_on_battery
+        && !task.settings.stop_on_battery
+        && task.settings.execution_time_limit == "PT0S"
+        && !task.settings.allow_hard_terminate
+        && task.triggers.entries.is_empty())
+}
+
+pub fn task_policy_matches() -> Result<bool, &'static str> {
+    let user_sid = current_task_user_sid().map_err(|_| "task_user_unreadable")?;
+    task_policy_verdict(&task_xml().ok_or("task_policy_unreadable")?, &user_sid)
+}
+
+fn verify_task_registration(
+    before: Option<&str>,
+    after: Option<&str>,
+    user_sid: &str,
+) -> Result<(), &'static str> {
+    let xml = after.ok_or("task_registration_missing")?;
+    let date = extract_task_date(xml).ok_or("task_registration_date_missing")?;
+    if date.trim().is_empty() {
+        return Err("task_registration_date_missing");
+    }
+    if Some(date.as_str()) == before {
+        return Err("task_not_reregistered");
+    }
+    if !task_policy_verdict(xml, user_sid)? {
+        return Err("task_policy_mismatch");
+    }
+    Ok(())
+}
+
 /// 任务注册的可执行文件名（`<Exec><Command>` 的最后一段路径）。
 /// **只取文件名**：完整路径是个人路径，不进日志。
 fn extract_task_command(xml: &str) -> Option<String> {
@@ -1040,12 +1169,33 @@ pub fn task_target_matches(helper_file_name: &str) -> Option<bool> {
 
 pub fn status(enabled: bool) -> TaskStatus {
     let installed = task_installed();
-    let cleanup = cleanup_presentation(
-        read_cleanup_receipt(),
-        helper_processes(),
-        stop_signal_path().exists(),
-        SUBMITTED_START_MS.load(std::sync::atomic::Ordering::Acquire),
-    );
+    let receipt = read_cleanup_receipt();
+    let processes = helper_processes();
+    let stop_requested = stop_signal_path().exists();
+    let submitted = SUBMITTED_START_MS.load(std::sync::atomic::Ordering::Acquire);
+    let active = processes
+        .as_ref()
+        .ok()
+        .and_then(|items| items.first())
+        .copied();
+    let receipt_ref = receipt.as_ref().ok().and_then(Option::as_ref);
+    let receipt_status = match receipt_ref.map(|receipt| receipt.status.as_str()) {
+        Some("requested") => "requested",
+        Some("unconfirmed") => "unconfirmed",
+        Some("passed") => "passed",
+        Some("host_exited") => "host_exited",
+        Some("agent_version_blocked") => "agent_version_blocked",
+        Some("not_started") => "not_started",
+        Some(_) => "invalid",
+        None => "none",
+    };
+    let receipt_valid = receipt_ref.is_some_and(CleanupReceipt::valid);
+    let matches_process = receipt_ref.is_some_and(|receipt| {
+        active.is_none_or(|(pid, started)| receipt.matches_process(pid, started))
+    });
+    let matches_start =
+        receipt_ref.is_some_and(|receipt| receipt.matches_submitted_start(submitted));
+    let cleanup = cleanup_presentation(receipt, processes, stop_requested, submitted);
     static LAST_CLEANUP_STATUS: std::sync::Mutex<Option<(bool, bool, &'static str)>> =
         std::sync::Mutex::new(None);
     let observed = (cleanup.pending, cleanup.can_retry, cleanup.reason);
@@ -1058,7 +1208,7 @@ pub fn status(enabled: bool) -> TaskStatus {
         changed
     };
     if changed {
-        sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=status phase=observed cleanup_pending={} can_retry_cleanup={} reason={}", cleanup.pending, cleanup.can_retry, cleanup.reason));
+        sayall_windows::gatt_note(format!("rc003 feature=enhanced-capture action=status phase=observed cleanup_pending={} can_retry_cleanup={} reason={} stop_requested={stop_requested} receipt_status={receipt_status} receipt_valid={receipt_valid} receipt_matches_process={matches_process} receipt_matches_start={matches_start} active_helper={}", cleanup.pending, cleanup.can_retry, cleanup.reason, active.is_some()));
     }
     TaskStatus {
         installed,
@@ -1139,6 +1289,17 @@ fn schtasks(args: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_policy_verdict(xml: &str) -> Result<bool, &'static str> {
+        super::task_policy_verdict(xml, "S-1-5-18")
+    }
+
+    fn verify_task_registration(
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<(), &'static str> {
+        super::verify_task_registration(before, after, "S-1-5-18")
+    }
 
     #[test]
     fn exited_process_inspection_does_not_create_cleanup_debt() {
@@ -1636,6 +1797,96 @@ mod tests {
     #[test]
     fn every_enable_requires_reauthorization() {
         assert!(AUTHORIZATION_REQUIRED_ON_EVERY_ENABLE);
+    }
+
+    #[test]
+    fn task_registration_rejects_changed_date_with_legacy_policy() {
+        let xml = "<Task><RegistrationInfo><Date>new</Date></RegistrationInfo><Triggers/><Settings><Priority>7</Priority><DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>true</StopIfGoingOnBatteries><ExecutionTimeLimit>PT72H</ExecutionTimeLimit><AllowHardTerminate>true</AllowHardTerminate></Settings></Task>";
+        assert!(verify_task_registration(Some("old"), Some(xml)).is_err());
+    }
+
+    fn current_task_policy_xml() -> String {
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><Date>new</Date></RegistrationInfo><Principals><Principal><UserId>S-1-5-18</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Triggers/><Settings><Priority>4</Priority><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><AllowHardTerminate>false</AllowHardTerminate></Settings></Task>".into()
+    }
+
+    #[test]
+    fn task_registration_accepts_only_new_date_and_current_policy() {
+        let xml = current_task_policy_xml();
+        assert_eq!(verify_task_registration(Some("old"), Some(&xml)), Ok(()));
+        assert_eq!(verify_task_registration(None, Some(&xml)), Ok(()));
+        assert_eq!(
+            verify_task_registration(Some("new"), Some(&xml)),
+            Err("task_not_reregistered")
+        );
+        assert_eq!(
+            verify_task_registration(Some("old"), None),
+            Err("task_registration_missing")
+        );
+        assert_eq!(
+            verify_task_registration(None, Some(&xml.replace("<Date>new</Date>", ""))),
+            Err("task_registration_date_missing")
+        );
+        for (expected, stale) in [
+            ("<Priority>4</Priority>", "<Priority>7</Priority>"),
+            (
+                "<DisallowStartIfOnBatteries>false",
+                "<DisallowStartIfOnBatteries>true",
+            ),
+            (
+                "<StopIfGoingOnBatteries>false",
+                "<StopIfGoingOnBatteries>true",
+            ),
+            ("<ExecutionTimeLimit>PT0S", "<ExecutionTimeLimit>PT72H"),
+            ("<AllowHardTerminate>false", "<AllowHardTerminate>true"),
+            (
+                "<Triggers/>",
+                "<Triggers><TimeTrigger><Enabled>true</Enabled></TimeTrigger></Triggers>",
+            ),
+        ] {
+            assert_eq!(
+                verify_task_registration(Some("old"), Some(&xml.replace(expected, stale))),
+                Err("task_policy_mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn task_policy_readback_rejects_wrong_principal() {
+        let xml = current_task_policy_xml();
+        for (correct, invalid) in [
+            ("S-1-5-18", "S-1-5-19"),
+            ("InteractiveToken", "Password"),
+            ("HighestAvailable", "LeastPrivilege"),
+        ] {
+            assert_eq!(
+                task_policy_verdict(&xml.replace(correct, invalid)),
+                Ok(false)
+            );
+        }
+        assert_eq!(
+            task_policy_verdict(&xml.replace("<UserId>S-1-5-18</UserId>", "")),
+            Err("task_policy_invalid_xml")
+        );
+    }
+
+    #[test]
+    fn task_policy_readback_rejects_missing_duplicate_and_malformed_fields() {
+        let xml = current_task_policy_xml();
+        for invalid in [
+            xml.replace("<Priority>4</Priority>", ""),
+            xml.replace(
+                "<Priority>4</Priority>",
+                "<Priority>4</Priority><Priority>7</Priority>",
+            ),
+            xml.replace("<Priority>4</Priority>", "<Priority>invalid</Priority>"),
+            xml.replace("</Settings>", "</Broken>"),
+        ] {
+            assert_eq!(
+                task_policy_verdict(&invalid),
+                Err("task_policy_invalid_xml")
+            );
+        }
+        assert_eq!(task_policy_verdict(&format!("\u{feff}{xml}")), Ok(true));
     }
     #[test]
     fn extracts_task_command_file_name_without_paths() {

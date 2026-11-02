@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import ApplicationTemplateBindings from "./ApplicationTemplateBindings.vue";
 import {
   listPresetApps, listRunningApps, pickCustomApp,
-  removeApplicationBinding,
+  removeApplicationBinding, updateApplicationBindings,
   reorderApplicationAssociations, saveMappingConfiguration, upsertApplicationBinding,
   type MappingConfiguration, type TemplateCatalogEntry,
 } from "../lib/bridge";
@@ -14,7 +14,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   return {
     ...actual,
     listPresetApps: vi.fn(), listRunningApps: vi.fn(), pickCustomApp: vi.fn(),
-    removeApplicationBinding: vi.fn(),
+    removeApplicationBinding: vi.fn(), updateApplicationBindings: vi.fn(),
     reorderApplicationAssociations: vi.fn(), saveMappingConfiguration: vi.fn(),
     upsertApplicationBinding: vi.fn(),
   };
@@ -48,6 +48,7 @@ describe("application template binding wizard", () => {
     vi.mocked(pickCustomApp).mockResolvedValue(null);
     vi.mocked(upsertApplicationBinding).mockResolvedValue(structuredClone(base));
     vi.mocked(removeApplicationBinding).mockResolvedValue(structuredClone(base));
+    vi.mocked(updateApplicationBindings).mockResolvedValue(structuredClone(base));
     vi.mocked(saveMappingConfiguration).mockImplementation(async (next) => structuredClone(next));
     vi.mocked(reorderApplicationAssociations).mockResolvedValue(structuredClone(base));
   });
@@ -247,5 +248,155 @@ describe("application template binding wizard", () => {
     await wrapper.setProps({ disabled: false });
     await rows[0]!.trigger("drop");
     expect(reorderApplicationAssociations).not.toHaveBeenCalled();
+  });
+
+  it("keeps bulk actions visible and supports none, partial, all and cleared selection", async () => {
+    const wrapper = mountPanel({ ...structuredClone(base), applicationBindings: [...structuredClone(base.applicationBindings), { applicationId: "edge", templateId: "buttons", menuOrder: 1, launchTarget: null }] });
+    const header = wrapper.find(".association-table-header");
+    const selectAll = header.find<HTMLInputElement>("input[type=checkbox]");
+    expect(header.findAll("button").map(item => item.text())).toEqual(["更换模板", "移除"]);
+    expect(header.findAll("button").every(item => item.attributes("disabled") !== undefined)).toBe(true);
+    await wrapper.findAll(".association-row input[type=checkbox]")[0]!.setValue(true);
+    expect(selectAll.element.checked).toBe(false);
+    expect(selectAll.element.indeterminate).toBe(true);
+    await selectAll.setValue(true);
+    expect(wrapper.findAll<HTMLInputElement>(".association-row input").every(item => item.element.checked)).toBe(true);
+    expect(selectAll.element.indeterminate).toBe(false);
+    await selectAll.setValue(false);
+    expect(wrapper.findAll<HTMLInputElement>(".association-row input").every(item => !item.element.checked)).toBe(true);
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+  });
+
+  it("intersects selected IDs on refresh without selecting new rows or losing reordered rows", async () => {
+    const configuration = { ...structuredClone(base), applicationBindings: [...structuredClone(base.applicationBindings), { applicationId: "edge", templateId: "buttons", menuOrder: 1, launchTarget: null }] };
+    const wrapper = mountPanel(configuration);
+    await wrapper.find(".association-table-header input").setValue(true);
+    await wrapper.setProps({ configuration: { ...configuration, applicationBindings: [{ applicationId: "EDGE", templateId: "buttons", menuOrder: 0, launchTarget: null }, { applicationId: "chrome", templateId: "buttons", menuOrder: 1, launchTarget: null }] } });
+    const checkboxes = wrapper.findAll<HTMLInputElement>(".association-row input");
+    expect(checkboxes.map(item => item.element.checked)).toEqual([true, false]);
+    expect(wrapper.find<HTMLInputElement>(".association-table-header input").element.indeterminate).toBe(true);
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+  });
+
+  it("changes only frozen selected IDs through one narrow batch request after confirmation", async () => {
+    const configuration = { ...structuredClone(base), applicationBindings: [...structuredClone(base.applicationBindings), { applicationId: "edge", templateId: "buttons", menuOrder: 1, launchTarget: null }, { applicationId: "wechat", templateId: "scene", menuOrder: 2, launchTarget: null }] };
+    const wrapper = mountPanel(configuration);
+    await wrapper.find(".association-row input").setValue(true);
+    await wrapper.findAll(".association-row input")[1]!.setValue(true);
+    await wrapper.find(".association-table-header button").trigger("click");
+    await wrapper.findAll(".bulk-template-choice").find(item => item.text().includes("工作按键"))!.trigger("click");
+    await wrapper.setProps({ configuration: { ...configuration, applicationBindings: [...configuration.applicationBindings, { applicationId: "chrome", templateId: "buttons", menuOrder: 2, launchTarget: null }] } });
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+    await button(wrapper, "确认更换").trigger("click");
+    await flushPromises();
+    expect(updateApplicationBindings).toHaveBeenCalledExactlyOnceWith(["codex", "edge"], "buttons");
+    expect(saveMappingConfiguration).not.toHaveBeenCalled();
+    expect(upsertApplicationBinding).not.toHaveBeenCalled();
+    expect(wrapper.emitted("saved")).toHaveLength(1);
+  });
+
+  it("cancels replacement or removal with zero writes and restores the trigger focus", async () => {
+    const wrapper = mount(ApplicationTemplateBindings, { attachTo: document.body, props: { configuration: structuredClone(base), catalog: structuredClone(catalog) } });
+    await wrapper.find(".association-row input").setValue(true);
+    const triggers = wrapper.findAll<HTMLButtonElement>(".association-table-header button");
+    for (const [index, trigger] of triggers.entries()) {
+      trigger.element.focus();
+      await trigger.trigger("click");
+      await flushPromises();
+      expect(wrapper.find("[role=dialog]").exists()).toBe(true);
+      if (index === 0) await button(wrapper, "取消").trigger("click");
+      else await wrapper.find("[role=dialog]").trigger("keydown", { key: "Escape" });
+      await flushPromises();
+      expect(wrapper.find("[role=dialog]").exists()).toBe(false);
+      expect(document.activeElement).toBe(trigger.element);
+    }
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+    expect(removeApplicationBinding).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("removes only selected associations after confirmation and preserves templates", async () => {
+    const configuration = { ...structuredClone(base), applicationBindings: [...structuredClone(base.applicationBindings), { applicationId: "edge", templateId: "buttons", menuOrder: 1, launchTarget: null }] };
+    const saved = { ...structuredClone(configuration), applicationBindings: [structuredClone(configuration.applicationBindings[1]!)] };
+    vi.mocked(updateApplicationBindings).mockResolvedValueOnce(saved);
+    const wrapper = mountPanel(configuration);
+    await wrapper.find(".association-row input").setValue(true);
+    await wrapper.findAll(".association-table-header button")[1]!.trigger("click");
+    expect(wrapper.find("[role=dialog]").text()).toContain("模板仍保留");
+    expect(updateApplicationBindings).not.toHaveBeenCalled();
+    await button(wrapper, "确认移除").trigger("click");
+    await flushPromises();
+    expect(updateApplicationBindings).toHaveBeenCalledExactlyOnceWith(["codex"], null);
+    expect(wrapper.emitted("saved")).toEqual([[saved]]);
+    expect(configuration.templates).toEqual(base.templates);
+  });
+
+  it("keeps full errors, frozen targets and selection for retry and blocks double submit or close while pending", async () => {
+    let rejectSave!: (error: Error) => void;
+    vi.mocked(updateApplicationBindings).mockReturnValueOnce(new Promise((_, reject) => { rejectSave = reject; }));
+    const wrapper = mountPanel();
+    await wrapper.find(".association-row input").setValue(true);
+    await wrapper.findAll(".association-table-header button")[1]!.trigger("click");
+    await button(wrapper, "确认移除").trigger("click");
+    await wrapper.find("[role=dialog]").trigger("keydown", { key: "Escape" });
+    await button(wrapper, "正在保存…").trigger("click");
+    expect(updateApplicationBindings).toHaveBeenCalledOnce();
+    expect(wrapper.find("[role=dialog]").exists()).toBe(true);
+    expect(wrapper.findAll("[role=dialog] button").every(item => item.attributes("disabled") !== undefined)).toBe(true);
+    expect(wrapper.emitted("busyChange")).toEqual([[true]]);
+    const message = "批量保存失败，请重试。".repeat(40);
+    rejectSave(new Error(message));
+    await flushPromises();
+    expect(wrapper.find("[role=alert]").text()).toBe(message);
+    expect(wrapper.find(".bulk-feedback").attributes("tabindex")).toBe("0");
+    expect(wrapper.find(".bulk-feedback").attributes("aria-label")).toBe("批量操作错误详情");
+    expect(wrapper.find<HTMLInputElement>(".association-row input").element.checked).toBe(true);
+    expect(wrapper.emitted("saved")).toBeUndefined();
+    expect(wrapper.emitted("busyChange")).toEqual([[true], [false]]);
+    await button(wrapper, "确认移除").trigger("click");
+    await flushPromises();
+    expect(updateApplicationBindings).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not start dragging from a row checkbox", async () => {
+    const wrapper = mountPanel({ ...structuredClone(base), applicationBindings: [...structuredClone(base.applicationBindings), { applicationId: "edge", templateId: "buttons", menuOrder: 1, launchTarget: null }] });
+    const rows = wrapper.findAll(".association-row");
+    await rows[1]!.find("input").trigger("pointerdown");
+    await rows[1]!.trigger("dragstart");
+    await rows[0]!.trigger("drop");
+    expect(reorderApplicationAssociations).not.toHaveBeenCalled();
+  });
+
+  it("cycles bulk dialog focus and focuses the association heading after removing its last selected row", async () => {
+    const wrapper: VueWrapper = mount(ApplicationTemplateBindings, { attachTo: document.body, props: { configuration: structuredClone(base), catalog: structuredClone(catalog), onSaved: (saved: MappingConfiguration) => { void wrapper.setProps({ configuration: saved }); } } });
+    await wrapper.find(".association-row input").setValue(true);
+    await wrapper.findAll(".association-bulk-actions button")[1]!.trigger("click"); await flushPromises();
+    const cancel = button(wrapper, "取消");
+    cancel.element.focus();
+    await cancel.trigger("keydown", { key: "Tab" });
+    expect(document.activeElement).toBe(wrapper.find(".dialog-close-button").element);
+    await wrapper.find(".dialog-close-button").trigger("keydown", { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel.element);
+    vi.mocked(updateApplicationBindings).mockResolvedValueOnce({ ...structuredClone(base), applicationBindings: [] });
+    await button(wrapper, "确认移除").trigger("click"); await flushPromises();
+    expect(document.activeElement).toBe(wrapper.find(".application-associations > summary").element);
+    wrapper.unmount();
+  });
+
+  it("does not restore bulk focus after navigating away while a save is pending", async () => {
+    let resolveSave!: (saved: MappingConfiguration) => void;
+    vi.mocked(updateApplicationBindings).mockReturnValueOnce(new Promise(resolve => { resolveSave = resolve; }));
+    const wrapper = mountPanel();
+    await wrapper.find(".association-row input").setValue(true);
+    await wrapper.findAll(".association-bulk-actions button")[1]!.trigger("click");
+    await button(wrapper, "确认移除").trigger("click");
+    wrapper.unmount();
+    const nextPageControl = document.createElement("button");
+    document.body.append(nextPageControl);
+    nextPageControl.focus();
+    resolveSave({ ...structuredClone(base), applicationBindings: [] });
+    await flushPromises();
+    expect(document.activeElement).toBe(nextPageControl);
+    nextPageControl.remove();
   });
 });

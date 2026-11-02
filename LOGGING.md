@@ -42,7 +42,7 @@ windows_build=<build 或 unknown>
 
 最终交付须从已安装 EXE 的真实运行日志或诊断读回上述字段及 `build_channel`，与当轮 build manifest、包 metadata 和安装载荷哈希对齐；仅构建脚本成功或 manifest 存在不算运行身份通过。输入范围以 `scripts/build-identity.ps1` 的 root/扩展名 allowlist 为准，排除构建缓存、过程证据和文档正文，不将指纹解释为全磁盘快照或逐字可重建源码档案。
 
-正式应用默认写入 `%LOCALAPPDATA%\SayAll\Logs\sayall-diagnostic.log`，不再要求用户
+个人版隔离候选默认写入 `%LOCALAPPDATA%\SayAllPersonal\Logs\sayall-diagnostic.log`；上游及隔离前旧包仍为 `%LOCALAPPDATA%\SayAll\Logs\sayall-diagnostic.log`。不再要求用户
 预先设置环境变量。受控测试仍可用 `SAYALL_GATT_LOG` 覆盖写入位置；日志正文不得
 打印实际文件路径。应用启动、Tauri setup、前端入口、Vue 挂载和首次 IPC 读取必须
 在用户看到主页面前后分别留痕，确保安装后白屏可以区分为宿主、WebView、脚本、
@@ -148,6 +148,10 @@ mask 使用 `RemoteButton` 序号位。`state_snapshot=true` 仅表示接收时�
 - [ ] 异步提交与真实完成分开记录，且一次操作只有一个终态。
 - [ ] 日志不包含个人信息、设备身份、路径、凭据、用户内容或第三方私有数据。
 - [ ] 已覆盖自动化、Windows 真机和第三方工具的验证边界。
+
+## TV 键盘观察候选
+
+`drivers/SayAllTvKeyboard` 的离线候选使用独立 kernel TraceLogging provider `WirelessMic.TvKeyboard`，不写 App 文件日志或现有 Helper 事件源。schema 1 仅包含构建源码指纹、临时匿名上下文/序号、阶段/NTSTATUS、候选观察与上层消费累计计数，不含任意键盘原始内容、键码、UnitId 或设备身份；无候选 profile 不输出逐批输入日志。无配置、坏配置、CONNECT 失败/取消、D0/移除、部分/零消费、消费越界、重叠/换代观察缺口分别可见，缺口不冒充物理 UP 或映射释放。provider/非分页 payload、字段与真实加载采集边界见 [候选契约](drivers/SayAllTvKeyboard/README.md#回调与诊断)。当前只编译及离线 harness，不启动 ETW session、写设备 profile 或加载驱动；实跑证据归 [原位 Bug](Bugs/2026-10-03-foreground-input-regression.md#2026-10-22-已选择签名过滤器路线的离线观察候选)。
 
 ## 三键增强维护 Helper
 

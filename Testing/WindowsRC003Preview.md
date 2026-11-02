@@ -1,5 +1,22 @@
 # Windows RC001 / RC003 Preview 测试手册
 
+## 2026-10-24 已可读所有权报文的有界交接候选
+
+- passed (真实IPC/自动化, 非遥控器验收): 旧样本过期但同代完整fresh O已可读时, 原代码timeout/available false→true已实证, 正确预期RED后最小有界预读和安全交接GREEN。覆盖旧持键取消/UP、旧E拒绝、新E单次动作、claimed面板配对、无效与半行输入、投递失败、满预算无换行关闭; 记录型注入器不操作真实桌面。完整Rust矩阵与独立review通过, 精确身份和失败夹具记录见原Bug。
+- passed (23:14实际部署): 21:22门禁停止后用户明确允许安装, fresh语音配对/正常退出/STOP回执/六配置/覆盖安装与普通Explorer新App身份均已核对。99D3F17A/8a3cf279实装App7521B5BD, Helper/Agent/Gadget与Normal任务不变; 首次观察者权限不足及runtime配置瞬态false保留原记录, 后续只读确认身份和六文件回到基线, 不倒推瞬态差异原因。
+- failed (23:15:29持续性): 新候选probe bytes0、buffer/pending0, 旧sample age1500时真实timeout, 同窗Helper wait1795/bridge idle1607ms, 后新O age0恢复不是通过。未启动4小时统计或继续硬件验收, 现有自动化只证明已可读fresh O的安全交接路径; 不把它当成全部现场故障的唯一根因, 反引号/来源隔离仍未修复。
+
+## 2026-10-24 普通调度任务候选
+
+- failed (18:17起用户定向测试): Menu/Back/TV先正常, 语音首用不可用且报告全按键灰态, 重试恢复; 不标整轮通过。旧候选窄窗未观察capture timeout/BLE断连, 音频回调和成对释放不代表第三方实际出字, 灰态及语音失败原因待归因, 详细时间链归原Bug。
+- passed (后续 App 诊断自动化/部署): 同轮 sample/decision tick/age 回归真实 IPC RED→GREEN, bridge44项和完整 workspace/fmt/check/runtime-simulation check 通过; 18:46正常升级仅App诊断, 原Helper/Agent/NormalTask保持, 实际resumed两条新增字段算术匹配。首次voice门禁停止及启动后配置总false均保留, 后续逐文件六项恢复基线且无回写; timeout故障分支自然实证仍deferred, 不扩大为持续性修复。字段与源码/包身份见原 G1 记录。
+- failed (持续性): 15:26:28 起的连续观察在 16:02:03.103 发生 ownership_timeout, 03.130 恢复不构成通过; 观察35分钟后收口, 未完成4小时。实际 Helper/任务仍 Normal/Priority4, 同窗 renew wait1764ms 与桥接 idle1161ms; 没有故障时 ETW, 不能再次直接认定 Ready 调度或 Agent 消费根因。先前构建短窗 passed 保留, 不扩大为持续性通过。
+- passed (源码/自动化): Helper 实际 XML 解析与 UTF-16 BSTR、注册前同用户门禁、App Date/Principal/策略后验、取消/迟到回调; Helper 104/3 ignored, workspace core61+4/Windows619+21 ignored/App189+1 ignored, fmt/check/runtime-simulation check/selftest 和独立 review 通过。精确源码与失败过程归[原 G1 记录](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-23-g1-续约同轮与控制写失败诊断)。
+- passed (2026-10-24 15:13–15:16, 本机 RC003 部署): 旧代正常 STOP/退出与安装配置保留, 新 App 由 Explorer 普通权限启动; 经 App 明确授权后实际读回个人任务 action、Principal 当前用户、InteractiveToken/HighestAvailable、Priority4、电池 false/false、PT0S、无 trigger、AllowHardTerminate=false。新 Helper 实际 NORMAL(0x20), renew 相对 priority0, 原 host/Agent 未换代, HELLO 与 owned=7167 成立。此为注册/接管核验, 不是持续性或硬件完整验收。
+- deferred: 真实 UAC 取消/注册失败不得 reset/trigger, 原 STOP/回执及恢复仍配对; COM 闭包失败测试不等于实机 API 失败验证。
+- passed (本轮短窗, 非完整 G1): 新候选一次真实标准 release 构建 146.66s, 与目标 ETW 行重叠 47.451s; 95 条完整等待链最大 Ready→run 29.882ms/总间隔 530.015ms, 无 >=750ms 链或同窗 timeout/rx_silence/写失败。实际 schema、零丢失/解析失败及自身会话清理均通过独立复核; 构建阶段不同, 不称严格同负载 A/B 或优先级因果全闭合。
+- G1 尚未通过: 原普通 release 构建 A 的 4 次 Ready 排队 1.046–2.159s 和 4 次 ownership_timeout 保留。新候选连续观察实际始于北京时间 15:26:28, 原计划上限 19:26:28, 已因16:02故障提前收口, 不再等待原截止或累计为4小时通过; 后续唯一60分钟诊断观察未捕获新故障, 不重启稳定通过统计。主动关闭、睡眠或换代不得累计为连续合格区间; 三轮硬件矩阵与 RC001/跨机/跨 Windows 未验证。
+
 ## 2026-10-23 菜单关闭交互复验
 
 - passed: 同机18:54用户确认Menu开/关后鼠标点击输入框不再唤回菜单, 输入与Back正常, 重开上下导航正常; 日志6次hide_completed与visible=false, 首Back直接map_fire, 无close blocked或下一按键清理残留。
@@ -9,7 +26,23 @@
 
 ## 2026-10-22 连接续约会话代次候选
 
+- **passed（2026-10-23 菜单 token 修复自动化/实装）, pending（精确鼠标复验）**: 确定性Controller边界RED为StaleToken/calls=0, GREEN所属8项与scene84/1ignored; 完整workspace core61+4、Windows619/21ignored、Host185/1ignored及集成、fmt/check/runtime-simulation均通过。原message-only激活假设的full失败保留, 新测试只做validation或注入边界, 不实际激活。16:22正常升级后Explorer普通权限/新指纹/同版Agent附着/owned7167、六配置保留通过, setup `8d77ffa8cf11098dfda5233bac048f83c6899dc23b112366992f548c12974ef0`;身份和ACK字段顺序门禁拒绝/受控续装归原Bug。等待Menu开/关后鼠标点击输入框不再现及焦点/Back确认。旧会话16:09–16:13仍有timeout/断连, 持续性未通过, 不外推菜单修复或短窗0异常为全按键已解决。
+- **failed（2026-10-23 新包首轮交互验收）, passed（本轮首 Menu/TV/两次语音）**: 用户观察第二 Menu 视觉消失并丢失输入焦点, 鼠标点击任意输入框使菜单再现, 首 Back 未删而后续关闭菜单后可删。新会话日志有两次关闭时 `stale_window`→保留菜单→首后续按键取消的完整链, 未见同期 ownership_timeout/reader_ended; 用户澄清不是键盘触发, 方向键或鼠标点击另一输入框可使菜单消失; 不能将整体标记通过。精确时序及 Controller 返回目标契约冲突候选归原 Bug; 开关/退出压力测试未测, 未提交/推送。
+- **passed（2026-10-23 新包安装与实际加载）, pending（硬件验收）**: 用户正常重启后旧 host 已结束且无 App/Helper/端口占用, 新包正常覆盖安装、六配置逐字保留、Explorer 普通权限启动; 失效 binding 自动失效, 个人端口 47832 的 HELLO 确认为 `2026-10-23.auth-lease`, owned=7167。setup SHA-256 `8e3cc243f3ad5339b86e89a0f62f51c38e44b9d8f327cf121735b536a142a90b`, source fingerprint `1a3b22c8518e1c9500f046f726aa2e8ab2573e855fed0f9c08cda4368fad3b5f`, local/dirty/included; App/Helper 安装 hash 和真实进程身份见原 Bug。本次前端嵌入、签名、生产隔离与安装载荷门禁通过, 不改旧包 manifest。下列未部署/安全关闭描述保留为此前阶段事实, 当前新包已运行等待冷首 Menu、Back/TV、语音及开关边界实测; 旧 bridge3 硬件 failed 不改为 passed, 不提交/推送。
 针对用户报告的 Menu 偶发原生行为/恢复后重新映射，现有同会话日志已证实 Helper-Agent TCP 10053 断线、App 所有权缺失及后续恢复，最初断线原因仍 unknown。时间线和累计 STAT 的可信边界归 [原 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-22-接管瞬断的连接代次隔离与诊断候选)。候选仅修可重复的跨连接 renew fault/授权污染并补诊断，不宣称整体接管或实体反引号已修。
+
+- **passed（失败后的离线切片，不是已安装包验收）**：Agent auth/lease 分离及旧 socket 回调隔离的 116 项 VM 测试通过；Helper 新旧 build 标记真实 RED 后同步到 `2026-10-23.auth-lease`，自检 60 项通过。Helper 空闲通知三项真实命名管道 no-wakeup RED 后，七项数据/仅 O/关闭的等待前后与 sender 断开用例通过，包含 FIFO 数据不丢、O-before-E、真实 BYE/worker 完成；全套 89 passed / 3 ignored、fmt/check 及独立 review 无阻断，原慢日志 sink/持续数据/renew 公平用例仍通过。入口为 `node hardware/RC003/helper/agent/agent_logic_test.mjs`、`cargo test --locked --manifest-path hardware/RC003/helper/Cargo.toml`、同 manifest 的 fmt/check 与 `cargo run --locked --manifest-path hardware/RC003/helper/Cargo.toml -- --selftest`。过程红/绿复用 `agent-marker-*.log`、`bridge-wake-*.log`，首次夹具并行撞名和 newline 比较误差不算业务 RED；最终三项 RED 均先确认真实管道副作用、再因未被通知唤醒失败。
+- **passed（Bridge 局部日志隔离，离线）**：真实管道 sink 阻塞的两项业务 RED 后，Bridge 42 项和诊断 18 项通过（重叠，不相加）。进程级唯一容量 256 worker 复用跨连接/Bridge 生命周期，入队前生成原格式时间戳，Full/closed/start_failed/write_failed 分别可观察；append/flush 失败不计成功，恢复后聚合诊断健康记录。UP/inactive 与到期用例均在 sink 释放前观察实际状态/消息：edges_applied 增二且新 epoch 的非零 R 已确认，不以超时、旧消息或仅 bool 判通过。证据在 `target/dev/capture-state/bridge-log-reader-red.log`、`bridge-log-isolation-suite-final.log`、`bridge-log-isolation-diagnostic-final.log`；独立 review 无阻断。仅 Bridge note 流离开 reader/watchdog，mapping/其他同步日志风险未排除，进程退出不保证所有诊断排空。
+- **passed（最终组合自动化）**：`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo check --workspace`、`cargo check -p sayall-windows-app --features runtime-simulation` 全部通过，前后四冻结源码散列相同。workspace core 61+4、Windows 615 passed / 21 ignored、Host 185 passed / 1 ignored，其他集成/文档通过；Helper 非成员，复用上述 89/3 与 Agent 116 精确源码证据。完整日志为 `target/dev/menu-capture-reliability/capture-final-combined-{fmt,test,check,simulation-check}.log`，结果/时间为同目录 `capture-final-combined-results.json`。前端未变，不重跑或构建；此次没有新安装 manifest，不复用旧包身份冒充新源码实装。
+- **deferred（实际加载与硬件）**：当前源码含新 auth-lease build，未重包/安装，不能复用下方 bridge3 安装 manifest 或硬件结论。现场旧 upstream-usage 驻留 ignore 脚本没有本次已授权热换入口；保持增强安全关闭，不要求用户现在重启或把反复重启/复测当作日常恢复办法。50ms 仅原控制轮询超时，不是 OS 调度保证；本轮没有精确配对跨端唯一 E 测点，仍不能唯一定位 Back 的 646ms 或 2231ms 等待返回区间的具体调度原因。下列已安装包硬件 failed 与安全停用事实继续有效。
+- 后续回归审计采用三个等长 15 分钟窗口；timeout 分别 17、0、52，旧包已存在最长 4923ms 的 O 排队，新包故障期最长 3076ms。负载/用户动作未控制，不能由频率确认或排除 1f 回归，也不能归因 CPU。旧/新安装身份、一次有界指纹复算未命中及新增日志热路径风险归原 Bug；不把相同前端资产名称/大小当成全部源码字节一致。
+- 后续 bridge3 候选已本机安装、用户硬件验收 **failed**：Helper 接收 HB 时采 GetTickCount64，显式 active/inactive/closed，O/E 冻结 Agent connection、ownership epoch、observation sequence 和已 ACK target，R 仅隔离旧观察代次，不宣称可靠物理来源。latest O 跨越短 inactive 时 App 仍须先撤权/取消/释放 Driver 持键/观察归零；首次/撤权后重新授权建立 sequence floor，连续有效 owned 的 HB 不前移 floor，避免同 epoch 本地超时后的旧 E 被 fresh O 带回执行。正常有效同 epoch E 保持 FIFO，不按年龄丢边沿。新旧线协议拒绝混用，不加 fallback，不改 Agent 或现有 1500ms 阈值。
+- **failed（该 bridge3 包本机硬件复验）**：用户确认闲置首 Menu 失败/第二次成功、语音失败、Back 两次删除过多，TV 成功。UTC `15:59` 发生 2231ms sleep 返回区间迟到、OS 10053 与约 15.329 秒 Agent 重连空窗；`16:03` Back 的 Agent DOWN/UP 间隔 228ms，Helper UP 至 App UP 晚 646ms，App 六次 repeat 加两次单击共八次 queued。当前模板仅 Backspace，非 Ctrl+Backspace/双击动作；逐 E 出线/读取/执行分段缺失，不凭后续恢复或自动化通过宣称整体修复。Voice attempt 26 abort、零音频 callback；无 chord_press ok 不能反推没有 DOWN，取消分支可在成功 press 后先 release。原始/最小脱敏证据复用 `capture-state-installed-failure-window.json`、`capture-state-user-failure-window.json`、`capture-state-failure-details.json`，详见原 Bug。
+- **passed（故障后正常安全停用，不是功能验收）**：UTC `16:07:28.037` 经已消歧的正常关闭按钮停用；Agent STOP passed/identity_match/hook_detached，匹配 fresh receipt，App release_confirmed，Helper/监听端口均释放，repeat mask 清零。`16:13` 左右 Ctrl/Win/Alt/Shift 与 Backspace 全 UP，UI 实际已关闭；仅正常停用更新增强开关为 false，保留用户映射/模板/音频。保持停用，无重装、采样、重试或新提交；后续诊断须先补足精确失败分段，不扩大既有 passed 范围。
+- **passed（后续业务 RED / Helper focused GREEN）**：真实隔离命名管道旧实现实际出现过期 O 仍写出、false HB 无即时撤权、持续 R 队列阻塞 T/W/S 与 Stop，四项因预期业务原因失败；不是仅用 v3 解析失败代替业务 RED。review 另发现取 O 后才取 E 的并发窗；闩锁精确在此窗注入 active+DOWN/UP，真实线输出实际得到 ordered=false。现取到 data 后再读最新 O 并先发送；两个 FIFO 边沿各一次、不重 stamp。当前 Helper `capture_` 为 12 passed、`cooperative_cleanup_tests` 为 22 passed；另含排队 true 被后续 false 替代、真实日志 sink 阻塞/队列满与持续 R 同时发生时，实际管道 O/T/W/S/Stop 及生产 renew 线程 TCP 至少两次续约有进展。最初新增测试缺 BufRead trait 的编译错误已修正，不算业务 RED。隔离目录和唯一测试管道不触生产端口、回执或用户配置。这些 focused 证据本身不能代替后述组合实装，更不能当作硬件持续性通过。
+- **passed（bridge3 组合自动化/审查）**：接收端 37 项真实 IPC/边界回归与 setter 1 项通过；Helper 全套 82 passed / 3 ignored、fmt/check 通过；workspace core 61+4、Windows 609 passed / 21 ignored、Host 185 passed / 1 ignored，其余集成/文档通过，fmt/check/runtime-simulation check 通过。三处 P2（首 E 超车 O、本地 timeout 后同 epoch 旧 E 复活、共享锁内同步观测）均经独立 review 闭合。首次 Helper full 仅旧 split fixture 期待 OK2 而输入已为 OK3 失败，修期待后全绿，不算生产故障。前端未改，复用 506 项证据并在打包中重新 build；不运行暂停的 bulk native 或 RawInput 采样。
+- **passed（bridge3 实装与有限读回）**：UTC `15:56:26` 正常覆盖安装、Explorer 普通权限 App 26148，Helper 74732 实际安装路径/hash 与精确创建代次读回；六配置、临时 binding/host 精确代次保持，无 SYS。setup SHA-256 `55777dd77d5ff49bee967c0f4225a99091d7f07ec59ad1f81bcffaac4a9385a7`；installed App `2df8aaf8d9a6016a6d2e7017da73e50c465ae4ac39a066dce4f5572ed79ef3ab`；Helper `938d942c30826f985e59d70b8de906f3e6ed7e010fbb65c585442edcabd332b7`。base `1f1baec`、fingerprint `e3284f2c028ce9b1ceada9e8134a7883267636d2ed17b9cfef063ef50e028ad7`，local/dirty/included；后置诊断 example 的离线修订不在这个固定 manifest 中，不覆盖重算为当前工作区身份。真实 descriptor version=3，HB1 false 后 inactive，HB2 true/epoch2/target2 对应 App owned=7167；30 秒聚合样本最大 203ms/write=0。只是实际新链生效，不能代替冷态、持键关闭/重开与长期稳定验收。
+- 升级停止边界：最初语音门禁只查当前文件，轮转后零条而拒绝；本地脚本仅补当前 PID+创建时间范围的合法轮转、物理 UP/attempt terminal/chord 清理，7 个正反 fixture 与实际只读检查通过。原 Helper 72348 的 stop 仍 unconfirmed，随后本次正常退出的 App 4180 明确提交 cleanup_only，后继 82392 经 RECOVERY Confirmed→App release_confirmed→整体 shutdown passed，才获准显式续装。Confirmed 分支强制同 instance、本次 stop_id、hook_detached 与 released_all，ACK 正文未单独留证；不是凭 passed 回执或进程退出推断。Task Ready/0 实例、无待启动控制进程、无 App/Helper/端口再次确认；停止意图按契约保留，不清回执、不强杀。本地门禁脚本/测试不纳入源码提交，原两次拒绝证据保留。
 
 - **passed（RED）**：旧授权在新连接上的读取回归实际失败；旧共享 fault 在受控 TCP 新会话已开始后到达，读取循环实际提前退出。首轮合跑第二项受预期失败的测试 Mutex poisoning 干扰，随后单独执行取得真实旧 fault 失败，不把 poisoning 当作产品证据。
 - **passed（定向 GREEN）**：Helper 的 `cooperative_cleanup_tests` 22 项与 `capture_log_stall_tests` 3 项通过，包含旧 fault 不关闭新代/同代 fault 仍可结束、授权和旧撤权隔离、正常收尾和日志接收线程不阻塞；新增 HB 诊断回归核对 connection_generation、helper_hb_seq、helper_receive 原点和不泄漏 synthetic token。授权回归还通过真实合成 loopback socket 验证旧代无 renew 字节、当前授权后实际收到完整 renew，再撤权后不再写。
@@ -23,10 +56,6 @@
 
 命令入口为 `cargo test --locked --manifest-path hardware/RC003/helper/Cargo.toml`、同 manifest 的 fmt/check，以及根 workspace 的 fmt/test/check 和 `cargo check -p sayall-windows-app --features runtime-simulation`。必要红/绿完整日志复用 `target/dev/menu-capture-reliability/connection-generation-*.log`，该目录历史材料保持原用途；审查与实装证据提炼后按 LOGGING 回收可重现输出，不删除本次唯一失败证据。
 
-2026-10-20 当前候选实体键盘共存已 **failed**：用户报告反引号→Tab，当前Helper TV报告与应用Tab注入链已记录；上游/个人版原始Agent的同报告离线对照均不区分设备来源。语音、UI布局及接管所有权通过不关闭该回归；详情见 [当前回归](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-上游规则候选的实体键盘回归)。
-
-2026-10-20 起的上游规则候选另须核对 Agent build=`2026-10-20.upstream-usage` 和 Helper `[CAPTURE] policy=upstream_usage_gate system_module_binding=false`。界面“已开启”须有当前目标代次的实际 ownership ACK，不能只看计划任务启动或桥连接。分别验证目标/非目标键、Menu 模板切换、持键释放/快速连按、冷态首用及普通键盘共存（含反引号、方向键）；同宿主同格式同 usage 不再保证来源隔离，不能复用下文 10 月 12 日旧实现的隔离结论。停止须核对新鲜回执和实际进程结束；记录归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-系统模块变化后恢复上游捕获规则)。
-
 ## 适用范围
 
 - 仓库：本 Windows fork；官方上游为 `GetSayAll/remote-mic-app-windows`
@@ -35,7 +64,23 @@
 - 硬件 B：小米蓝牙遥控器 2 Pro / RC003
 - 当前状态：WinRT BLE / ATVV / PCM / WASAPI、设备名与 2A24 型号识别、端点持久化、退避重连、睡眠恢复、Raw Input、本机使用统计和 Windows 10 1809 双层版本门禁代码路径已实现；Windows、RC001、RC003、VB-CABLE 真机验收均为 deferred
 
+## 2026-10-20 上游整合候选验证
+
+输入为 `ea832bdf2579d1e2f99871bb979727c255abf779` 与 `upstream/main@ab9aa197e59c65b6c7b22e51a968cd0cb4312446` 的真实三方合并，保留原有未提交个人修改；源码整合检查点 `ce7bdc0a26f28120c7ceb88abc0416c43e811744` 已经独立审查并仅本地提交。以下完整验证结论属于恢复这些修改后的组合工作区，不冒充纯提交或已安装候选的证据；限定索引补验单独列出。
+
+- passed：`pnpm test` 471 项、`pnpm build`；P1 宏取消修正后的 `cargo test --workspace`（核心 61、Windows 590/21 ignored、Tauri 174/1 ignored，其他独立测试全部通过）；`cargo fmt --all -- --check`、`cargo check --workspace`、带 `runtime-simulation` 的宿主检查；安装身份/退出静态契约 10 项。
+- passed：仿真前端嵌入内容门禁；宿主普通用户实际 Tauri/WebView/IPC 20 步，包括七页导航、模板读取、宏保存/渲染/绑定引用/删除清理及模板保持、启动显示设置往返、240 采样语音和断开清理。宏步骤未执行真实快捷键；未启动提权 Helper。报告终态为 `windows-ci-simulation`，仿真进程已正常自行退出。
+- passed（限定候选补验）：获准的九个 tracked 路径临时对齐 merge-only index 后，宿主身份 1、安装器退出契约 5、生命周期 27、模板 16、组合动作持久化 4，以及 Windows 宏 25、模板 6、正常退出 6、模板目录契约 1 项分别通过；测试过滤范围有交集，不累加为独立用例总数。随后九路径逐一恢复，原始字节与规范化 blob 均一致，索引、MERGE_HEAD、四个 stash 和范围外既有修改保持。此补验仍保留其余旧 dirty，尤其 Helper 捕获策略与连接页有实质修改；未执行它们的安装/真机路径，不能称完整 pure-index 全套或独立身份部署通过。
+- failed：首次沙箱内启动 60 秒没有前端事件或报告；保留进程后通过正常退出事件退出，未强杀。相同二进制在宿主普通用户环境运行上述 20 步通过，不能将首次失败隐藏成一次通过。
+- deferred：宏的真实 SendInput/第三方应用聚焦、按住键期间真实应用退出、RC001/RC003、冷态首用、全按键接管及实体反引号隔离。宏取消/释放/关停超时与关闭后拒绝启动由 fake stepper 覆盖；生产等待取消、启动返回后禁止后续快捷键/聚焦/位置点击、共享取消信号阻断 FocusRunner 重试/队列由单元测试覆盖，不能当作物理键释放或真实 UIA SetFocus 实证；常用语公开组件仍为空壳。
+
+本轮不构建安装包，不替换已安装版本，不修改 Helper/桥的既有接管算法。上游在共同基线之后未改变 Helper 目录、`rc003_task.rs` 或 `rc003_bridge.rs`，两项已知故障不能因此关闭；继续按下文既有失败记录及 TODO 串行验收。
+
 ## 测试前准备
+
+2026-10-20 当前候选实体键盘共存已 **failed**：用户报告反引号→Tab，当前Helper TV报告与应用Tab注入链已记录；上游/个人版原始Agent的同报告离线对照均不区分设备来源。语音、UI布局及接管所有权通过不关闭该回归；详情见 [当前回归](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-上游规则候选的实体键盘回归)。
+
+2026-10-20 起的上游规则候选另须核对 Agent build=`2026-10-20.upstream-usage` 和 Helper `[CAPTURE] policy=upstream_usage_gate system_module_binding=false`。界面“已开启”须有当前目标代次的实际 ownership ACK，不能只看计划任务启动或桥连接。分别验证目标/非目标键、Menu 模板切换、持键释放/快速连按、冷态首用及普通键盘共存（含反引号、方向键）；同宿主同格式同 usage 不再保证来源隔离，不能复用下文 10 月 12 日旧实现的隔离结论。停止须核对新鲜回执和实际进程结束；记录归 [同主题 Bug](../Bugs/2026-10-03-foreground-input-regression.md#2026-10-20-系统模块变化后恢复上游捕获规则)。
 
 1. 记录 Commit、版本、Windows 版本和电脑蓝牙适配器。
 2. 分别准备真实 RC001 和 RC003，并确认两者都可以在 Windows 蓝牙设置中完成配对。不得用其中一种型号的结果代替另一种。
@@ -420,6 +465,12 @@
 - **passed（用户实际菜单观察，本机/当前遥控器）**：用户回复“一二三都成功了”：Codex 前台短按 Menu 后松开，菜单保持；遥控方向选择模板并确认，模板正常应用；重新开菜单后切换到其他软件，菜单关闭。此三项是本机本次用户观察，不外推到 RC001、另一台 RC003、长期稳定或全按键新一轮验收。
 - **运行日志中的分支证据与关联限制**：同一安装进程 `10:37:17.776Z`（北京时间 `18:37:17.776`）generation 13 激活 API 返回 false、actual_foreground=false；窗口可见、未最小化、no-activate=false、调用方为窗口线程。随后 `activation_denied_policy` 记录 panel_before=true / panel_after=true，`snapshot_applied` passed，确认本轮出现“激活拒绝后面板保留”状态。`10:38:15.075Z` generation 22 API 与实际前台均成功、面板保持；`10:38:16.756Z` generation 23 模板选择 `actions_available=true`，随后有 `focus_ignored hide_completed`。脱敏证据 `target/dev/foreground-input/menu-focus-fix-user-validation-evidence.json`（1,823 字节）。没有用户动作关联 ID，不能唯一断定 generation 13 对应用户第一项操作，也不能证明“拒绝→继续遥控→确认模板”完整同次链；未见 remote-only 专属字段。三项外部行为仍按用户确认记当前本机观察 `passed`。Windows 拒绝激活的底层原因仍未知。
 - **材料留存**：保留当前 `370b51b2` 安装候选供当前部署恢复；保留 e39 单安装器失败对照以比较诊断失败现场；保留 `5fd60bef` 基线以对照此前 dirty 音频/构建身份。完成本轮完整链路验收、相关引用与对照唯一性核对后，再按 LOGGING 规则确认是否回收；本轮不删除。
+
+### 本地历史局部验证（不代表当前候选通过）
+
+2026-09-15 登录自启动历史实证：release 安装版 0.2.6 注销重登后由登录 shell 自动启动，父进程为 Explorer；日志链为 `document_load finished → vue_mount(80ms) → initial_ipc_ready(337ms)`，并有 `startup feature=launch_at_login action=sync terminal_result=passed enabled=true`。该结果只证明当时版本的当前用户 Run 项启动；Win+L 锁屏/解锁不会重新运行 Run 项，不能代替注销重登验收，不外推当前候选或硬件功能。
+
+关于页“启动行为”与“软件更新”间12px分组间距的历史局部修改已通过类型检查与 AboutPage 仿真测试；仅证明 CSS/页面边界，无独立硬件验收要求，不作为当前全部设置或安装矩阵通过证据。
 
 ### 上游历史记录（不代表本 fork 当前合并候选通过）
 

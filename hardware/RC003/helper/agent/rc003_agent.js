@@ -91,7 +91,7 @@
    [AGENT-STALE]。没有它，"改了 agent 但宿主里跑的还是上一代"是完全静默的——
    握手正常、命令照发、日志漂亮，只有按键行为是旧的（2026-09-26 哨兵键那次
    就是这样白跑了一轮：以为在验新逻辑，其实接管的是旧实例）。 */
-var AGENT_BUILD = '2026-10-20.upstream-usage';
+var AGENT_BUILD = '2026-10-23.auth-lease';
 
 var TARGET_IOCTL = 0x80018483;
 var TARGET_USAGES = [
@@ -620,8 +620,8 @@ function pump() {
   var mine = sock;
   pumpRunning = true;
   mine.input.read(4096).then(function (buf) {
-    pumpRunning = false;
     if (!connected || sock !== mine) return;
+    pumpRunning = false;
     var len = 0;
     try { len = new Uint8Array(buf).length; } catch (e) { len = 0; }
     if (len === 0) { setTimeout(pump, 200); return; }
@@ -636,8 +636,8 @@ function pump() {
     }
     pump();
   }).catch(function () {
-    pumpRunning = false;
     if (sock !== mine) return;     /* 已被更新的连接取代：别动它 */
+    pumpRunning = false;
     /* 读失败 = 这条连接死了。**必须走 dropConnection**：
        此前这里只写 `connected = false`，于是 retryNotBefore / sock / tLastRx 都不复位，
        而且"连接死过"这件事在统计里完全不可见。
@@ -678,6 +678,8 @@ function connectOnce() {
       }
       sock = conn;
       connected = true;
+      handshakeDone = false;
+      lastRenewAt = 0;
       rxBuffer = '';
       /* 新连接 = 新的鉴权判定代次：只有这条连接真的收到过 renew，才允许把
          "租约过期"当成链路问题（rx_silence）而不是令牌问题（auth_mismatch）。 */
@@ -743,6 +745,8 @@ function dropConnection(reason, slow) {
     retryNotBefore = Date.now() + RECONNECT_MS;
   }
   everRenewed = false;
+  handshakeDone = false;
+  lastRenewAt = 0;
   tConnect = 0;
   tLastRx = 0;
   pumpRunning = false;

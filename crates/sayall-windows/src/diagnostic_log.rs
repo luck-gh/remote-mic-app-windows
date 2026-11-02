@@ -12,7 +12,6 @@
 //! - 轮转判定用「当前大小 + 本次长度 > 上限」，因此单个文件不会超过上限一个记录以上；
 //! - 轮转文件名带 UTC 时间戳与进程号，两个进程同时轮转也不会互相覆盖。
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// 单个日志文件的体积上限（10 MB）。
@@ -27,27 +26,31 @@ pub fn rotation_due(current_bytes: u64, incoming_bytes: u64, cap: u64) -> bool {
 
 /// 追加一行；必要时先轮转。返回是否写入成功。
 pub fn append_line(path: &Path, line: &str) -> bool {
+    append_line_checked(path, line).is_ok()
+}
+
+pub(crate) fn append_line_checked(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
     let incoming = line.len() as u64 + 1;
     let current = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     if rotation_due(current, incoming, ROTATE_BYTES) {
         rotate(path);
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-    else {
-        return false;
-    };
+        .open(path)?;
+    write_line_checked(&mut file, line)
+}
+
+fn write_line_checked(output: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
     let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
-    let ok = file.write_all(buf.as_bytes()).is_ok();
-    let _ = file.flush();
-    ok
+    output.write_all(buf.as_bytes())?;
+    output.flush()
 }
 
 /// 探测"这个路径能不能写"（只创建空文件，不写内容）：`initialize_diagnostic_log`
@@ -185,6 +188,27 @@ mod tests {
         assert!(rotation_due(10 * 1024 * 1024 - 10, 11, 10 * 1024 * 1024));
         assert!(!rotation_due(10 * 1024 * 1024 - 10, 10, 10 * 1024 * 1024));
         assert!(!rotation_due(0, 1, 10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn checked_append_reports_flush_failure_after_successful_write() {
+        struct FlushFailure(Vec<u8>);
+        impl std::io::Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fixture flush failure",
+                ))
+            }
+        }
+        let mut output = FlushFailure(Vec::new());
+        let error = write_line_checked(&mut output, "record").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(output.0, b"record\n");
     }
 
     #[test]

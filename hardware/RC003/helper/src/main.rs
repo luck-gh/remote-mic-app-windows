@@ -491,6 +491,7 @@ mod imp {
 
     #[link(name = "kernel32")]
     extern "system" {
+        fn GetCurrentThreadId() -> u32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn CloseHandle(h: Handle) -> i32;
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
@@ -1953,6 +1954,752 @@ mod imp {
     }
 
     #[cfg(test)]
+    mod capture_bridge_contract_tests {
+        use super::*;
+        use std::io::BufRead;
+        use std::os::windows::io::FromRawHandle;
+
+        fn test_context() -> CaptureContext {
+            CaptureContext {
+                connection_generation: 4,
+                ownership_epoch: 1,
+                target_generation: 4,
+            }
+        }
+
+        struct OwnBridge {
+            bridge: AppBridge,
+            lines: mpsc::Receiver<String>,
+            control: mpsc::Sender<String>,
+            refill: Arc<AtomicBool>,
+            paused: Arc<AtomicBool>,
+            dequeued: mpsc::Receiver<()>,
+            idle_armed: Arc<AtomicBool>,
+            idle_reached: mpsc::Receiver<()>,
+            idle_release: mpsc::Sender<()>,
+            idle_finished: mpsc::Receiver<bool>,
+            done: mpsc::Receiver<()>,
+            server_stop: Arc<AtomicBool>,
+            server: Option<JoinHandle<()>>,
+        }
+
+        impl OwnBridge {
+            fn start() -> Self {
+                Self::start_with_logger(Logger::new(None))
+            }
+
+            fn start_with_logger(logger: Logger) -> Self {
+                static NEXT_BRIDGE: AtomicU64 = AtomicU64::new(0);
+                let fixture_id = format!(
+                    "{}-{}",
+                    std::process::id(),
+                    NEXT_BRIDGE.fetch_add(1, Ordering::Relaxed)
+                );
+                let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/dev/capture-bridge-tests")
+                    .join(&fixture_id);
+                fs::create_dir_all(&root).unwrap();
+                let pipe = format!(r"\\.\pipe\SayAll.Test.CaptureBridge.{fixture_id}");
+                let descriptor = root.join("bridge.ini");
+                fs::write(&descriptor, format!(
+                    "version={BRIDGE_PROTOCOL_VERSION}\nport=1\npipe={pipe}\ntoken=synthetic-capture-token\npid={}\n", std::process::id()
+                )).unwrap();
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (line_tx, lines) = mpsc::channel();
+                let (control, commands) = mpsc::channel::<String>();
+                let server_stop = Arc::new(AtomicBool::new(false));
+                let peer_stop = Arc::clone(&server_stop);
+                let server = std::thread::spawn(move || {
+                    #[link(name = "kernel32")]
+                    extern "system" {
+                        fn CreateNamedPipeW(
+                            name: *const u16,
+                            open_mode: u32,
+                            pipe_mode: u32,
+                            max_instances: u32,
+                            out_size: u32,
+                            in_size: u32,
+                            timeout: u32,
+                            attributes: *mut c_void,
+                        ) -> Handle;
+                        fn ConnectNamedPipe(pipe: Handle, overlapped: *mut c_void) -> i32;
+                    }
+                    let raw = unsafe {
+                        CreateNamedPipeW(
+                            to_wide(&pipe).as_ptr(),
+                            3,
+                            1,
+                            1,
+                            65_536,
+                            65_536,
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    assert_ne!(raw, INVALID_HANDLE_VALUE);
+                    let mut file = unsafe { fs::File::from_raw_handle(raw) };
+                    ready_tx.send(()).unwrap();
+                    loop {
+                        if peer_stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) };
+                        if connected != 0 || lasts_error() == 535 {
+                            break;
+                        }
+                        assert_eq!(lasts_error(), 536);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    set_named_pipe_nowait(&file).unwrap();
+                    let mut pending = Vec::new();
+                    while !peer_stop.load(Ordering::Acquire) {
+                        let mut bytes = [0; 8192];
+                        match file.read(&mut bytes) {
+                            Ok(count) => pending.extend_from_slice(&bytes[..count]),
+                            Err(error) if error.raw_os_error() == Some(109) => {
+                                let _ = line_tx.send("TEST peer_closed".into());
+                                break;
+                            }
+                            Err(error) if error.raw_os_error() == Some(232) => {}
+                            Err(error) => panic!("owned pipe read failed: {error}"),
+                        }
+                        while let Some((line, remaining)) = split_first_line(&pending) {
+                            pending = remaining;
+                            if line.starts_with("HELLO ") {
+                                file.write_all(
+                                    format!("OK {BRIDGE_PROTOCOL_VERSION} 4 f1\n").as_bytes(),
+                                )
+                                .unwrap();
+                            }
+                            let _ = line_tx.send(line);
+                        }
+                        while let Ok(command) = commands.try_recv() {
+                            file.write_all(command.as_bytes()).unwrap();
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                let (tx, rx) = mpsc::channel();
+                let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+                let stop = Arc::new(AtomicBool::new(false));
+                let stats = Arc::new(BridgeStats::default());
+                let pending = Arc::new(AtomicU64::new(0));
+                let ownership = Arc::new(Mutex::new(None));
+                let targets = Arc::new(Mutex::new(BridgeCaptureTargets::default()));
+                let synth = Arc::new(Mutex::new(None));
+                let synth_dirty = Arc::new(AtomicBool::new(false));
+                let gate = Arc::new(AtomicBool::new(false));
+                let gate_dirty = Arc::new(AtomicBool::new(false));
+                let refill = Arc::new(AtomicBool::new(false));
+                let paused = Arc::new(AtomicBool::new(false));
+                let hook_paused = Arc::clone(&paused);
+                let hook_refill = Arc::clone(&refill);
+                let hook_tx = tx.clone();
+                let (dequeued_tx, dequeued) = mpsc::channel();
+                let idle_armed = Arc::new(AtomicBool::new(false));
+                let hook_idle_armed = Arc::clone(&idle_armed);
+                let (idle_reached_tx, idle_reached) = mpsc::channel();
+                let (idle_release, idle_release_rx) = mpsc::channel();
+                let (idle_finished_tx, idle_finished) = mpsc::channel();
+                let (done_tx, done) = mpsc::channel();
+                let worker_stop = Arc::clone(&stop);
+                let worker_stats = Arc::clone(&stats);
+                let worker_pending = Arc::clone(&pending);
+                let worker_ownership = Arc::clone(&ownership);
+                let hook_pending = Arc::clone(&pending);
+                let worker_targets = Arc::clone(&targets);
+                let worker_synth = Arc::clone(&synth);
+                let worker_synth_dirty = Arc::clone(&synth_dirty);
+                let worker_gate = Arc::clone(&gate);
+                let worker_gate_dirty = Arc::clone(&gate_dirty);
+                let handle = std::thread::spawn(move || {
+                    let mut tracked_idle = false;
+                    BRIDGE_IDLE_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move |finished| match finished {
+                            None if hook_idle_armed.swap(false, Ordering::AcqRel) => {
+                                tracked_idle = true;
+                                idle_reached_tx.send(()).unwrap();
+                                idle_release_rx
+                                    .recv_timeout(Duration::from_secs(3))
+                                    .unwrap();
+                                Some(Duration::from_secs(2))
+                            }
+                            Some(notified) if tracked_idle => {
+                                tracked_idle = false;
+                                idle_finished_tx.send(notified).unwrap();
+                                None
+                            }
+                            _ => None,
+                        }));
+                    });
+                    BRIDGE_DEQUEUE_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            if hook_paused.load(Ordering::Acquire) {
+                                let _ = dequeued_tx.send(());
+                                while hook_paused.load(Ordering::Acquire) {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                            if hook_refill.load(Ordering::Acquire) {
+                                hook_pending.fetch_add(1, Ordering::AcqRel);
+                                hook_tx
+                                    .send(QueuedBridgeOutbound {
+                                        queued_at: Instant::now(),
+                                        message: BridgeOutbound::Observed {
+                                            context: test_context(),
+                                            usages: Vec::new(),
+                                        },
+                                    })
+                                    .unwrap();
+                                let _ = dequeued_tx.send(());
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }))
+                    });
+                    app_bridge_worker(
+                        descriptor,
+                        rx,
+                        wake_rx,
+                        worker_stop,
+                        worker_stats,
+                        worker_pending,
+                        worker_ownership,
+                        logger,
+                        Arc::new(AtomicU64::new(now_ms_u64())),
+                        false,
+                        worker_targets,
+                        worker_synth,
+                        worker_synth_dirty,
+                        worker_gate,
+                        worker_gate_dirty,
+                    );
+                    let _ = done_tx.send(());
+                });
+                let fixture = Self {
+                    bridge: AppBridge {
+                        tx,
+                        wake_tx,
+                        pending,
+                        ownership,
+                        handle: Some(handle),
+                        stop,
+                        stats,
+                        targets,
+                        voice_synth: synth,
+                        voice_synth_dirty: synth_dirty,
+                        voice_gate: gate,
+                        voice_gate_dirty: gate_dirty,
+                    },
+                    lines,
+                    control,
+                    refill,
+                    paused,
+                    dequeued,
+                    idle_armed,
+                    idle_reached,
+                    idle_release,
+                    idle_finished,
+                    done,
+                    server_stop,
+                    server: Some(server),
+                };
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while fixture.bridge.capture_targets().generation != 4 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "owned bridge did not authenticate"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                fixture
+            }
+
+            fn flood(&self) {
+                self.refill.store(true, Ordering::Release);
+                self.bridge.push_observed(test_context(), Vec::new());
+                self.dequeued.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+
+            fn pause_next_idle(&self) {
+                self.idle_armed.store(true, Ordering::Release);
+                self.idle_reached
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+            }
+
+            fn release_idle(&self) -> bool {
+                self.idle_release.send(()).unwrap();
+                self.idle_finished
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+            }
+
+            fn begin_idle_wait(&self) {
+                self.idle_release.send(()).unwrap();
+                assert!(matches!(
+                    self.idle_finished.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+            }
+
+            fn receives(&self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> bool {
+                let deadline = Instant::now() + timeout;
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    match self.lines.recv_timeout(remaining) {
+                        Ok(line) if predicate(&line) => return true,
+                        Ok(_) => {}
+                        Err(_) => return false,
+                    }
+                }
+                false
+            }
+        }
+
+        impl Drop for OwnBridge {
+            fn drop(&mut self) {
+                self.paused.store(false, Ordering::Release);
+                self.refill.store(false, Ordering::Release);
+                let _ = self.idle_release.send(());
+                self.bridge.shutdown();
+                self.bridge.join();
+                self.server_stop.store(true, Ordering::Release);
+                self.server.take().unwrap().join().unwrap();
+            }
+        }
+
+        #[test]
+        fn capture_bridge_idle_data_wakes_without_waiting_for_timeout() {
+            let fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.bridge.push_edges(test_context(), 7, vec![0xf1]);
+            fixture.bridge.push_edges(test_context(), 7, Vec::new());
+            fixture.bridge.push_observed(test_context(), vec![0xf1]);
+            fixture.bridge.push_synth_ack(None);
+            let notified = fixture.release_idle();
+            let down = fixture.receives(
+                |line| line.trim_end() == "E 4 1 7 4 f1",
+                Duration::from_secs(2),
+            );
+            let up = fixture.receives(
+                |line| line.trim_end() == "E 4 1 7 4 -",
+                Duration::from_secs(2),
+            );
+            let observed =
+                fixture.receives(|line| line.trim_end() == "R 4 1 f1", Duration::from_secs(2));
+            let ack = fixture.receives(|line| line.trim_end() == "A -", Duration::from_secs(2));
+            drop(fixture);
+            assert!(down && up && observed && ack, "queued data must retain FIFO wire output: down={down} up={up} observed={observed} ack={ack}");
+            assert!(notified, "queued data did not wake the idle wait");
+        }
+
+        #[test]
+        fn capture_bridge_idle_ownership_alone_wakes_without_data() {
+            let fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context: test_context(),
+                sequence: 7,
+                helper_hb_seq: 7,
+                sampled_ms: capture_tick_ms(),
+                state: CaptureState::Active,
+                usages: vec![0xf1],
+            });
+            let notified = fixture.release_idle();
+            let written =
+                fixture.receives(|line| line.starts_with("O 4 1 7 "), Duration::from_secs(2));
+            drop(fixture);
+            assert!(written, "ownership-only update never reached the real pipe");
+            assert!(
+                notified,
+                "ownership-only publication did not wake the idle wait"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_idle_shutdown_wakes_and_closes_real_pipe() {
+            let fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.bridge.shutdown();
+            let notified = fixture.release_idle();
+            let bye = fixture.receives(
+                |line| line.trim_end() == "BYE helper_shutdown",
+                Duration::from_secs(2),
+            );
+            let ended = fixture.done.recv_timeout(Duration::from_secs(2)).is_ok();
+            drop(fixture);
+            assert!(
+                bye && ended,
+                "idle shutdown did not close and finish: bye={bye} ended={ended}"
+            );
+            assert!(
+                notified,
+                "stop before the wait was not retained as a wakeup"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_idle_waiting_data_wakes_and_keeps_edges_once() {
+            let fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.begin_idle_wait();
+            fixture.bridge.push_edges(test_context(), 7, vec![0xf1]);
+            fixture.bridge.push_edges(test_context(), 7, Vec::new());
+            let notified = fixture
+                .idle_finished
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            let down = fixture.receives(
+                |line| line.trim_end() == "E 4 1 7 4 f1",
+                Duration::from_secs(2),
+            );
+            let up = fixture.receives(
+                |line| line.trim_end() == "E 4 1 7 4 -",
+                Duration::from_secs(2),
+            );
+            let duplicate =
+                fixture.receives(|line| line.starts_with("E "), Duration::from_millis(100));
+            drop(fixture);
+            assert!(notified && down && up && !duplicate);
+        }
+
+        #[test]
+        fn capture_bridge_idle_waiting_ownership_wakes_without_data() {
+            let fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.begin_idle_wait();
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context: test_context(),
+                sequence: 7,
+                helper_hb_seq: 7,
+                sampled_ms: capture_tick_ms(),
+                state: CaptureState::Active,
+                usages: vec![0xf1],
+            });
+            let notified = fixture
+                .idle_finished
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            let written =
+                fixture.receives(|line| line.starts_with("O 4 1 7 "), Duration::from_secs(2));
+            drop(fixture);
+            assert!(notified && written);
+        }
+
+        #[test]
+        fn capture_bridge_idle_waiting_shutdown_wakes_and_finishes() {
+            let fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.begin_idle_wait();
+            fixture.bridge.shutdown();
+            let notified = fixture
+                .idle_finished
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            let bye = fixture.receives(
+                |line| line.trim_end() == "BYE helper_shutdown",
+                Duration::from_secs(2),
+            );
+            let ended = fixture.done.recv_timeout(Duration::from_secs(2)).is_ok();
+            drop(fixture);
+            assert!(notified && bye && ended);
+        }
+
+        #[test]
+        fn capture_bridge_idle_disconnected_notifier_finishes_without_spin() {
+            let mut fixture = OwnBridge::start();
+            fixture.pause_next_idle();
+            fixture.begin_idle_wait();
+            let (replacement, _receiver) = mpsc::sync_channel(1);
+            drop(std::mem::replace(&mut fixture.bridge.wake_tx, replacement));
+            let bye = fixture.receives(
+                |line| line.trim_end() == "BYE helper_shutdown",
+                Duration::from_secs(2),
+            );
+            let ended = fixture.done.recv_timeout(Duration::from_secs(2)).is_ok();
+            drop(fixture);
+            assert!(bye && ended);
+        }
+
+        #[test]
+        fn capture_bridge_expired_ownership_is_not_written() {
+            let fixture = OwnBridge::start();
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context: test_context(),
+                sequence: 90,
+                helper_hb_seq: 90,
+                sampled_ms: capture_tick_ms() - 2050,
+                state: CaptureState::Active,
+                usages: vec![0xf1],
+            });
+            let stale_written =
+                fixture.receives(|line| line.starts_with("O "), Duration::from_millis(300));
+            drop(fixture);
+            assert!(
+                !stale_written,
+                "expired Helper sample was written as current ownership"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_false_heartbeat_publishes_revocation() {
+            let fixture = OwnBridge::start();
+            let mut session = Session {
+                connection_generation: 4,
+                ownership_epoch: 0,
+                ownership_state: CaptureState::Inactive,
+                ownership_sequence: 0,
+                hb_sequence: 89,
+                last_hb_rx: None,
+                connected_at: Instant::now(),
+                last_rx: Instant::now(),
+                hello: None,
+                edges: Vec::new(),
+                lines: 0,
+                authenticated: true,
+                config_sent: true,
+                target_ack: Some(BridgeCaptureTargets {
+                    generation: 4,
+                    usages: vec![0xf1],
+                }),
+                last_hb_log: None,
+            };
+            handle_line(
+                r#"{"type":"hb","lease_ok":true,"handshake":true,"disarmed":false}"#,
+                &mut session,
+                &Logger::new(None),
+                "synthetic-capture-token",
+                Some(&fixture.bridge),
+            );
+            assert!(fixture.receives(|line| line.starts_with("O "), Duration::from_secs(2)));
+            session.hb_sequence = 93;
+            handle_line(
+                r#"{"type":"hb","lease_ok":false,"handshake":true,"disarmed":false}"#,
+                &mut session,
+                &Logger::new(None),
+                "synthetic-capture-token",
+                Some(&fixture.bridge),
+            );
+            let revoked = fixture.receives(
+                |line| line.starts_with("O ") && line.contains("inactive"),
+                Duration::from_millis(300),
+            );
+            drop(fixture);
+            assert!(
+                revoked,
+                "false heartbeat did not publish an explicit ownership revocation"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_false_sample_supersedes_queued_true_before_write() {
+            let fixture = OwnBridge::start();
+            fixture.paused.store(true, Ordering::Release);
+            fixture.flood();
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context: test_context(),
+                sequence: 90,
+                helper_hb_seq: 90,
+                sampled_ms: capture_tick_ms(),
+                state: CaptureState::Active,
+                usages: vec![0xf1],
+            });
+            let mut revoked_context = test_context();
+            revoked_context.ownership_epoch = 2;
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context: revoked_context,
+                sequence: 94,
+                helper_hb_seq: 94,
+                sampled_ms: capture_tick_ms(),
+                state: CaptureState::Inactive,
+                usages: vec![0xf1],
+            });
+            fixture.paused.store(false, Ordering::Release);
+            let revoked = fixture.receives(
+                |line| line.starts_with("O 4 2 94 ") && line.contains(" inactive "),
+                Duration::from_secs(1),
+            );
+            let stale_authorized = fixture.receives(
+                |line| line.starts_with("O 4 1 90 "),
+                Duration::from_millis(100),
+            );
+            drop(fixture);
+            assert!(
+                revoked && !stale_authorized,
+                "superseded true sample escaped the ownership slot"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_new_epoch_ownership_precedes_its_first_queued_edge() {
+            let fixture = OwnBridge::start();
+            fixture.paused.store(true, Ordering::Release);
+            fixture
+                .dequeued
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            let context = test_context();
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context,
+                sequence: 2,
+                helper_hb_seq: 2,
+                sampled_ms: capture_tick_ms(),
+                state: CaptureState::Active,
+                usages: vec![0xf1],
+            });
+            fixture.bridge.push_edges(context, 2, vec![0xf1]);
+            fixture.bridge.push_edges(context, 2, Vec::new());
+            fixture.paused.store(false, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut ownership_seen = false;
+            let mut edges = Vec::new();
+            let mut ordered = true;
+            while edges.len() < 2 && Instant::now() < deadline {
+                if let Ok(line) = fixture.lines.recv_timeout(Duration::from_millis(100)) {
+                    if line.starts_with("O 4 1 2 ") {
+                        ownership_seen = true;
+                    }
+                    if line.starts_with("E 4 1 2 4 ") {
+                        ordered &= ownership_seen;
+                        edges.push(line.trim_end().to_owned());
+                    }
+                }
+            }
+            drop(fixture);
+            assert!(
+                ordered && edges == ["E 4 1 2 4 f1", "E 4 1 2 4 -"],
+                "new epoch edge overtook its ownership: ordered={ordered} edges={edges:?}"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_continuous_data_does_not_starve_control() {
+            let fixture = OwnBridge::start();
+            fixture.flood();
+            fixture.control.send("T 9 f1\nW 1\nS -\n".into()).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while fixture.bridge.capture_targets().generation != 9 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let progressed = fixture.bridge.capture_targets().generation == 9
+                && fixture.bridge.voice_gate.load(Ordering::Acquire);
+            drop(fixture);
+            assert!(
+                progressed,
+                "continuous data prevented the real IPC control read from progressing"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_continuous_data_does_not_starve_stop() {
+            let fixture = OwnBridge::start();
+            fixture.flood();
+            fixture.bridge.shutdown();
+            let stopped = fixture
+                .done
+                .recv_timeout(Duration::from_millis(300))
+                .is_ok();
+            drop(fixture);
+            assert!(
+                stopped,
+                "continuous data prevented the worker from observing Stop"
+            );
+        }
+
+        #[test]
+        fn capture_bridge_slow_logger_and_continuous_data_preserve_control_stop_and_renew() {
+            let _authorization = super::cooperative_cleanup_tests::CONNECTION_TEST_GATE
+                .lock()
+                .unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let sink_release = Arc::clone(&release);
+            let once = AtomicBool::new(true);
+            let mut sink = Logger::new(None);
+            sink.test_sink = Some(Arc::new(move |_| {
+                if once.swap(false, Ordering::AcqRel) {
+                    entered_tx.send(()).unwrap();
+                }
+                let _released = sink_release
+                    .1
+                    .wait_while(sink_release.0.lock().unwrap(), |released| !*released)
+                    .unwrap();
+            }));
+            let logger = sink.nonblocking().unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let fixture = OwnBridge::start_with_logger(logger.clone());
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let shared = Arc::new(Mutex::new(Some(AgentRenewalConnection {
+                generation: 41,
+                stream: client,
+                last_success: Some(Instant::now() - Duration::from_secs(2)),
+            })));
+            let stop = Arc::new(AtomicBool::new(false));
+            let counter = Arc::new(AtomicU64::new(0));
+            let stale = Arc::new(AtomicU64::new(0));
+            AGENT_AUTHORIZED_GENERATION.store(41, Ordering::Release);
+            let renew = {
+                let shared = Arc::clone(&shared);
+                let stop = Arc::clone(&stop);
+                let counter = Arc::clone(&counter);
+                let logger = logger.clone();
+                std::thread::spawn(move || {
+                    run_agent_renewal(
+                        shared,
+                        stop,
+                        counter,
+                        stale,
+                        "synthetic-capture-token".into(),
+                        logger,
+                    )
+                })
+            };
+            fixture.flood();
+            for _ in 0..LOG_QUEUE_CAPACITY + 8 {
+                logger.line("[CAPTURE-TEST] event=queue_pressure");
+            }
+            fixture.bridge.push_ownership(OwnershipObservation {
+                context: test_context(),
+                sequence: 1,
+                helper_hb_seq: 1,
+                sampled_ms: capture_tick_ms(),
+                state: CaptureState::Active,
+                usages: vec![0xf1],
+            });
+            fixture.control.send("T 9 f1\nW 1\nS -\n".into()).unwrap();
+            let fresh_ownership =
+                fixture.receives(|line| line.starts_with("O "), Duration::from_secs(1));
+            let deadline = Instant::now() + Duration::from_millis(1200);
+            while counter.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let control_progressed = fixture.bridge.capture_targets().generation == 9
+                && fixture.bridge.voice_gate.load(Ordering::Acquire);
+            let renewed = counter.load(Ordering::Acquire);
+            let mut peer = std::io::BufReader::new(peer);
+            let mut command = String::new();
+            let renewal_arrived =
+                peer.read_line(&mut command).is_ok() && command.contains("\"type\":\"renew\"");
+            fixture.bridge.shutdown();
+            let stopped = fixture
+                .done
+                .recv_timeout(Duration::from_millis(300))
+                .is_ok();
+            stop.store(true, Ordering::Release);
+            renew.join().unwrap();
+            revoke_renewal_authorization(41);
+            drop(fixture);
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+            assert!(logger.shutdown());
+            assert!(fresh_ownership && control_progressed && stopped && renewed >= 2 && renewal_arrived, "ownership={fresh_ownership} control={control_progressed} stop={stopped} renew_count={renewed} socket_renew={renewal_arrived}");
+        }
+    }
+
+    #[cfg(test)]
     mod capture_log_stall_tests {
         use super::*;
 
@@ -1976,8 +2723,12 @@ mod imp {
             // Establish the blocked sink before the capture thread can receive any HB/edge.
             entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             let (tx, rx) = mpsc::channel();
+            let (wake_tx, _wake_rx) = mpsc::sync_channel(1);
             let bridge = AppBridge {
                 tx,
+                wake_tx,
+                pending: Arc::new(AtomicU64::new(0)),
+                ownership: Arc::new(Mutex::new(None)),
                 handle: None,
                 stop: Arc::new(AtomicBool::new(false)),
                 stats: Arc::new(BridgeStats::default()),
@@ -1992,6 +2743,9 @@ mod imp {
                 let logger = capture_logger;
                 let mut session = Session {
                     connection_generation: 1,
+                    ownership_epoch: 0,
+                    ownership_state: CaptureState::Inactive,
+                    ownership_sequence: 0,
                     hb_sequence: 0,
                     last_hb_rx: None,
                     connected_at: Instant::now(),
@@ -2028,34 +2782,28 @@ mod imp {
                     "test",
                     Some(&bridge),
                 );
+                bridge.ownership.lock().unwrap().clone()
             });
             // Hold the sink beyond the real 1500 ms ownership safety window.
             let held_at = Instant::now();
-            let ownership = rx.recv_timeout(Duration::from_millis(1700));
             let down = rx.recv_timeout(Duration::from_millis(100));
             let up = rx.recv_timeout(Duration::from_millis(100));
             let forwarded_in_ms = elapsed_ms(held_at);
             std::thread::sleep(Duration::from_millis(1700).saturating_sub(held_at.elapsed()));
             *gate.0.lock().unwrap() = true;
             gate.1.notify_all();
-            handle.join().unwrap();
+            let ownership = handle.join().unwrap();
             assert!(logger.shutdown());
             assert!(
-                matches!(
-                    ownership,
-                    Ok(QueuedBridgeOutbound {
-                        message: BridgeOutbound::Ownership { .. },
-                        ..
-                    })
-                ),
+                ownership.is_some_and(|sample| sample.state == CaptureState::Active),
                 "logging stalled ownership past the safety window"
             );
             assert!(forwarded_in_ms < 1500, "forwarded_in_ms={forwarded_in_ms}");
             assert!(
-                matches!(down, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges(ref keys), .. }) if keys == &[101])
+                matches!(down, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges { usages: ref keys, .. }, .. }) if keys == &[101])
             );
             assert!(
-                matches!(up, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges(ref keys), .. }) if keys.is_empty())
+                matches!(up, Ok(QueuedBridgeOutbound { message: BridgeOutbound::Edges { usages: ref keys, .. }, .. }) if keys.is_empty())
             );
         }
 
@@ -2191,6 +2939,7 @@ mod imp {
         ///
         /// 与一次捕获运行无关的**管理命令**，在 `run()` 的早期分支截住处理。
         install_task: bool,
+        task_user_sid: Option<String>,
         /// 移除上面那个计划任务（需要提权）。卸载/关闭开关时用。
         remove_task: bool,
         /// 只查询计划任务是否存在与是否最高权限（**不需要提权**）。
@@ -2239,6 +2988,7 @@ mod imp {
             canary_usages: Vec::new(),
             app_bridge: Some(default_app_bridge_path()),
             install_task: false,
+            task_user_sid: None,
             remove_task: false,
             task_status: false,
             follow_app: false,
@@ -2259,8 +3009,12 @@ mod imp {
     }
 
     fn parse_args() -> Result<Args, String> {
+        parse_args_from(std::env::args().skip(1))
+    }
+
+    fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args, String> {
         let mut args = default_args();
-        let mut it = std::env::args().skip(1);
+        let mut it = arguments;
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} 缺少取值"));
             match flag.as_str() {
@@ -2295,6 +3049,12 @@ mod imp {
                 "--no-app-bridge" => args.app_bridge = None,
                 // ---- 任务管理（配合主程序的开关：首次授权一次，之后自动拉起）----
                 "--install-task" => args.install_task = true,
+                "--task-user-sid" => {
+                    if args.task_user_sid.is_some() {
+                        return Err("--task-user-sid 不得重复".into());
+                    }
+                    args.task_user_sid = Some(value()?);
+                }
                 "--remove-task" => args.remove_task = true,
                 "--task-status" => args.task_status = true,
                 "--follow-app" => args.follow_app = true,
@@ -2336,6 +3096,13 @@ mod imp {
                 "--help" | "-h" => return Err("HELP".to_string()),
                 other => return Err(format!("未知参数 {other}")),
             }
+        }
+
+        if args.install_task && args.task_user_sid.is_none() {
+            return Err("--install-task 必须提供 --task-user-sid".into());
+        }
+        if args.task_user_sid.is_some() && !args.install_task {
+            return Err("--task-user-sid 仅用于 --install-task".into());
         }
 
         // 令牌**不在这里生成**：默认值来自运行时目录里的持久文件（跨运行稳定），
@@ -2471,7 +3238,7 @@ mod imp {
                         助手读取它后回连主程序，把三键边沿转发过去 —— 见下方\n\
                         「三键为什么按下去没反应」。默认启用\n\
   --no-app-bridge       关闭转发：三键仍会被清空，但主程序侧的映射不会触发\n\
-  --install-task        【需管理员】注册计划任务 SayAll Personal RC003 Helper（最高权限、仅手动触发）。\n\
+  --install-task --task-user-sid <SID>  【需管理员】为同一用户注册个人版任务（普通调度、最高权限、仅手动触发）。\n\
                         主程序打开三键开关时装一次，之后用 schtasks /run 拉起，不再弹 UAC\n\
   --remove-task         【需管理员】移除上述计划任务（卸载 / 用户关闭并移除授权时用）\n\
   --task-status         查询计划任务是否存在（免提权）\n\
@@ -3256,7 +4023,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
     /// 桥接协议版本。与主程序 `rc003_bridge::BRIDGE_PROTOCOL_VERSION` 必须一致：
     /// 不一致时主程序会直接拒绝连接——宁可不可用，也不要跑一个"半懂"的协议。
-    const BRIDGE_PROTOCOL_VERSION: u32 = 2;
+    const BRIDGE_PROTOCOL_VERSION: u32 = 3;
+    const OWNERSHIP_WINDOW_MS: u64 = 1_500;
     /// 回连重试间隔。
     const BRIDGE_RETRY_MS: u64 = 2000;
     /// 心跳间隔。主程序侧静默看门狗是 3000 ms，这里留两倍余量。
@@ -3457,14 +4225,49 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         usages: Vec<u16>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CaptureContext {
+        connection_generation: u64,
+        ownership_epoch: u64,
+        target_generation: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureState {
+        Active,
+        Inactive,
+        Closed,
+    }
+
+    impl CaptureState {
+        fn wire(self) -> &'static str {
+            match self {
+                Self::Active => "active",
+                Self::Inactive => "inactive",
+                Self::Closed => "closed",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct OwnershipObservation {
+        context: CaptureContext,
+        sequence: u64,
+        helper_hb_seq: u64,
+        sampled_ms: u64,
+        state: CaptureState,
+        usages: Vec<u16>,
+    }
+
     enum BridgeOutbound {
-        Edges(Vec<u16>),
-        Observed(Vec<u16>),
-        Ownership {
-            targets: BridgeCaptureTargets,
-            connection_generation: u64,
-            helper_hb_seq: u64,
-            helper_received_at: Instant,
+        Edges {
+            context: CaptureContext,
+            observation_sequence: u64,
+            usages: Vec<u16>,
+        },
+        Observed {
+            context: CaptureContext,
+            usages: Vec<u16>,
         },
         /// agent 已应用语音键合成配置的确认（绝对状态；`None` = 关闭）。
         ///
@@ -3476,6 +4279,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     struct QueuedBridgeOutbound {
         queued_at: Instant,
         message: BridgeOutbound,
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static BRIDGE_DEQUEUE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+        static BRIDGE_IDLE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(Option<bool>) -> Option<Duration>>>> = const { std::cell::RefCell::new(None) };
     }
 
     /// 主程序桥接：把 agent 上报的动态目标按键边沿转发给主程序。
@@ -3496,6 +4305,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 这是选绝对语义而不是"逐键按下/抬起事件"的主要理由。
     struct AppBridge {
         tx: mpsc::Sender<QueuedBridgeOutbound>,
+        wake_tx: mpsc::SyncSender<()>,
+        pending: Arc<AtomicU64>,
+        ownership: Arc<Mutex<Option<OwnershipObservation>>>,
         handle: Option<JoinHandle<()>>,
         stop: Arc<AtomicBool>,
         stats: Arc<BridgeStats>,
@@ -3513,34 +4325,46 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     }
 
     impl AppBridge {
+        fn notify_worker(&self) {
+            match self.wake_tx.try_send(()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+                Err(mpsc::TrySendError::Disconnected(())) => {
+                    self.stop.store(true, Ordering::Release);
+                }
+            }
+        }
+
         fn enqueue(&self, message: BridgeOutbound) {
-            let _ = self.tx.send(QueuedBridgeOutbound {
-                queued_at: Instant::now(),
-                message,
-            });
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if self
+                .tx
+                .send(QueuedBridgeOutbound {
+                    queued_at: Instant::now(),
+                    message,
+                })
+                .is_err()
+            {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                self.notify_worker();
+            }
         }
         /// 转发一份绝对状态（空 = 全部释放）。
-        fn push_edges(&self, usages: Vec<u16>) {
-            self.enqueue(BridgeOutbound::Edges(usages));
-        }
-
-        fn push_observed(&self, usages: Vec<u16>) {
-            self.enqueue(BridgeOutbound::Observed(usages));
-        }
-
-        fn push_ownership(
-            &self,
-            targets: BridgeCaptureTargets,
-            connection_generation: u64,
-            helper_hb_seq: u64,
-            helper_received_at: Instant,
-        ) {
-            self.enqueue(BridgeOutbound::Ownership {
-                targets,
-                connection_generation,
-                helper_hb_seq,
-                helper_received_at,
+        fn push_edges(&self, context: CaptureContext, observation_sequence: u64, usages: Vec<u16>) {
+            self.enqueue(BridgeOutbound::Edges {
+                context,
+                observation_sequence,
+                usages,
             });
+        }
+
+        fn push_observed(&self, context: CaptureContext, usages: Vec<u16>) {
+            self.enqueue(BridgeOutbound::Observed { context, usages });
+        }
+
+        fn push_ownership(&self, observation: OwnershipObservation) {
+            *self.ownership.lock().unwrap() = Some(observation);
+            self.notify_worker();
         }
 
         /// 转发 agent 的合成回执（绝对状态）给主程序（门禁闭环的输入）。
@@ -3583,7 +4407,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
 
         fn shutdown(&self) {
-            self.stop.store(true, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Release);
+            self.notify_worker();
         }
 
         fn join(&mut self) {
@@ -3916,7 +4741,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         set_capture_identity(Some(identity.clone()));
         write_cleanup_state("requested", false).map_err(|_| "identity_write_failed")?;
         logger.line("[RECOVERY] phase=stop_requested capture_authorized=false");
-        match stop_agent_outcome(&mut stream, token, &identity, Some(host)) {
+        match stop_agent_outcome(&mut stream, token, &identity, Some(host), logger) {
             StopOutcome::Confirmed => Ok("passed"),
             StopOutcome::HostExited => Ok("host_exited"),
             StopOutcome::Unconfirmed => Err("stop_unconfirmed"),
@@ -3987,6 +4812,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         if token.is_empty() {
             return Err("recovery_token_empty");
         }
+        let logger = logger
+            .nonblocking()
+            .map_err(|_| "recovery_log_worker_start_failed")?;
         write_cleanup_state("requested", false).map_err(|_| "recovery_write_failed")?;
         listener
             .set_nonblocking(true)
@@ -4009,7 +4837,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         &identity,
                         &host,
                         token,
-                        logger,
+                        &logger,
                         &args.runtime_dir,
                         deadline,
                     )
@@ -4283,10 +5111,22 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     }
 
     /// 发一条边沿行。空集合编码为 `-`（主程序侧据此释放全部）。
-    fn bridge_send_edges(stream: &mut impl Write, usages: &[u16]) -> std::io::Result<()> {
+    fn bridge_send_edges(
+        stream: &mut impl Write,
+        context: CaptureContext,
+        observation_sequence: u64,
+        usages: &[u16],
+    ) -> std::io::Result<()> {
         bridge_write_line(
             stream,
-            &format!("E {} {}", now_ms(), format_edge_payload(usages)),
+            &format!(
+                "E {} {} {} {} {}",
+                context.connection_generation,
+                context.ownership_epoch,
+                observation_sequence,
+                context.target_generation,
+                format_edge_payload(usages)
+            ),
         )
     }
 
@@ -4510,8 +5350,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     fn app_bridge_worker(
         path: PathBuf,
         rx: mpsc::Receiver<QueuedBridgeOutbound>,
+        wake_rx: mpsc::Receiver<()>,
         stop: Arc<AtomicBool>,
         stats: Arc<BridgeStats>,
+        pending: Arc<AtomicU64>,
+        ownership: Arc<Mutex<Option<OwnershipObservation>>>,
         logger: Logger,
         last_connected_ms: Arc<AtomicU64>,
         follow_app: bool,
@@ -4522,7 +5365,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         voice_gate_dirty: Arc<AtomicBool>,
     ) {
         let mut conn: Option<AppBridgeStream> = None;
-        let mut last_known: Vec<u16> = Vec::new();
+        let mut current_ownership: Option<OwnershipObservation> = None;
+        let mut last_ownership_sent = None;
         let mut last_attempt: Option<Instant> = None;
         let mut last_ping = Instant::now();
         let mut resolved: Option<PathBuf> = Some(path);
@@ -4531,20 +5375,35 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let mut had_connection = false;
         let mut app_process: Option<AppProcess> = None;
         let mut last_follow_action = FollowAppAction::Continue;
+        let mut last_observation_log = Instant::now();
+        let mut observation_count = 0u64;
+        let mut observation_expired = 0u64;
+        let mut observation_max_age = 0u64;
+        let mut observation_max_write = 0u64;
+        let mut last_round_log: Option<Instant> = None;
+        let mut slow_rounds = 0u64;
+        let mut max_head_age = 0u64;
+        let mut max_pending = 0u64;
+        let mut max_phases = [0u64; 7];
 
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Acquire) {
+            let round_started = Instant::now();
+            let pending_before = pending.load(Ordering::Acquire);
+            let mut process_ms = 0;
+            let mut stop_file_ms = 0;
             if follow_app {
                 let idle_ms =
                     now_ms_u64().saturating_sub(last_connected_ms.load(Ordering::Relaxed));
+                let process_started = Instant::now();
                 let state = app_process
                     .as_ref()
                     .map(AppProcess::state)
                     .unwrap_or(AppProcessState::Unbound);
-                let action = follow_app_action(
-                    take_stop_signal(&app_stop_signal_path()),
-                    state,
-                    idle_ms > FOLLOW_APP_GRACE_MS,
-                );
+                process_ms = elapsed_ms(process_started);
+                let stop_started = Instant::now();
+                let requested = take_stop_signal(&app_stop_signal_path());
+                stop_file_ms = elapsed_ms(stop_started);
+                let action = follow_app_action(requested, state, idle_ms > FOLLOW_APP_GRACE_MS);
                 if action != last_follow_action {
                     let (event, reason, error) = match action {
                         FollowAppAction::Continue => ("resumed", "bridge_available", 0),
@@ -4583,15 +5442,115 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 }
             }
 
-            // 1) 消化待发消息。用 try_recv 而不是 recv_timeout：断线期间积压的消息
-            //    只需要"最后一份绝对状态"，逐条补发没有意义（见 AppBridge 的说明）。
-            while let Ok(queued) = rx.try_recv() {
+            let drain_started = Instant::now();
+            let mut dequeued_head_age_ms = 0;
+            let mut dequeued_kind = "none";
+            #[cfg(test)]
+            BRIDGE_DEQUEUE_HOOK.with(|hook| {
+                if let Some(callback) = hook.borrow_mut().as_mut() {
+                    callback();
+                }
+            });
+            let queued = rx.try_recv().ok();
+            if queued.is_some() {
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
+            if let Some(observation) = ownership.lock().unwrap().take() {
+                current_ownership = Some(observation);
+            }
+            if let (Some(stream), Some(observation)) = (conn.as_mut(), current_ownership.as_ref()) {
+                let identity = (
+                    observation.context.connection_generation,
+                    observation.context.ownership_epoch,
+                    observation.sequence,
+                );
+                if last_ownership_sent != Some(identity) {
+                    let changed = last_ownership_sent.is_none_or(|(connection, epoch, _)| {
+                        connection != identity.0 || epoch != identity.1
+                    });
+                    let sample_age_ms = capture_tick_ms().checked_sub(observation.sampled_ms);
+                    let write_started = Instant::now();
+                    let expired = observation.state == CaptureState::Active
+                        && sample_age_ms.is_none_or(|age| age >= OWNERSHIP_WINDOW_MS);
+                    let result = if expired {
+                        Ok(())
+                    } else {
+                        bridge_write_line(
+                            stream,
+                            &format!(
+                                "O {} {} {} {} {} {} {}",
+                                identity.0,
+                                identity.1,
+                                identity.2,
+                                observation.sampled_ms,
+                                observation.context.target_generation,
+                                observation.state.wire(),
+                                format_edge_payload(&observation.usages)
+                            ),
+                        )
+                    };
+                    observation_count += 1;
+                    observation_expired += u64::from(expired);
+                    observation_max_age =
+                        observation_max_age.max(sample_age_ms.unwrap_or(u64::MAX));
+                    observation_max_write = observation_max_write.max(elapsed_ms(write_started));
+                    if changed || result.is_err() || last_observation_log.elapsed() >= HB_LOG_EVERY
+                    {
+                        logger.kv(
+                            "[OWNERSHIP-SAMPLE]",
+                            &[
+                                ("connection_generation", identity.0.to_string()),
+                                ("ownership_epoch", identity.1.to_string()),
+                                ("observation_seq", identity.2.to_string()),
+                                ("helper_hb_seq", observation.helper_hb_seq.to_string()),
+                                ("sample_origin", "helper_receive".into()),
+                                (
+                                    "target_generation",
+                                    observation.context.target_generation.to_string(),
+                                ),
+                                ("state", observation.state.wire().into()),
+                                ("sample_count", observation_count.to_string()),
+                                ("expired_count", observation_expired.to_string()),
+                                ("max_helper_sample_age_ms", observation_max_age.to_string()),
+                                ("max_write_ms", observation_max_write.to_string()),
+                                (
+                                    "result",
+                                    if expired {
+                                        "expired"
+                                    } else if result.is_ok() {
+                                        "passed"
+                                    } else {
+                                        "failed"
+                                    }
+                                    .into(),
+                                ),
+                            ],
+                        );
+                        last_observation_log = Instant::now();
+                        observation_count = 0;
+                        observation_expired = 0;
+                        observation_max_age = 0;
+                        observation_max_write = 0;
+                    }
+                    last_ownership_sent = Some(identity);
+                    if result.is_err() {
+                        conn = None;
+                    }
+                }
+            }
+            if let Some(queued) = queued {
+                dequeued_head_age_ms = elapsed_ms(queued.queued_at);
                 LATENCY.record(LatencyStage::BridgeQueue, elapsed_ms(queued.queued_at));
                 match queued.message {
-                    BridgeOutbound::Edges(usages) => {
-                        last_known = usages;
+                    BridgeOutbound::Edges {
+                        context,
+                        observation_sequence,
+                        usages,
+                    } => {
+                        dequeued_kind = "edge";
                         if let Some(stream) = conn.as_mut() {
-                            match bridge_send_edges(stream, &last_known) {
+                            match bridge_send_edges(stream, context, observation_sequence, &usages)
+                            {
                                 Ok(()) => {
                                     stats.edges_forwarded.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -4599,11 +5558,17 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                             }
                         }
                     }
-                    BridgeOutbound::Observed(usages) => {
+                    BridgeOutbound::Observed { context, usages } => {
+                        dequeued_kind = "observation";
                         if let Some(stream) = conn.as_mut() {
                             if bridge_write_line(
                                 stream,
-                                &format!("R {} {}", now_ms(), format_edge_payload(&usages)),
+                                &format!(
+                                    "R {} {} {}",
+                                    context.connection_generation,
+                                    context.ownership_epoch,
+                                    format_edge_payload(&usages)
+                                ),
                             )
                             .is_err()
                             {
@@ -4611,56 +5576,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                             }
                         }
                     }
-                    BridgeOutbound::Ownership {
-                        targets: owned,
-                        connection_generation,
-                        helper_hb_seq,
-                        helper_received_at,
-                    } => {
-                        let queue_age_ms = elapsed_ms(queued.queued_at);
-                        let helper_sample_age_ms = elapsed_ms(helper_received_at);
-                        let write_started = Instant::now();
-                        let result = if let Some(stream) = conn.as_mut() {
-                            Some(bridge_write_line(
-                                stream,
-                                &format!(
-                                    "O {} {}",
-                                    owned.generation,
-                                    format_edge_payload(&owned.usages)
-                                ),
-                            ))
-                        } else {
-                            None
-                        };
-                        if helper_hb_seq == 1
-                            || helper_sample_age_ms >= LATENCY_SLOW_MS
-                            || result.as_ref().is_none_or(|outcome| outcome.is_err())
-                        {
-                            logger.kv(
-                                "[OWNERSHIP-SAMPLE]",
-                                &[
-                                    ("connection_generation", connection_generation.to_string()),
-                                    ("helper_hb_seq", helper_hb_seq.to_string()),
-                                    ("sample_origin", "helper_receive".into()),
-                                    ("target_generation", owned.generation.to_string()),
-                                    ("phase", "bridge_write".into()),
-                                    ("queue_age_ms", queue_age_ms.to_string()),
-                                    ("helper_sample_age_ms", helper_sample_age_ms.to_string()),
-                                    ("write_ms", write_started.elapsed().as_millis().to_string()),
-                                    (
-                                        "result",
-                                        match result {
-                                            Some(Ok(())) => "passed",
-                                            Some(Err(_)) => "failed",
-                                            None => "not_connected",
-                                        }
-                                        .into(),
-                                    ),
-                                ],
-                            );
-                        }
-                    }
                     BridgeOutbound::SynthAck(state) => {
+                        dequeued_kind = "synth_ack";
                         // agent 回执原样转发（绝对状态）——主程序据此置/清门禁。
                         if let Some(stream) = conn.as_mut() {
                             let _ = bridge_write_line(stream, &synth_ack_line(state));
@@ -4668,7 +5585,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     }
                 }
             }
+            let drain_ms = elapsed_ms(drain_started);
 
+            let connect_started = Instant::now();
             // 2) 没有连接 → 按间隔重试（每轮都重新读描述文件，端口与令牌可能已变）。
             if conn.is_none() {
                 let due = last_attempt
@@ -4722,12 +5641,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 );
                             }
                             conn = Some(stream);
+                            last_ownership_sent = None;
                             had_connection = true;
-                            // 重连后立刻对齐绝对状态：断线期间的变化无从逐条补发，
-                            // 但一份绝对状态就能完全对齐（这是绝对语义的价值）。
-                            if let Some(stream) = conn.as_mut() {
-                                let _ = bridge_send_edges(stream, &last_known);
-                            }
                         }
                         Err(reason) => {
                             stats.failures.fetch_add(1, Ordering::Relaxed);
@@ -4764,7 +5679,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     }
                 }
             }
+            let connect_ms = elapsed_ms(connect_started);
 
+            let control_started = Instant::now();
             // 2.5) 主程序热更新动态目标：`T <generation> <usages>`。
             //      同一读循环里顺带处理 `S <usage>` / `S -`（语音键报告层合成，
             //      来源 = 主程序的「按住说话快捷键」设置）。
@@ -4790,7 +5707,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     &logger,
                 );
             }
+            let control_ms = elapsed_ms(control_started);
 
+            let ping_started = Instant::now();
             // 3) 心跳：主程序侧以 3 s 静默为断线判据，这里 1 s 一次。
             if let Some(stream) = conn.as_mut() {
                 if last_ping.elapsed().as_millis() as u64 >= BRIDGE_PING_MS {
@@ -4804,6 +5723,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     }
                 }
             }
+            let ping_ms = elapsed_ms(ping_started);
 
             if conn.is_none() && had_connection {
                 had_connection = false;
@@ -4826,16 +5746,111 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 );
             }
 
-            std::thread::sleep(Duration::from_millis(50));
+            let sleep_started = Instant::now();
+            if pending.load(Ordering::Acquire) == 0 {
+                let wait_timeout = Duration::from_millis(50);
+                #[cfg(test)]
+                let wait_timeout = BRIDGE_IDLE_HOOK
+                    .with(|hook| {
+                        hook.borrow_mut()
+                            .as_mut()
+                            .and_then(|callback| callback(None))
+                    })
+                    .unwrap_or(wait_timeout);
+                let notified = match wake_rx.recv_timeout(wait_timeout) {
+                    Ok(()) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        logger.kv(
+                            "[APP-BRIDGE]",
+                            &[
+                                ("event", "worker_ended".into()),
+                                ("reason", "wake_disconnected".into()),
+                            ],
+                        );
+                        break;
+                    }
+                };
+                #[cfg(test)]
+                BRIDGE_IDLE_HOOK.with(|hook| {
+                    if let Some(callback) = hook.borrow_mut().as_mut() {
+                        callback(Some(notified));
+                    }
+                });
+                #[cfg(not(test))]
+                let _ = notified;
+            }
+            let sleep_ms = elapsed_ms(sleep_started);
+            let round_ms = elapsed_ms(round_started);
+            if round_ms >= LATENCY_SLOW_MS || dequeued_head_age_ms >= LATENCY_SLOW_MS {
+                slow_rounds += 1;
+                max_head_age = max_head_age.max(dequeued_head_age_ms);
+                max_pending = max_pending.max(pending_before);
+                for (maximum, elapsed) in max_phases.iter_mut().zip([
+                    process_ms,
+                    stop_file_ms,
+                    connect_ms,
+                    drain_ms,
+                    control_ms,
+                    ping_ms,
+                    round_ms,
+                ]) {
+                    *maximum = (*maximum).max(elapsed);
+                }
+            }
+            if slow_rounds > 0 && last_round_log.is_none_or(|at| at.elapsed() >= HB_LOG_EVERY) {
+                logger.kv(
+                    "[BRIDGE-ROUND]",
+                    &[
+                        ("slow_rounds", slow_rounds.to_string()),
+                        ("max_round_ms", max_phases[6].to_string()),
+                        ("max_process_ms", max_phases[0].to_string()),
+                        ("max_stop_file_ms", max_phases[1].to_string()),
+                        ("max_connect_ack_ms", max_phases[2].to_string()),
+                        ("max_drain_ms", max_phases[3].to_string()),
+                        ("max_control_ms", max_phases[4].to_string()),
+                        ("max_ping_ms", max_phases[5].to_string()),
+                        ("idle_sleep_ms", sleep_ms.to_string()),
+                        ("pending_before", pending_before.to_string()),
+                        ("pending_after", pending.load(Ordering::Acquire).to_string()),
+                        ("dequeued_kind", dequeued_kind.into()),
+                        ("max_dequeued_head_age_ms", max_head_age.to_string()),
+                        ("max_pending", max_pending.to_string()),
+                    ],
+                );
+                last_round_log = Some(Instant::now());
+                slow_rounds = 0;
+                max_head_age = 0;
+                max_pending = 0;
+                max_phases = [0; 7];
+            }
         }
 
-        // 收尾：先给释放边沿再告别。顺序不能反——先 BYE 的话，主程序会把它
-        // 当成"正常收尾"而不再等待后续释放（虽然它自己有看门狗兜底）。
         if let Some(stream) = conn.as_mut() {
-            let _ = bridge_send_edges(stream, &[]);
-            let _ = bridge_write_line(stream, &format!("R {} -", now_ms()));
             let _ = bridge_write_line(stream, "BYE helper_shutdown");
             stream.shutdown();
+        }
+        if observation_count > 0 || slow_rounds > 0 {
+            logger.kv(
+                "[BRIDGE-SUMMARY]",
+                &[
+                    ("phase", "stopping".into()),
+                    ("sample_count", observation_count.to_string()),
+                    ("expired_count", observation_expired.to_string()),
+                    ("max_helper_sample_age_ms", observation_max_age.to_string()),
+                    ("max_write_ms", observation_max_write.to_string()),
+                    ("slow_rounds", slow_rounds.to_string()),
+                    ("max_dequeued_head_age_ms", max_head_age.to_string()),
+                    ("max_pending", max_pending.to_string()),
+                    ("max_round_ms", max_phases[6].to_string()),
+                    ("max_process_ms", max_phases[0].to_string()),
+                    ("max_stop_file_ms", max_phases[1].to_string()),
+                    ("max_connect_ack_ms", max_phases[2].to_string()),
+                    ("max_drain_ms", max_phases[3].to_string()),
+                    ("max_control_ms", max_phases[4].to_string()),
+                    ("max_ping_ms", max_phases[5].to_string()),
+                ],
+            );
         }
     }
 
@@ -4846,8 +5861,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     ) -> Option<AppBridge> {
         let path = path?;
         let (tx, rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(BridgeStats::default());
+        let pending = Arc::new(AtomicU64::new(0));
+        let ownership = Arc::new(Mutex::new(None));
         // 首次实际管道身份绑定必须在现有宽限期内完成。
         let last_connected_ms = Arc::new(AtomicU64::new(now_ms_u64()));
         let targets = Arc::new(Mutex::new(BridgeCaptureTargets::default()));
@@ -4860,6 +5878,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let worker_logger = logger.clone();
         let worker_stop = Arc::clone(&stop);
         let worker_stats = Arc::clone(&stats);
+        let worker_pending = Arc::clone(&pending);
+        let worker_ownership = Arc::clone(&ownership);
         // 首次未完成实际身份绑定时沿用同一宽限期，避免提权 Helper 长期遗留。
         let worker_last = Arc::clone(&last_connected_ms);
         let worker_targets = Arc::clone(&targets);
@@ -4871,8 +5891,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 app_bridge_worker(
                     path,
                     rx,
+                    wake_rx,
                     worker_stop,
                     worker_stats,
+                    worker_pending,
+                    worker_ownership,
                     worker_logger,
                     worker_last,
                     follow_app,
@@ -4886,6 +5909,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             .ok()?;
         Some(AppBridge {
             tx,
+            wake_tx,
+            pending,
+            ownership,
             handle: Some(handle),
             stop,
             stats,
@@ -4903,31 +5929,327 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// （两边各有一份常量，靠自检核对字符串、靠联调核对行为）。
     const SCHEDULED_TASK_NAME: &str = "SayAll Personal RC003 Helper";
 
-    /// `schtasks /create` 的参数。**纯函数**——自检要对它做断言，
-    /// 真正的执行在 `manage_scheduled_task`（装/删任务都要提权，不该在自检里发生）。
-    ///
-    /// 建的是一个**只能手动触发**的任务：`/sc once /st 00:00` 指向一个已经过去的时间，
-    /// 于是调度器永远不会自动跑它，只有主程序 `schtasks /run` 时才会启动。
-    /// **为什么不用 `/sc daily`**：那会让调度器每天真的拉起一次提权进程，
-    /// 而我们要的是"主程序需要时才跑、跑完就退"。
-    ///
-    /// `/rl highest` 是关键：任务本身以最高权限运行，
-    /// 于是**触发它的主程序可以保持普通权限**——这正是"只弹一次 UAC"的实现方式。
-    fn task_create_args(helper_exe: &Path) -> Vec<String> {
-        vec![
-            "/create".to_string(),
-            "/tn".to_string(),
-            SCHEDULED_TASK_NAME.to_string(),
-            "/tr".to_string(),
-            format!("\"{}\" --follow-app", helper_exe.display()),
-            "/sc".to_string(),
-            "once".to_string(),
-            "/st".to_string(),
-            "00:00".to_string(),
-            "/rl".to_string(),
-            "highest".to_string(),
-            "/f".to_string(),
-        ]
+    fn task_xml(helper_exe: &str, user_sid: &str, date: &str) -> String {
+        fn escape(value: &str) -> String {
+            value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+        }
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<RegistrationInfo><Date>{}</Date></RegistrationInfo><Triggers/>
+<Principals><Principal id="Author"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority></Settings>
+<Actions Context="Author"><Exec><Command>{}</Command><Arguments>--follow-app</Arguments></Exec></Actions></Task>"#,
+            escape(date),
+            escape(user_sid),
+            escape(helper_exe)
+        )
+    }
+
+    fn current_task_user_sid() -> windows::core::Result<String> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = HANDLE::default();
+        unsafe {
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+        }
+        let token_owner = unsafe { OwnedHandle::from_raw_handle(token.0) };
+        let mut bytes = 0;
+        let probe = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut bytes) };
+        if probe.as_ref().err().map(|error| error.code())
+            != Some(windows::core::HRESULT::from_win32(122))
+        {
+            probe?;
+            return Err(windows::core::Error::from_hresult(
+                windows::core::HRESULT::from_win32(13),
+            ));
+        }
+        let mut storage = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(storage.as_mut_ptr().cast()),
+                bytes,
+                &mut bytes,
+            )?;
+        }
+        drop(token_owner);
+        let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+        let mut text = windows::core::PWSTR::null();
+        unsafe {
+            ConvertSidToStringSidW(user.User.Sid, &mut text)?;
+        }
+        let result = unsafe { text.to_string() }.map_err(|_| {
+            windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(13))
+        });
+        unsafe {
+            LocalFree(Some(HLOCAL(text.0.cast())));
+        }
+        result
+    }
+
+    #[derive(Debug)]
+    struct TaskRegistrationError {
+        phase: &'static str,
+        code: windows::core::HRESULT,
+    }
+
+    fn register_for_task_user(
+        expected: Option<&str>,
+        current: &str,
+        register: impl FnOnce() -> Result<(), TaskRegistrationError>,
+    ) -> Result<(), TaskRegistrationError> {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let invalid = || TaskRegistrationError {
+            phase: "user_identity",
+            code: windows::core::HRESULT::from_win32(87),
+        };
+        let expected = expected.ok_or_else(invalid)?;
+        if expected.contains('\0') {
+            return Err(invalid());
+        }
+        let wide: Vec<u16> = expected.encode_utf16().chain(Some(0)).collect();
+        let mut sid = windows::Win32::Security::PSID::default();
+        unsafe { ConvertStringSidToSidW(windows::core::PCWSTR(wide.as_ptr()), &mut sid) }.map_err(
+            |error| TaskRegistrationError {
+                phase: "user_identity",
+                code: error.code(),
+            },
+        )?;
+        unsafe {
+            LocalFree(Some(HLOCAL(sid.0)));
+        }
+        if expected != current {
+            return Err(TaskRegistrationError {
+                phase: "user_identity",
+                code: windows::core::HRESULT::from_win32(5),
+            });
+        }
+        register()
+    }
+
+    fn register_task_xml(xml: &str) -> Result<(), TaskRegistrationError> {
+        use windows::core::BSTR;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoInitializeSecurity, CoUninitialize,
+            CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+        };
+        use windows::Win32::System::TaskScheduler::{
+            ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN,
+        };
+        use windows::Win32::System::Variant::VARIANT;
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+        let failure = |phase, error: windows::core::Error| TaskRegistrationError {
+            phase,
+            code: error.code(),
+        };
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
+            .map_err(|error| failure("com_initialize", error))?;
+        let _apartment = Apartment;
+        unsafe {
+            CoInitializeSecurity(
+                None,
+                -1,
+                None,
+                None,
+                RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOAC_NONE,
+                None,
+            )
+        }
+        .map_err(|error| failure("com_security", error))?;
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|error| failure("service_create", error))?;
+        let empty = VARIANT::default();
+        unsafe { service.Connect(&empty, &empty, &empty, &empty) }
+            .map_err(|error| failure("service_connect", error))?;
+        let folder = unsafe { service.GetFolder(&BSTR::from("\\")) }
+            .map_err(|error| failure("folder_open", error))?;
+        let _registered = unsafe {
+            folder.RegisterTask(
+                &BSTR::from(SCHEDULED_TASK_NAME),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )
+        }
+        .map_err(|error| failure("task_register", error))?;
+        Ok(())
+    }
+
+    #[test]
+    fn task_install_arguments_require_one_explicit_identity() {
+        for arguments in [
+            vec!["--install-task"],
+            vec!["--install-task", "--task-user-sid"],
+            vec!["--task-user-sid", "S-1-5-18"],
+            vec![
+                "--install-task",
+                "--task-user-sid",
+                "S-1-5-18",
+                "--task-user-sid",
+                "S-1-5-19",
+            ],
+        ] {
+            assert!(parse_args_from(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+        let arguments = [
+            "--install-task",
+            "--hide-window",
+            "--task-user-sid",
+            "S-1-5-18",
+        ];
+        let parsed = parse_args_from(arguments.into_iter().map(str::to_owned)).unwrap();
+        assert!(parsed.install_task && parsed.hide_window);
+        assert_eq!(parsed.task_user_sid.as_deref(), Some("S-1-5-18"));
+    }
+
+    #[test]
+    fn task_xml_roundtrip_preserves_action_identity_and_scheduler_contract() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Task {
+            registration_info: RegistrationInfo,
+            principals: Principals,
+            triggers: Triggers,
+            settings: Settings,
+            actions: Actions,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct RegistrationInfo {
+            date: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Principals {
+            principal: Principal,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Principal {
+            user_id: String,
+            logon_type: String,
+            run_level: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Triggers {
+            #[serde(rename = "$value", default)]
+            entries: Vec<serde::de::IgnoredAny>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Settings {
+            priority: u8,
+            disallow_start_if_on_batteries: bool,
+            stop_if_going_on_batteries: bool,
+            execution_time_limit: String,
+            allow_hard_terminate: bool,
+            multiple_instances_policy: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Actions {
+            exec: Exec,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Exec {
+            command: String,
+            arguments: String,
+        }
+        let path = r#"C:\fixture\无线麦 & <>'"\sayall-helper.exe"#;
+        let date = "2026-10-24T08:00:00.123Z";
+        let xml = task_xml(path, "S-1-5-18", date);
+        let task: Task = quick_xml::de::from_str(&xml).unwrap();
+        assert_eq!(task.registration_info.date, date);
+        assert_eq!(task.principals.principal.user_id, "S-1-5-18");
+        assert_eq!(task.principals.principal.logon_type, "InteractiveToken");
+        assert_eq!(task.principals.principal.run_level, "HighestAvailable");
+        assert!(task.triggers.entries.is_empty());
+        assert_eq!(task.settings.priority, 4);
+        assert!(!task.settings.disallow_start_if_on_batteries);
+        assert!(!task.settings.stop_if_going_on_batteries);
+        assert_eq!(task.settings.execution_time_limit, "PT0S");
+        assert!(!task.settings.allow_hard_terminate);
+        assert_eq!(task.settings.multiple_instances_policy, "IgnoreNew");
+        assert_eq!(task.actions.exec.command, path);
+        assert_eq!(task.actions.exec.arguments, "--follow-app");
+        let bstr = windows::core::BSTR::from(xml.as_str());
+        assert_eq!(&*bstr, xml.encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn task_registration_rejects_identity_before_calling_scheduler() {
+        for expected in [
+            None,
+            Some(""),
+            Some("not-a-sid"),
+            Some("S-1-5-19"),
+            Some("S-1-5-18\0injected"),
+            Some("SY"),
+        ] {
+            let called = std::cell::Cell::new(false);
+            let result = register_for_task_user(expected, "S-1-5-18", || {
+                called.set(true);
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(!called.get());
+        }
+        let called = std::cell::Cell::new(0);
+        register_for_task_user(Some("S-1-5-18"), "S-1-5-18", || {
+            called.set(called.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(called.get(), 1);
+    }
+
+    #[test]
+    fn task_registration_preserves_scheduler_failure_without_retry() {
+        let calls = std::cell::Cell::new(0);
+        let error = register_for_task_user(Some("S-1-5-18"), "S-1-5-18", || {
+            calls.set(calls.get() + 1);
+            Err(TaskRegistrationError {
+                phase: "task_register",
+                code: windows::core::HRESULT::from_win32(5),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error.phase, "task_register");
+        assert_eq!(error.code, windows::core::HRESULT::from_win32(5));
+    }
+
+    #[test]
+    fn task_current_user_roundtrips_through_public_sid_parser() {
+        let sid = current_task_user_sid().unwrap();
+        register_for_task_user(Some(&sid), &sid, || Ok(())).unwrap();
     }
 
     fn task_query_args() -> Vec<String> {
@@ -4973,17 +6295,37 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 );
                 return false;
             }
-            if !run_task_command(task_create_args(&self_exe), "安装", logger) {
+            let result = current_task_user_sid()
+                .map_err(|error| TaskRegistrationError {
+                    phase: "user_token",
+                    code: error.code(),
+                })
+                .and_then(|current| {
+                    register_for_task_user(args.task_user_sid.as_deref(), &current, || {
+                        let path = self_exe.to_str().ok_or(TaskRegistrationError {
+                            phase: "executable_path",
+                            code: windows::core::HRESULT::from_win32(1113),
+                        })?;
+                        register_task_xml(&task_xml(path, &current, &utc_stamp()))
+                    })
+                });
+            if let Err(error) = result {
+                logger.line(&format!(
+                    "[TASK] action=install result=failed phase={} hresult=0x{:08X}",
+                    error.phase, error.code.0 as u32
+                ));
                 return false;
             }
             logger.kv(
-                "[TASK-READY]",
+                "[TASK]",
                 &[
+                    ("action", "install".into()),
+                    ("result", "submitted".into()),
                     ("task", SCHEDULED_TASK_NAME.to_string()),
-                    ("exe", self_exe.display().to_string()),
+                    ("requested_priority", "normal".into()),
                     (
                         "note",
-                        "已最高权限注册；此后主程序用 `schtasks /run` 触发即可，不再弹 UAC".into(),
+                        "注册已提交, 等待主程序读回任务策略; 每次手动开启仍需授权".into(),
                     ),
                 ],
             );
@@ -5046,6 +6388,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
 
     struct Session {
         connection_generation: u64,
+        ownership_epoch: u64,
+        ownership_state: CaptureState,
+        ownership_sequence: u64,
         hb_sequence: u64,
         last_hb_rx: Option<Instant>,
         connected_at: Instant,
@@ -5067,6 +6412,76 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         /// 把日志刷爆；现在只在状态变化或每 `HB_LOG_EVERY` 记一条，
         /// ownership 续约等协议动作不受影响。
         last_hb_log: Option<(Instant, (bool, bool, bool))>,
+    }
+
+    impl Session {
+        fn capture_context(&self) -> CaptureContext {
+            CaptureContext {
+                connection_generation: self.connection_generation,
+                ownership_epoch: self.ownership_epoch,
+                target_generation: self
+                    .target_ack
+                    .as_ref()
+                    .map_or(0, |target| target.generation),
+            }
+        }
+
+        fn publish_capture(
+            &mut self,
+            state: CaptureState,
+            target_changed: bool,
+            sampled_ms: u64,
+            logger: &Logger,
+            bridge: Option<&AppBridge>,
+        ) {
+            let changed = target_changed || self.ownership_state != state;
+            if changed {
+                self.ownership_epoch = self.ownership_epoch.checked_add(1).unwrap();
+                self.ownership_state = state;
+            }
+            self.ownership_sequence = self.ownership_sequence.checked_add(1).unwrap();
+            if let Some(bridge) = bridge {
+                bridge.push_ownership(OwnershipObservation {
+                    context: self.capture_context(),
+                    sequence: self.ownership_sequence,
+                    helper_hb_seq: self.hb_sequence,
+                    sampled_ms,
+                    state,
+                    usages: self
+                        .target_ack
+                        .as_ref()
+                        .map_or_else(Vec::new, |target| target.usages.clone()),
+                });
+            }
+            if changed {
+                logger.kv(
+                    "[CAPTURE-EPOCH]",
+                    &[
+                        (
+                            "connection_generation",
+                            self.connection_generation.to_string(),
+                        ),
+                        ("ownership_epoch", self.ownership_epoch.to_string()),
+                        ("observation_seq", self.ownership_sequence.to_string()),
+                        ("helper_hb_seq", self.hb_sequence.to_string()),
+                        (
+                            "target_generation",
+                            self.capture_context().target_generation.to_string(),
+                        ),
+                        ("state", state.wire().into()),
+                        (
+                            "reason",
+                            if target_changed {
+                                "target_changed"
+                            } else {
+                                "observed_state_changed"
+                            }
+                            .into(),
+                        ),
+                    ],
+                );
+            }
+        }
     }
 
     struct AgentRenewalConnection {
@@ -5106,6 +6521,556 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0)
+    }
+
+    fn run_agent_renewal(
+        renew_shared: Arc<Mutex<Option<AgentRenewalConnection>>>,
+        renew_stop: Arc<AtomicBool>,
+        renew_counter: Arc<AtomicU64>,
+        renew_stale: Arc<AtomicU64>,
+        renew_token: String,
+        renew_logger: Logger,
+    ) {
+        renew_logger.kv(
+            "[THREAD]",
+            &[
+                ("role", "renew".into()),
+                ("tid", unsafe { GetCurrentThreadId() }.to_string()),
+            ],
+        );
+        let mut tick: u64 = 0;
+        while !renew_stop.load(Ordering::Relaxed) {
+            let wait_started = Instant::now();
+            std::thread::sleep(Duration::from_millis(RENEW_MS));
+            let wait_ms = elapsed_ms(wait_started);
+            let lock_started = Instant::now();
+            let mut guard = match renew_shared.lock() {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            if let Some(connection) = guard.as_mut() {
+                let generation = connection.generation;
+                let lock_ms = elapsed_ms(lock_started);
+                let previous_success = connection.last_success;
+                let write_started = Instant::now();
+                let result = renew_connection_stream(connection, &renew_token);
+                let write_ms = elapsed_ms(write_started);
+                if matches!(&result, Ok(false)) {
+                    continue;
+                }
+                let success_gap_ms = if result.is_ok() {
+                    previous_success
+                        .zip(connection.last_success)
+                        .map(|(previous, current)| {
+                            current.duration_since(previous).as_millis() as u64
+                        })
+                } else {
+                    None
+                };
+                tick += 1;
+                if result.is_err() {
+                    *guard = None;
+                    renew_stale.store(generation, Ordering::Release);
+                } else {
+                    renew_counter.fetch_add(1, Ordering::Relaxed);
+                }
+                drop(guard);
+                let slow = wait_ms >= RENEW_MS + LATENCY_SLOW_MS
+                    || lock_ms >= LATENCY_SLOW_MS
+                    || write_ms >= LATENCY_SLOW_MS
+                    || success_gap_ms.is_some_and(|gap| gap >= RENEW_MS + LATENCY_SLOW_MS);
+                let fields = || {
+                    vec![
+                        ("tick", tick.to_string()),
+                        ("connection_generation", generation.to_string()),
+                        ("wait_ms", wait_ms.to_string()),
+                        ("lock_ms", lock_ms.to_string()),
+                        ("write_ms", write_ms.to_string()),
+                        (
+                            "success_gap_ms",
+                            success_gap_ms
+                                .map(|gap| gap.to_string())
+                                .unwrap_or_else(|| "none".into()),
+                        ),
+                        ("slow", slow.to_string()),
+                    ]
+                };
+                if let Err(error) = result {
+                    let mut failed = fields();
+                    failed.extend([
+                        ("state", "write_failed".into()),
+                        ("io_kind", format!("{:?}", error.kind())),
+                        (
+                            "os_code",
+                            error
+                                .raw_os_error()
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "none".into()),
+                        ),
+                    ]);
+                    renew_logger.kv("[RENEW]", &failed);
+                    // **必须同时置位 `conn_stale`**，否则会进入死亡螺旋：
+                    //
+                    // 写失败的可能原因不只是"对端已关闭"，还包括**对端不再读**
+                    // （写缓冲写满）。后一种情况下 socket 并没有断，
+                    // `serve_connection` 的读仍然正常 → 它继续阻塞主循环，
+                    // 而主循环是**串行**的（accept → serve 跑完 → 再 accept），
+                    // 于是 agent 重连上来的新连接只能排在 backlog 里没人 accept，
+                    // 续约也就永远恢复不了：租约过期 → `auth_mismatch` → 断开重连
+                    // → 又排不上队 …… 2026-09-23 真机实测的"按了没反应、日志停在
+                    // write_failed"就是这个形状。
+                    //
+                    // 置位后由 `serve_connection` 立刻收尾，把主循环还给 accept，
+                    // 新连接一进来 `shared` 就被重建，续约随即恢复。
+                } else {
+                    if slow || tick % 10 == 0 {
+                        let mut succeeded = fields();
+                        succeeded.push(("state", "ok".into()));
+                        renew_logger.kv("[RENEW]", &succeeded);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod renewal_diagnostic_tests {
+        use super::*;
+        use std::io::BufRead;
+
+        fn recorded_logger() -> (Logger, Arc<Mutex<Vec<String>>>) {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&records);
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                captured.lock().unwrap().push(record.to_owned());
+            }));
+            (logger, records)
+        }
+
+        #[test]
+        fn renewal_thread_identity_reports_actual_worker_once() {
+            let (logger, records) = recorded_logger();
+            let worker = std::thread::spawn(move || {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn GetCurrentThreadId() -> u32;
+                }
+                let thread_id = unsafe { GetCurrentThreadId() };
+                run_agent_renewal(
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    "synthetic-thread-secret".into(),
+                    logger,
+                );
+                thread_id
+            });
+            let thread_id = worker.join().unwrap();
+            let records = records.lock().unwrap();
+            let identities = records
+                .iter()
+                .filter(|record| record.contains("[THREAD]"))
+                .collect::<Vec<_>>();
+            assert_eq!(identities.len(), 1);
+            assert_eq!(field(identities[0], "role"), "renew");
+            assert_eq!(field(identities[0], "tid"), thread_id.to_string());
+            assert!(!identities[0].contains("synthetic-thread-secret"));
+        }
+
+        fn field<'record>(record: &'record str, name: &str) -> &'record str {
+            record
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("missing field {name} in {record}"))
+        }
+
+        fn observed_renewal_round(hold_lock: bool) -> Vec<String> {
+            let _authorization = super::cooperative_cleanup_tests::CONNECTION_TEST_GATE
+                .lock()
+                .unwrap();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (logger, records) = recorded_logger();
+            let logger = logger.nonblocking().unwrap();
+            let shared = Arc::new(Mutex::new(Some(AgentRenewalConnection {
+                generation: 73,
+                stream: client,
+                last_success: (!hold_lock).then(|| Instant::now() - Duration::from_secs(2)),
+            })));
+            let guard = hold_lock.then(|| shared.lock().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let counter = Arc::new(AtomicU64::new(0));
+            let stale = Arc::new(AtomicU64::new(0));
+            let (started_tx, started_rx) = mpsc::channel();
+            AGENT_AUTHORIZED_GENERATION.store(73, Ordering::Release);
+            let worker = {
+                let shared = Arc::clone(&shared);
+                let stop = Arc::clone(&stop);
+                let logger = logger.clone();
+                std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    run_agent_renewal(
+                        shared,
+                        stop,
+                        counter,
+                        stale,
+                        "synthetic-renewal-secret".into(),
+                        logger,
+                    );
+                })
+            };
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if hold_lock {
+                std::thread::sleep(Duration::from_millis(RENEW_MS + LATENCY_SLOW_MS * 3));
+            }
+            drop(guard);
+            let mut line = String::new();
+            let received = std::io::BufReader::new(peer).read_line(&mut line);
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            revoke_renewal_authorization(73);
+            assert!(logger.shutdown());
+            received.unwrap();
+            assert!(line.contains("\"type\":\"renew\""));
+            let captured = records.lock().unwrap().clone();
+            assert!(!captured
+                .iter()
+                .any(|record| record.contains("synthetic-renewal-secret")));
+            captured
+        }
+
+        #[test]
+        fn renewal_diagnostic_slow_success_gap_reports_first_round() {
+            let records = observed_renewal_round(false);
+            let record = records
+                .iter()
+                .find(|record| record.contains("[RENEW]") && record.contains("tick=1 "))
+                .expect("first slow renewal was not logged despite delivery to the TCP peer");
+            assert_eq!(field(record, "connection_generation"), "73");
+            assert_eq!(field(record, "state"), "ok");
+            assert!(field(record, "wait_ms").parse::<u64>().unwrap() >= RENEW_MS);
+            assert!(field(record, "success_gap_ms").parse::<u64>().unwrap() >= 2000);
+            field(record, "lock_ms").parse::<u64>().unwrap();
+            field(record, "write_ms").parse::<u64>().unwrap();
+        }
+
+        #[test]
+        fn renewal_diagnostic_lock_contention_reports_same_round_without_prior_success() {
+            let records = observed_renewal_round(true);
+            let record = records
+                .iter()
+                .find(|record| record.contains("[RENEW]") && record.contains("tick=1 "))
+                .expect(
+                    "first lock-delayed renewal was not logged despite delivery to the TCP peer",
+                );
+            assert_eq!(field(record, "success_gap_ms"), "none");
+            assert!(field(record, "lock_ms").parse::<u64>().unwrap() >= LATENCY_SLOW_MS);
+            assert!(field(record, "wait_ms").parse::<u64>().unwrap() >= RENEW_MS);
+            assert_eq!(field(record, "connection_generation"), "73");
+            field(record, "write_ms").parse::<u64>().unwrap();
+        }
+
+        struct ControlWriter {
+            failure: Option<&'static str>,
+            calls: Vec<&'static str>,
+        }
+
+        impl Write for ControlWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls.push("write");
+                if self.failure == Some("write") {
+                    Err(std::io::Error::from_raw_os_error(10053))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.calls.push("flush");
+                if self.failure == Some("flush") {
+                    Err(std::io::Error::from_raw_os_error(10053))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn control_failure_case(phase: &'static str) {
+            for command in ["targets", "synth", "gate"] {
+                let (logger, records) = recorded_logger();
+                let mut writer = ControlWriter {
+                    failure: Some(phase),
+                    calls: Vec::new(),
+                };
+                let token = "synthetic-control-secret";
+                let sent = match command {
+                    "targets" => send_dynamic_targets(
+                        &mut writer,
+                        &logger,
+                        token,
+                        &BridgeCaptureTargets {
+                            generation: 7,
+                            usages: vec![0x3a],
+                        },
+                    ),
+                    "synth" => send_voice_synth(&mut writer, &logger, token, None),
+                    "gate" => send_voice_gate(&mut writer, &logger, token, true),
+                    _ => unreachable!(),
+                };
+                assert!(!sent);
+                assert_eq!(
+                    writer.calls,
+                    if phase == "write" {
+                        vec!["write"]
+                    } else {
+                        vec!["write", "flush"]
+                    }
+                );
+                let records = records.lock().unwrap();
+                let record = records
+                    .iter()
+                    .find(|record| record.contains("[CONTROL-WRITE]"))
+                    .expect("failed control command discarded its IO details");
+                assert_eq!(field(record, "command"), command);
+                assert_eq!(field(record, "phase"), phase);
+                assert_eq!(field(record, "io_kind"), "ConnectionAborted");
+                assert_eq!(field(record, "os_code"), "10053");
+                field(record, "elapsed_ms").parse::<u64>().unwrap();
+                assert!(!record.contains(token));
+            }
+        }
+
+        #[test]
+        fn renewal_diagnostic_control_write_failure_preserves_io_details() {
+            control_failure_case("write");
+        }
+
+        #[test]
+        fn renewal_diagnostic_control_flush_failure_preserves_io_details() {
+            control_failure_case("flush");
+        }
+
+        #[test]
+        fn renewal_diagnostic_control_success_preserves_write_then_flush() {
+            let (logger, records) = recorded_logger();
+            let mut writer = ControlWriter {
+                failure: None,
+                calls: Vec::new(),
+            };
+            assert!(send_voice_gate(
+                &mut writer,
+                &logger,
+                "synthetic-control-secret",
+                true
+            ));
+            assert_eq!(writer.calls, ["write", "flush"]);
+            assert!(records.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn renewal_diagnostic_config_failure_keeps_unsent_commands_and_flush_order() {
+            let (logger, records) = recorded_logger();
+            let mut writer = ControlWriter {
+                failure: Some("write"),
+                calls: Vec::new(),
+            };
+            send_session_config(
+                &mut writer,
+                &logger,
+                "synthetic-control-secret",
+                false,
+                true,
+                &[],
+                &BridgeCaptureTargets {
+                    generation: 9,
+                    usages: vec![0x3a],
+                },
+                None,
+            );
+            assert_eq!(writer.calls, ["write", "flush"]);
+            let records = records.lock().unwrap();
+            let failed = records
+                .iter()
+                .find(|record| record.contains("[CONTROL-WRITE]"))
+                .unwrap();
+            assert_eq!(field(failed, "command"), "arm");
+            assert_eq!(field(failed, "phase"), "write");
+            assert_eq!(field(failed, "os_code"), "10053");
+            let config = records
+                .iter()
+                .find(|record| record.contains("[CONFIG]"))
+                .unwrap();
+            for name in ["arm_sent", "mode_sent", "restore_sent", "targets_sent"] {
+                assert_eq!(field(config, name), "false");
+            }
+            assert!(!records
+                .iter()
+                .any(|record| record.contains("synthetic-control-secret")));
+        }
+
+        #[test]
+        fn renewal_diagnostic_failed_or_unauthorized_write_preserves_previous_success() {
+            let _authorization = super::cooperative_cleanup_tests::CONNECTION_TEST_GATE
+                .lock()
+                .unwrap();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            let previous = Instant::now() - Duration::from_secs(2);
+            let mut connection = AgentRenewalConnection {
+                generation: 74,
+                stream: client,
+                last_success: Some(previous),
+            };
+            AGENT_AUTHORIZED_GENERATION.store(0, Ordering::Release);
+            assert!(!renew_connection_stream(&mut connection, "synthetic-renewal-secret").unwrap());
+            assert_eq!(connection.last_success, Some(previous));
+            AGENT_AUTHORIZED_GENERATION.store(74, Ordering::Release);
+            let failed = renew_connection_stream(&mut connection, "synthetic-renewal-secret");
+            revoke_renewal_authorization(74);
+            assert!(failed.is_err());
+            assert_eq!(connection.last_success, Some(previous));
+        }
+
+        #[test]
+        fn renewal_diagnostic_failed_round_reports_io_and_no_success_gap() {
+            let _authorization = super::cooperative_cleanup_tests::CONNECTION_TEST_GATE
+                .lock()
+                .unwrap();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            let shared = Arc::new(Mutex::new(Some(AgentRenewalConnection {
+                generation: 75,
+                stream: client,
+                last_success: Some(Instant::now() - Duration::from_secs(2)),
+            })));
+            let stop = Arc::new(AtomicBool::new(false));
+            let counter = Arc::new(AtomicU64::new(0));
+            let stale = Arc::new(AtomicU64::new(0));
+            let (record_tx, record_rx) = mpsc::channel();
+            let mut sink = Logger::new(None);
+            sink.test_sink = Some(Arc::new(move |record| {
+                if record.contains("[RENEW]") {
+                    record_tx.send(record.to_owned()).unwrap();
+                }
+            }));
+            let logger = sink.nonblocking().unwrap();
+            AGENT_AUTHORIZED_GENERATION.store(75, Ordering::Release);
+            let worker = {
+                let shared = Arc::clone(&shared);
+                let stop = Arc::clone(&stop);
+                let counter = Arc::clone(&counter);
+                let stale = Arc::clone(&stale);
+                let logger = logger.clone();
+                std::thread::spawn(move || {
+                    run_agent_renewal(
+                        shared,
+                        stop,
+                        counter,
+                        stale,
+                        "synthetic-renewal-secret".into(),
+                        logger,
+                    );
+                })
+            };
+            let recorded = record_rx.recv_timeout(Duration::from_secs(3));
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            revoke_renewal_authorization(75);
+            assert!(logger.shutdown());
+            let record = recorded.unwrap();
+            assert_eq!(field(&record, "tick"), "1");
+            assert_eq!(field(&record, "connection_generation"), "75");
+            assert_eq!(field(&record, "state"), "write_failed");
+            assert_eq!(field(&record, "success_gap_ms"), "none");
+            assert!(field(&record, "wait_ms").parse::<u64>().unwrap() >= RENEW_MS);
+            field(&record, "lock_ms").parse::<u64>().unwrap();
+            field(&record, "write_ms").parse::<u64>().unwrap();
+            let code = field(&record, "os_code").parse::<i32>().unwrap();
+            assert_eq!(
+                field(&record, "io_kind"),
+                format!("{:?}", std::io::Error::from_raw_os_error(code).kind())
+            );
+            assert!(!record.contains("synthetic-renewal-secret"));
+            assert!(shared.lock().unwrap().is_none());
+            assert_eq!(counter.load(Ordering::Acquire), 0);
+            assert_eq!(stale.load(Ordering::Acquire), 75);
+        }
+
+        #[test]
+        fn renewal_diagnostic_control_errors_do_not_wait_for_blocked_log_sink() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let sink_release = Arc::clone(&release);
+            let mut sink = Logger::new(None);
+            let once = AtomicBool::new(true);
+            sink.test_sink = Some(Arc::new(move |_| {
+                if once.swap(false, Ordering::AcqRel) {
+                    entered_tx.send(()).unwrap();
+                }
+                let _released = sink_release
+                    .1
+                    .wait_while(sink_release.0.lock().unwrap(), |released| !*released)
+                    .unwrap();
+            }));
+            let logger = sink.nonblocking().unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let producer = {
+                let logger = logger.clone();
+                std::thread::spawn(move || {
+                    let mut writer = ControlWriter {
+                        failure: Some("write"),
+                        calls: Vec::new(),
+                    };
+                    for _ in 0..LOG_QUEUE_CAPACITY + 8 {
+                        assert!(!send_voice_gate(
+                            &mut writer,
+                            &logger,
+                            "synthetic-control-secret",
+                            true
+                        ));
+                    }
+                    run_agent_renewal(
+                        Arc::new(Mutex::new(None)),
+                        Arc::new(AtomicBool::new(true)),
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(AtomicU64::new(0)),
+                        "synthetic-thread-secret".into(),
+                        logger,
+                    );
+                    done_tx.send(writer.calls.len()).unwrap();
+                })
+            };
+            let completed_while_blocked = done_rx.recv_timeout(Duration::from_secs(2));
+            let dropped = logger
+                .queue
+                .as_ref()
+                .unwrap()
+                .dropped
+                .load(Ordering::Relaxed);
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+            producer.join().unwrap();
+            assert!(logger.shutdown());
+            assert_eq!(completed_while_blocked.unwrap(), LOG_QUEUE_CAPACITY + 8);
+            assert!(dropped >= 9);
+        }
+    }
+
+    fn capture_tick_ms() -> u64 {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetTickCount64() -> u64;
+        }
+        unsafe { GetTickCount64() }
     }
 
     /// `now_ms()` 的 u64 版本：给 `AtomicU64` 用的。
@@ -5192,6 +7157,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     return false;
                 }
                 let received_at = Instant::now();
+                let sampled_ms = capture_tick_ms();
                 session.hb_sequence = session.hb_sequence.checked_add(1).unwrap();
                 session.last_hb_rx = Some(received_at);
                 let lease_ok = extract_bool(line, "lease_ok");
@@ -5200,6 +7166,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 // 心跳降噪：状态变化立即记，否则每 HB_LOG_EVERY 记一条（agent 的
                 // hb ≈2 条/秒；逐条落盘是 2026-10-08 日志膨胀的主因）。
                 let state = (lease_ok, handshake, disarmed);
+                let capture_state =
+                    if lease_ok && handshake && !disarmed && session.target_ack.is_some() {
+                        CaptureState::Active
+                    } else {
+                        CaptureState::Inactive
+                    };
+                session.publish_capture(capture_state, false, sampled_ms, logger, bridge);
                 let due = match session.last_hb_log {
                     Some((at, previous)) => previous != state || at.elapsed() >= HB_LOG_EVERY,
                     None => true,
@@ -5242,16 +7215,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         ],
                     );
                 }
-                if lease_ok {
-                    if let (Some(bridge), Some(ack)) = (bridge, session.target_ack.clone()) {
-                        bridge.push_ownership(
-                            ack,
-                            session.connection_generation,
-                            session.hb_sequence,
-                            received_at,
-                        );
-                    }
-                }
             }
             "targets_ack" => {
                 if !session.authenticated {
@@ -5264,7 +7227,17 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     .collect::<Vec<_>>();
                 let ack = BridgeCaptureTargets { generation, usages };
                 let usage_count = ack.usages.len();
+                let changed = session.target_ack.as_ref() != Some(&ack);
                 session.target_ack = Some(ack);
+                if changed {
+                    session.publish_capture(
+                        CaptureState::Inactive,
+                        true,
+                        capture_tick_ms(),
+                        logger,
+                        bridge,
+                    );
+                }
                 // 此前 ack 到达完全无日志，2026-09-28 排查"启动静默"时只能靠
                 // [AGENT] applied 计数间接推断；与 [TARGETS-RESEND] 成对出现，
                 // 重发→确认的自愈全程可观测。
@@ -5315,7 +7288,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         .filter_map(|usage| u16::try_from(usage).ok())
                         .filter(|usage| TARGET_USAGES.contains(usage))
                         .collect();
-                    bridge.push_observed(usages);
+                    bridge.push_observed(session.capture_context(), usages);
                 }
             }
             "edge" => {
@@ -5355,7 +7328,11 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         .iter()
                         .filter_map(|usage| u16::try_from(*usage).ok())
                         .collect();
-                    bridge.push_edges(usages);
+                    bridge.push_edges(
+                        session.capture_context(),
+                        session.ownership_sequence,
+                        usages,
+                    );
                 }
             }
             "log" => {
@@ -6083,79 +8060,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 它若写分隔线会让"每轮起点"的 grep 多算一次（2026-09-23 实测）。
         let renew_logger = logger.clone();
         let renew_handle = std::thread::spawn(move || {
-            let mut tick: u64 = 0;
-            while !renew_stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(RENEW_MS));
-                let mut guard = match renew_shared.lock() {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                if let Some(connection) = guard.as_mut() {
-                    let generation = connection.generation;
-                    let write_started = Instant::now();
-                    let result = renew_connection_stream(connection, &renew_token);
-                    if matches!(&result, Ok(false)) {
-                        continue;
-                    }
-                    tick += 1;
-                    if let Err(error) = result {
-                        renew_logger.kv(
-                            "[RENEW]",
-                            &[
-                                ("state", "write_failed".into()),
-                                ("connection_generation", generation.to_string()),
-                                ("io_kind", format!("{:?}", error.kind())),
-                                (
-                                    "os_code",
-                                    error
-                                        .raw_os_error()
-                                        .map(|code| code.to_string())
-                                        .unwrap_or_else(|| "none".into()),
-                                ),
-                                ("write_ms", elapsed_ms(write_started).to_string()),
-                            ],
-                        );
-                        *guard = None;
-                        // **必须同时置位 `conn_stale`**，否则会进入死亡螺旋：
-                        //
-                        // 写失败的可能原因不只是"对端已关闭"，还包括**对端不再读**
-                        // （写缓冲写满）。后一种情况下 socket 并没有断，
-                        // `serve_connection` 的读仍然正常 → 它继续阻塞主循环，
-                        // 而主循环是**串行**的（accept → serve 跑完 → 再 accept），
-                        // 于是 agent 重连上来的新连接只能排在 backlog 里没人 accept，
-                        // 续约也就永远恢复不了：租约过期 → `auth_mismatch` → 断开重连
-                        // → 又排不上队 …… 2026-09-23 真机实测的"按了没反应、日志停在
-                        // write_failed"就是这个形状。
-                        //
-                        // 置位后由 `serve_connection` 立刻收尾，把主循环还给 accept，
-                        // 新连接一进来 `shared` 就被重建，续约随即恢复。
-                        renew_stale.store(generation, Ordering::Release);
-                    } else {
-                        renew_counter.fetch_add(1, Ordering::Relaxed);
-                        let write_elapsed_ms = write_started.elapsed().as_millis() as u64;
-                        if write_elapsed_ms >= RENEW_SLOW_MS {
-                            renew_logger.kv(
-                                "[RENEW]",
-                                &[
-                                    ("state", "slow".into()),
-                                    ("elapsed_ms", write_elapsed_ms.to_string()),
-                                ],
-                            );
-                        }
-                        if tick % 10 == 0 {
-                            renew_logger.kv(
-                                "[RENEW]",
-                                &[
-                                    ("tick", tick.to_string()),
-                                    ("state", "ok".into()),
-                                    ("connection_generation", generation.to_string()),
-                                    ("write_ms", elapsed_ms(write_started).to_string()),
-                                ],
-                            );
-                        }
-                    }
-                }
-            }
+            run_agent_renewal(
+                renew_shared,
+                renew_stop,
+                renew_counter,
+                renew_stale,
+                renew_token,
+                renew_logger,
+            );
         });
 
         logger.line("");
@@ -6187,6 +8099,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let mut connection_generation = 0u64;
         let mut session = Session {
             connection_generation,
+            ownership_epoch: 0,
+            ownership_state: CaptureState::Inactive,
+            ownership_sequence: 0,
             hb_sequence: 0,
             last_hb_rx: None,
             connected_at: Instant::now(),
@@ -6250,6 +8165,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     );
                     session = Session {
                         connection_generation,
+                        ownership_epoch: 0,
+                        ownership_state: CaptureState::Inactive,
+                        ownership_sequence: 0,
                         hb_sequence: 0,
                         last_hb_rx: None,
                         connected_at: Instant::now(),
@@ -6295,29 +8213,33 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     if session.authenticated {
                         saw_authenticated = true;
                     }
-                    if let Ok(mut guard) = shared.lock() {
-                        if let Some(connection) = guard.as_ref().filter(|connection| {
+                    let retired = {
+                        let mut guard = shared.lock().unwrap();
+                        if guard.as_ref().is_some_and(|connection| {
                             connection.generation == session.connection_generation
                         }) {
-                            logger.kv(
-                                "[CONNECTION]",
-                                &[
-                                    ("phase", "retired".into()),
-                                    (
-                                        "connection_generation",
-                                        session.connection_generation.to_string(),
-                                    ),
-                                    (
-                                        "last_renew_write_age_ms",
-                                        connection
-                                            .last_success
-                                            .map(|at| elapsed_ms(at).to_string())
-                                            .unwrap_or_else(|| "none".into()),
-                                    ),
-                                ],
-                            );
-                            *guard = None;
+                            Some(guard.take().unwrap().last_success)
+                        } else {
+                            None
                         }
+                    };
+                    if let Some(last_success) = retired {
+                        logger.kv(
+                            "[CONNECTION]",
+                            &[
+                                ("phase", "retired".into()),
+                                (
+                                    "connection_generation",
+                                    session.connection_generation.to_string(),
+                                ),
+                                (
+                                    "last_renew_write_age_ms",
+                                    last_success
+                                        .map(|at| elapsed_ms(at).to_string())
+                                        .unwrap_or_else(|| "none".into()),
+                                ),
+                            ],
+                        );
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -6519,7 +8441,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// - `mode`    让"这一轮用 clear 还是 observe"由**助手**决定，而不是 Gadget 加载时那份旧配置。
     /// - `restore` 同上，控制 onLeave 是否回写复原。
     fn send_session_config(
-        stream: &mut TcpStream,
+        stream: &mut impl Write,
         logger: &Logger,
         token: &str,
         observe: bool,
@@ -6568,16 +8490,26 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 那条连接的 arm 根本没送到（socket 已被对端重置）。
         let mut sent = vec![false; lines.len()];
         let mut write_error: Option<io::Error> = None;
+        let commands = ["arm", "mode", "restore", "targets", "synth"];
         for (i, l) in lines.iter().enumerate() {
             if write_error.is_some() {
                 continue;
             }
-            match write_socket_line(stream, l) {
+            let started = Instant::now();
+            let result = stream.write_all(l.as_bytes());
+            control_write_result(&result, logger, commands[i], "write", started);
+            match result {
                 Ok(()) => sent[i] = true,
                 Err(error) => write_error = Some(error),
             }
         }
-        let flush_ok = write_error.is_none() && stream.flush().is_ok();
+        let started = Instant::now();
+        let flush_result = stream.flush();
+        let flush_ok =
+            control_write_result(&flush_result, logger, "session_config", "flush", started);
+        if write_error.is_none() {
+            write_error = flush_result.err();
+        }
         let mut config_fields: Vec<(&str, String)> = vec![
             ("arm_sent", sent[0].to_string()),
             ("mode_sent", sent[1].to_string()),
@@ -6648,18 +8580,71 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         );
     }
 
+    fn control_write_result(
+        result: &std::io::Result<()>,
+        logger: &Logger,
+        command: &str,
+        phase: &str,
+        started: Instant,
+    ) -> bool {
+        if let Err(error) = result {
+            let duration_ms = elapsed_ms(started);
+            logger.kv(
+                "[CONTROL-WRITE]",
+                &[
+                    ("command", command.into()),
+                    ("phase", phase.into()),
+                    ("state", "failed".into()),
+                    ("io_kind", format!("{:?}", error.kind())),
+                    (
+                        "os_code",
+                        error
+                            .raw_os_error()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "none".into()),
+                    ),
+                    ("elapsed_ms", duration_ms.to_string()),
+                ],
+            );
+            false
+        } else {
+            true
+        }
+    }
+
+    fn send_control_line(
+        stream: &mut impl Write,
+        logger: &Logger,
+        command: &str,
+        line: &str,
+    ) -> bool {
+        let started = Instant::now();
+        if !control_write_result(
+            &stream.write_all(line.as_bytes()),
+            logger,
+            command,
+            "write",
+            started,
+        ) {
+            return false;
+        }
+        let started = Instant::now();
+        control_write_result(&stream.flush(), logger, command, "flush", started)
+    }
+
     fn send_dynamic_targets(
-        stream: &mut TcpStream,
+        stream: &mut impl Write,
+        logger: &Logger,
         token: &str,
         targets: &BridgeCaptureTargets,
-    ) -> io::Result<()> {
+    ) -> bool {
         let line = format!(
             "{{\"type\":\"targets\",\"token\":\"{token}\",\"generation\":{},\"report\":[{}],\"clear\":[{}]}}\n",
             targets.generation,
             usages_json(&targets.usages),
             usages_json(&targets.usages)
         );
-        write_socket_line(stream, &line)
+        send_control_line(stream, logger, "targets", &line)
     }
 
     /// 语音合成命令的行编码（纯函数，单测钉住格式）：
@@ -6675,9 +8660,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     }
 
     /// 给 agent 补发一条语音合成命令（与 send_session_config 里的 synth 行同格式）。
-    fn send_voice_synth(stream: &mut TcpStream, token: &str, to: Option<u16>) -> io::Result<()> {
+    fn send_voice_synth(
+        stream: &mut impl Write,
+        logger: &Logger,
+        token: &str,
+        to: Option<u16>,
+    ) -> bool {
         let line = voice_synth_command_line(token, to);
-        write_socket_line(stream, &line)
+        send_control_line(stream, logger, "synth", &line)
     }
 
     /// 门内延迟开关命令（`gate`）的线格式。与 synth 命令同为 JSON 行、同样带令牌。
@@ -6689,9 +8679,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     }
 
     /// 给 agent 下发门内延迟开关（幂等；agent 侧只影响按下帧的呈现时机）。
-    fn send_voice_gate(stream: &mut TcpStream, token: &str, on: bool) -> io::Result<()> {
+    fn send_voice_gate(stream: &mut impl Write, logger: &Logger, token: &str, on: bool) -> bool {
         let line = voice_gate_command_line(token, on);
-        write_socket_line(stream, &line)
+        send_control_line(stream, logger, "gate", &line)
     }
 
     /// targets 重发判据（纯函数，语义由单测钉住）。
@@ -6783,6 +8773,14 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             conn_stale,
             cleanup,
         );
+        revoke_renewal_authorization(session.connection_generation);
+        session.publish_capture(
+            CaptureState::Closed,
+            false,
+            capture_tick_ms(),
+            logger,
+            bridge,
+        );
         logger.kv(
             "[CONNECTION]",
             &[
@@ -6803,7 +8801,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 ("authenticated", session.authenticated.to_string()),
             ],
         );
-        revoke_renewal_authorization(session.connection_generation);
         if session
             .hello
             .as_deref()
@@ -6854,7 +8851,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 logger.line("[RESIDENT-BINDING] result=blocked reason=agent_instance_mismatch capture_authorized=false");
                 return;
             }
-            let confirmed = stop_agent(&mut stream, token, &identity);
+            let confirmed = stop_agent(&mut stream, token, &identity, logger);
             if confirmed {
                 cleanup.confirm(&identity);
             }
@@ -6917,8 +8914,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         Unconfirmed,
     }
 
-    fn stop_agent(stream: &mut TcpStream, token: &str, identity: &AgentIdentity) -> bool {
-        stop_agent_outcome(stream, token, identity, None) == StopOutcome::Confirmed
+    fn stop_agent(
+        stream: &mut TcpStream,
+        token: &str,
+        identity: &AgentIdentity,
+        logger: &Logger,
+    ) -> bool {
+        stop_agent_outcome(stream, token, identity, None, logger) == StopOutcome::Confirmed
     }
 
     fn stop_agent_outcome(
@@ -6926,62 +8928,131 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         token: &str,
         identity: &AgentIdentity,
         host: Option<&AppProcess>,
+        logger: &Logger,
     ) -> StopOutcome {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-        let request = random_token();
-        let command = format!("{{\"type\":\"disarm\",\"token\":\"{token}\",\"instance\":\"{}\",\"stop_id\":\"{request}\"}}\n", identity.instance);
-        if stream.write_all(command.as_bytes()).is_err() {
-            return StopOutcome::Unconfirmed;
-        }
-        let started = Instant::now();
-        let mut waiting_reported = false;
-        let mut pending = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            if let Some(host) = host {
-                match host.state() {
-                    AppProcessState::Exited => return StopOutcome::HostExited,
-                    AppProcessState::Running => {}
-                    _ => return StopOutcome::Unconfirmed,
-                }
+        static NEXT_STOP_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+        let attempt_id = NEXT_STOP_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let attempt_started = Instant::now();
+        let progress = |phase: &str, fields: &[(&str, String)]| {
+            let mut record = vec![
+                ("attempt_id", attempt_id.to_string()),
+                ("phase", phase.to_owned()),
+                ("elapsed_ms", elapsed_ms(attempt_started).to_string()),
+                ("host_exit_observer", host.is_some().to_string()),
+            ];
+            record.extend_from_slice(fields);
+            logger.kv("[AGENT-STOP-PROGRESS]", &record);
+        };
+        progress("write_requested", &[]);
+        let (outcome, reason) = (|| {
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+            let request = random_token();
+            let command = format!("{{\"type\":\"disarm\",\"token\":\"{token}\",\"instance\":\"{}\",\"stop_id\":\"{request}\"}}\n", identity.instance);
+            if stream.write_all(command.as_bytes()).is_err() {
+                return (StopOutcome::Unconfirmed, "write_failed");
             }
-            if !waiting_reported && started.elapsed() >= Duration::from_secs(3) {
-                // 主程序/安装器可在自己的预算到期后返回 blocked；本连接仍保留，
-                // 持键稍后真实释放的 stopped 回执不能因 Helper 提前退出而遗失。
-                let _ = write_cleanup_state("unconfirmed", false);
-                waiting_reported = true;
-            }
-            match stream.read(&mut chunk) {
-                Ok(0) => return StopOutcome::Unconfirmed,
-                Ok(count) => {
-                    pending.extend_from_slice(&chunk[..count]);
-                    if pending.len() > 65536 {
-                        return StopOutcome::Unconfirmed;
-                    }
-                    while let Some(end) = pending.iter().position(|b| *b == b'\n') {
-                        let line: Vec<_> = pending.drain(..=end).collect();
-                        let line = String::from_utf8_lossy(&line);
-                        if stop_ack_matches(&line, identity, &request) {
-                            return StopOutcome::Confirmed;
-                        }
-                        if extract_str(&line, "type").as_deref() == Some("stopped")
-                            && extract_str(&line, "instance").as_deref()
-                                == Some(identity.instance.as_str())
-                            && extract_str(&line, "stop_id").as_deref() == Some(request.as_str())
-                        {
-                            return StopOutcome::Unconfirmed;
-                        }
+            let started = Instant::now();
+            progress("submitted", &[]);
+            let mut waiting_reported = false;
+            let mut pending = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(host) = host {
+                    match host.state() {
+                        AppProcessState::Exited => return (StopOutcome::HostExited, "host_exited"),
+                        AppProcessState::Running => {}
+                        _ => return (StopOutcome::Unconfirmed, "host_state_unconfirmed"),
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(_) => return StopOutcome::Unconfirmed,
+                if !waiting_reported && started.elapsed() >= Duration::from_secs(3) {
+                    // 主程序/安装器可在自己的预算到期后返回 blocked；本连接仍保留，
+                    // 持键稍后真实释放的 stopped 回执不能因 Helper 提前退出而遗失。
+                    let receipt_result = write_cleanup_state("unconfirmed", false);
+                    progress(
+                        "waiting",
+                        &[
+                            ("reason", "ack_not_received".into()),
+                            ("receipt_write_failed", receipt_result.is_err().to_string()),
+                        ],
+                    );
+                    waiting_reported = true;
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) => return (StopOutcome::Unconfirmed, "connection_closed"),
+                    Ok(count) => {
+                        pending.extend_from_slice(&chunk[..count]);
+                        if pending.len() > 65536 {
+                            return (StopOutcome::Unconfirmed, "record_too_large");
+                        }
+                        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                            let line: Vec<_> = pending.drain(..=end).collect();
+                            let line = String::from_utf8_lossy(&line);
+                            if extract_str(&line, "type").as_deref() == Some("stopped") {
+                                progress(
+                                    "ack_received",
+                                    &[
+                                        (
+                                            "instance_match",
+                                            (extract_str(&line, "instance").as_deref()
+                                                == Some(identity.instance.as_str()))
+                                            .to_string(),
+                                        ),
+                                        (
+                                            "request_match",
+                                            (extract_str(&line, "stop_id").as_deref()
+                                                == Some(request.as_str()))
+                                            .to_string(),
+                                        ),
+                                        (
+                                            "hook_detached",
+                                            extract_bool(&line, "hook_detached").to_string(),
+                                        ),
+                                        (
+                                            "released_all",
+                                            extract_bool(&line, "released_all").to_string(),
+                                        ),
+                                    ],
+                                );
+                            }
+                            if stop_ack_matches(&line, identity, &request) {
+                                return (StopOutcome::Confirmed, "ack_confirmed");
+                            }
+                            if extract_str(&line, "type").as_deref() == Some("stopped")
+                                && extract_str(&line, "instance").as_deref()
+                                    == Some(identity.instance.as_str())
+                                && extract_str(&line, "stop_id").as_deref()
+                                    == Some(request.as_str())
+                            {
+                                return (StopOutcome::Unconfirmed, "release_not_confirmed");
+                            }
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return (StopOutcome::Unconfirmed, "read_failed"),
+                }
             }
-        }
+        })();
+        progress(
+            "completed",
+            &[
+                (
+                    "terminal_result",
+                    match outcome {
+                        StopOutcome::Confirmed => "passed",
+                        StopOutcome::HostExited => "host_exited",
+                        StopOutcome::Unconfirmed => "unconfirmed",
+                    }
+                    .into(),
+                ),
+                ("reason", reason.into()),
+            ],
+        );
+        outcome
     }
 
     fn serve_connection_inner(
@@ -7061,11 +9132,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 if let Some(bridge) = bridge {
                     let current = bridge.capture_targets();
                     if sent_targets.as_ref() != Some(&current) {
-                        if send_dynamic_targets(stream, token, &current).is_err() {
+                        if !send_dynamic_targets(stream, logger, token, &current) {
                             return "targets_write_failed";
                         }
                         sent_targets = Some(current);
                         session.target_ack = None;
+                        session.publish_capture(
+                            CaptureState::Inactive,
+                            true,
+                            capture_tick_ms(),
+                            logger,
+                            Some(bridge),
+                        );
                         // 新配置 = 新一轮等待：重置计时与快节奏预算。
                         sent_at = Some(Instant::now());
                         resend_attempts = 0;
@@ -7075,7 +9153,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     // 下发同哲学）；agent 侧幂等，重复应用无害。
                     let (synth_current, synth_dirty) = bridge.voice_synth_state();
                     if synth_dirty || sent_synth.as_ref() != Some(&synth_current) {
-                        if send_voice_synth(stream, token, synth_current).is_err() {
+                        if !send_voice_synth(stream, logger, token, synth_current) {
                             return "synth_write_failed";
                         }
                         logger.kv(
@@ -7096,7 +9174,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     // 变更即单独补发一条 gate 命令；agent 侧幂等，仅影响按下帧的呈现时机。
                     let (gate_on, gate_dirty) = bridge.voice_gate_state();
                     if gate_dirty || sent_gate != Some(gate_on) {
-                        if send_voice_gate(stream, token, gate_on).is_err() {
+                        if !send_voice_gate(stream, logger, token, gate_on) {
                             return "gate_write_failed";
                         }
                         logger.kv(
@@ -7132,7 +9210,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                     resend_attempts,
                     wait.as_millis()
                 ));
-                if send_dynamic_targets(stream, token, sent).is_err() {
+                if !send_dynamic_targets(stream, logger, token, sent) {
                     return "targets_retry_write_failed";
                 }
                 sent_at = Some(Instant::now());
@@ -7193,16 +9271,6 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                             }
                             AGENT_AUTHORIZED_GENERATION
                                 .store(session.connection_generation, Ordering::Release);
-                            logger.kv(
-                                "[CONNECTION]",
-                                &[
-                                    ("phase", "authorized".into()),
-                                    (
-                                        "connection_generation",
-                                        session.connection_generation.to_string(),
-                                    ),
-                                ],
-                            );
                             if stream
                                 .write_all(
                                     format!("{{\"type\":\"renew\",\"token\":\"{token}\"}}\n")
@@ -7213,6 +9281,16 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                                 return "initial_renew_write_failed";
                             }
                             session.config_sent = true;
+                            logger.kv(
+                                "[CONNECTION]",
+                                &[
+                                    ("phase", "authorized".into()),
+                                    (
+                                        "connection_generation",
+                                        session.connection_generation.to_string(),
+                                    ),
+                                ],
+                            );
                             let targets = bridge
                                 .map(|bridge| bridge.capture_targets())
                                 .unwrap_or_else(|| BridgeCaptureTargets {
@@ -7540,6 +9618,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             // 任务管理三个命令都**不执行**：自检不得改动系统状态
             //（装/删计划任务都要提权，也不该在自检里发生）。
             install_task: false,
+            task_user_sid: None,
             remove_task: false,
             task_status: false,
             follow_app: false,
@@ -7732,6 +9811,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 if let Ok((stream, _)) = listener.accept() {
                     let mut sess = Session {
                         connection_generation: 1,
+                        ownership_epoch: 0,
+                        ownership_state: CaptureState::Inactive,
+                        ownership_sequence: 0,
                         hb_sequence: 0,
                         last_hb_rx: None,
                         connected_at: Instant::now(),
@@ -8223,7 +10305,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         // 24) 桥接描述文件解析（捕获链第 ② 段）。解析错一处，现象是
         //     "主程序在跑、助手也在跑，但三键就是不动"——日志上只有 APP-BRIDGE unavailable，
         //     而那是一条折叠日志，本身不会告诉你是哪一项不匹配。逐项钉住。
-        let good = "version=2\nport=53124\npipe=\\\\.\\pipe\\SayAllPersonal.Rc003Bridge.999.deadbeef\ntoken=deadbeefcafe\npid=999\n";
+        let good = "version=3\nport=53124\npipe=\\\\.\\pipe\\SayAllPersonal.Rc003Bridge.999.deadbeef\ntoken=deadbeefcafe\npid=999\n";
         let parsed = parse_bridge_descriptor(good);
         check(
             "桥接描述文件：正常解析",
@@ -8260,9 +10342,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         );
         check(
             "桥接描述文件：缺令牌或缺端口必须拒绝",
-            parse_bridge_descriptor("version=2\nport=53124\n").is_none()
-                && parse_bridge_descriptor("version=2\ntoken=abc\n").is_none()
-                && parse_bridge_descriptor("version=2\nport=53124\ntoken=\n").is_none(),
+            parse_bridge_descriptor("version=3\nport=53124\n").is_none()
+                && parse_bridge_descriptor("version=3\ntoken=abc\n").is_none()
+                && parse_bridge_descriptor("version=3\nport=53124\ntoken=\n").is_none(),
             "缺 token / 缺 port / 空 token 三种都应拒绝".to_string(),
         );
 
@@ -8294,7 +10376,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         check(
             "桥接描述文件路径：与主程序侧约定一致（SayAllPersonal\\rc003-bridge.ini）",
             bridge_leaf == "rc003-bridge.ini"
-                && bridge_joined.contains("\\sayall\\")
+                && bridge_joined.contains("\\sayallpersonal\\")
                 && bridge_path
                     .parent()
                     .map(|parent| parent.ends_with("SayAllPersonal"))
@@ -8311,7 +10393,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         let probe_file = probe_dir.join("rc003-bridge.ini");
         let _ = fs::write(
             &probe_file,
-            "version=2\nport=53124\ntoken=deadbeef\npid=1\n",
+            "version=3\nport=53124\ntoken=deadbeef\npid=1\n",
         );
         let probe_ok = probe_bridge_descriptor(&probe_file);
         let _ = fs::write(&probe_file, "version=9\nport=53124\ntoken=deadbeef\n");
@@ -8368,6 +10450,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                         if let Ok((stream, _)) = stale_listener.accept() {
                             let mut sess = Session {
                                 connection_generation: 1,
+                                ownership_epoch: 0,
+                                ownership_state: CaptureState::Inactive,
+                                ownership_sequence: 0,
                                 hb_sequence: 0,
                                 last_hb_rx: None,
                                 connected_at: Instant::now(),
@@ -8487,27 +10572,18 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             ),
         }
 
-        // 30) 计划任务创建参数：**纯函数**，不碰系统就能钉住契约。
-        //     这是"只弹一次 UAC"方案的根基，每一条都对应一种会走样的产品行为：
-        //     丢 `/rl highest` ⇒ 触发后仍是普通权限（拿不到报告）；
-        //     改成 `/sc daily` ⇒ 调度器每天真的拉起一个提权进程；
-        //     丢 `--follow-app` ⇒ 主程序关了助手还挂在后台；
-        //     `/tr` 里丢引号 ⇒ 路径带空格时任务指向错误的位置。
-        //     真正的安装/删除要提权且会改系统状态，所以**只**在这里验证参数本身。
-        let create = task_create_args(std::path::Path::new("C:\\fake\\rc003-helper.exe"));
-        let create_text = create.join(" ");
-        let exe_part = "\"C:\\fake\\rc003-helper.exe\" --follow-app";
+        let xml = task_xml(
+            "C:\\fixture\\sayall-helper.exe",
+            "S-1-5-18",
+            "2026-10-24T00:00:00Z",
+        );
         check(
-            "计划任务创建参数：手动触发 + 最高权限 + 跟随主程序 + 路径带引号",
-            create
-                .windows(2)
-                .any(|pair| pair[0] == "/tn" && pair[1] == SCHEDULED_TASK_NAME)
-                && create_text.contains(exe_part)
-                && create_text.contains("/rl highest")
-                && create_text.contains("/sc once")
-                && create_text.contains("/st 00:00")
-                && !create_text.contains("/sc daily"),
-            create_text,
+            "计划任务: 手动触发、普通调度、最高权限、跟随主程序",
+            xml.contains("<Triggers/>")
+                && xml.contains("<Priority>4</Priority>")
+                && xml.contains("<RunLevel>HighestAvailable</RunLevel>")
+                && xml.contains("<Arguments>--follow-app</Arguments>"),
+            "xml_contract".into(),
         );
 
         // 31) 查询与删除：任务名必须一致（否则状态查询正常、删除却删错对象），
@@ -8808,7 +10884,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 有了代次，接管旧实例时日志会打 `[AGENT-STALE]`，让这件事一眼可见。
     ///
     /// 旧/未知代次不允许接管；本助手不结束共享宿主来替换 DLL。
-    const AGENT_BUILD: &str = "2026-10-20.upstream-usage";
+    const AGENT_BUILD: &str = "2026-10-23.auth-lease";
     /// 锁定文件在编译期内联。三重作用：
     /// 1) **缺失即编译失败**：锁定文件被删/路径写错，构建直接报错，不会产出"看起来正常、
     ///    实际没登记完整性"的二进制（本常量写错路径时已实测触发编译错误）；
@@ -8963,7 +11039,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert!(AppProcess::from_pipe(&pipe, peer.child.id().wrapping_add(1)).is_err());
             let process = AppProcess::from_pipe(&pipe, peer.child.id()).unwrap();
             assert_eq!(process.state(), AppProcessState::Running);
-            pipe.write_all(b"HELLO 2 test 1\n").unwrap();
+            pipe.write_all(b"HELLO 3 test 1\n").unwrap();
             let mut ack = [0; 64];
             assert!(pipe.read(&mut ack).unwrap() > 0);
             assert_eq!(
@@ -9266,7 +11342,19 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             args.cleanup_only = true;
             let listener = bind_listener(args.port).unwrap();
             fs::write(root.join("listening"), b"ready").unwrap();
-            let result = reconcile_previous_capture(&listener, &args, &Logger::new(None), true);
+            let mut logger = Logger::new(None);
+            if root.join("slow-stop-log").exists() {
+                let sink_root = root.clone();
+                logger.test_sink = Some(Arc::new(move |record| {
+                    if record.contains("[AGENT-STOP-PROGRESS]") {
+                        fs::write(sink_root.join("stop-log-entered"), b"blocked").unwrap();
+                        while !sink_root.join("release-stop-log").exists() {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }));
+            }
+            let result = reconcile_previous_capture(&listener, &args, &logger, true);
             let expected_error = std::env::var("SAYALL_RECOVERY_EXPECT_ERROR").ok();
             match expected_error {
                 Some(reason) => assert_eq!(result, Err(reason.as_str())),
@@ -9481,6 +11569,55 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         }
 
         #[test]
+        fn blocked_stop_diagnostics_do_not_delay_recovery_ack_or_terminal_receipt() {
+            let host = AppProcess::open(std::process::id()).unwrap();
+            let case = Case::new("blocked-stop-diagnostics");
+            case.write(&pending_for(&host));
+            fs::write(case.root.join("slow-stop-log"), b"block").unwrap();
+            let mut worker = case.start(None);
+            let port = case.port;
+            let peer = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(4)))
+                    .unwrap();
+                writeln!(stream, "{{\"type\":\"hello\",\"token\":\"synthetic-recovery-token\",\"pid\":{},\"agent\":\"rc003_agent/1\",\"build\":\"{AGENT_BUILD}\",\"instance\":\"{INSTANCE}\"}}", host.pid).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                assert_eq!(extract_str(&command, "type").as_deref(), Some("disarm"));
+                let request = extract_str(&command, "stop_id").unwrap();
+                writeln!(stream, "{{\"type\":\"stopped\",\"instance\":\"{INSTANCE}\",\"stop_id\":\"{request}\",\"hook_detached\":true,\"released_all\":true}}").unwrap();
+            });
+            let entered_deadline = Instant::now() + Duration::from_secs(3);
+            while !case.root.join("stop-log-entered").exists() {
+                assert!(
+                    Instant::now() < entered_deadline,
+                    "stop diagnostics were not reached"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let receipt_deadline = Instant::now() + Duration::from_secs(1);
+            let confirmed_while_blocked = loop {
+                let receipt = case.read();
+                if receipt.status == "passed" && receipt.settled() {
+                    break true;
+                }
+                if Instant::now() >= receipt_deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            fs::write(case.root.join("release-stop-log"), b"released").unwrap();
+            peer.join().unwrap();
+            worker.finish();
+            assert!(
+                confirmed_while_blocked,
+                "synchronous diagnostics blocked STOP/ACK or terminal receipt"
+            );
+        }
+
+        #[test]
         fn killed_owned_host_or_reused_pid_records_host_exited_without_an_ack() {
             let case = Case::new("host-killed");
             let mut child = OwnChild::fixture();
@@ -9537,7 +11674,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     mod cooperative_cleanup_tests {
         use super::*;
 
-        static CONNECTION_TEST_GATE: Mutex<()> = Mutex::new(());
+        pub(super) static CONNECTION_TEST_GATE: Mutex<()> = Mutex::new(());
 
         fn identity(pid: u32, created: u64, instance: &str) -> AgentIdentity {
             AgentIdentity {
@@ -9622,6 +11759,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         fn session() -> Session {
             Session {
                 connection_generation: 1,
+                ownership_epoch: 0,
+                ownership_state: CaptureState::Inactive,
+                ownership_sequence: 0,
                 hb_sequence: 0,
                 last_hb_rx: None,
                 connected_at: Instant::now(),
@@ -10073,7 +12213,19 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert!(!log.contains("value="));
         }
 
-        fn cleanup_exchange(delay: Duration, reply: &'static [u8]) -> bool {
+        fn stop_progress_logger() -> (Logger, Arc<Mutex<Vec<String>>>, mpsc::Receiver<String>) {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let sink_records = records.clone();
+            let (events, receive) = mpsc::channel();
+            let mut logger = Logger::new(None);
+            logger.test_sink = Some(Arc::new(move |record| {
+                sink_records.lock().unwrap().push(record.to_owned());
+                let _ = events.send(record.to_owned());
+            }));
+            (logger.nonblocking().unwrap(), records, receive)
+        }
+
+        fn cleanup_exchange_logged(delay: Duration, reply: &'static [u8]) -> (bool, Vec<String>) {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let addr = listener.local_addr().unwrap();
             let peer = std::thread::spawn(move || {
@@ -10087,13 +12239,156 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 std::thread::sleep(delay);
                 stream.write_all(reply.as_bytes()).unwrap();
             });
+            let (logger, records, _) = stop_progress_logger();
             let confirmed = stop_agent(
                 &mut TcpStream::connect(addr).unwrap(),
                 "test",
                 &identity(42, 100, "a"),
+                &logger,
             );
             peer.join().unwrap();
-            confirmed
+            assert!(logger.shutdown());
+            let records = records.lock().unwrap().clone();
+            (confirmed, records)
+        }
+
+        fn cleanup_exchange(delay: Duration, reply: &'static [u8]) -> bool {
+            cleanup_exchange_logged(delay, reply).0
+        }
+
+        #[test]
+        fn stop_progress_write_failure_is_distinct_from_a_submitted_wait() {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let (logger, records, _) = stop_progress_logger();
+            let result = stop_agent_outcome(
+                &mut stream,
+                "synthetic-private-stop-token",
+                &identity(42, 100, "synthetic-private-agent-instance"),
+                None,
+                &logger,
+            );
+            assert!(logger.shutdown());
+            assert_eq!(result, StopOutcome::Unconfirmed);
+            let records = records.lock().unwrap();
+            let progress: Vec<_> = records
+                .iter()
+                .filter(|line| line.contains("[AGENT-STOP-PROGRESS]"))
+                .collect();
+            assert_eq!(progress.len(), 2);
+            assert!(progress[0].contains("phase=write_requested"));
+            assert!(progress[0].contains("host_exit_observer=false"));
+            assert!(progress[1].contains("phase=completed"));
+            assert!(progress[1].contains("reason=write_failed"));
+            assert!(progress[1].contains("terminal_result=unconfirmed"));
+            assert!(
+                !records.iter().any(|line| line.contains("synthetic-private")
+                    || line.contains("token=")
+                    || line.contains("instance=")
+                    || line.contains("stop_id="))
+            );
+        }
+
+        #[test]
+        fn stop_progress_reports_late_ack_and_wait_without_claiming_host_proof() {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (logger, records, events) = stop_progress_logger();
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut command = [0u8; 512];
+                let count = stream.read(&mut command).unwrap();
+                let command = String::from_utf8_lossy(&command[..count]);
+                let request = extract_str(&command, "stop_id").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    match events.recv_timeout(remaining) {
+                        Ok(record) if record.contains("phase=waiting") => {
+                            writeln!(stream, "{{\"type\":\"stopped\",\"instance\":\"a\",\"stop_id\":\"{request}\",\"hook_detached\":true,\"released_all\":true}}").unwrap();
+                            return true;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                false
+            });
+            let confirmed = stop_agent(
+                &mut TcpStream::connect(address).unwrap(),
+                "test",
+                &identity(42, 100, "a"),
+                &logger,
+            );
+            let waited = peer.join().unwrap();
+            assert!(logger.shutdown());
+            let records = records.lock().unwrap();
+            let progress: Vec<_> = records
+                .iter()
+                .filter(|line| line.contains("[AGENT-STOP-PROGRESS]"))
+                .collect();
+            let phases: Vec<_> = progress
+                .iter()
+                .map(|line| {
+                    line.split("phase=")
+                        .nth(1)
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                phases,
+                [
+                    "write_requested",
+                    "submitted",
+                    "waiting",
+                    "ack_received",
+                    "completed"
+                ]
+            );
+            assert!(progress[0].contains("host_exit_observer=false"));
+            assert!(progress[2].contains("reason=ack_not_received"));
+            assert!(progress[3].contains(
+                "instance_match=true request_match=true hook_detached=true released_all=true"
+            ));
+            assert!(progress[4].contains("terminal_result=passed"));
+            assert!(waited && confirmed);
+            let attempt_ids: std::collections::BTreeSet<_> = progress
+                .iter()
+                .map(|line| {
+                    line.split("attempt_id=")
+                        .nth(1)
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(attempt_ids.len(), 1);
+            assert!(!records
+                .iter()
+                .any(|line| line.contains("token=") || line.contains("stop_id=")));
+        }
+
+        #[test]
+        fn stop_progress_distinguishes_stale_ack_from_connection_close() {
+            let (confirmed, records) = cleanup_exchange_logged(
+                Duration::ZERO,
+                b"{\"type\":\"stopped\",\"instance\":\"a\",\"stop_id\":\"old\",\"hook_detached\":true,\"released_all\":true}\n",
+            );
+            assert!(!confirmed);
+            let progress: Vec<_> = records
+                .iter()
+                .filter(|line| line.contains("[AGENT-STOP-PROGRESS]"))
+                .collect();
+            assert_eq!(progress.len(), 4);
+            assert!(progress[2].contains("phase=ack_received"));
+            assert!(progress[2].contains("instance_match=true request_match=false"));
+            assert!(progress[3].contains("reason=connection_closed"));
+            assert!(progress[3].contains("terminal_result=unconfirmed"));
         }
 
         #[test]
@@ -10309,12 +12604,12 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             let client = TcpStream::connect(address).expect("连接回环");
             let (mut server, _) = listener.accept().expect("接受连接");
             // 与真实主程序一致：两行一次写出（不是两次 write）。
-            server.write_all(b"OK 2 12 -\nS 00E6\n").expect("写回两行");
+            server.write_all(b"OK 3 12 -\nS 00E6\n").expect("写回两行");
             server.flush().ok();
 
             let mut stream = AppBridgeStream::Tcp(client);
             let (line, surplus) = bridge_read_ack(&mut stream).expect("读到 ack");
-            assert_eq!(line, "OK 2 12 -\n");
+            assert_eq!(line, "OK 3 12 -\n");
             assert_eq!(
                 surplus, b"S 00E6\n",
                 "同一次读里的后续行必须以余量交回，而不是丢弃"
@@ -10354,9 +12649,9 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         /// 未成行的尾巴不能吐掉：没有换行就留在缓冲里等下一次读补齐。
         #[test]
         fn split_first_line_waits_for_the_newline() {
-            assert!(split_first_line(b"OK 2 1").is_none());
-            let (line, surplus) = split_first_line(b"OK 2 12 -\nS 00E6\nP 1\n").expect("第一行");
-            assert_eq!(line, "OK 2 12 -\n");
+            assert!(split_first_line(b"OK 3 1").is_none());
+            let (line, surplus) = split_first_line(b"OK 3 12 -\nS 00E6\nP 1\n").expect("第一行");
+            assert_eq!(line, "OK 3 12 -\n");
             assert_eq!(surplus, b"S 00E6\nP 1\n");
         }
     }
@@ -10373,7 +12668,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         fn descriptor_log_field_wins_over_convention() {
             // 主程序写明 `log=` 时以它为准（它能反映 SAYALL_GATT_LOG 覆盖）。
             let text =
-                "version=2\nport=1\ntoken=t\nlog=C:\\Users\\x\\AppData\\Local\\SayAllPersonal\\Logs\\other.log\n";
+                "version=3\nport=1\ntoken=t\nlog=C:\\Users\\x\\AppData\\Local\\SayAllPersonal\\Logs\\other.log\n";
             assert_eq!(
                 resolve_shared_log(Some(Path::new(DESCRIPTOR)), Some(text)),
                 Some(PathBuf::from(
@@ -10385,13 +12680,13 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         #[test]
         fn missing_or_unreadable_descriptor_falls_back_to_convention() {
             // 旧版主程序没有 `log=`：按约定推导到同一个目录树。
-            let text = "version=2\nport=1\ntoken=t\n";
+            let text = "version=3\nport=1\ntoken=t\n";
             assert_eq!(
                 resolve_shared_log(Some(Path::new(DESCRIPTOR)), Some(text)),
                 Some(PathBuf::from(CONVENTION))
             );
             // `log=` 空值视为缺字段，不得把空路径当落点。
-            let empty = "version=2\nport=1\ntoken=t\nlog=\n";
+            let empty = "version=3\nport=1\ntoken=t\nlog=\n";
             assert_eq!(
                 resolve_shared_log(Some(Path::new(DESCRIPTOR)), Some(empty)),
                 Some(PathBuf::from(CONVENTION))

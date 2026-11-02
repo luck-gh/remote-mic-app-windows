@@ -608,6 +608,202 @@ check('鉴权退避按失败次数渐进：2/4/8/15s 封顶',
 check('新连接重置 everRenewed（不让上一代续约影响鉴权判定）',
   ctx.everRenewed === false);
 
+async function authenticatedSession() {
+  let now = 100000;
+  const frames = [];
+  const connections = [];
+  const callbacks = {};
+  const context = createContext({
+    ...sandbox,
+    rpc: {},
+    Date: class extends Date { static now() { return now; } },
+    Interceptor: {
+      attach(_address, handler) {
+        callbacks.onEnter = handler.onEnter;
+        callbacks.onLeave = handler.onLeave;
+        return { detach() {} };
+      },
+      flush() {},
+    },
+    Socket: {
+      connect() {
+        const connection = {
+          reads: [],
+          closed: false,
+          close() { this.closed = true; },
+          setNoDelay() {},
+          output: { write(bytes) {
+            frames.push(JSON.parse(String.fromCharCode(...new Uint8Array(bytes.buffer || bytes))));
+          } },
+          input: { read() {
+            return new Promise((resolveRead, rejectRead) => {
+              connection.reads.push({ resolve: resolveRead, reject: rejectRead });
+            });
+          } },
+        };
+        connections.push(connection);
+        return Promise.resolve(connection);
+      },
+    },
+  });
+  runInContext(src, context, { filename: 'rc003_agent.js' });
+  context.params = { port: 47831, token: 'fixture-token' };
+  context.installHook();
+  await context.connectOnce();
+  return {
+    context, frames, connections,
+    advance(milliseconds) { now += milliseconds; },
+    now() { return now; },
+    command(command) {
+      context.handleCommand(JSON.stringify({ token: 'fixture-token', ...command }));
+    },
+    async deliver(connection, command) {
+      const text = JSON.stringify({ token: 'fixture-token', ...command }) + '\n';
+      connection.reads.at(-1).resolve(toArrayBuffer(Uint8Array.from(text, (character) => character.charCodeAt(0))));
+      await new Promise((resolveRead) => setImmediate(resolveRead));
+    },
+    press(...usages) {
+      const pointer = fakePtr(report(...usages));
+      const call = {};
+      callbacks.onEnter.call(call, fakeArgs(pointer));
+      const restore = context.restoreOnLeave;
+      context.restoreOnLeave = false;
+      callbacks.onLeave.call(call, num(0));
+      context.restoreOnLeave = restore;
+      return pointer;
+    },
+  };
+}
+
+{
+  const session = await authenticatedSession();
+  const agent = session.context;
+  check('认证：首次连接没有继承握手或租约', !agent.handshakeDone && !agent.leaseOk());
+  session.advance(agent.AUTH_TIMEOUT_MS + 1);
+  session.command({ type: 'mode', clear: true });
+  agent.heartbeat();
+  check('认证：未收到首次 renew 进入首级鉴权退避', !agent.connected && agent.stat.auth_rejected === 1 &&
+    agent.retryNotBefore === session.now() + 2000);
+}
+
+{
+  const session = await authenticatedSession();
+  const agent = session.context;
+  session.command({ type: 'renew', token: 'invalid-token' });
+  check('认证：错误 token 不建立握手或租约', !agent.handshakeDone && !agent.leaseOk() && agent.stat.cmd_rejected === 1);
+  session.advance(agent.AUTH_TIMEOUT_MS + 1);
+  session.command({ type: 'renew', token: 'invalid-token' });
+  agent.heartbeat();
+  check('认证：错误 token 流量不能绕过首级鉴权退避', !agent.connected && agent.stat.auth_rejected === 1 &&
+    agent.retryNotBefore === session.now() + 2000);
+}
+
+{
+  const session = await authenticatedSession();
+  const agent = session.context;
+  session.command({ type: 'targets', generation: 1, report: [0xf1], clear: [0xf1] });
+  await session.deliver(session.connections[0], { type: 'renew' });
+  check('租约：认证 renew 后目标 DOWN 实际被清除', session.press(0xf1).buf[3] === 0 && agent.handshakeDone);
+  session.advance(agent.LEASE_MS + 1);
+  agent.heartbeat();
+  const releases = session.frames.filter((frame) => frame.type === 'edge' && frame.reason === 'lease_expired');
+  check('租约：实际过期撤销许可并成对释放一次', !agent.leaseOk() && agent.lastRenewAt === 0 &&
+    Object.keys(agent.pressed).length === 0 && releases.length === 1 && releases[0].usages.length === 0);
+  check('租约：失效后原报告保持原样', session.press(0xf1).buf[3] === 0xf1);
+  session.advance(agent.AUTH_TIMEOUT_MS - agent.LEASE_MS);
+  session.command({ type: 'mode', clear: true });
+  agent.heartbeat();
+  check('租约：已认证连接过期不会误判 auth_mismatch 或进入15秒退避', agent.connected && agent.handshakeDone &&
+    agent.stat.auth_rejected === 0 && agent.retryNotBefore === 0);
+  check('租约：重复失效检查不重复释放', session.frames.filter((frame) => frame.type === 'edge' && frame.reason === 'lease_expired').length === 1);
+  session.press();
+  await session.deliver(session.connections[0], { type: 'renew' });
+  check('租约：同连接合法重新 renew 恢复既有目标捕获', agent.leaseOk() && session.press(0xf1).buf[3] === 0 &&
+    JSON.stringify(Array.from(agent.reportUsages)) === '[241]' && !agent.disarmed);
+  session.press();
+  const renewedAt = agent.lastRenewAt;
+  session.command({ type: 'renew', token: 'invalid-token' });
+  check('租约：已经认证也不接受错误 token 续约', agent.lastRenewAt === renewedAt && agent.stat.cmd_rejected === 1);
+}
+
+for (const oldRead of ['resolve', 'reject']) {
+  const session = await authenticatedSession();
+  const agent = session.context;
+  await session.deliver(session.connections[0], { type: 'renew' });
+  const original = session.connections[0];
+  const pendingRead = original.reads.at(-1);
+  agent.dropConnection('fixture_drop', false);
+  check(`重连 ${oldRead}：drop 立即清当前连接认证和租约`, !agent.handshakeDone && agent.lastRenewAt === 0 && !agent.leaseOk());
+  session.advance(agent.RECONNECT_MS);
+  await agent.connectOnce();
+  const current = session.connections.at(-1);
+  check(`重连 ${oldRead}：新 socket 必须重新认证`, !agent.handshakeDone && !agent.leaseOk() && agent.lastRenewAt === 0);
+  const readCount = current.reads.length;
+  const rxAt = agent.tLastRx;
+  if (oldRead === 'resolve') {
+    pendingRead.resolve(toArrayBuffer(Uint8Array.from('{"type":"renew","token":"fixture-token"}\n', (character) => character.charCodeAt(0))));
+  } else {
+    pendingRead.reject(new Error('stale read'));
+  }
+  await new Promise((resolveRead) => setImmediate(resolveRead));
+  check(`重连 ${oldRead}：旧 read 回调不能认证或改新 pump`, agent.connected && agent.sock === current &&
+    !agent.handshakeDone && agent.lastRenewAt === 0 && agent.tLastRx === rxAt && agent.pumpRunning && agent.stat.read_errors === 0,
+    `connected=${agent.connected} current_socket=${agent.sock === current} handshake=${agent.handshakeDone} last_renew=${agent.lastRenewAt} pump_running=${agent.pumpRunning} read_errors=${agent.stat.read_errors}`);
+  agent.pump();
+  check(`重连 ${oldRead}：旧回调后仍恰好一个新连接 read`, current.reads.length === readCount,
+    `reads_before=${readCount} reads_after=${current.reads.length}`);
+  session.advance(agent.AUTH_TIMEOUT_MS + 1);
+  session.command({ type: 'renew', token: 'invalid-token' });
+  agent.heartbeat();
+  check(`重连 ${oldRead}：旧认证不能豁免新连接首级鉴权退避`, !agent.connected && agent.stat.auth_rejected === 1 &&
+    agent.retryNotBefore === session.now() + 2000);
+}
+
+{
+  const session = await authenticatedSession();
+  const agent = session.context;
+  await session.deliver(session.connections[0], { type: 'renew' });
+  const renewedAt = agent.lastRenewAt;
+  const original = agent.sock;
+  await agent.connectOnce();
+  check('认证：落败的新连接回调不清现有合法握手/租约', agent.sock === original && agent.handshakeDone &&
+    agent.lastRenewAt === renewedAt && session.connections.at(-1).closed);
+}
+
+{
+  const session = await authenticatedSession();
+  const agent = session.context;
+  session.command({ type: 'targets', generation: 2, report: [0xf1], clear: [0xf1] });
+  await session.deliver(session.connections[0], { type: 'renew' });
+  session.press(0xf1);
+  agent.dropConnection('fixture_held_drop', false);
+  check('重连持键：drop 撤销许可但不伪造物理 UP', !agent.leaseOk() && agent.pressed[0xf1] === true);
+  session.advance(agent.RECONNECT_MS);
+  await agent.connectOnce();
+  check('重连持键：新连接未续约时旧持键报告保持原样', session.press(0xf1).buf[3] === 0xf1);
+  await session.deliver(session.connections.at(-1), { type: 'renew' });
+  const beforeHeld = session.frames.length;
+  session.press(0xf1);
+  check('重连持键：未物理 UP 不把旧持键重放成新 DOWN',
+    !session.frames.slice(beforeHeld).some((frame) => frame.type === 'edge' && frame.usages.length > 0));
+  session.press();
+  const before = session.frames.length;
+  session.press(0xf1);
+  session.press();
+  const edges = session.frames.slice(before).filter((frame) => frame.type === 'edge');
+  check('重连持键：旧物理 UP 后新按放仍有完整 DOWN/UP', edges.length === 2 && edges[0].usages.length === 1 && edges[1].usages.length === 0);
+}
+
+{
+  const session = await authenticatedSession();
+  const agent = session.context;
+  session.command({ type: 'targets', generation: 3, report: [0xf1], clear: [0xf1] });
+  session.command({ type: 'disarm', instance: agent.agentInstance, stop_id: 'fixture-disarmed' });
+  await session.deliver(session.connections[0], { type: 'renew' });
+  check('认证：合法 renew 不扩大 targets 或替代 arm', agent.handshakeDone && agent.disarmed && !agent.leaseOk() &&
+    JSON.stringify(Array.from(agent.reportUsages)) === '[241]' && session.press(0xf1).buf[3] === 0xf1);
+}
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) {
   console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.detail ? '  -- ' + r.detail : ''}`);

@@ -18,6 +18,19 @@ name = "sayall-helper"
 path = "src/main.rs"
 
 [dependencies]
-# 与主工作区使用相同的成熟 JSON 解析库；Win32 访问仍由既有 FFI 承担。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+quick-xml = { version = "=0.41.0", features = ["serialize"] }

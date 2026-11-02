@@ -344,6 +344,44 @@ impl MappingConfiguration {
         self.application_bindings
             .retain(|b| !b.application_id.eq_ignore_ascii_case(application_id));
     }
+    pub fn update_application_bindings(
+        &mut self,
+        application_ids: &[String],
+        template_id: Option<&str>,
+    ) -> Result<(), String> {
+        if application_ids.is_empty() {
+            return Err("请至少选择一个程序关联".into());
+        }
+        let mut selected = HashSet::new();
+        for id in application_ids {
+            let id = normalized_required(id, "程序关联 ID")?.to_lowercase();
+            if !selected.insert(id.clone()) {
+                return Err("选择的程序关联不得重复".into());
+            }
+            if !self
+                .application_bindings
+                .iter()
+                .any(|binding| binding.application_id.to_lowercase() == id)
+            {
+                return Err("选择的程序关联已不存在，请刷新后重试".into());
+            }
+        }
+        if let Some(id) = template_id {
+            let id = normalized_required(id, "模板 ID")?;
+            if self.template_mappings(&id).is_none() {
+                return Err("目标模板已不存在，请刷新后重试".into());
+            }
+            for binding in &mut self.application_bindings {
+                if selected.contains(&binding.application_id.to_lowercase()) {
+                    binding.template_id.clone_from(&id);
+                }
+            }
+        } else {
+            self.application_bindings
+                .retain(|binding| !selected.contains(&binding.application_id.to_lowercase()));
+        }
+        Ok(())
+    }
     pub fn reorder_application_associations(&mut self, ids: Vec<String>) -> Result<(), String> {
         let requested: HashSet<_> = ids.iter().map(|id| id.trim().to_lowercase()).collect();
         let existing: HashSet<_> = self
@@ -520,6 +558,68 @@ pub fn new_template_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    fn bulk_binding_configuration() -> MappingConfiguration {
+        MappingConfiguration {
+            application_bindings: ["codex", "edge", "wechat"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| ApplicationBinding {
+                    application_id: id.into(),
+                    template_id: BUILTIN_AGENT_TEMPLATE_ID.into(),
+                    menu_order: index as u32 * 5,
+                    launch_target: Some(format!("{id}.exe")),
+                })
+                .collect(),
+            ..MappingConfiguration::default()
+        }
+    }
+
+    #[test]
+    fn bulk_binding_replace_preserves_all_unselected_fields_and_order() {
+        let mut configuration = bulk_binding_configuration();
+        let mut expected = configuration.clone();
+        expected.application_bindings[0].template_id = BUILTIN_CHAT_TEMPLATE_ID.into();
+        expected.application_bindings[2].template_id = BUILTIN_CHAT_TEMPLATE_ID.into();
+        configuration
+            .update_application_bindings(
+                &["CODEX".into(), "wechat".into()],
+                Some(BUILTIN_CHAT_TEMPLATE_ID),
+            )
+            .unwrap();
+        assert_eq!(configuration, expected);
+        configuration
+            .update_application_bindings(&["edge".into()], None)
+            .unwrap();
+        expected.application_bindings.remove(1);
+        assert_eq!(configuration, expected);
+    }
+
+    #[test]
+    fn bulk_binding_rejects_invalid_or_stale_targets_before_mutation() {
+        let original = bulk_binding_configuration();
+        for ids in [
+            vec![],
+            vec!["".into()],
+            vec!["codex".into(), "CODEX".into()],
+            vec!["codex".into(), "missing".into()],
+        ] {
+            for target in [None, Some(BUILTIN_CHAT_TEMPLATE_ID)] {
+                let mut configuration = original.clone();
+                assert!(configuration
+                    .update_application_bindings(&ids, target)
+                    .is_err());
+                assert_eq!(configuration, original);
+            }
+        }
+        for target in ["", "missing"] {
+            let mut configuration = original.clone();
+            assert!(configuration
+                .update_application_bindings(&["codex".into()], Some(target))
+                .is_err());
+            assert_eq!(configuration, original);
+        }
+    }
+
     use super::*;
     #[test]
     fn builtin_edits_keep_identity_and_bindings_and_survive_reload() {

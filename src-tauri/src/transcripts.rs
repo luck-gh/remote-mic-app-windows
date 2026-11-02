@@ -1,6 +1,6 @@
 //! 「回眸」本地归档。
 //!
-//! 数据完全在本机：`%LOCALAPPDATA%\SayAll\transcripts\v1\<applicationKey>\<YYYY-MM-DD>.json`。
+//! 数据完全在本机：`%LOCALAPPDATA%\SayAllPersonal\transcripts\v1\<applicationKey>\<YYYY-MM-DD>.json`。
 //! 记录只保存本段新增文字和应用显示名；不保存输入框全文、窗口标题、文档名、网址或
 //! 可执行文件路径。删除只走 Windows 回收站，失败时保留原文件。
 
@@ -117,12 +117,12 @@ impl TranscriptStore {
         }
     }
 
-    /// `%LOCALAPPDATA%\SayAll\transcripts\v1`；与其他本机运行数据同目录。
+    /// `%LOCALAPPDATA%\SayAllPersonal\transcripts\v1`；与其他本机运行数据同目录。
     pub fn default_root() -> Result<PathBuf, String> {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| "读不到 LOCALAPPDATA，无法保存回眸记录".to_owned())?;
-        Ok(base.join("SayAll").join("transcripts").join("v1"))
+        Ok(base.join("SayAllPersonal").join("transcripts").join("v1"))
     }
 
     #[cfg(test)]
@@ -751,6 +751,16 @@ pub fn default_move_to_recycle_bin(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn default_root_is_personal() {
+        let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert_eq!(
+            TranscriptStore::default_root().unwrap(),
+            base.join("SayAllPersonal").join("transcripts").join("v1")
+        );
+    }
+
     use super::*;
     use sayall_core::transcripts::{
         application_key, CAPTURE_METHOD_VERSION, TRANSCRIPT_SCHEMA_VERSION,

@@ -3482,6 +3482,43 @@ async fn remove_application_binding(
 }
 
 #[tauri::command]
+async fn update_application_bindings(
+    application_ids: Vec<String>,
+    template_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::templates::MappingConfiguration, String> {
+    let started = std::time::Instant::now();
+    let action = if template_id.is_some() {
+        "replace"
+    } else {
+        "remove"
+    };
+    let count = application_ids.len();
+    sayall_windows::gatt_note(format!(
+        "template_binding_batch action={action} phase=requested count={count}"
+    ));
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        settings.update_mapping_configuration(
+            |configuration| {
+                configuration.update_application_bindings(&application_ids, template_id.as_deref())
+                    .inspect_err(|_| sayall_windows::gatt_note(format!(
+                        "template_binding_batch action={action} phase=validated result=failed error_domain=validation error_code=invalid_bulk_request reason=selection_or_template_invalid retryable=true"
+                    )))
+            },
+            |saved| apply_mapping_configuration(platform.as_ref(), saved),
+        ).map(|(saved, ())| saved)
+    }).await.map_err(|error| format!("批量更新程序关联任务失败：{error}"))
+        .and_then(|result| result);
+    sayall_windows::gatt_note(format!(
+        "template_binding_batch action={action} phase=completed count={count} terminal_result={} elapsed_ms={}",
+        if result.is_ok() { "passed" } else { "failed" }, started.elapsed().as_millis()
+    ));
+    result
+}
+
+#[tauri::command]
 async fn reorder_application_associations(
     application_ids: Vec<String>,
     state: tauri::State<'_, AppState>,
@@ -6950,6 +6987,7 @@ pub fn run() {
                 let enabled = saved_settings.rc003_capture_enabled;
                 let support = rc003_task::capture_support();
                 let target_matches = rc003_task::task_target_matches(&support.helper_expected);
+                let policy_matches = rc003_task::task_policy_matches();
                 let reason = if !support.available {
                     support.reason.as_deref().unwrap_or("helper_unavailable")
                 } else if target_matches == Some(false) {
@@ -6958,6 +6996,10 @@ pub fn run() {
                     "reauth_marker_present"
                 } else if !rc003_task::task_installed() {
                     "task_missing"
+                } else if policy_matches == Ok(false) {
+                    "task_policy_mismatch"
+                } else if policy_matches.is_err() {
+                    "task_policy_unverified"
                 } else {
                     "authorized"
                 };
@@ -7133,7 +7175,7 @@ pub fn run() {
                 app.path()
                     .app_local_data_dir()
                     .unwrap_or_else(|_| std::env::temp_dir())
-                    .join("SayAll")
+                    .join("SayAllPersonal")
                     .join("transcripts")
                     .join("v1")
             });
@@ -7452,6 +7494,7 @@ pub fn run() {
         delete_mapping_template,
         upsert_application_binding,
         remove_application_binding,
+        update_application_bindings,
         reorder_application_associations,
         set_mapping_suspension,
         begin_key_observation,
@@ -7621,6 +7664,7 @@ pub fn run() {
         delete_mapping_template,
         upsert_application_binding,
         remove_application_binding,
+        update_application_bindings,
         reorder_application_associations,
         set_mapping_suspension,
         begin_key_observation,

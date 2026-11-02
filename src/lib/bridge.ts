@@ -1338,6 +1338,7 @@ export async function renameMappingTemplate(templateId: string, name: string): P
 export async function deleteMappingTemplate(templateId: string, replacementTemplateId: string | null, unbindApplications = false): Promise<MappingConfiguration> { return invoke("delete_mapping_template", { templateId, replacementTemplateId, unbindApplications }); }
 export async function upsertApplicationBinding(binding: ApplicationBinding): Promise<MappingConfiguration> { return invoke("upsert_application_binding", { binding }); }
 export async function removeApplicationBinding(applicationId: string): Promise<MappingConfiguration> { return invoke("remove_application_binding", { applicationId }); }
+export async function updateApplicationBindings(applicationIds: string[], templateId: string | null): Promise<MappingConfiguration> { return invoke("update_application_bindings", { applicationIds, templateId }); }
 export async function exportMappingConfiguration(templateIds: string[] | null = null): Promise<boolean> { return invoke("export_mapping_configuration", { templateIds }); }
 export async function previewMappingConfigurationImport(): Promise<MappingConfigurationImportPreview | null> { return invoke("preview_mapping_configuration_import"); }
 export async function applyMappingConfigurationImport(token: string): Promise<MappingConfiguration> { return invoke("apply_mapping_configuration_import", { token }); }

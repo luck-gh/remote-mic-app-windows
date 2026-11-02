@@ -4115,9 +4115,13 @@ fn gatt_log(kind: &str, bytes: &[u8]) {
 /// 2026-09-05 起对 src-tauri 应用层公开（应用内更新流程等非 GATT 功能点
 /// 复用同一日志载体与格式），保持"一次日志拉取"覆盖全部功能点。
 pub fn gatt_note(note: String) {
+    let _ = diagnostic_log_append(&diagnostic_note_record(&note));
+}
+
+pub(crate) fn diagnostic_note_record(note: &str) -> String {
     let timestamp = utc_timestamp();
     let metadata = DIAGNOSTIC_LOG_METADATA.get();
-    let _ = diagnostic_log_append(&format!(
+    format!(
         "{timestamp} pid={} ver={} build={} source_revision={} source_fingerprint={} source_state={} payload_inputs={} build_channel={} release_tag={} {note}",
         std::process::id(),
         metadata.map(|value| value.app_version.as_str()).unwrap_or("unknown"),
@@ -4128,7 +4132,7 @@ pub fn gatt_note(note: String) {
         metadata.map(|value| value.payload_inputs.as_str()).unwrap_or("unknown"),
         metadata.map(|value| value.build_channel.as_str()).unwrap_or("unknown"),
         metadata.map(|value| value.release_tag.as_str()).unwrap_or("unknown"),
-    ));
+    )
 }
 
 /// 轮转文件名用的紧凑 UTC 时间戳（形如 `20261008T063158984Z`）：只保留 ASCII

@@ -29,6 +29,7 @@ const status = ref<string | null>(null);
 const ruleNames = { buttonMappingFollowEnabled: "按程序加载默认模板", menuTemplateSwitchEnabled: "菜单键选择完整模板", mappingNoticeEnabled: "模板切换提示" };
 type RuleField = keyof typeof ruleNames;
 const rulePending = ref<Record<RuleField, boolean>>({ buttonMappingFollowEnabled: false, menuTemplateSwitchEnabled: false, mappingNoticeEnabled: false });
+const ruleSaving = computed(() => Object.values(rulePending.value).some(Boolean));
 const ruleErrors = ref<Partial<Record<RuleField, string>>>({});
 const ruleError = computed(() => (Object.keys(ruleNames) as RuleField[])
   .filter(field => ruleErrors.value[field])
@@ -392,7 +393,7 @@ onMounted(() => {
       <ApplicationTemplateBindings
         :configuration="configuration"
         :catalog="catalog"
-        :disabled="saving || loading"
+        :disabled="saving || loading || ruleSaving"
         @busy-change="associationBusy = $event"
         @saved="configuration = $event"
         @status="status = $event"

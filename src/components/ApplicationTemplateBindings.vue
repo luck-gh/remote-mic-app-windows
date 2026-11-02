@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import SettingsDialog from "./SettingsDialog.vue";
 import { reportFrontendEvent, reasonToken } from "../lib/frontend-diagnostics";
 import { useUiPreference } from "../lib/ui-preferences";
 import {
   listRunningApps, pickCustomApp,
-  removeApplicationBinding,
-  reorderApplicationAssociations, saveMappingConfiguration, upsertApplicationBinding,
+  removeApplicationBinding, updateApplicationBindings,
+  reorderApplicationAssociations, upsertApplicationBinding,
   type ApplicationBinding, type MappingConfiguration, type TemplateCatalogEntry,
 } from "../lib/bridge";
 
@@ -75,6 +75,103 @@ const filteredChoices = computed(() => {
 });
 
 const visibleAssociations = computed(() => associations.value);
+const selectedIds = ref(new Set<string>());
+const associationSection = ref<HTMLDetailsElement | null>(null);
+const selectedAssociations = computed(() => visibleAssociations.value.filter(item => selectedIds.value.has(item.applicationId.toLocaleLowerCase())));
+const allSelected = computed(() => visibleAssociations.value.length > 0 && selectedAssociations.value.length === visibleAssociations.value.length);
+const partiallySelected = computed(() => selectedAssociations.value.length > 0 && !allSelected.value);
+const bulkDialog = ref<{ action: "replace" | "remove"; targets: { id: string; name: string }[] } | null>(null);
+const bulkTemplateId = ref<string | null>(null);
+const bulkError = ref<string | null>(null);
+let bulkTrigger: HTMLButtonElement | null = null;
+watch(() => props.configuration.applicationBindings, bindings => {
+  const existing = new Set(bindings.map(binding => binding.applicationId.toLocaleLowerCase()));
+  selectedIds.value = new Set([...selectedIds.value].filter(id => existing.has(id)));
+});
+
+function toggleSelection(applicationId: string, checked: boolean): void {
+  if (busy.value || bulkDialog.value) return;
+  const next = new Set(selectedIds.value);
+  const id = applicationId.toLocaleLowerCase();
+  if (checked) next.add(id); else next.delete(id);
+  selectedIds.value = next;
+}
+
+function toggleAll(event: Event): void {
+  if (busy.value || bulkDialog.value) return;
+  selectedIds.value = new Set((event.target as HTMLInputElement).checked
+    ? visibleAssociations.value.map(item => item.applicationId.toLocaleLowerCase()) : []);
+}
+
+function openBulk(action: "replace" | "remove", event: Event): void {
+  if (busy.value || bulkDialog.value || !selectedAssociations.value.length) return;
+  bulkTrigger = event.currentTarget as HTMLButtonElement;
+  bulkDialog.value = { action, targets: selectedAssociations.value.map(item => ({ id: item.applicationId, name: fallbackName(item.applicationId) })) };
+  bulkTemplateId.value = null;
+  bulkError.value = null;
+  reportFrontendEvent({ event: "template_binding_batch", phase: "opened", result: "passed", reason: reasonToken(action, bulkDialog.value.targets.length) });
+}
+
+function closeBulk(): void {
+  if (busy.value) return;
+  reportFrontendEvent({ event: "template_binding_batch", phase: "completed", result: "cancelled", reason: "user_cancelled" });
+  bulkDialog.value = null;
+  void nextTick(restoreBulkFocus);
+}
+
+function restoreBulkFocus(): void {
+  const section = associationSection.value;
+  if (!section) return;
+  if (bulkTrigger?.isConnected && !bulkTrigger.disabled) bulkTrigger.focus();
+  else section.querySelector("summary")!.focus();
+}
+
+function trapBulkFocus(event: KeyboardEvent): void {
+  const dialog = (event.currentTarget as HTMLElement).querySelector<HTMLElement>("[role='dialog']")!;
+  const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), [tabindex='0']"));
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (!first) {
+    event.preventDefault();
+    dialog.focus();
+  } else if (!controls.includes(document.activeElement as HTMLElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last! : first).focus();
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last!.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+async function confirmBulk(event: MouseEvent): Promise<void> {
+  const operation = bulkDialog.value;
+  if (busy.value || !operation || (operation.action === "replace" && !bulkTemplateId.value)) return;
+  const targetId = operation.action === "replace" ? bulkTemplateId.value : null;
+  saving.value = true;
+  if (event.currentTarget === document.activeElement) {
+    (event.currentTarget as HTMLElement).closest<HTMLElement>("[role='dialog']")!.focus();
+  }
+  bulkError.value = null;
+  const started = performance.now();
+  const reasonCode = reasonToken(operation.action, operation.targets.length);
+  reportFrontendEvent({ event: "template_binding_batch", phase: "started", result: "passed", reason: reasonCode });
+  try {
+    const saved = await updateApplicationBindings(operation.targets.map(item => item.id), targetId);
+    emit("saved", saved);
+    emit("status", operation.action === "replace" ? `已更换 ${operation.targets.length} 个程序的模板关联` : `已移除 ${operation.targets.length} 个程序关联；模板仍保留`);
+    bulkDialog.value = null;
+    reportFrontendEvent({ event: "template_binding_batch", phase: "completed", result: "passed", reason: reasonCode, elapsedMs: Math.round(performance.now() - started) });
+  } catch (reason) {
+    bulkError.value = reason instanceof Error ? reason.message : String(reason);
+    reportFrontendEvent({ event: "template_binding_batch", phase: "completed", result: "failed", reason: reasonCode, elapsedMs: Math.round(performance.now() - started) });
+  } finally {
+    saving.value = false;
+    if (!bulkDialog.value) void nextTick(restoreBulkFocus);
+  }
+}
 
 const allTemplates = computed<TemplateChoice[]>(() => props.catalog.map((template) => ({
   kind: template.kind, id: template.id, name: template.name,
@@ -263,7 +360,7 @@ async function dropAssociation(target: Association): Promise<void> {
 </script>
 
 <template>
-  <details class="card collapsible-card application-associations" :open="expansion.value.value" :aria-busy="expansion.pending.value" @toggle="expansion.toggleDetails">
+  <details ref="associationSection" class="card collapsible-card application-associations" :open="expansion.value.value" :aria-busy="expansion.pending.value" :inert="!!bulkDialog" @toggle="expansion.toggleDetails">
     <summary><h2>程序关联</h2><span class="section-count">{{ configuration.applicationBindings.length }} 个程序</span></summary>
     <div class="collapsible-body">
     <div class="card-title-row">
@@ -276,12 +373,15 @@ async function dropAssociation(target: Association): Promise<void> {
     <p v-if="error && !dialogOpen" class="error-text">{{ error }}</p>
     <div v-if="visibleAssociations.length" class="association-table" role="table" aria-label="已添加的程序关联">
       <div class="association-table-row association-table-header" role="row">
-        <span role="columnheader">软件名称</span>
-        <span role="columnheader">选择的模板</span>
-        <span role="columnheader" class="association-action-header">操作</span>
+        <span role="columnheader"><label class="association-selection"><input type="checkbox" aria-label="全选程序关联" :checked="allSelected" :indeterminate="partiallySelected" :disabled="busy || !!bulkDialog" @change="toggleAll" />软件名称</label></span>
+        <span role="columnheader" class="association-template-header">选择的模板</span>
+        <span role="columnheader" class="association-bulk-actions" aria-label="批量操作">
+          <button type="button" class="secondary-button" :disabled="busy || !!bulkDialog || !selectedAssociations.length" @click="openBulk('replace', $event)">更换模板</button>
+          <button type="button" class="secondary-button" :disabled="busy || !!bulkDialog || !selectedAssociations.length" @click="openBulk('remove', $event)">移除</button>
+        </span>
       </div>
       <div v-for="association in visibleAssociations" :key="association.applicationId" class="association-table-row association-row" :class="{ dragging: sameId(draggingId ?? '', association.applicationId), 'drop-target': sameId(dropTargetId ?? '', association.applicationId) }" role="row" :draggable="!busy" @pointerdown.capture="rememberDragOrigin" @dragstart="startDrag($event, association)" @dragend="finishDrag" @dragover.prevent="!busy && (dropTargetId = association.applicationId)" @dragleave="dropTargetId = null" @drop.prevent="dropAssociation(association)">
-        <strong role="cell">{{ fallbackName(association.applicationId) }}</strong>
+        <span role="cell"><label class="association-selection"><input type="checkbox" :aria-label="`选择 ${fallbackName(association.applicationId)}`" :checked="selectedIds.has(association.applicationId.toLocaleLowerCase())" :disabled="busy || !!bulkDialog" @change="toggleSelection(association.applicationId, ($event.target as HTMLInputElement).checked)" /><strong>{{ fallbackName(association.applicationId) }}</strong></label></span>
         <span role="cell" class="association-template-cell">
           <strong>{{ templateName(association) }}</strong>
           <small>{{ associationStatus(association) }}</small>
@@ -296,6 +396,23 @@ async function dropAssociation(target: Association): Promise<void> {
     </div>
   </details>
   <p v-if="expansion.error.value" role="alert" class="error-text">{{ expansion.error.value }}</p>
+
+  <SettingsDialog v-if="bulkDialog" :title="bulkDialog.action === 'replace' ? '批量更换模板' : '批量移除关联'" :description="`已选择 ${bulkDialog.targets.length} 个程序`" :busy="busy" @close="closeBulk" @keydown.tab="trapBulkFocus">
+    <div class="bulk-targets" aria-label="本次选择的程序"><span v-for="target in bulkDialog.targets" :key="target.id">{{ target.name }}</span></div>
+    <template v-if="bulkDialog.action === 'replace'">
+      <p class="selection-context">为这些程序选择同一个模板，保持当前运行开关。</p>
+      <div v-if="allTemplates.length" class="choice-list bulk-template-list">
+        <button v-for="choice in allTemplates" :key="choice.id" type="button" class="choice-card bulk-template-choice" :class="{ selected: bulkTemplateId === choice.id }" :aria-pressed="bulkTemplateId === choice.id" :disabled="busy" @click="bulkTemplateId = choice.id">{{ choice.name }}</button>
+      </div>
+      <p v-else class="muted">还没有可关联的模板。请先在按键页保存按键模板。</p>
+    </template>
+    <p v-else class="selection-context">确认后只移除上述程序关联，模板仍保留，运行开关保持不变。</p>
+    <div class="bulk-feedback" :tabindex="bulkError ? 0 : undefined" :aria-label="bulkError ? '批量操作错误详情' : undefined"><p v-if="bulkError" role="alert" class="error-text">{{ bulkError }}</p></div>
+    <template #actions>
+      <button type="button" class="primary-button" :disabled="busy || (bulkDialog.action === 'replace' && !bulkTemplateId)" @click="confirmBulk">{{ busy ? '正在保存…' : bulkDialog.action === 'replace' ? '确认更换' : '确认移除' }}</button>
+      <button type="button" class="secondary-button" :disabled="busy" @click="closeBulk">取消</button>
+    </template>
+  </SettingsDialog>
 
   <SettingsDialog
     v-if="dialogOpen"
@@ -377,18 +494,25 @@ async function dropAssociation(target: Association): Promise<void> {
 <style scoped>
 .application-associations { margin-top: 0; }
 .association-table { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.association-table-row { display: grid; grid-template-columns: minmax(130px, 1fr) minmax(180px, 1.35fr) 310px; gap: 16px; align-items: center; padding: 12px 14px; }
+.association-table-row { display: grid; grid-template-columns: minmax(130px, 1fr) minmax(180px, 1.35fr) 224px; gap: 16px; align-items: center; padding: 12px 14px; }
 .association-table-header { padding-top: 9px; padding-bottom: 9px; color: var(--muted); background: var(--surface-subtle); font-size: 12px; font-weight: 600; }
 .association-row + .association-row { border-top: 1px solid var(--border); }
 .association-template-cell strong, .association-template-cell small { display: block; }
 .association-template-cell small { margin-top: 3px; color: var(--muted); font-size: 12.5px; }
-.association-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.association-actions button { min-width: 0; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; }
+.association-actions, .association-bulk-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.association-actions button, .association-bulk-actions button { min-width: 0; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; }
 .association-row { cursor: grab; }
 .association-row.dragging { opacity: .55; }
 .association-row.drop-target { box-shadow: inset 0 3px 0 var(--accent); }
 .association-row button { cursor: pointer; }
-.association-action-header { text-align: right; }
+.association-selection { display: flex; align-items: center; gap: 10px; cursor: pointer; overflow-wrap: anywhere; }
+.association-selection input { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.association-table-row > *, .association-template-cell strong { min-width: 0; overflow-wrap: anywhere; }
+.bulk-targets { display: flex; flex-wrap: wrap; gap: 6px 12px; max-height: 90px; overflow: auto; margin-bottom: 12px; overflow-wrap: anywhere; }
+.bulk-template-list { max-height: 260px; overflow: auto; }
+.bulk-feedback { height: 64px; overflow: auto; margin-top: 12px; }
+.bulk-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bulk-feedback .error-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .empty-association { margin: 14px 0 2px; }
 .program-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
 .choice-list { display: grid; gap: 8px; margin-top: 12px; }
@@ -411,8 +535,11 @@ async function dropAssociation(target: Association): Promise<void> {
 @media (max-width: 680px) {
   .program-toolbar { grid-template-columns: 1fr; }
   .association-table-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; }
-  .association-table-header, .association-actions { grid-column: 1 / -1; }
-  .association-table-header { display: none; }
-  .association-actions { justify-content: flex-start; padding-top: 4px; flex-wrap: wrap; }
+  .association-table-header { grid-template-columns: minmax(0, 1fr) auto; }
+  .association-template-header { display: none; }
+  .association-bulk-actions { grid-column: 2; }
+  .association-bulk-actions button { padding-inline: 10px; }
+  .association-row .association-actions { grid-column: 1 / -1; padding-top: 4px; }
+  .association-row .association-template-cell { grid-column: 1 / -1; }
 }
 </style>

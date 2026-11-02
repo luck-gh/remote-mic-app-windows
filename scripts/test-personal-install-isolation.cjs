@@ -42,6 +42,17 @@ test("personal app and helper use matching isolated runtime resources", () => {
   assert.ok(read("hardware/RC003/helper/src/main.rs").includes("const DEFAULT_PORT: u16 = 47832;"));
 });
 
+test("transcript and audio archives use the personal runtime root", () => {
+  for (const path of [
+    "src-tauri/src/transcripts.rs",
+    "crates/sayall-windows/src/voice_recording.rs",
+  ]) {
+    const source = read(path);
+    assert.ok(source.includes('.join("SayAllPersonal")'), path);
+    assert.ok(!source.includes('.join("SayAll")'), path);
+  }
+});
+
 test("exit, activation, startup and installer cleanup do not target upstream", () => {
   for (const path of [
     "crates/sayall-windows/src/graceful_exit.rs",

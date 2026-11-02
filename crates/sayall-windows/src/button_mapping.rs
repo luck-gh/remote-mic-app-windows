@@ -120,6 +120,9 @@ pub enum EngineMessage {
     DriverEdge(ButtonEdge),
     /// Verified physical state for UI only; never enters the gesture/execution merger.
     HidObservation(u64),
+    CaptureContinuityReset {
+        old_owned_mask: u64,
+    },
     /// Raw Input 监听器已停止：释放全部按住状态。
     ListenerStopped,
     /// 匹配的遥控器 HID 设备被移除（断连/睡眠）：释放全部按住状态。
@@ -1175,7 +1178,7 @@ impl ButtonMappingRuntime {
     }
 
     /// Grant execution only for the current report-capture ownership acknowledgement.
-    pub(crate) fn set_capture_owned(&self, mask: u64) {
+    pub(crate) fn set_capture_owned(&self, mask: u64) -> Option<u64> {
         let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
         let mask = if configuration.connected && configuration.model == crate::RemoteModel::Rc003 {
             mask & configuration.requested_mask()
@@ -1183,7 +1186,7 @@ impl ButtonMappingRuntime {
             0
         };
         if configuration.captured_mask == mask {
-            return;
+            return None;
         }
         configuration.captured_mask = mask;
         configuration.enhanced = mask != 0;
@@ -1193,15 +1196,12 @@ impl ButtonMappingRuntime {
             recognition,
             enhanced: mask != 0,
         });
-        crate::ble::gatt_note(format!(
-            "enhanced_capture event=engine_ownership mask={mask} available={}",
-            mask != 0
-        ));
+        Some(mask)
     }
 
     #[cfg(test)]
     fn set_input_enhancement(&self, available: bool) {
-        self.set_capture_owned(if available { (1 << 13) - 1 } else { 0 });
+        let _ = self.set_capture_owned(if available { (1 << 13) - 1 } else { 0 });
     }
 
     pub(crate) fn requested_capture_mask(&self) -> u64 {
@@ -1623,6 +1623,29 @@ fn engine_worker(
         };
 
         match message {
+            EngineMessage::CaptureContinuityReset { old_owned_mask } => {
+                let active = merger.active_button_set();
+                let mut cancelled = 0;
+                for button in crate::raw_input::ALL_BUTTONS {
+                    if old_owned_mask & (1 << button.ordinal()) == 0 {
+                        continue;
+                    }
+                    recognizer.cancel_press(button);
+                    finish_repeat_run(&mut repeat_runs, button, "capture_handoff");
+                    native_pending.remove(&button);
+                    if !phrase_claimed.contains(&button) {
+                        gesture_input.accepted.remove(&button);
+                        if active.contains(&button) {
+                            gesture_input.blocked.insert(button);
+                        }
+                    }
+                    cancelled += 1;
+                }
+                crate::ble::gatt_note(format!(
+                    "map_capture_handoff cancelled_keys={cancelled} waiting_release={} available={enhancement_active}",
+                    gesture_input.blocked.len(),
+                ));
+            }
             EngineMessage::HidObservation(buttons) => {
                 if key_gate::listener_active()
                     && observation
@@ -2782,7 +2805,7 @@ mod tests {
                 .mapped_mask(),
             0
         );
-        runtime.set_capture_owned(1 << RemoteButton::Menu.ordinal());
+        let _ = runtime.set_capture_owned(1 << RemoteButton::Menu.ordinal());
         assert_eq!(
             runtime
                 .configuration
@@ -2797,7 +2820,7 @@ mod tests {
             Some(mappings_with_single(RemoteButton::Right, KeyCode::Right)),
             mappings_with_single(RemoteButton::Menu, KeyCode::Escape),
         );
-        runtime.set_capture_owned(1 << RemoteButton::Ok.ordinal()); // stale target ACK
+        let _ = runtime.set_capture_owned(1 << RemoteButton::Ok.ordinal()); // stale target ACK
         assert_eq!(
             runtime
                 .configuration
@@ -2809,7 +2832,7 @@ mod tests {
             0
         );
         runtime.set_input_context(crate::RemoteModel::Unknown, false);
-        runtime.set_capture_owned((1 << 13) - 1); // late callback after disconnect
+        let _ = runtime.set_capture_owned((1 << 13) - 1); // late callback after disconnect
         assert_eq!(
             runtime
                 .configuration
@@ -3348,7 +3371,7 @@ mod tests {
             .unwrap();
         flush(&runtime);
         for _ in 0..6 {
-            runtime.set_capture_owned(1 << RemoteButton::Ok.ordinal());
+            let _ = runtime.set_capture_owned(1 << RemoteButton::Ok.ordinal());
             flush(&runtime);
             runtime
                 .sender()
@@ -5426,6 +5449,176 @@ mod tests {
             fired_sink.lock().unwrap().push(gesture);
         }));
         (runtime, fired)
+    }
+
+    #[test]
+    fn capture_handoff_cancels_pending_and_held_gestures_without_reconfiguring() {
+        let _gate_lock = GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _gate = crate::key_gate::KeyGate::start();
+        for case in ["double_pending", "long_pending", "repeat_running"] {
+            let injector = Arc::new(RecordingInjector::default());
+            let mut mappings = if case == "double_pending" {
+                mappings_with_double(RemoteButton::Back, KeyCode::Backspace, KeyCode::Enter)
+            } else {
+                mappings_with_long(RemoteButton::Back, KeyCode::Backspace, KeyCode::Enter)
+            };
+            mappings
+                .actions
+                .get_mut(&RemoteButton::Back)
+                .unwrap()
+                .hold_repeat = Some(if case == "repeat_running" {
+                HoldRepeat::Long
+            } else {
+                HoldRepeat::Off
+            });
+            let (runtime, fired) = spawn_phrase_engine(&injector, mappings);
+            runtime.set_input_context(crate::RemoteModel::Rc003, true);
+            let owned_mask = 1 << RemoteButton::Back.ordinal();
+            runtime.set_capture_owned(owned_mask);
+            let sender = runtime.sender();
+            sender
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            if case == "double_pending" {
+                sender
+                    .send(EngineMessage::DriverEdge(ButtonEdge {
+                        button: RemoteButton::Back,
+                        is_pressed: false,
+                    }))
+                    .unwrap();
+            }
+            if case == "repeat_running" {
+                assert!(wait_until(
+                    || !injector.taps.lock().unwrap().is_empty(),
+                    Duration::from_secs(2)
+                ));
+            }
+            sender
+                .send(EngineMessage::CaptureContinuityReset {
+                    old_owned_mask: owned_mask,
+                })
+                .unwrap();
+            assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+            let before_release = fired.lock().unwrap().len();
+            let before_taps = injector.taps.lock().unwrap().len();
+            if case != "double_pending" {
+                sender
+                    .send(EngineMessage::DriverEdge(ButtonEdge {
+                        button: RemoteButton::Back,
+                        is_pressed: false,
+                    }))
+                    .unwrap();
+            }
+            assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+            std::thread::sleep(Duration::from_millis(700));
+            assert_eq!(
+                fired.lock().unwrap().len(),
+                before_release,
+                "{case} fired after cancellation"
+            );
+            assert_eq!(injector.taps.lock().unwrap().len(), before_taps);
+            assert_eq!(
+                runtime.configuration.lock().unwrap().captured_mask,
+                owned_mask
+            );
+            assert!(runtime.configuration.lock().unwrap().enhanced);
+            sender
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true,
+                }))
+                .unwrap();
+            sender
+                .send(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false,
+                }))
+                .unwrap();
+            assert!(wait_until(
+                || fired.lock().unwrap().len() > before_release,
+                Duration::from_secs(1)
+            ));
+            assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+            assert_eq!(fired.lock().unwrap().len(), before_release + 1);
+            assert_eq!(injector.taps.lock().unwrap().len(), before_taps + 1);
+        }
+    }
+
+    #[test]
+    fn capture_handoff_preserves_claimed_release_and_other_button_gesture() {
+        let _gate_lock = GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let host = Arc::new(MockPhraseHost::default());
+        host.claim_presses
+            .lock()
+            .unwrap()
+            .insert(RemoteButton::Back);
+        injector.set_phrase_host(host.clone());
+        let mut mappings =
+            mappings_with_double(RemoteButton::Back, KeyCode::Backspace, KeyCode::Enter);
+        mappings.actions.extend(
+            mappings_with_double(RemoteButton::Left, KeyCode::Space, KeyCode::Enter).actions,
+        );
+        let (runtime, fired) = spawn_phrase_engine(&injector, mappings);
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        runtime.set_capture_owned(
+            (1 << RemoteButton::Back.ordinal()) | (1 << RemoteButton::Left.ordinal()),
+        );
+        let sender = runtime.sender();
+        for (button, is_pressed) in [
+            (RemoteButton::Back, true),
+            (RemoteButton::Left, true),
+            (RemoteButton::Left, false),
+        ] {
+            sender
+                .send(EngineMessage::DriverEdge(ButtonEdge { button, is_pressed }))
+                .unwrap();
+        }
+        sender
+            .send(EngineMessage::CaptureContinuityReset {
+                old_owned_mask: 1 << RemoteButton::Back.ordinal(),
+            })
+            .unwrap();
+        sender
+            .send(EngineMessage::DriverEdge(ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: false,
+            }))
+            .unwrap();
+        assert!(wait_until(
+            || !fired.lock().unwrap().is_empty(),
+            Duration::from_secs(1)
+        ));
+        assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+        assert_eq!(
+            host.edges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(button, _)| *button == RemoteButton::Back)
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(RemoteButton::Back, true), (RemoteButton::Back, false)]
+        );
+        assert!(host.resets.lock().unwrap().is_empty());
+        assert_eq!(
+            fired
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|gesture| gesture.button)
+                .collect::<Vec<_>>(),
+            vec![RemoteButton::Left]
+        );
+        assert_eq!(injector.taps.lock().unwrap().len(), 1);
     }
 
     /// 认领早于手势识别（评审 M2）：面板认领的按下沿不进入单击/双击/长按判定；

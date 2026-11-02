@@ -1561,6 +1561,136 @@ mod tests {
     }
 
     #[test]
+    fn bulk_binding_transaction_merges_latest_and_applies_once_after_persisting() {
+        let store = template_test_store();
+        let ids = vec!["codex".into(), "edge".into()];
+        store
+            .update_mapping_configuration(
+                |configuration| {
+                    for (index, id) in ["codex", "edge", "wechat"].into_iter().enumerate() {
+                        configuration.upsert_application_binding(ApplicationBinding {
+                            application_id: id.into(),
+                            template_id: "preset-agent".into(),
+                            menu_order: index as u32,
+                            launch_target: Some(format!("{id}.exe")),
+                        })?;
+                    }
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap();
+        store
+            .update_mapping_configuration(
+                |configuration| {
+                    configuration.button_mapping_follow_enabled = true;
+                    configuration.menu_template_switch_enabled = true;
+                    configuration.mapping_notice_enabled = false;
+                    configuration.create_template("后续新建".into())?;
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap();
+        let latest = store.load_mapping_configuration().unwrap();
+        let revision = store.revision.load(Ordering::Acquire);
+        let mut applied = Vec::new();
+        let (saved, ()) = store
+            .update_mapping_configuration(
+                |configuration| {
+                    configuration.update_application_bindings(&ids, Some("preset-browser"))
+                },
+                |configuration| {
+                    assert_eq!(
+                        store.load_mapping_configuration_unlocked().unwrap(),
+                        *configuration
+                    );
+                    applied.push(configuration.clone());
+                },
+            )
+            .unwrap();
+        let mut expected = latest;
+        for binding in &mut expected.application_bindings[..2] {
+            binding.template_id = "preset-browser".into();
+        }
+        assert_eq!(saved, expected);
+        assert_eq!(applied, vec![expected.clone()]);
+        assert_eq!(store.revision.load(Ordering::Acquire), revision + 1);
+        assert_eq!(
+            SettingsStore::new(store.path.clone())
+                .load_mapping_configuration()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn bulk_binding_transaction_rejects_deleted_selection_without_writes_or_apply() {
+        let store = template_test_store();
+        let original = store
+            .save_mapping_configuration(MappingConfiguration::default())
+            .unwrap();
+        let before = fs::read(store.button_mappings_path()).unwrap();
+        let revision = store.revision.load(Ordering::Acquire);
+        for target in [None, Some("preset-agent")] {
+            assert!(store
+                .update_mapping_configuration(
+                    |configuration| configuration
+                        .update_application_bindings(&["deleted".into()], target),
+                    |_| panic!("rejected batch must not apply"),
+                )
+                .is_err());
+            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), before);
+            assert_eq!(store.revision.load(Ordering::Acquire), revision);
+            assert_eq!(store.load_mapping_configuration().unwrap(), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bulk_binding_transaction_write_failure_keeps_all_bindings_runtime_and_revision() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let store = template_test_store();
+        let original = store
+            .update_mapping_configuration(
+                |configuration| {
+                    for id in ["codex", "edge"] {
+                        configuration.upsert_application_binding(ApplicationBinding {
+                            application_id: id.into(),
+                            template_id: "preset-agent".into(),
+                            menu_order: 0,
+                            launch_target: None,
+                        })?;
+                    }
+                    Ok(())
+                },
+                |_| {},
+            )
+            .unwrap()
+            .0;
+        let before = fs::read(store.button_mappings_path()).unwrap();
+        let revision = store.revision.load(Ordering::Acquire);
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(store.button_mappings_path())
+            .unwrap();
+        for target in [None, Some("preset-chat")] {
+            assert!(store
+                .update_mapping_configuration(
+                    |configuration| configuration
+                        .update_application_bindings(&["codex".into(), "edge".into()], target),
+                    |_| panic!("failed persistence must not apply"),
+                )
+                .is_err());
+            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), before);
+            assert_eq!(store.revision.load(Ordering::Acquire), revision);
+            assert_eq!(store.load_mapping_configuration().unwrap(), original);
+        }
+        drop(guard);
+    }
+
+    #[test]
     fn remembered_template_transaction_preserves_latest_choice_through_editor_save_and_reopen() {
         let store = template_test_store();
         let mut stale_editor = store.load_mapping_configuration().unwrap();

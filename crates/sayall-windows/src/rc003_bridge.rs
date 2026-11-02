@@ -13,7 +13,7 @@
 //!    本地模板、菜单及短/双/长按继续共用原引擎。
 //!
 //! 捕获边沿使用独立的 [`EngineMessage::DriverEdge`] 来源，避免 Raw Input 的迟到
-//! UP 释放捕获通道的按住状态。`R` 物理观察只驱动界面，零映射不会执行动作。
+//! UP 释放捕获通道的按住状态。`R` 报告观察只驱动界面，不保证物理来源，零映射不会执行动作。
 //! 没有当前所有权时暂停 RC003 自定义映射，保持原生输入，不启用键盘吞键兜底。
 //!
 //! ## 方向与发现机制：为什么是「主程序监听、助手连接」
@@ -44,10 +44,9 @@
 //! | `HELLO <ver> <token> <helper_pid>` | 助手 → app | 鉴权；必须首行 |
 //! | `OK <ver> <gen> <usages>` / `DENY <reason>` | app → 助手 | 鉴权结果与初始目标 |
 //! | `T <gen> <usages>` | app → 助手 | 热更新报告层捕获目标 |
-//! | `O <gen> <usages>` | 助手 → app | agent 已应用目标；随后随心跳续租所有权 |
-//! | `E <t_ms> <u1,u2,...>` | 助手 → app | 边沿：当前按下的 usage 集合（十六进制） |
-//! | `E <t_ms> -` | 助手 → app | 边沿：集合为空 = 全部释放 |
-//! | `R <t_ms> <usages>` | 助手 → app | 全部普通按键的物理观察，仅供界面 |
+//! | `O <conn> <epoch> <seq> <sample_ms> <gen> <state> <usages>` | 助手 → app | 同机单调时钟采样的接管状态 |
+//! | `E <conn> <epoch> <seq> <gen> <usages>` | 助手 → app | 当前代次按下的 usage 集合；`-` 为全部释放 |
+//! | `R <conn> <epoch> <usages>` | 助手 → app | 仅供界面的报告观察，不保证物理来源 |
 //! | `S -` / `A -` | app → 助手 / 助手 → app | 固定关闭报告语音合成及回执 |
 //! | `P <t_ms>` | 助手 → app | 心跳（每 1s） |
 //! | `R <1|0>` | 助手 → app | 设备节点恢复进行中/结束（绝对状态；期间暂缓 capture_recover） |
@@ -62,8 +61,8 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -97,7 +96,7 @@ pub const VOICE_KEY_HID_USAGE: u16 = 0x003E;
 pub const BRIDGE_FILE_NAME: &str = "rc003-bridge.ini";
 
 /// 协议版本。助手与主程序不一致时**拒绝连接**（宁可不可用，也不要半懂不懂地跑）。
-pub const BRIDGE_PROTOCOL_VERSION: u32 = 2;
+pub const BRIDGE_PROTOCOL_VERSION: u32 = 3;
 
 /// 允许通过桥接的 usage 白名单。实际还必须命中当前动态目标集。
 ///
@@ -190,7 +189,47 @@ pub struct BridgeSnapshot {
     pub target_usages: Vec<u16>,
     /// 已由 agent ACK 且仍在所有权租约内的集合。
     pub owned_usages: Vec<u16>,
+    pub diagnostics: BridgeDiagnosticSnapshot,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeDiagnosticSnapshot {
+    pub queue_full: u64,
+    pub queue_closed: u64,
+    pub start_failed: u64,
+    pub write_failed: u64,
+}
+
+#[derive(Default)]
+struct BridgeDiagnosticHealth {
+    queue_full: AtomicU64,
+    queue_closed: AtomicU64,
+    start_failed: AtomicU64,
+    write_failed: AtomicU64,
+}
+
+impl BridgeDiagnosticHealth {
+    fn snapshot(&self) -> BridgeDiagnosticSnapshot {
+        BridgeDiagnosticSnapshot {
+            queue_full: self.queue_full.load(Ordering::Relaxed),
+            queue_closed: self.queue_closed.load(Ordering::Relaxed),
+            start_failed: self.start_failed.load(Ordering::Relaxed),
+            write_failed: self.write_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+const DIAGNOSTIC_QUEUE_CAPACITY: usize = 256;
+static DIAGNOSTIC_HEALTH: BridgeDiagnosticHealth = BridgeDiagnosticHealth {
+    queue_full: AtomicU64::new(0),
+    queue_closed: AtomicU64::new(0),
+    start_failed: AtomicU64::new(0),
+    write_failed: AtomicU64::new(0),
+};
+static DIAGNOSTIC_WORKER: OnceLock<Result<SyncSender<String>, ()>> = OnceLock::new();
+#[cfg(test)]
+static DIAGNOSTIC_WORKER_STARTS: AtomicU64 = AtomicU64::new(0);
 
 /// 默认桥接描述文件目录：`%LOCALAPPDATA%\SayAll`。
 ///
@@ -213,16 +252,27 @@ pub enum BridgeLine {
     },
     /// 绝对状态边沿。`usages` 为空表示"全部释放"。
     Edges {
+        conn_gen: u64,
+        epoch: u64,
+        observation_seq: u64,
+        generation: u64,
         usages: Vec<u16>,
     },
-    /// Physical UI observation, independent of capture targets; never executes actions.
+    /// UI report observation, independent of capture targets; never executes actions.
     Observed {
+        conn_gen: u64,
+        epoch: u64,
         usages: Vec<u16>,
     },
     Ping,
     /// agent 已应用该代目标集合；后续心跳重复上报同一所有权。
     Ownership {
+        conn_gen: u64,
+        epoch: u64,
+        observation_seq: u64,
+        sampled_tick_ms: u64,
         generation: u64,
+        state: CaptureState,
         usages: Vec<u16>,
     },
     /// agent 已把语音键报告层合成配置应用到位（助手转发的 agent 回执）。
@@ -235,6 +285,19 @@ pub enum BridgeLine {
     Bye {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureState {
+    Active,
+    Inactive,
+    Closed,
+}
+
+fn parse_capture_number(part: Option<&str>, field: &str) -> Result<u64, String> {
+    part.ok_or_else(|| format!("capture 缺少 {field}"))?
+        .parse()
+        .map_err(|_| format!("capture {field} 不是整数"))
 }
 
 fn parse_usage_payload(payload: &str) -> Result<Vec<u16>, String> {
@@ -298,16 +361,33 @@ pub fn parse_bridge_line(line: &str) -> Result<Option<BridgeLine>, String> {
             }))
         }
         "E" | "R" => {
-            parts
-                .next()
-                .ok_or_else(|| "E 缺少时间戳".to_string())?
-                .parse::<u64>()
-                .map_err(|_| "E 时间戳不是整数".to_string())?;
-            let usages = parse_usage_payload(parts.next().unwrap_or("-"))?;
-            Ok(Some(if head == "R" {
-                BridgeLine::Observed { usages }
+            let conn_gen = parse_capture_number(parts.next(), "conn_gen")?;
+            let epoch = parse_capture_number(parts.next(), "epoch")?;
+            let edge = if head == "E" {
+                Some((
+                    parse_capture_number(parts.next(), "observation_seq")?,
+                    parse_capture_number(parts.next(), "generation")?,
+                ))
             } else {
-                BridgeLine::Edges { usages }
+                None
+            };
+            let usages = parse_usage_payload(parts.next().ok_or("capture 缺少 usages")?)?;
+            if parts.next().is_some() {
+                return Err("capture 存在多余字段".to_owned());
+            }
+            Ok(Some(match edge {
+                Some((observation_seq, generation)) => BridgeLine::Edges {
+                    conn_gen,
+                    epoch,
+                    observation_seq,
+                    generation,
+                    usages,
+                },
+                None => BridgeLine::Observed {
+                    conn_gen,
+                    epoch,
+                    usages,
+                },
             }))
         }
         "P" => Ok(Some(BridgeLine::Ping)),
@@ -325,13 +405,30 @@ pub fn parse_bridge_line(line: &str) -> Result<Option<BridgeLine>, String> {
             Ok(Some(BridgeLine::SynthAck { to }))
         }
         "O" => {
-            let generation = parts
-                .next()
-                .ok_or_else(|| "O 缺少目标代次".to_string())?
-                .parse::<u64>()
-                .map_err(|_| "O 目标代次不是整数".to_string())?;
-            let usages = parse_usage_payload(parts.next().unwrap_or("-"))?;
-            Ok(Some(BridgeLine::Ownership { generation, usages }))
+            let conn_gen = parse_capture_number(parts.next(), "conn_gen")?;
+            let epoch = parse_capture_number(parts.next(), "epoch")?;
+            let observation_seq = parse_capture_number(parts.next(), "observation_seq")?;
+            let sampled_tick_ms = parse_capture_number(parts.next(), "sampled_tick_ms")?;
+            let generation = parse_capture_number(parts.next(), "generation")?;
+            let state = match parts.next() {
+                Some("active") => CaptureState::Active,
+                Some("inactive") => CaptureState::Inactive,
+                Some("closed") => CaptureState::Closed,
+                _ => return Err("capture state 无效".to_owned()),
+            };
+            let usages = parse_usage_payload(parts.next().ok_or("capture 缺少 usages")?)?;
+            if parts.next().is_some() {
+                return Err("capture 存在多余字段".to_owned());
+            }
+            Ok(Some(BridgeLine::Ownership {
+                conn_gen,
+                epoch,
+                observation_seq,
+                sampled_tick_ms,
+                generation,
+                state,
+                usages,
+            }))
         }
         "BYE" => Ok(Some(BridgeLine::Bye {
             reason: parts.collect::<Vec<_>>().join(" "),
@@ -400,7 +497,7 @@ struct BridgeShared {
     pressed: BTreeSet<u16>,
     last_rx: Option<Instant>,
     owned: BTreeSet<u16>,
-    ownership_last_rx: Option<Instant>,
+    ownership_sampled_tick_ms: Option<u64>,
     mapping: std::sync::Weak<crate::button_mapping::ButtonMappingRuntime>,
 }
 
@@ -419,7 +516,7 @@ impl Default for BridgeShared {
             pressed: BTreeSet::new(),
             last_rx: None,
             owned: BTreeSet::new(),
-            ownership_last_rx: None,
+            ownership_sampled_tick_ms: None,
             mapping: std::sync::Weak::new(),
         }
     }
@@ -460,24 +557,86 @@ fn usage_mask(usages: &BTreeSet<u16>) -> u64 {
     })
 }
 
-fn clear_ownership(shared: &Arc<Mutex<BridgeShared>>) {
+fn clear_ownership(shared: &Arc<Mutex<BridgeShared>>, notes: &mut Vec<String>) {
     let (had_ownership, mapping) = {
         let mut state = lock(shared);
         let had = !state.owned.is_empty();
         state.owned.clear();
-        state.ownership_last_rx = None;
+        state.ownership_sampled_tick_ms = None;
         (had, state.mapping.upgrade())
     };
     crate::key_gate::set_enhanced_owned_mask(0);
     if let Some(mapping) = mapping {
-        mapping.set_capture_owned(0);
+        if let Some(mask) = mapping.set_capture_owned(0) {
+            notes.push(format!(
+                "enhanced_capture event=engine_ownership mask={mask} available={}",
+                mask != 0
+            ));
+        }
     }
     // 门禁必须跟所有权一起落下：所有权是"报告层还归我们"的唯一证据，租约一丢
     // 报告层合成就不可能再生效。少这一行，按下的路径选择会继续指向已经死掉的
     // 报告层（issue #264 现场形态）。
     if had_ownership {
-        note("enhanced_capture event=ownership_released native=passthrough".to_owned());
+        notes.push(
+            "enhanced_capture event=ownership_released scope=local mapping=revoked".to_owned(),
+        );
     }
+}
+
+#[cfg(windows)]
+fn capture_tick_ms() -> u64 {
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+#[cfg(not(windows))]
+fn capture_tick_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock precedes epoch")
+        .as_millis() as u64
+}
+
+fn capture_sample_fresh(sampled_tick_ms: u64) -> bool {
+    capture_sample_age_fresh(capture_tick_ms().checked_sub(sampled_tick_ms))
+}
+
+fn capture_sample_age_fresh(age_ms: Option<u64>) -> bool {
+    age_ms.is_some_and(|age| age < OWNERSHIP_TIMEOUT.as_millis() as u64)
+}
+
+fn revoke_capture(
+    shared: &Arc<Mutex<BridgeShared>>,
+    targets: &Arc<Mutex<CaptureTargets>>,
+    sender: &Sender<EngineMessage>,
+    notes: &mut Vec<String>,
+) -> usize {
+    clear_ownership(shared, notes);
+    release_capture_usages(shared, targets, sender)
+}
+
+fn release_capture_usages(
+    shared: &Arc<Mutex<BridgeShared>>,
+    targets: &Arc<Mutex<CaptureTargets>>,
+    sender: &Sender<EngineMessage>,
+) -> usize {
+    let released = apply_usages(shared, targets, &BTreeSet::new());
+    let count = released.len();
+    for edge in released {
+        let _ = sender.send(EngineMessage::DriverEdge(edge));
+    }
+    let _ = sender.send(EngineMessage::HidObservation(0));
+    count
+}
+
+#[derive(Debug)]
+struct CaptureObservation {
+    conn_gen: u64,
+    epoch: u64,
+    observation_seq: u64,
+    min_edge_seq: u64,
+    generation: u64,
+    state: CaptureState,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -488,10 +647,130 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn note(message: String) {
+    #[cfg(test)]
+    let test_sink = tests::diagnostic_fixture_enabled();
+    #[cfg(not(test))]
+    let test_sink = false;
     #[cfg(windows)]
-    crate::ble::gatt_note(message);
+    if !test_sink && crate::ble::diagnostic_log_path().is_none() {
+        return;
+    }
     #[cfg(not(windows))]
-    let _ = message;
+    if !test_sink {
+        return;
+    }
+    let record = diagnostic_record(&message);
+    let worker = DIAGNOSTIC_WORKER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel(DIAGNOSTIC_QUEUE_CAPACITY);
+        match std::thread::Builder::new()
+            .name("sayall-bridge-diagnostic".into())
+            .spawn(move || diagnostic_writer(receiver))
+        {
+            Ok(_) => {
+                #[cfg(test)]
+                DIAGNOSTIC_WORKER_STARTS.fetch_add(1, Ordering::Relaxed);
+                Ok(sender)
+            }
+            Err(_) => {
+                DIAGNOSTIC_HEALTH
+                    .start_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(())
+            }
+        }
+    });
+    if let Ok(sender) = worker {
+        enqueue_diagnostic(sender, record, &DIAGNOSTIC_HEALTH);
+    }
+}
+
+fn diagnostic_record(message: &str) -> String {
+    #[cfg(windows)]
+    return crate::ble::diagnostic_note_record(message);
+    #[cfg(not(windows))]
+    message.to_owned()
+}
+
+fn enqueue_diagnostic(
+    sender: &SyncSender<String>,
+    record: String,
+    health: &BridgeDiagnosticHealth,
+) {
+    match sender.try_send(record) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            health.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            health.queue_closed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn write_diagnostic(record: &str) -> std::io::Result<bool> {
+    #[cfg(test)]
+    {
+        tests::block_diagnostic_if_selected(record);
+        if let Some(result) = tests::write_test_diagnostic(record) {
+            return result;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let Some(path) = crate::ble::diagnostic_log_path() else {
+            return Ok(false);
+        };
+        crate::diagnostic_log::append_line_checked(&path, record)?;
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = record;
+        Ok(false)
+    }
+}
+
+fn diagnostic_writer(receiver: mpsc::Receiver<String>) {
+    let mut reported = BridgeDiagnosticSnapshot::default();
+    for record in receiver {
+        match write_diagnostic(&record) {
+            Err(_) => {
+                DIAGNOSTIC_HEALTH
+                    .write_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Ok(true) => {
+                let health = DIAGNOSTIC_HEALTH.snapshot();
+                if health != reported {
+                    let summary = diagnostic_record(&format!(
+                        "capture event=diagnostic_recovered queue_full={} queue_closed={} start_failed={} write_failed={}",
+                        health.queue_full, health.queue_closed, health.start_failed, health.write_failed
+                    ));
+                    match write_diagnostic(&summary) {
+                        Ok(true) => reported = health,
+                        Ok(false) => {}
+                        Err(_) => {
+                            DIAGNOSTIC_HEALTH
+                                .write_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CaptureNotes(Vec<String>);
+
+impl Drop for CaptureNotes {
+    fn drop(&mut self) {
+        for message in self.0.drain(..) {
+            note(message);
+        }
+    }
 }
 
 /// 当前助手连接：自增编号 + 连接克隆。
@@ -577,6 +856,31 @@ impl Write for BridgeIo {
             Self::Pipe(file) => file.flush(),
         }
     }
+}
+
+fn read_available_capture_input(
+    reader: &mut BufReader<BridgeIo>,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let budget = MAX_LINE_BYTES - pending.len();
+    let buffered = reader.buffer().len().min(budget);
+    pending.extend_from_slice(&reader.buffer()[..buffered]);
+    reader.consume(buffered);
+    #[cfg(windows)]
+    if buffered < budget {
+        if let BridgeIo::Pipe(pipe) = reader.get_mut() {
+            let mut bytes = [0u8; MAX_LINE_BYTES];
+            match pipe.read(&mut bytes[..budget - buffered]) {
+                Ok(read) => {
+                    pending.extend_from_slice(&bytes[..read]);
+                    return Ok(buffered + read);
+                }
+                Err(error) if retryable_bridge_read(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(buffered)
 }
 
 #[derive(Debug)]
@@ -747,12 +1051,15 @@ impl Rc003Bridge {
             target_generation: targets.generation,
             target_usages: targets.usages.iter().copied().collect(),
             owned_usages: state.owned.iter().copied().collect(),
+            diagnostics: DIAGNOSTIC_HEALTH.snapshot(),
         }
     }
 
     /// 更新增强捕获目标。只有功能开启且已配置映射的按键才被报告层接管；
     /// 关闭功能或删除映射会立即撤销所有权并恢复既有 Raw Input/键盘门控路径。
     pub fn set_capture_targets(&self, enabled: bool, mapped_mask: u64) {
+        let mut notes = CaptureNotes::default();
+        let _connection = lock(&self.current);
         let usages: BTreeSet<u16> = if enabled {
             ENHANCED_CAPTURE_BUTTON_USAGES
                 .iter()
@@ -775,17 +1082,8 @@ impl Rc003Bridge {
 
         // 先撤销旧所有权，再让 Helper 切换目标；期间自定义映射暂停，
         // 不恢复无设备归属的全局键盘吞键。
-        clear_ownership(&self.shared);
-        let retained: BTreeSet<u16> = lock(&self.shared)
-            .pressed
-            .intersection(&usages)
-            .copied()
-            .collect();
-        let releases = apply_usages(&self.shared, &self.targets, &retained);
-        for edge in releases {
-            let _ = self.sender.send(EngineMessage::DriverEdge(edge));
-        }
-        note(format!(
+        revoke_capture(&self.shared, &self.targets, &self.sender, &mut notes.0);
+        notes.0.push(format!(
             "enhanced_capture event=targets_changed generation={generation} enabled={enabled} usages={}",
             format_usage_payload(&usages)
         ));
@@ -795,10 +1093,13 @@ impl Rc003Bridge {
 impl Drop for Rc003Bridge {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(conn) = lock(&self.current).take() {
+        let mut notes = CaptureNotes::default();
+        let mut connection = lock(&self.current);
+        if let Some(conn) = connection.take() {
             conn.stream.disconnect();
         }
-        clear_ownership(&self.shared);
+        revoke_capture(&self.shared, &self.targets, &self.sender, &mut notes.0);
+        drop(connection);
         if let Some(worker) = lock(&self.worker).take() {
             let _ = worker.join();
         }
@@ -908,6 +1209,13 @@ fn accept_loop(
                 stream.set_nonblocking(false).ok();
                 stream.set_nodelay(true).ok();
                 stream.set_read_timeout(Some(READ_POLL)).ok();
+                if stream.set_write_timeout(Some(READ_POLL)).is_err() {
+                    note(
+                        "rc003_bridge event=accept_rejected reason=write_timeout_config_failed"
+                            .to_owned(),
+                    );
+                    continue;
+                }
                 adopt_connection(
                     BridgeIo::Tcp(stream),
                     format!("tcp:{addr}"),
@@ -981,7 +1289,9 @@ fn adopt_connection(
             return;
         }
     };
-    let previous = lock(current).replace(CurrentConn {
+    let mut notes = CaptureNotes::default();
+    let mut connection = lock(current);
+    let previous = connection.replace(CurrentConn {
         id: my_id,
         stream: clone,
     });
@@ -999,11 +1309,13 @@ fn adopt_connection(
         }
     }
     if replaced {
-        clear_ownership(shared);
-        note(format!(
+        revoke_capture(shared, targets, sender, &mut notes.0);
+        notes.0.push(format!(
             "rc003_bridge event=replaced_by_new_connection from={source}"
         ));
     }
+    drop(connection);
+    drop(notes);
     let thread_stop = Arc::clone(stop);
     let thread_shared = Arc::clone(shared);
     let thread_current = Arc::clone(current);
@@ -1107,8 +1419,11 @@ fn handle_connection(
     let mut session_edges = 0u64;
     // Local receive order for E/O diagnostics; never changes protocol or ownership.
     let mut capture_rx_seq = 0u64;
-    let mut last_logged_ownership: Option<(u64, BTreeSet<u16>)> = None;
+    let mut observation: Option<CaptureObservation> = None;
+    let mut capture_rejected_total = 0u64;
+    let mut last_rejection = None;
     let mut last_received_usages: Option<BTreeSet<u16>> = None;
+    let mut ownership_refresh_attempted = false;
     // 不用初值：所有出口都在 break 前赋值，给它一个"默认值"只会掩盖漏赋值的分支。
     let drop_reason: &str;
 
@@ -1139,6 +1454,12 @@ fn handle_connection(
             let Some(message) = parsed else {
                 continue;
             };
+            let mut notes = CaptureNotes::default();
+            let connection = lock(current);
+            if connection.as_ref().is_none_or(|conn| conn.id != my_id) {
+                drop_reason = "replaced";
+                break 'outer;
+            }
             last_rx = Instant::now();
             if !authenticated {
                 match message {
@@ -1166,7 +1487,7 @@ fn handle_connection(
                                 state.denied_total += 1;
                                 state.denied_total
                             };
-                            note(deny_note(reason, helper_pid, denied_total));
+                            notes.0.push(deny_note(reason, helper_pid, denied_total));
                             let _ = write_line(&mut writer, &format!("DENY {reason}"));
                             if deny_count >= MAX_DENY {
                                 drop_reason = "deny_limit";
@@ -1181,11 +1502,8 @@ fn handle_connection(
                             state.helper_pid = helper_pid;
                             // 新助手会话不继承上一实例的恢复窗口。
                         }
-                        // 上一代连接的租约不属于这一代助手：不清掉的话快照会对外
-                        // 谎报"已接管"（对账据此判 active，门禁也会被旧回执抬起），
-                        // 而新会话其实还没回执任何东西（issue #264 同型）。
-                        clear_ownership(shared);
-                        note(format!(
+                        clear_ownership(shared, &mut notes.0);
+                        notes.0.push(format!(
                             "rc003_bridge event=helper_authenticated helper_pid={helper_pid} version={version} transport={} auth={}",
                             writer.transport(),
                             if writer.uses_os_identity() { "os_pipe_acl" } else { "token" }
@@ -1211,10 +1529,10 @@ fn handle_connection(
                         // 门内延迟能力声明（2026-10-03）：与 S 行同批、独立一行；
                         // 当前固定 Helper 按 T/S/W 同一协议解析。
                         let gate_ok = write_line(&mut writer, &voice_gate_line()).is_ok();
-                        note(format!(
+                        notes.0.push(format!(
                             "rc003_bridge event=voice_gate_sent on=true scope=hello write_ok={gate_ok}"
                         ));
-                        note(format!(
+                        notes.0.push(format!(
                             "rc003_bridge event=voice_synth_sent to=off scope=hello await=ack local_voice=send_input write_ok={}",
                             synth_sent_at.is_some()
                         ));
@@ -1233,8 +1551,51 @@ fn handle_connection(
                 continue;
             }
             match message {
-                BridgeLine::Edges { usages } => {
+                BridgeLine::Edges {
+                    conn_gen,
+                    epoch,
+                    observation_seq,
+                    generation,
+                    usages,
+                } => {
                     capture_rx_seq = capture_rx_seq.wrapping_add(1);
+                    let target = lock(targets).clone();
+                    let fresh = lock(shared)
+                        .ownership_sampled_tick_ms
+                        .is_some_and(capture_sample_fresh);
+                    let rejection = match observation.as_ref() {
+                        None => Some("ownership_unobserved"),
+                        Some(current)
+                            if current.conn_gen != conn_gen
+                                || current.epoch != epoch
+                                || current.generation != generation
+                                || generation != target.generation =>
+                        {
+                            Some("epoch_or_target")
+                        }
+                        Some(current) if observation_seq < current.min_edge_seq => {
+                            Some("pregrant_observation")
+                        }
+                        Some(current) if observation_seq > current.observation_seq => {
+                            Some("unobserved_sequence")
+                        }
+                        Some(current) if current.state != CaptureState::Active => {
+                            Some("capture_inactive")
+                        }
+                        _ if !fresh => Some("ownership_expired"),
+                        _ => None,
+                    };
+                    if let Some(reason) = rejection {
+                        if !fresh {
+                            revoke_capture(shared, targets, sender, &mut notes.0);
+                        }
+                        capture_rejected_total += 1;
+                        if last_rejection != Some(reason) {
+                            notes.0.push(format!("enhanced_capture event=capture_rejected kind=edge reason={reason} conn_gen={conn_gen} epoch={epoch} observation_seq={observation_seq} target_generation={generation}"));
+                            last_rejection = Some(reason);
+                        }
+                        continue;
+                    }
                     let wanted: BTreeSet<u16> = usages.into_iter().collect();
                     let diagnostic_snapshot =
                         edge_diagnostic_needed(last_received_usages.as_ref(), &wanted).then(|| {
@@ -1245,7 +1606,7 @@ fn handle_connection(
                     let edges = apply_usages(shared, targets, &wanted);
                     // Track the raw report so even a filtered Back DOWN has a logged UP.
                     if let Some((target, owned)) = diagnostic_snapshot {
-                        note(edge_diagnostic_note(
+                        notes.0.push(edge_diagnostic_note(
                             capture_rx_seq,
                             &target,
                             &wanted,
@@ -1272,7 +1633,7 @@ fn handle_connection(
                                 .map(|usage| format!("0x{usage:04X}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
-                            note(format!(
+                            notes.0.push(format!(
                                 "rc003_bridge event=first_edge pressed={pressed} \
                                  note=边沿已投递给映射引擎，此后按键动作由映射配置决定"
                             ));
@@ -1280,7 +1641,23 @@ fn handle_connection(
                         session_edges += 1;
                     }
                 }
-                BridgeLine::Observed { usages } => {
+                BridgeLine::Observed {
+                    conn_gen,
+                    epoch,
+                    usages,
+                } => {
+                    if !observation.as_ref().is_some_and(|current| {
+                        current.conn_gen == conn_gen
+                            && current.epoch == epoch
+                            && current.state != CaptureState::Closed
+                    }) {
+                        capture_rejected_total += 1;
+                        if last_rejection != Some("observation_epoch") {
+                            notes.0.push(format!("enhanced_capture event=capture_rejected kind=observation reason=epoch conn_gen={conn_gen} epoch={epoch}"));
+                            last_rejection = Some("observation_epoch");
+                        }
+                        continue;
+                    }
                     let observed: BTreeSet<_> = usages
                         .into_iter()
                         .filter(|u| BRIDGE_ALLOWED_USAGES.contains(u))
@@ -1288,57 +1665,136 @@ fn handle_connection(
                     let _ = sender.send(EngineMessage::HidObservation(usage_mask(&observed)));
                 }
                 BridgeLine::Ping => {}
-                BridgeLine::Ownership { generation, usages } => {
+                BridgeLine::Ownership {
+                    conn_gen,
+                    epoch,
+                    observation_seq,
+                    sampled_tick_ms,
+                    generation,
+                    state: reported_state,
+                    usages,
+                } => {
                     capture_rx_seq = capture_rx_seq.wrapping_add(1);
+                    let app_consumed_tick_ms = capture_tick_ms();
+                    let old = observation.as_ref();
+                    let rejection = old.and_then(|current| {
+                        if conn_gen < current.conn_gen {
+                            Some("old_connection")
+                        } else if conn_gen == current.conn_gen
+                            && current.state == CaptureState::Closed
+                        {
+                            Some("connection_closed")
+                        } else if conn_gen == current.conn_gen
+                            && (epoch < current.epoch || observation_seq <= current.observation_seq)
+                        {
+                            Some("old_observation")
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(reason) = rejection {
+                        capture_rejected_total += 1;
+                        if last_rejection != Some(reason) {
+                            notes.0.push(format!("enhanced_capture event=ownership_rejected reason={reason} conn_gen={conn_gen} epoch={epoch} observation_seq={observation_seq}"));
+                            last_rejection = Some(reason);
+                        }
+                        continue;
+                    }
                     let reported: BTreeSet<u16> = usages.into_iter().collect();
                     let target = lock(targets).clone();
-                    if generation == target.generation && reported == target.usages {
+                    let reason = if sampled_tick_ms > capture_tick_ms() {
+                        Some("future_sample")
+                    } else if !capture_sample_fresh(sampled_tick_ms) {
+                        Some("stale_sample")
+                    } else if reported_state != CaptureState::Active {
+                        Some(match reported_state {
+                            CaptureState::Closed => "closed",
+                            _ => "inactive",
+                        })
+                    } else if generation != target.generation || reported != target.usages {
+                        Some("target_mismatch")
+                    } else {
+                        None
+                    };
+                    let changed = old.is_none_or(|current| {
+                        current.conn_gen != conn_gen
+                            || current.epoch != epoch
+                            || current.generation != generation
+                            || current.state != reported_state
+                    });
+                    let local_sample = lock(shared).ownership_sampled_tick_ms;
+                    let locally_active = local_sample.is_some_and(capture_sample_fresh);
+                    let min_edge_seq = if changed || !locally_active {
+                        observation_seq
+                    } else {
+                        old.expect("unchanged observation exists").min_edge_seq
+                    };
+                    if changed || (local_sample.is_some() && reason.is_some()) {
+                        revoke_capture(shared, targets, sender, &mut notes.0);
+                    } else if local_sample.is_some() && !locally_active {
+                        let old_owned_mask = usage_mask(&lock(shared).owned);
+                        if sender
+                            .send(EngineMessage::CaptureContinuityReset { old_owned_mask })
+                            .is_err()
+                        {
+                            notes.0.push("enhanced_capture event=ownership_handoff_failed reason=engine_closed".to_owned());
+                            drop_reason = "engine_closed";
+                            break 'outer;
+                        }
+                        let released = release_capture_usages(shared, targets, sender);
+                        notes.0.push(format!(
+                            "enhanced_capture event=ownership_handoff conn_gen={conn_gen} epoch={epoch} observation_seq={observation_seq} target_generation={generation} old_sampled_tick_ms={} sampled_tick_ms={sampled_tick_ms} released={released} reset_queued=true availability=preserved",
+                            local_sample.expect("handoff requires an accepted sample"),
+                        ));
+                    }
+                    observation = Some(CaptureObservation {
+                        conn_gen,
+                        epoch,
+                        observation_seq,
+                        min_edge_seq,
+                        generation,
+                        state: reported_state,
+                    });
+                    if let Some(reason) = reason {
+                        capture_rejected_total += 1;
+                        if changed || last_rejection != Some(reason) {
+                            notes.0.push(format!("enhanced_capture event=ownership_rejected reason={reason} scope=local mapping=revoked conn_gen={conn_gen} epoch={epoch} observation_seq={observation_seq} target_generation={generation} sampled_tick_ms={sampled_tick_ms}"));
+                            last_rejection = Some(reason);
+                        }
+                    } else {
                         let new_mask = usage_mask(&reported);
                         let resumed = crate::key_gate::enhanced_owned_mask() == 0 && new_mask != 0;
-                        let previous_rx_age_ms = {
+                        {
                             let mut state = lock(shared);
-                            let age = state.ownership_last_rx.map(|at| at.elapsed().as_millis());
-                            state.owned = reported.clone();
-                            state.ownership_last_rx = Some(Instant::now());
-                            age.map(|value| value.to_string())
-                                .unwrap_or_else(|| "none".into())
-                        };
+                            state.owned = reported;
+                            state.ownership_sampled_tick_ms = Some(sampled_tick_ms);
+                        }
                         crate::key_gate::set_enhanced_owned_mask(new_mask);
                         let mapping = lock(shared).mapping.upgrade();
                         if let Some(mapping) = mapping {
-                            mapping.set_capture_owned(new_mask);
+                            if let Some(mask) = mapping.set_capture_owned(new_mask) {
+                                notes.0.push(format!("enhanced_capture event=engine_ownership mask={mask} available={}", mask != 0));
+                            }
                         }
-                        if resumed {
-                            note(format!(
-                                "enhanced_capture event=ownership_resumed usages={} rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask} previous_rx_age_ms={previous_rx_age_ms} clock_origin=app_receive",
-                                format_usage_payload(&reported),
-                            ));
-                        } else if last_logged_ownership.as_ref()
-                            != Some(&(generation, reported.clone()))
-                        {
-                            note(format!(
-                                "enhanced_capture event=ownership_confirmed rx_seq={capture_rx_seq} target_generation={generation} owned_mask={new_mask} usages={} previous_rx_age_ms={previous_rx_age_ms} clock_origin=app_receive",
-                                format_usage_payload(&reported)
+                        if changed || resumed {
+                            let sample_age = app_consumed_tick_ms
+                                .checked_sub(sampled_tick_ms)
+                                .map_or_else(|| "none".to_owned(), |age| age.to_string());
+                            notes.0.push(format!(
+                                "enhanced_capture event=ownership_resumed rx_seq={capture_rx_seq} conn_gen={conn_gen} epoch={epoch} observation_seq={observation_seq} min_edge_seq={min_edge_seq} target_generation={generation} owned_mask={new_mask} sampled_tick_ms={sampled_tick_ms} app_consumed_tick_ms={app_consumed_tick_ms} sample_age_ms={sample_age} clock_origin=helper_receive_tick",
                             ));
                         }
-                        last_logged_ownership = Some((generation, reported));
-                    } else {
-                        note(format!(
-                            "enhanced_capture event=ownership_rejected reported_generation={generation} expected_generation={} reported={} expected={} rx_seq={capture_rx_seq}",
-                            target.generation,
-                            format_usage_payload(&reported),
-                            format_usage_payload(&target.usages)
-                        ));
+                        last_rejection = None;
                     }
                 }
                 BridgeLine::SynthAck { to } => {
                     if to.is_none() {
                         synth_confirmed = true;
-                        note("rc003_bridge event=voice_synth_ack to=off confirm=agent local_voice=send_input".to_owned());
+                        notes.0.push("rc003_bridge event=voice_synth_ack to=off confirm=agent local_voice=send_input".to_owned());
                     } else {
                         synth_confirmed = false;
                         synth_sent_at = None;
-                        note(format!(
+                        notes.0.push(format!(
                             "rc003_bridge event=voice_synth_ack to={} stale=true expected=off",
                             to.map(|u| format!("0x{u:04X}"))
                                 .unwrap_or_else(|| "off".to_owned())
@@ -1346,7 +1802,9 @@ fn handle_connection(
                     }
                 }
                 BridgeLine::Bye { reason } => {
-                    note(format!("rc003_bridge event=helper_bye reason={reason}"));
+                    notes
+                        .0
+                        .push(format!("rc003_bridge event=helper_bye reason={reason}"));
                     drop_reason = "helper_bye";
                     break 'outer;
                 }
@@ -1367,6 +1825,12 @@ fn handle_connection(
             break;
         }
         if authenticated {
+            let mut notes = CaptureNotes::default();
+            let connection = lock(current);
+            if connection.as_ref().is_none_or(|conn| conn.id != my_id) {
+                drop_reason = "replaced";
+                break;
+            }
             let target = lock(targets).clone();
             if target.generation != last_sent_generation {
                 if write_line(
@@ -1397,28 +1861,67 @@ fn handle_connection(
                     synth_sent_at = Some(Instant::now());
                     // 前 3 次逐条、之后每 60 次一条。
                     if synth_resend_attempts <= 3 || synth_resend_attempts % 60 == 0 {
-                        note(format!(
+                        notes.0.push(format!(
                             "rc003_bridge event=voice_synth_resend to=off attempt={}",
                             synth_resend_attempts
                         ));
                     }
                 }
             }
-            let ownership_expired = lock(shared)
-                .ownership_last_rx
-                .map(|at| at.elapsed() > OWNERSHIP_TIMEOUT)
-                .unwrap_or(false);
-            if ownership_expired {
-                clear_ownership(shared);
-                // 租约没了 ⇒ 上一份 `A` 行不再代表"现在会改写"：作废回执，逼
-                // 重发 S 行重新确认（新 agent 会话只能靠新的 `A` 行证明）。
-                synth_confirmed = false;
-                note(format!(
-                    "enhanced_capture event=ownership_timeout timeout_ms={} native=passthrough",
-                    OWNERSHIP_TIMEOUT.as_millis()
-                ));
+            let ownership_check = lock(shared)
+                .ownership_sampled_tick_ms
+                .map(|sampled_tick_ms| {
+                    let decision_tick_ms = capture_tick_ms();
+                    (
+                        sampled_tick_ms,
+                        decision_tick_ms,
+                        decision_tick_ms.checked_sub(sampled_tick_ms),
+                    )
+                });
+            if let Some((sampled_tick_ms, decision_tick_ms, age_ms)) =
+                ownership_check.filter(|(_, _, age)| !capture_sample_age_fresh(*age))
+            {
+                if !ownership_refresh_attempted {
+                    ownership_refresh_attempted = true;
+                    match read_available_capture_input(&mut reader, &mut pending) {
+                        Ok(bytes) => {
+                            let complete = pending.contains(&b'\n');
+                            notes.0.push(format!(
+                                "enhanced_capture event=ownership_refresh_probe bytes={bytes} complete_line={complete} local_connection_id={my_id}"
+                            ));
+                            if complete {
+                                continue 'outer;
+                            }
+                            if pending.len() == MAX_LINE_BYTES {
+                                drop_reason = "line_too_long";
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            drop_reason = "read_error";
+                            break;
+                        }
+                    }
+                }
+                let current_observation = observation
+                    .as_ref()
+                    .expect("accepted ownership has a connection observation");
+                let sample_age = age_ms.map_or_else(|| "none".to_owned(), |age| age.to_string());
+                let diagnostic = format!(
+                    "enhanced_capture event=ownership_timeout timeout_ms={} scope=local mapping=revoked clock_origin=helper_receive_tick last_accepted_sampled_tick_ms={sampled_tick_ms} decision_tick_ms={decision_tick_ms} sample_age_ms={sample_age} current_rx_seq={capture_rx_seq} local_connection_id={my_id} current_conn_gen={} current_epoch={} current_observation_seq={} current_target_generation={} buffered_bytes={} pending_bytes={}",
+                    OWNERSHIP_TIMEOUT.as_millis(),
+                    current_observation.conn_gen,
+                    current_observation.epoch,
+                    current_observation.observation_seq,
+                    current_observation.generation,
+                    reader.buffer().len(),
+                    pending.len(),
+                );
+                revoke_capture(shared, targets, sender, &mut notes.0);
+                notes.0.push(diagnostic);
             }
         }
+        ownership_refresh_attempted = false;
         match reader.read_until(b'\n', &mut pending) {
             Ok(0) => {
                 drop_reason = "peer_closed";
@@ -1442,12 +1945,11 @@ fn handle_connection(
     // 此时释放会误伤接手方刚建立的按下状态（表现为"刚按下就被松开"）。
     // 接手方收到的是**绝对状态**集合，自己会重建正确状态；即便它什么都不发，
     // 它自己的静默看门狗也会兜底。同理，共享状态也不该由旧连接改写。
+    let mut notes = CaptureNotes::default();
+    let mut connection = lock(current);
+    let still_mine = connection.as_ref().is_some_and(|conn| conn.id == my_id);
     let mut released_count = 0u64;
-    if drop_reason != "replaced" {
-        clear_ownership(shared);
-        let _ = sender.send(EngineMessage::HidObservation(0));
-        let released = apply_usages(shared, targets, &BTreeSet::new());
-        released_count = released.len() as u64;
+    if still_mine {
         // **先落状态、再投边沿**：边沿是"释放已经发生"的通知，一旦投出，任何观察者
         // （测试、诊断读取、引擎侧回查）都可能立刻读快照——若此时计数与按下集合还没落，
         // 就会读到"已释放但未计数、pressed 仍非空"的半更新状态。2026-10-03 CI 双核实测：
@@ -1458,30 +1960,23 @@ fn handle_connection(
             if drop_reason != "helper_bye" {
                 state.watchdog_release_total += 1;
             }
-            state.pressed.clear();
             state.last_rx = None;
             if state.phase == BridgePhase::Connected {
                 state.phase = BridgePhase::Listening;
             }
             state.helper_pid = 0;
         }
-        for edge in released {
-            let _ = sender.send(EngineMessage::DriverEdge(edge));
-        }
+        released_count = revoke_capture(shared, targets, sender, &mut notes.0) as u64;
     }
     writer.disconnect();
-    {
-        // 只清理"当前连接还是我"的情况。无条件 take 会把**接手的新连接**一起清掉，
-        // 于是新连接下一轮就认为自己被替换 —— 两个连接互相让位，桥接整体哑掉。
-        let mut guard = lock(current);
-        let still_mine = guard.as_ref().map(|conn| conn.id == my_id).unwrap_or(false);
-        if still_mine {
-            *guard = None;
-        }
+    if still_mine {
+        *connection = None;
     }
+    drop(connection);
+    drop(notes);
     note(format!(
         "rc003_bridge event=closed reason={drop_reason} edges={session_edges} \
-         released={released_count} dropped={}",
+         released={released_count} capture_rejected_total={capture_rejected_total} dropped={}",
         lock(shared).usages_dropped
     ));
 }
@@ -1665,6 +2160,61 @@ mod tests {
     use crate::raw_input::RemoteButton;
     use std::sync::mpsc::channel;
 
+    struct BlockedDiagnostic {
+        needle: &'static str,
+        entered: Sender<String>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    static BLOCKED_DIAGNOSTIC: Mutex<Option<BlockedDiagnostic>> = Mutex::new(None);
+
+    struct TestDiagnosticSink {
+        records: Sender<String>,
+        failures: usize,
+    }
+
+    static TEST_DIAGNOSTIC_SINK: Mutex<Option<TestDiagnosticSink>> = Mutex::new(None);
+
+    pub(super) fn diagnostic_fixture_enabled() -> bool {
+        lock(&BLOCKED_DIAGNOSTIC).is_some() || lock(&TEST_DIAGNOSTIC_SINK).is_some()
+    }
+
+    pub(super) fn write_test_diagnostic(record: &str) -> Option<std::io::Result<bool>> {
+        let mut sink = lock(&TEST_DIAGNOSTIC_SINK);
+        let sink = sink.as_mut()?;
+        if sink.failures != 0 {
+            sink.failures -= 1;
+            return Some(Err(std::io::Error::new(
+                ErrorKind::Other,
+                "fixture write failed",
+            )));
+        }
+        Some(
+            sink.records
+                .send(record.to_owned())
+                .map(|_| true)
+                .map_err(|error| std::io::Error::new(ErrorKind::BrokenPipe, error.to_string())),
+        )
+    }
+
+    pub(super) fn block_diagnostic_if_selected(message: &str) {
+        let blocked = {
+            let mut selected = lock(&BLOCKED_DIAGNOSTIC);
+            if selected
+                .as_ref()
+                .is_some_and(|selected| message.contains(selected.needle))
+            {
+                selected.take()
+            } else {
+                None
+            }
+        };
+        if let Some(blocked) = blocked {
+            let _ = blocked.entered.send(message.to_owned());
+            let _ = blocked.release.recv();
+        }
+    }
+
     fn targets(usages: &[u16]) -> Arc<Mutex<CaptureTargets>> {
         Arc::new(Mutex::new(CaptureTargets {
             generation: 1,
@@ -1672,10 +2222,1331 @@ mod tests {
         }))
     }
 
+    #[cfg(windows)]
+    fn diagnostic_pipe_peer() -> (
+        Arc<Rc003Bridge>,
+        File,
+        std::sync::mpsc::Receiver<EngineMessage>,
+    ) {
+        let (sender, receiver) = channel();
+        let (bridge, stream) = diagnostic_pipe_peer_with_sender(sender);
+        while receiver.try_recv().is_ok() {}
+        (bridge, stream, receiver)
+    }
+
+    #[cfg(windows)]
+    fn diagnostic_pipe_peer_with_sender(sender: Sender<EngineMessage>) -> (Arc<Rc003Bridge>, File) {
+        let dir =
+            std::env::temp_dir().join(format!("sayall-bridge-diagnostic-{}", generate_token()));
+        let bridge = Rc003Bridge::start_in(dir.clone(), sender);
+        bridge.set_capture_targets(true, mask(&[RemoteButton::Back]));
+        let descriptor = std::fs::read_to_string(dir.join(BRIDGE_FILE_NAME)).unwrap();
+        let pipe = descriptor
+            .lines()
+            .find_map(|line| line.strip_prefix("pipe="))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pipe)
+            {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("test pipe unavailable: {error}"),
+            }
+        };
+        writeln!(stream, "HELLO {BRIDGE_PROTOCOL_VERSION} local-pipe 9100").unwrap();
+        let mut ack = Vec::new();
+        while !String::from_utf8_lossy(&ack).contains("W 1\n") {
+            read_pipe_chunk(&mut stream, &mut ack);
+        }
+        let generation = bridge.snapshot().target_generation;
+        writeln!(
+            stream,
+            "A -\nO 4 2 90 {} {generation} active f1",
+            sampled_tick()
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bridge.snapshot().owned_usages.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(bridge.snapshot().owned_usages, vec![0xf1]);
+        (bridge, stream)
+    }
+
+    fn diagnostic_fixture_barrier() {
+        let (entered, observed) = channel();
+        let (release, released) = channel();
+        release.send(()).unwrap();
+        *lock(&BLOCKED_DIAGNOSTIC) = Some(BlockedDiagnostic {
+            needle: "capture_test event=diagnostic_barrier",
+            entered,
+            release: released,
+        });
+        note("capture_test event=diagnostic_barrier".to_owned());
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    fn wait_driver_release(receiver: &std::sync::mpsc::Receiver<EngineMessage>) -> bool {
+        let deadline = Instant::now() + OWNERSHIP_TIMEOUT + READ_POLL * 8;
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(EngineMessage::DriverEdge(ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false,
+                })) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn diagnostic_queue_disconnect_and_full_have_independent_health() {
+        let health = BridgeDiagnosticHealth::default();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        enqueue_diagnostic(&sender, "first".into(), &health);
+        enqueue_diagnostic(&sender, "full".into(), &health);
+        assert_eq!(health.snapshot().queue_full, 1);
+        assert_eq!(receiver.recv().unwrap(), "first");
+        drop(receiver);
+        enqueue_diagnostic(&sender, "closed".into(), &health);
+        assert_eq!(health.snapshot().queue_closed, 1);
+        assert_eq!(health.snapshot().write_failed, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_blocked_worker_is_bounded_and_reused_after_bridge_restart() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let (bridge, stream, _) = diagnostic_pipe_peer();
+        diagnostic_fixture_barrier();
+        let (records, observed_records) = channel();
+        *lock(&TEST_DIAGNOSTIC_SINK) = Some(TestDiagnosticSink {
+            records,
+            failures: 0,
+        });
+        let (entered, blocked) = channel();
+        let (release, released) = channel();
+        *lock(&BLOCKED_DIAGNOSTIC) = Some(BlockedDiagnostic {
+            needle: "capture_test event=blocked_writer",
+            entered,
+            release: released,
+        });
+        note("capture_test event=blocked_writer".into());
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        let starts = DIAGNOSTIC_WORKER_STARTS.load(Ordering::Relaxed);
+        let before = bridge.snapshot().diagnostics;
+        let delayed_record = diagnostic_record("capture_test event=prepared_before_release");
+        enqueue_diagnostic(
+            DIAGNOSTIC_WORKER.get().unwrap().as_ref().unwrap(),
+            delayed_record.clone(),
+            &DIAGNOSTIC_HEALTH,
+        );
+        for sequence in 1..DIAGNOSTIC_QUEUE_CAPACITY + 8 {
+            note(format!(
+                "capture_test event=queue_pressure sequence={sequence}"
+            ));
+        }
+        assert_eq!(
+            bridge.snapshot().diagnostics.queue_full - before.queue_full,
+            8
+        );
+        drop(stream);
+        drop(bridge);
+        let (replacement, replacement_stream, _) = diagnostic_pipe_peer();
+        let snapshot = replacement.snapshot();
+        let same_worker = DIAGNOSTIC_WORKER_STARTS.load(Ordering::Relaxed) == starts;
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut recovered = false;
+        let mut retained_event_record = false;
+        while Instant::now() < deadline && !(recovered && retained_event_record) {
+            if let Ok(record) =
+                observed_records.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                recovered |= record.contains("event=diagnostic_recovered");
+                retained_event_record |= record == delayed_record;
+            }
+        }
+        diagnostic_fixture_barrier();
+        *lock(&TEST_DIAGNOSTIC_SINK) = None;
+        assert!(same_worker);
+        assert_eq!(starts, 1);
+        assert_eq!(snapshot.owned_usages, vec![0xf1]);
+        assert!(recovered);
+        assert!(retained_event_record);
+        drop(replacement_stream);
+    }
+
+    #[test]
+    fn diagnostic_write_failure_is_visible_and_recovery_is_aggregated() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        diagnostic_fixture_barrier();
+        let before = DIAGNOSTIC_HEALTH.snapshot();
+        let (records, observed) = channel();
+        *lock(&TEST_DIAGNOSTIC_SINK) = Some(TestDiagnosticSink {
+            records,
+            failures: 1,
+        });
+        note("capture_test event=write_failure".into());
+        note("capture_test event=write_recovered".into());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut summary = None;
+        while Instant::now() < deadline && summary.is_none() {
+            if let Ok(record) =
+                observed.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                if record.contains("event=diagnostic_recovered") {
+                    summary = Some(record);
+                }
+            }
+        }
+        diagnostic_fixture_barrier();
+        *lock(&TEST_DIAGNOSTIC_SINK) = None;
+        assert_eq!(
+            DIAGNOSTIC_HEALTH.snapshot().write_failed,
+            before.write_failed + 1
+        );
+        assert!(summary
+            .unwrap()
+            .contains(&format!("write_failed={}", before.write_failed + 1)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_sink_blocked_pipe_reader_still_processes_up_and_inactive() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let (bridge, mut stream, receiver) = diagnostic_pipe_peer();
+        diagnostic_fixture_barrier();
+        let (entered, blocked) = channel();
+        let (release, released) = channel();
+        *lock(&BLOCKED_DIAGNOSTIC) = Some(BlockedDiagnostic {
+            needle: "event=edge_received",
+            entered,
+            release: released,
+        });
+        let before = bridge.snapshot();
+        let generation = before.target_generation;
+        writeln!(stream, "E 4 2 90 {generation} f1").unwrap();
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        writeln!(
+            stream,
+            "E 4 2 90 {generation} -\nO 4 3 91 {} {generation} inactive -\nR 4 3 f1",
+            sampled_tick()
+        )
+        .unwrap();
+        let up_while_blocked = wait_driver_release(&receiver);
+        let deadline = Instant::now() + READ_POLL * 8;
+        let mut inactive_epoch_observed = false;
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(EngineMessage::HidObservation(observed))
+                    if observed == mask(&[RemoteButton::Back]) =>
+                {
+                    inactive_epoch_observed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let snapshot = bridge.snapshot();
+        release.send(()).unwrap();
+        assert!(up_while_blocked, "UP waited for the diagnostic sink latch");
+        assert_eq!(snapshot.edges_applied, before.edges_applied + 2);
+        assert_eq!(
+            snapshot.watchdog_release_total,
+            before.watchdog_release_total
+        );
+        assert!(
+            inactive_epoch_observed,
+            "inactive epoch was not processed while the sink latch was held"
+        );
+        assert!(
+            snapshot.owned_usages.is_empty(),
+            "inactive waited for the diagnostic sink latch"
+        );
+        assert!(snapshot.pressed_usages.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_sink_blocked_pipe_reader_still_expires_ownership() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let (bridge, mut stream, receiver) = diagnostic_pipe_peer();
+        diagnostic_fixture_barrier();
+        let (entered, blocked) = channel();
+        let (release, released) = channel();
+        *lock(&BLOCKED_DIAGNOSTIC) = Some(BlockedDiagnostic {
+            needle: "event=edge_received",
+            entered,
+            release: released,
+        });
+        let generation = bridge.snapshot().target_generation;
+        writeln!(stream, "E 4 2 90 {generation} f1").unwrap();
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        let released_while_blocked = wait_driver_release(&receiver);
+        let snapshot = bridge.snapshot();
+        release.send(()).unwrap();
+        assert!(
+            released_while_blocked,
+            "lease watchdog waited for the diagnostic sink latch"
+        );
+        assert!(snapshot.owned_usages.is_empty());
+        assert!(snapshot.pressed_usages.is_empty());
+    }
+
     fn mask(buttons: &[RemoteButton]) -> u64 {
         buttons
             .iter()
             .fold(0, |mask, button| mask | (1u64 << button.ordinal()))
+    }
+
+    struct CapturePeer {
+        bridge: Arc<Rc003Bridge>,
+        stream: TcpStream,
+        receiver: std::sync::mpsc::Receiver<EngineMessage>,
+        generation: u64,
+    }
+
+    impl CapturePeer {
+        fn start() -> Self {
+            let (sender, receiver) = channel();
+            Self::start_with_sender(sender, receiver)
+        }
+
+        fn start_with_sender(
+            sender: Sender<EngineMessage>,
+            receiver: std::sync::mpsc::Receiver<EngineMessage>,
+        ) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sayall-capture-state-{}-{}",
+                std::process::id(),
+                generate_token()
+            ));
+            let bridge = Rc003Bridge::start_in(dir.clone(), sender);
+            bridge.set_capture_targets(true, mask(&[RemoteButton::Back]));
+            let text = std::fs::read_to_string(dir.join(BRIDGE_FILE_NAME)).unwrap();
+            let (port, token, _) = parse_descriptor(&text).unwrap();
+            let stream = Self::connect(port, &token);
+            let generation = bridge.snapshot().target_generation;
+            while receiver.try_recv().is_ok() {}
+            Self {
+                bridge,
+                stream,
+                receiver,
+                generation,
+            }
+        }
+
+        fn connect(port: u16, token: &str) -> TcpStream {
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            writeln!(stream, "HELLO {BRIDGE_PROTOCOL_VERSION} {token} 9003").unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("OK "), "{line}");
+            stream
+        }
+
+        fn send(&mut self, lines: &str) -> Vec<EngineMessage> {
+            let before = self.bridge.snapshot().malformed_total;
+            writeln!(self.stream, "{lines}\nCAPTURE_TEST_BARRIER").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.bridge.snapshot().malformed_total == before && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                self.bridge.snapshot().malformed_total > before,
+                "IPC barrier not received"
+            );
+            self.receiver.try_iter().collect()
+        }
+
+        fn ownership(
+            &mut self,
+            conn: u64,
+            epoch: u64,
+            seq: u64,
+            sample: u64,
+            state: &str,
+        ) -> Vec<EngineMessage> {
+            self.send(&format!(
+                "O {conn} {epoch} {seq} {sample} {} {state} f1",
+                self.generation
+            ))
+        }
+    }
+
+    fn sampled_tick() -> u64 {
+        #[cfg(windows)]
+        {
+            unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+        }
+        #[cfg(not(windows))]
+        {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        }
+    }
+
+    fn driver_edges(messages: &[EngineMessage]) -> Vec<ButtonEdge> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                EngineMessage::DriverEdge(edge) => Some(*edge),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct CaptureInjector(AtomicU64);
+
+    impl crate::button_mapping::MappingInjector for CaptureInjector {
+        fn tap(&self, _chord: &crate::send_input::KeyChord) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn scroll(
+            &self,
+            _direction: crate::send_input::ScrollDirection,
+            _steps: u16,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+        fn mouse_click(&self, _kind: crate::send_input::MouseClickKind) -> Result<(), String> {
+            unreachable!()
+        }
+        fn mouse_move(
+            &self,
+            _direction: crate::send_input::MoveDirection,
+            _distance: u16,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+        fn launch_app(&self, _target: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn focus_frontmost(&self) -> Result<(), String> {
+            unreachable!()
+        }
+        fn launch_app_and_focus(
+            &self,
+            _target: &str,
+            _profile: Option<&crate::focus::AppFocusProfile>,
+            _cancellation: Option<&AtomicBool>,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+        fn learn_focus_target(&self) -> Result<crate::focus::RecordedFocusTarget, String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn capture_ipc_epoch_reset_releases_engine_merger_and_accepts_next_press() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let injector = Arc::new(CaptureInjector::default());
+        let snapshot = Arc::new(Mutex::new(crate::raw_input::RawInputSnapshot::default()));
+        let runtime = Arc::new(crate::button_mapping::ButtonMappingRuntime::new(
+            injector.clone(),
+            Arc::new(crate::UsageCounters::default()),
+            snapshot.clone(),
+            Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                crate::macro_runtime::UnsupportedStepperSource,
+            ))),
+        ));
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        let mut mappings = crate::send_input::ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Back,
+            crate::send_input::ButtonActions {
+                single: crate::send_input::ButtonAction::Shortcut {
+                    chord: crate::send_input::KeyChord {
+                        keys: vec![crate::send_input::KeyCode::Backspace],
+                    },
+                },
+                hold_repeat: Some(crate::send_input::HoldRepeat::Off),
+                ..Default::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+        let (_unused_sender, receiver) = channel();
+        let mut peer = CapturePeer::start_with_sender(runtime.sender(), receiver);
+        peer.bridge.attach_mapping_runtime(&runtime);
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        peer.send(&format!("E 4 2 90 {} f1", peer.generation));
+        assert!(runtime.wait_for_idle(Duration::from_secs(2)));
+        assert_eq!(runtime.snapshot().fired_gestures, 1);
+        assert_eq!(lock(&snapshot).active_buttons, vec![RemoteButton::Back]);
+        peer.ownership(4, 4, 92, sampled_tick(), "active");
+        assert!(runtime.wait_for_idle(Duration::from_secs(2)));
+        assert!(lock(&snapshot).active_buttons.is_empty());
+        peer.send(&format!("E 4 2 90 {} -", peer.generation));
+        assert!(runtime.wait_for_idle(Duration::from_secs(2)));
+        assert_eq!(runtime.snapshot().fired_gestures, 1);
+        peer.send(&format!(
+            "E 4 4 92 {} f1\nE 4 4 92 {} -",
+            peer.generation, peer.generation
+        ));
+        assert!(runtime.wait_for_idle(Duration::from_secs(2)));
+        assert_eq!(
+            runtime.snapshot().fired_gestures,
+            2,
+            "new press remained blocked by old merger hold"
+        );
+        assert_eq!(injector.0.load(Ordering::SeqCst), 0);
+        assert!(lock(&snapshot).active_buttons.is_empty());
+    }
+
+    #[test]
+    fn capture_ipc_rejects_stale_future_and_reordered_observations() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+        peer.ownership(4, 2, 91, sampled_tick() - 2_050, "active");
+        assert!(
+            peer.bridge.snapshot().owned_usages.is_empty(),
+            "queued O renewed ownership"
+        );
+        peer.ownership(4, 2, 92, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+        peer.ownership(4, 2, 93, sampled_tick() + 10_000, "active");
+        assert!(
+            peer.bridge.snapshot().owned_usages.is_empty(),
+            "future O renewed ownership"
+        );
+        peer.ownership(4, 3, 94, sampled_tick(), "inactive");
+        peer.ownership(4, 2, 93, sampled_tick(), "active");
+        assert!(
+            peer.bridge.snapshot().owned_usages.is_empty(),
+            "old seq revived ownership"
+        );
+        peer.ownership(4, 4, 95, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+    }
+
+    #[test]
+    fn capture_ipc_false_and_coalesced_epoch_clear_held_before_resume() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        assert_eq!(
+            driver_edges(&peer.send(&format!("E 4 2 90 {} f1", peer.generation))).len(),
+            1
+        );
+        let revoked = peer.ownership(4, 3, 91, sampled_tick(), "inactive");
+        assert_eq!(
+            driver_edges(&revoked),
+            vec![ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: false
+            }]
+        );
+        assert!(peer.bridge.snapshot().pressed_usages.is_empty());
+        assert!(peer.bridge.snapshot().owned_usages.is_empty());
+        peer.ownership(4, 4, 92, sampled_tick(), "active");
+        peer.send(&format!("E 4 4 92 {} f1", peer.generation));
+        let resumed = peer.ownership(4, 6, 94, sampled_tick(), "active");
+        assert_eq!(
+            driver_edges(&resumed),
+            vec![ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: false
+            }]
+        );
+        let old = peer.send(&format!(
+            "E 4 4 92 {} -\nE 3 6 94 {} f1\nE 4 6 94 {} f1\nE 4 6 94 {} -",
+            peer.generation, peer.generation, peer.generation, peer.generation
+        ));
+        assert_eq!(
+            driver_edges(&old),
+            vec![
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true
+                },
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_ipc_closed_cannot_revive_but_new_helper_resets_namespace() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        peer.ownership(4, 3, 91, sampled_tick(), "closed");
+        peer.ownership(4, 9, 900, sampled_tick(), "active");
+        assert!(peer.bridge.snapshot().owned_usages.is_empty());
+        peer.ownership(5, 1, 1, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+        peer.ownership(4, 20, 901, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+        let text = std::fs::read_to_string(peer.bridge.file.as_ref().unwrap()).unwrap();
+        let (port, token, _) = parse_descriptor(&text).unwrap();
+        peer.stream = CapturePeer::connect(port, &token);
+        peer.ownership(1, 1, 1, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+    }
+
+    #[test]
+    fn capture_ipc_same_epoch_renewal_preserves_fast_press_release_fifo() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        let sample = sampled_tick();
+        let messages = peer.send(&format!(
+            "E 4 2 90 {} f1\nO 4 2 91 {sample} {} active f1\nE 4 2 90 {} -",
+            peer.generation, peer.generation, peer.generation
+        ));
+        assert_eq!(
+            driver_edges(&messages),
+            vec![
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true
+                },
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_ipc_local_expiry_fences_old_edges_when_same_epoch_resumes() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        let started = Instant::now();
+        peer.ownership(4, 2, 90, sampled_tick() - 1_000, "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+        let deadline = started + Duration::from_millis(1_200);
+        while !peer.bridge.snapshot().owned_usages.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            peer.bridge.snapshot().owned_usages.is_empty(),
+            "receipt reset the sample budget"
+        );
+        peer.ownership(4, 2, 95, sampled_tick(), "active");
+        assert_eq!(peer.bridge.snapshot().owned_usages, vec![0xf1]);
+        let future = peer.send(&format!("E 4 2 96 {} f1", peer.generation));
+        assert!(
+            driver_edges(&future).is_empty(),
+            "unobserved ownership sequence authorized E"
+        );
+        let old = peer.send(&format!(
+            "E 4 2 90 {} f1\nE 4 2 90 {} -",
+            peer.generation, peer.generation
+        ));
+        assert!(
+            driver_edges(&old).is_empty(),
+            "pre-expiry FIFO edges replayed after new grant"
+        );
+        let fresh = peer.send(&format!(
+            "E 4 2 95 {} f1\nO 4 2 96 {} {} active f1\nE 4 2 95 {} -",
+            peer.generation,
+            sampled_tick(),
+            peer.generation,
+            peer.generation
+        ));
+        assert_eq!(
+            driver_edges(&fresh),
+            vec![
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true
+                },
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_ipc_blocked_diagnostic_allows_target_change_and_stop() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        diagnostic_fixture_barrier();
+        let (entered, blocked) = channel();
+        let (release, released) = channel();
+        *lock(&BLOCKED_DIAGNOSTIC) = Some(BlockedDiagnostic {
+            needle: "event=ownership_resumed",
+            entered,
+            release: released,
+        });
+        writeln!(
+            peer.stream,
+            "O 4 2 90 {} {} active f1",
+            sampled_tick(),
+            peer.generation
+        )
+        .unwrap();
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        let bridge = peer.bridge.clone();
+        let (changed, change_done) = channel();
+        let changer = std::thread::spawn(move || {
+            bridge.set_capture_targets(true, mask(&[RemoteButton::Home]));
+            changed.send(()).unwrap();
+        });
+        let progressed = change_done.recv_timeout(Duration::from_millis(750)).is_ok();
+        let snapshot = peer.bridge.snapshot();
+        let (stopped, stop_done) = channel();
+        let stopper = std::thread::spawn(move || {
+            drop(peer);
+            let _ = stopped.send(());
+        });
+        let stop_progressed = stop_done.recv_timeout(Duration::from_millis(750)).is_ok();
+        release.send(()).unwrap();
+        changer.join().unwrap();
+        stopper.join().unwrap();
+        assert!(
+            progressed,
+            "blocked diagnostic retained the connection lock"
+        );
+        assert!(
+            stop_progressed,
+            "stop waited for another thread's diagnostic sink"
+        );
+        assert!(snapshot.owned_usages.is_empty());
+        assert_eq!(snapshot.target_usages, vec![0x4a]);
+    }
+
+    #[test]
+    fn capture_ipc_timeout_records_decision_sample_and_resumed_consumption() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        diagnostic_fixture_barrier();
+        let (records, observed) = channel();
+        *lock(&TEST_DIAGNOSTIC_SINK) = Some(TestDiagnosticSink {
+            records,
+            failures: 0,
+        });
+        let sample = sampled_tick();
+        peer.ownership(4, 2, 90, sample, "active");
+        let deadline = Instant::now() + OWNERSHIP_TIMEOUT + READ_POLL * 8;
+        while !peer.bridge.snapshot().owned_usages.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let expired = peer.bridge.snapshot().owned_usages.is_empty();
+        let resumed_sample = sampled_tick();
+        peer.ownership(4, 2, 95, resumed_sample, "active");
+        diagnostic_fixture_barrier();
+        *lock(&TEST_DIAGNOSTIC_SINK) = None;
+        let captured: Vec<_> = observed.try_iter().collect();
+        assert!(expired, "ownership did not expire");
+        let timeout = captured
+            .iter()
+            .find(|record| record.contains("event=ownership_timeout"))
+            .expect("timeout diagnostic missing");
+        let field = |record: &str, name: &str| -> u64 {
+            record
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("missing {name} in diagnostic"))
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(field(timeout, "last_accepted_sampled_tick_ms"), sample);
+        let decision = field(timeout, "decision_tick_ms");
+        assert_eq!(field(timeout, "sample_age_ms"), decision - sample);
+        assert!(decision - sample >= OWNERSHIP_TIMEOUT.as_millis() as u64);
+        assert_eq!(field(timeout, "current_rx_seq"), 1);
+        assert!(field(timeout, "local_connection_id") > 0);
+        assert_eq!(field(timeout, "current_conn_gen"), 4);
+        assert_eq!(field(timeout, "current_epoch"), 2);
+        assert_eq!(field(timeout, "current_observation_seq"), 90);
+        assert_eq!(field(timeout, "current_target_generation"), peer.generation);
+        assert_eq!(field(timeout, "pending_bytes"), 0);
+        let _buffered = field(timeout, "buffered_bytes");
+        let resumed = captured
+            .iter()
+            .find(|record| {
+                record.contains("event=ownership_resumed") && record.contains("observation_seq=95")
+            })
+            .expect("resumed diagnostic missing");
+        let consumed = field(resumed, "app_consumed_tick_ms");
+        assert_eq!(field(resumed, "sample_age_ms"), consumed - resumed_sample);
+        assert_eq!(field(resumed, "sampled_tick_ms"), resumed_sample);
+        assert!(consumed >= decision);
+        let descriptor = std::fs::read_to_string(peer.bridge.file.as_ref().unwrap()).unwrap();
+        let (_, token, _) = parse_descriptor(&descriptor).unwrap();
+        assert!(!timeout.contains(&token));
+        assert!(!resumed.contains(&token));
+    }
+
+    #[test]
+    fn capture_sample_age_boundary_remains_strict() {
+        assert!(capture_sample_age_fresh(Some(0)));
+        assert!(capture_sample_age_fresh(Some(1_499)));
+        assert!(!capture_sample_age_fresh(Some(1_500)));
+        assert!(!capture_sample_age_fresh(Some(1_501)));
+        assert!(!capture_sample_age_fresh(None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_pipe_readable_fresh_observation_does_not_revoke_before_consumption() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let _gate_handle = crate::key_gate::KeyGate::start();
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                *lock(&TEST_DIAGNOSTIC_SINK) = None;
+            }
+        }
+        let _sink_reset = ResetSink;
+        let injector = Arc::new(CaptureInjector::default());
+        let runtime = Arc::new(crate::button_mapping::ButtonMappingRuntime::new(
+            injector.clone(),
+            Arc::new(crate::UsageCounters::default()),
+            Arc::new(Mutex::new(crate::raw_input::RawInputSnapshot::default())),
+            Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                crate::macro_runtime::UnsupportedStepperSource,
+            ))),
+        ));
+        runtime.set_input_context(crate::RemoteModel::Rc003, true);
+        let mut mappings = crate::send_input::ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Back,
+            crate::send_input::ButtonActions {
+                single: crate::send_input::ButtonAction::Shortcut {
+                    chord: crate::send_input::KeyChord {
+                        keys: vec![crate::send_input::KeyCode::Backspace],
+                    },
+                },
+                double: crate::send_input::ButtonAction::Shortcut {
+                    chord: crate::send_input::KeyChord {
+                        keys: vec![crate::send_input::KeyCode::Enter],
+                    },
+                },
+                hold_repeat: Some(crate::send_input::HoldRepeat::Off),
+                ..Default::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+        let (bridge, mut stream) = diagnostic_pipe_peer_with_sender(runtime.sender());
+        bridge.attach_mapping_runtime(&runtime);
+        diagnostic_fixture_barrier();
+        let (records, observed) = channel();
+        *lock(&TEST_DIAGNOSTIC_SINK) = Some(TestDiagnosticSink {
+            records,
+            failures: 0,
+        });
+        let generation = bridge.snapshot().target_generation;
+        let old_sample = sampled_tick() - 1_300;
+        writeln!(stream, "O 4 2 91 {old_sample} {generation} active f1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let record = observed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if record.contains("event=engine_ownership") && record.contains("available=true") {
+                break;
+            }
+        }
+        assert_eq!(
+            lock(&bridge.shared).ownership_sampled_tick_ms,
+            Some(old_sample)
+        );
+        writeln!(stream, "E 4 2 91 {generation} f1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while bridge.snapshot().pressed_usages.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bridge.snapshot().pressed_usages, vec![0xf1]);
+        assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+        assert_eq!(runtime.snapshot().fired_gestures, 0);
+        let evidence = (|| -> Result<_, &'static str> {
+            let connection = bridge.current.lock().map_err(|_| "current_poisoned")?;
+            let server = connection
+                .as_ref()
+                .ok_or("missing_connection")?
+                .stream
+                .try_clone()
+                .map_err(|_| "clone_failed")?;
+            let held_targets = bridge.targets.lock().map_err(|_| "targets_poisoned")?;
+            drop(connection);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match bridge.current.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => break,
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Err("current_poisoned"),
+                    Ok(guard) => drop(guard),
+                }
+                if Instant::now() >= deadline {
+                    return Err("reader_not_held");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while capture_tick_ms() - old_sample < OWNERSHIP_TIMEOUT.as_millis() as u64 {
+                if Instant::now() >= deadline {
+                    return Err("old_sample_not_expired");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let fresh_sample = sampled_tick();
+            let fresh_line = format!("O 4 2 95 {fresh_sample} {generation} active f1\n");
+            stream
+                .write_all(fresh_line.as_bytes())
+                .map_err(|_| "write_failed")?;
+            let BridgeIo::Pipe(server) = server else {
+                return Err("not_named_pipe");
+            };
+            let mut readable = vec![0u8; fresh_line.len() + 1];
+            let mut copied = 0;
+            let mut available = 0;
+            unsafe {
+                windows::Win32::System::Pipes::PeekNamedPipe(
+                    windows::Win32::Foundation::HANDLE(server.as_raw_handle()),
+                    Some(readable.as_mut_ptr().cast()),
+                    readable.len() as u32,
+                    Some(&mut copied),
+                    Some(&mut available),
+                    None,
+                )
+            }
+            .map_err(|_| "peek_failed")?;
+            if available as usize != fresh_line.len()
+                || &readable[..copied as usize] != fresh_line.as_bytes()
+            {
+                return Err("complete_fresh_line_not_readable");
+            }
+            let release_tick = capture_tick_ms();
+            if release_tick - old_sample < OWNERSHIP_TIMEOUT.as_millis() as u64
+                || !capture_sample_age_fresh(release_tick.checked_sub(fresh_sample))
+            {
+                return Err("sample_age_precondition_failed");
+            }
+            drop(held_targets);
+            Ok((fresh_sample, release_tick, copied))
+        })();
+        let (fresh_sample, release_tick, readable_bytes) = evidence.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&bridge.shared).ownership_sampled_tick_ms != Some(fresh_sample)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let accepted_sample = lock(&bridge.shared).ownership_sampled_tick_ms;
+        let owned = bridge.snapshot().owned_usages;
+        assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+        let cancelled_fires = runtime.snapshot().fired_gestures;
+        let cancelled_pressed = bridge.snapshot().pressed_usages;
+        diagnostic_fixture_barrier();
+        let captured: Vec<_> = observed.try_iter().collect();
+        writeln!(stream, "E 4 2 91 {generation} f1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let old_edge_rejected = loop {
+            match observed.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(record) if record.contains("reason=pregrant_observation") => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        writeln!(stream, "E 4 2 95 {generation} f1\nE 4 2 95 {generation} -").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().fired_gestures == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let new_fires = runtime.snapshot().fired_gestures;
+        assert!(runtime.wait_for_idle(Duration::from_secs(1)));
+        drop(stream);
+        drop(bridge);
+        diagnostic_fixture_barrier();
+        *lock(&TEST_DIAGNOSTIC_SINK) = None;
+        assert_eq!(accepted_sample, Some(fresh_sample));
+        assert_eq!(owned, vec![0xf1]);
+        assert_eq!(cancelled_fires, 0, "old held gesture fired during handoff");
+        assert!(cancelled_pressed.is_empty());
+        assert!(old_edge_rejected);
+        assert_eq!(
+            new_fires, 1,
+            "new edge did not clear the cancellation fence"
+        );
+        assert_eq!(injector.0.load(Ordering::SeqCst), 1);
+        assert!(
+            !captured
+                .iter()
+                .any(|record| record.contains("event=ownership_timeout")),
+            "already readable fresh O caused timeout: old_sample={old_sample} fresh_sample={fresh_sample} readable_bytes={readable_bytes} release_tick={release_tick}"
+        );
+        assert!(!captured.iter().any(|record| {
+            record.contains("event=engine_ownership") && record.contains("available=false")
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_pipe_queued_invalid_input_does_not_extend_expired_ownership() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                *lock(&TEST_DIAGNOSTIC_SINK) = None;
+            }
+        }
+        let _sink_reset = ResetSink;
+        for case in [
+            "empty",
+            "partial",
+            "stale",
+            "future",
+            "epoch",
+            "target",
+            "sequence",
+            "malformed",
+            "flood",
+            "no_newline_flood",
+            "closed_receiver",
+        ] {
+            let (bridge, mut stream, receiver) = diagnostic_pipe_peer();
+            let mut receiver = Some(receiver);
+            let generation = bridge.snapshot().target_generation;
+            let old_sample = sampled_tick() - 1_300;
+            writeln!(stream, "O 4 2 91 {old_sample} {generation} active f1").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while lock(&bridge.shared).ownership_sampled_tick_ms != Some(old_sample)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                lock(&bridge.shared).ownership_sampled_tick_ms,
+                Some(old_sample)
+            );
+            let closed_evidence = if matches!(case, "no_newline_flood" | "closed_receiver") {
+                diagnostic_fixture_barrier();
+                let (records, observed) = channel();
+                *lock(&TEST_DIAGNOSTIC_SINK) = Some(TestDiagnosticSink {
+                    records,
+                    failures: 0,
+                });
+                Some(observed)
+            } else {
+                None
+            };
+            let connection = bridge.current.lock().unwrap();
+            let held_targets = bridge.targets.lock().unwrap();
+            drop(connection);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let reader_held = loop {
+                match bridge.current.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => break true,
+                    Err(std::sync::TryLockError::Poisoned(_)) => break false,
+                    Ok(guard) => drop(guard),
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            while capture_tick_ms() - old_sample < 1_500 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let fresh = sampled_tick();
+            let payload = match case {
+                "empty" => String::new(),
+                "partial" => format!("O 4 2 95 {fresh} {generation} active f1"),
+                "stale" => format!("O 4 2 95 {old_sample} {generation} active f1\n"),
+                "future" => format!("O 4 2 95 {} {generation} active f1\n", fresh + 10_000),
+                "epoch" => format!("O 4 1 95 {fresh} {generation} active f1\n"),
+                "target" => format!("O 4 2 95 {fresh} {} active f1\n", generation + 1),
+                "sequence" => format!("O 4 2 90 {fresh} {generation} active f1\n"),
+                "malformed" => "invalid ownership\n".to_owned(),
+                "flood" => "invalid\n".repeat(MAX_LINE_BYTES / 8),
+                "no_newline_flood" => "x".repeat(MAX_LINE_BYTES),
+                "closed_receiver" => {
+                    drop(receiver.take());
+                    format!("O 4 2 95 {fresh} {generation} active f1\n")
+                }
+                _ => unreachable!(),
+            };
+            let written = stream.write_all(payload.as_bytes());
+            let release_tick = capture_tick_ms();
+            drop(held_targets);
+            assert!(reader_held);
+            written.unwrap();
+            assert!(release_tick - old_sample >= 1_500);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !bridge.snapshot().owned_usages.is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let snapshot = bridge.snapshot();
+            drop(stream);
+            drop(bridge);
+            if let Some(closed_evidence) = closed_evidence {
+                let reason = if case == "no_newline_flood" {
+                    "line_too_long"
+                } else {
+                    "engine_closed"
+                };
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let closed = loop {
+                    match closed_evidence
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(record) if record.contains(&format!("event=closed reason={reason}")) => {
+                            break true
+                        }
+                        Ok(_) => {}
+                        Err(_) => break false,
+                    }
+                };
+                *lock(&TEST_DIAGNOSTIC_SINK) = None;
+                assert_ne!(
+                    snapshot.phase,
+                    BridgePhase::Connected,
+                    "{case} did not close before test cleanup"
+                );
+                assert!(closed, "{case} missing its own close reason");
+            }
+            assert!(
+                snapshot.owned_usages.is_empty(),
+                "{case} extended ownership"
+            );
+            assert!(snapshot.pressed_usages.is_empty());
+            if let Some(receiver) = receiver {
+                assert!(receiver
+                    .try_iter()
+                    .any(|event| matches!(event, EngineMessage::HidObservation(0))));
+            } else {
+                assert_ne!(snapshot.phase, BridgePhase::Connected);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_available_read_has_one_fixed_byte_budget_and_preserves_partial_line() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let (bridge, mut stream, _) = diagnostic_pipe_peer();
+        let connection = bridge.current.lock().unwrap();
+        let server = connection.as_ref().unwrap().stream.try_clone().unwrap();
+        let held_targets = bridge.targets.lock().unwrap();
+        drop(connection);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reader_held = loop {
+            match bridge.current.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break true,
+                Err(std::sync::TryLockError::Poisoned(_)) => break false,
+                Ok(guard) => drop(guard),
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let mut reader = BufReader::new(server);
+        let mut pending = vec![b'p'; MAX_LINE_BYTES - 16];
+        let written = stream.write_all(&vec![b'x'; MAX_LINE_BYTES]);
+        let read = read_available_capture_input(&mut reader, &mut pending);
+        let second_read = read_available_capture_input(&mut reader, &mut pending);
+        drop(held_targets);
+        drop(stream);
+        drop(bridge);
+        assert!(reader_held);
+        written.unwrap();
+        assert_eq!(read.unwrap(), 16);
+        assert_eq!(second_read.unwrap(), 0);
+        assert_eq!(pending.len(), MAX_LINE_BYTES);
+        assert!(pending[..MAX_LINE_BYTES - 16]
+            .iter()
+            .all(|byte| *byte == b'p'));
+        assert!(pending[MAX_LINE_BYTES - 16..]
+            .iter()
+            .all(|byte| *byte == b'x'));
+        assert!(!pending.contains(&b'\n'));
+    }
+
+    #[test]
+    fn capture_ipc_blocked_tcp_reader_times_out_releases_and_allows_replacement() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            #[link(name = "Ws2_32")]
+            extern "system" {
+                fn setsockopt(
+                    socket: usize,
+                    level: i32,
+                    option: i32,
+                    value: *const u8,
+                    length: i32,
+                ) -> i32;
+            }
+            let receive_bytes = 1_024i32;
+            assert_eq!(
+                unsafe {
+                    setsockopt(
+                        peer.stream.as_raw_socket() as usize,
+                        0xffff,
+                        0x1002,
+                        (&receive_bytes as *const i32).cast(),
+                        std::mem::size_of::<i32>() as i32,
+                    )
+                },
+                0
+            );
+        }
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        peer.send(&format!("E 4 2 90 {} f1", peer.generation));
+        diagnostic_fixture_barrier();
+        let (entered, closed) = channel();
+        let (release, released) = channel();
+        release.send(()).unwrap();
+        *lock(&BLOCKED_DIAGNOSTIC) = Some(BlockedDiagnostic {
+            needle: "reason=voice_synth_write_error",
+            entered,
+            release: released,
+        });
+        let mut writer = lock(&peer.bridge.current)
+            .as_ref()
+            .unwrap()
+            .stream
+            .try_clone()
+            .unwrap();
+        let payload = vec![b'x'; 16 * 1024 * 1024];
+        let started = Instant::now();
+        let error = loop {
+            match writer.write_all(&payload) {
+                Ok(()) => assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "TCP receive buffer never filled"
+                ),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "{error}"
+        );
+        let closed_note = closed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(closed_note.contains("reason=voice_synth_write_error"));
+        assert!(peer.bridge.snapshot().owned_usages.is_empty());
+        assert!(peer.bridge.snapshot().pressed_usages.is_empty());
+        assert_eq!(
+            driver_edges(&peer.receiver.try_iter().collect::<Vec<_>>()),
+            vec![ButtonEdge {
+                button: RemoteButton::Back,
+                is_pressed: false
+            }]
+        );
+        let text = std::fs::read_to_string(peer.bridge.file.as_ref().unwrap()).unwrap();
+        let (port, token, _) = parse_descriptor(&text).unwrap();
+        peer.stream = CapturePeer::connect(port, &token);
+        peer.ownership(1, 1, 1, sampled_tick(), "active");
+        let fresh = peer.send(&format!(
+            "E 1 1 1 {} f1\nE 1 1 1 {} -",
+            peer.generation, peer.generation
+        ));
+        assert_eq!(driver_edges(&fresh).len(), 2);
+    }
+
+    #[test]
+    fn capture_ipc_inactive_observation_ignores_old_epoch_and_connection() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        peer.ownership(4, 3, 93, sampled_tick(), "inactive");
+        let messages = peer.send("R 3 3 28\nR 4 2 28\nR 4 3 f1");
+        let observed: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                EngineMessage::HidObservation(mask) => Some(*mask),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(observed, vec![mask(&[RemoteButton::Back])]);
+        assert!(driver_edges(&messages).is_empty());
+    }
+
+    #[test]
+    fn capture_ipc_new_target_rejects_queued_old_generation_edges() {
+        let _gate = crate::key_gate::lock_gate_tests();
+        let mut peer = CapturePeer::start();
+        peer.ownership(4, 2, 90, sampled_tick(), "active");
+        let old_generation = peer.generation;
+        peer.bridge
+            .set_capture_targets(true, mask(&[RemoteButton::Back, RemoteButton::Home]));
+        peer.generation = peer.bridge.snapshot().target_generation;
+        peer.send(&format!(
+            "O 4 3 91 {} {} active f1,4a",
+            sampled_tick(),
+            peer.generation
+        ));
+        let rejected = peer.send(&format!(
+            "E 4 2 90 {old_generation} f1\nE 4 3 91 {old_generation} f1\nE 3 3 91 {} f1",
+            peer.generation
+        ));
+        assert!(driver_edges(&rejected).is_empty());
+        assert!(peer.bridge.snapshot().pressed_usages.is_empty());
+        let messages = peer.send(&format!(
+            "E 4 3 91 {} f1\nE 4 3 91 {} -",
+            peer.generation, peer.generation
+        ));
+        assert_eq!(
+            driver_edges(&messages),
+            vec![
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: true
+                },
+                ButtonEdge {
+                    button: RemoteButton::Back,
+                    is_pressed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_protocol_v3_requires_one_version_and_rejects_legacy_data() {
+        assert_eq!(BRIDGE_PROTOCOL_VERSION, 3);
+        for line in ["O 1 f1", "E 1 f1", "R 1 f1"] {
+            assert!(
+                parse_bridge_line(line).is_err(),
+                "accepted legacy frame: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_protocol_v3_decodes_epoch_data_without_reinterpreting_usages() {
+        for line in ["O 4 2 90 1000 8 active f1", "E 4 2 90 8 f1", "R 4 2 f1"] {
+            let parsed = parse_bridge_line(line).unwrap().unwrap();
+            let usages = match parsed {
+                BridgeLine::Ownership { usages, .. }
+                | BridgeLine::Edges { usages, .. }
+                | BridgeLine::Observed { usages, .. } => usages,
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(usages, vec![0xf1], "misdecoded capture frame: {line}");
+        }
     }
 
     #[test]
@@ -1750,14 +3621,20 @@ mod tests {
     #[test]
     fn observation_protocol_is_independent_of_capture_targets_and_excludes_voice() {
         assert_eq!(
-            parse_bridge_line("R 1 f1,28,65,80"),
+            parse_bridge_line("R 4 1 f1,28,65,80"),
             Ok(Some(BridgeLine::Observed {
+                conn_gen: 4,
+                epoch: 1,
                 usages: vec![0xf1, 0x28, 0x65, 0x80]
             }))
         );
         assert_eq!(
-            parse_bridge_line("R 2 -"),
-            Ok(Some(BridgeLine::Observed { usages: vec![] }))
+            parse_bridge_line("R 4 2 -"),
+            Ok(Some(BridgeLine::Observed {
+                conn_gen: 4,
+                epoch: 2,
+                usages: vec![]
+            }))
         );
         assert!(parse_bridge_line("R invalid f1").is_err());
         let physical: BTreeSet<_> = ENHANCED_CAPTURE_BUTTON_USAGES
@@ -1829,26 +3706,37 @@ mod tests {
     #[test]
     fn parses_edges_in_hex_and_empty_means_release() {
         assert_eq!(
-            parse_bridge_line("E 1758622200123 f1,80").unwrap(),
+            parse_bridge_line("E 4 2 90 8 f1,80").unwrap(),
             Some(BridgeLine::Edges {
+                conn_gen: 4,
+                epoch: 2,
+                observation_seq: 90,
+                generation: 8,
                 usages: vec![0x00F1, 0x0080]
             })
         );
         // 带 0x 前缀与大小写混用都要接受：日志与脚本里两种写法都会出现。
         assert_eq!(
-            parse_bridge_line("E 1 0x00F1,0X81").unwrap(),
+            parse_bridge_line("E 4 2 90 8 0x00F1,0X81").unwrap(),
             Some(BridgeLine::Edges {
+                conn_gen: 4,
+                epoch: 2,
+                observation_seq: 90,
+                generation: 8,
                 usages: vec![0x00F1, 0x0081]
             })
         );
         assert_eq!(
-            parse_bridge_line("E 1 -").unwrap(),
-            Some(BridgeLine::Edges { usages: Vec::new() })
+            parse_bridge_line("E 4 2 90 8 -").unwrap(),
+            Some(BridgeLine::Edges {
+                conn_gen: 4,
+                epoch: 2,
+                observation_seq: 90,
+                generation: 8,
+                usages: Vec::new()
+            })
         );
-        assert_eq!(
-            parse_bridge_line("E 1").unwrap(),
-            Some(BridgeLine::Edges { usages: Vec::new() })
-        );
+        assert!(parse_bridge_line("E 4 2 90 8").is_err());
         assert!(parse_bridge_line("E 1 zz").is_err());
         assert!(parse_bridge_line("E notanumber f1").is_err());
         // 空行与 CRLF 要被容忍（助手侧写的是 LF，但人工用脚本联调时会有 CRLF）。
@@ -1859,15 +3747,25 @@ mod tests {
     #[test]
     fn parses_dynamic_capture_ownership() {
         assert_eq!(
-            parse_bridge_line("O 7 28,4a,f1").unwrap(),
+            parse_bridge_line("O 4 2 90 1000 7 active 28,4a,f1").unwrap(),
             Some(BridgeLine::Ownership {
+                conn_gen: 4,
+                epoch: 2,
+                observation_seq: 90,
+                sampled_tick_ms: 1000,
+                state: CaptureState::Active,
                 generation: 7,
                 usages: vec![0x0028, 0x004A, 0x00F1],
             })
         );
         assert_eq!(
-            parse_bridge_line("O 8 -").unwrap(),
+            parse_bridge_line("O 4 3 91 1001 8 inactive -").unwrap(),
             Some(BridgeLine::Ownership {
+                conn_gen: 4,
+                epoch: 3,
+                observation_seq: 91,
+                sampled_tick_ms: 1001,
+                state: CaptureState::Inactive,
                 generation: 8,
                 usages: Vec::new(),
             })
@@ -1897,16 +3795,16 @@ mod tests {
 
     #[test]
     fn descriptor_round_trip() {
-        let text = "version=2\nport=53124\ntoken=deadbeefcafe\npid=999\n";
+        let text = "version=3\nport=53124\ntoken=deadbeefcafe\npid=999\n";
         assert_eq!(
             parse_descriptor(text),
-            Some((53124, "deadbeefcafe".to_string(), 2))
+            Some((53124, "deadbeefcafe".to_string(), 3))
         );
         // 版本不符必须整份拒绝：宁可不可用，也不要跑一个半懂的协议。
         assert_eq!(parse_descriptor("version=1\nport=1\ntoken=x\n"), None);
         assert_eq!(parse_descriptor("port=1\ntoken=x\n"), None);
-        assert_eq!(parse_descriptor("version=2\nport=1\n"), None);
-        assert_eq!(parse_descriptor("version=2\nport=1\ntoken=\n"), None);
+        assert_eq!(parse_descriptor("version=3\nport=1\n"), None);
+        assert_eq!(parse_descriptor("version=3\nport=1\ntoken=\n"), None);
     }
 
     #[test]
@@ -1917,7 +3815,7 @@ mod tests {
             "tok",
             None,
         );
-        assert!(body.starts_with("version=2\nport=53124\n"), "{body:?}");
+        assert!(body.starts_with("version=3\nport=53124\n"), "{body:?}");
         assert!(
             body.contains("pipe=\\\\.\\pipe\\SayAllPersonal.Rc003Bridge\n"),
             "{body:?}"
@@ -1935,7 +3833,7 @@ mod tests {
             "{body:?}"
         );
         // 新字段对解析方透明：主程序自己的解析器（与助手逐字对齐）照常工作。
-        assert_eq!(parse_descriptor(&body), Some((1, "t".to_string(), 2)));
+        assert_eq!(parse_descriptor(&body), Some((1, "t".to_string(), 3)));
     }
 
     #[test]
@@ -2020,11 +3918,25 @@ mod tests {
             "握手必须重放关闭态，避免 helper 重启后 resident agent 保留上一轮 RightAlt；实际收到 {ack:?}"
         );
 
-        stream.write_all(b"E 1 f1\n").unwrap();
+        let generation = bridge.snapshot().target_generation;
+        stream
+            .write_all(
+                format!(
+                    "O 1 1 1 {} {generation} active f1\nE 1 1 1 {generation} f1\n",
+                    sampled_tick()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         stream.flush().unwrap();
-        let edge = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("命名管道边沿必须送入映射引擎");
+        let edge = loop {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("命名管道边沿必须送入映射引擎");
+            if matches!(message, EngineMessage::DriverEdge(_)) {
+                break message;
+            }
+        };
         assert!(matches!(
             edge,
             EngineMessage::DriverEdge(ButtonEdge {
@@ -2337,7 +4249,7 @@ mod tests {
         stream.write_all(b"A -\n").unwrap();
         stream.flush().unwrap();
         stream
-            .write_all(format!("O {generation} f1,80\n").as_bytes())
+            .write_all(format!("O 1 1 1 {} {generation} active f1,80\n", sampled_tick()).as_bytes())
             .unwrap();
         stream.flush().unwrap();
         for _ in 0..20 {
@@ -2353,7 +4265,9 @@ mod tests {
         );
 
         // 两个当前目标键按下。
-        stream.write_all(b"E 1 f1,80\n").unwrap();
+        stream
+            .write_all(format!("E 1 1 1 {generation} f1,80\n").as_bytes())
+            .unwrap();
         stream.flush().unwrap();
         let mut first = Vec::new();
         let mut second = Vec::new();
@@ -2379,7 +4293,9 @@ mod tests {
         assert_eq!(second.len(), 1, "音量+应有且只有一次按下边沿");
 
         // 全部释放。
-        stream.write_all(b"E 2 -\n").unwrap();
+        stream
+            .write_all(format!("E 1 1 1 {generation} -\n").as_bytes())
+            .unwrap();
         stream.flush().unwrap();
         let mut released = 0;
         for _ in 0..40 {
@@ -2430,11 +4346,25 @@ mod tests {
         }
         assert!(target_line.starts_with("T "), "实际收到 {target_line:?}");
         assert!(target_line.trim().ends_with("4a"));
-        stream.write_all(b"E 3 4a\n").unwrap();
+        let generation = bridge.snapshot().target_generation;
+        stream
+            .write_all(
+                format!(
+                    "O 1 2 2 {} {generation} active 4a\nE 1 2 2 {generation} 4a\n",
+                    sampled_tick()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         stream.flush().unwrap();
-        let home = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("主页边沿应被动态桥接");
+        let home = loop {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("主页边沿应被动态桥接");
+            if matches!(message, EngineMessage::DriverEdge(_)) {
+                break message;
+            }
+        };
         assert!(matches!(
             home,
             EngineMessage::DriverEdge(ButtonEdge {
@@ -2498,7 +4428,16 @@ mod tests {
         };
 
         let mut alpha = connect(1001);
-        alpha.write_all(b"E 1 f1\n").unwrap();
+        let generation = bridge.snapshot().target_generation;
+        alpha
+            .write_all(
+                format!(
+                    "O 1 1 1 {} {generation} active f1,80\nE 1 1 1 {generation} f1\n",
+                    sampled_tick()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         alpha.flush().unwrap();
         let mut saw_back = false;
         for _ in 0..40 {
@@ -2521,7 +4460,14 @@ mod tests {
         while receiver.try_recv().is_ok() {}
         assert_eq!(bridge.snapshot().replaced_total, 1, "必须记录一次接管");
 
-        beta.write_all(b"E 2 80\n").unwrap();
+        beta.write_all(
+            format!(
+                "O 1 1 1 {} {generation} active f1,80\nE 1 1 1 {generation} 80\n",
+                sampled_tick()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         beta.flush().unwrap();
         let mut saw_volume = false;
         for _ in 0..40 {
@@ -2574,7 +4520,16 @@ mod tests {
         reader.read_line(&mut ok).unwrap();
         assert!(ok.starts_with("OK "), "实际收到 {ok:?}");
 
-        stream.write_all(b"E 1 f1\n").unwrap();
+        let generation = bridge.snapshot().target_generation;
+        stream
+            .write_all(
+                format!(
+                    "O 1 1 1 {} {generation} active f1\nE 1 1 1 {generation} f1\n",
+                    sampled_tick()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         stream.flush().unwrap();
         let mut pressed = false;
         for _ in 0..40 {

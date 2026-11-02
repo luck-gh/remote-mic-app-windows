@@ -587,6 +587,16 @@ pub fn cycle_wetype_profile() -> Result<String, String> {
     }
 }
 
+fn cycle_profile_actions(
+    activate_alternative: impl FnOnce() -> Result<(), String>,
+    settle: impl FnOnce(),
+    restore_wetype: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    activate_alternative()?;
+    settle();
+    restore_wetype()
+}
+
 fn sta_cycle_wetype_profile() -> Result<String, String> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -633,28 +643,33 @@ fn sta_cycle_wetype_profile() -> Result<String, String> {
                 return Err("无可用作切换的其他输入法配置".to_owned());
             };
             // 第一步：切到临时输入法（制造配置变更事件）。
-            manager
-                .ActivateProfile(
-                    TF_PROFILETYPE_INPUTPROCESSOR,
-                    LANGID_ZH_CN,
-                    &alt_clsid,
-                    &alt_profile,
-                    HKL::default(),
-                    TF_IPPMF_FORSESSION,
-                )
-                .map_err(|error| format!("切换到临时输入法失败：{error}"))?;
-            std::thread::sleep(SESSION_REBIND_SETTLE);
-            // 第二步：切回微信输入法。
-            manager
-                .ActivateProfile(
-                    TF_PROFILETYPE_INPUTPROCESSOR,
-                    LANGID_ZH_CN,
-                    &WETYPE_CLSID,
-                    &WETYPE_PROFILE,
-                    HKL::default(),
-                    TF_IPPMF_FORSESSION,
-                )
-                .map_err(|error| format!("切回微信输入法失败：{error}"))?;
+            cycle_profile_actions(
+                || {
+                    manager
+                        .ActivateProfile(
+                            TF_PROFILETYPE_INPUTPROCESSOR,
+                            LANGID_ZH_CN,
+                            &alt_clsid,
+                            &alt_profile,
+                            HKL::default(),
+                            TF_IPPMF_FORSESSION,
+                        )
+                        .map_err(|error| format!("切换到临时输入法失败：{error}"))
+                },
+                || std::thread::sleep(SESSION_REBIND_SETTLE),
+                || {
+                    manager
+                        .ActivateProfile(
+                            TF_PROFILETYPE_INPUTPROCESSOR,
+                            LANGID_ZH_CN,
+                            &WETYPE_CLSID,
+                            &WETYPE_PROFILE,
+                            HKL::default(),
+                            TF_IPPMF_FORSESSION,
+                        )
+                        .map_err(|error| format!("切回微信输入法失败：{error}"))
+                },
+            )?;
             Ok(format!(
                 "switched via clsid={:08X} and back to WeType",
                 alt_clsid.data1
@@ -662,6 +677,80 @@ fn sta_cycle_wetype_profile() -> Result<String, String> {
         })();
         CoUninitialize();
         result
+    }
+}
+
+#[cfg(test)]
+mod cycle_profile_contract_tests {
+    use super::cycle_profile_actions;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn unchanged_cycle_preserves_action_order() {
+        let actions = Mutex::new(Vec::new());
+        cycle_profile_actions(
+            || {
+                actions.lock().unwrap().push("alternative");
+                Ok(())
+            },
+            || actions.lock().unwrap().push("settle"),
+            || {
+                actions.lock().unwrap().push("wetype");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *actions.lock().unwrap(),
+            ["alternative", "settle", "wetype"]
+        );
+    }
+
+    #[test]
+    fn first_activation_error_does_not_start_later_actions() {
+        let result = cycle_profile_actions(
+            || Err("synthetic_activation_failure".into()),
+            || panic!("settle must not start"),
+            || panic!("restore must not start"),
+        );
+        assert_eq!(result, Err("synthetic_activation_failure".into()));
+    }
+
+    #[test]
+    fn external_selection_after_alternative_must_not_be_overwritten() {
+        let active_profile = Arc::new(Mutex::new("original"));
+        let worker_profile = Arc::clone(&active_profile);
+        let (settled_sender, settled_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            cycle_profile_actions(
+                || {
+                    *worker_profile.lock().unwrap() = "alternative";
+                    Ok(())
+                },
+                || {
+                    settled_sender.send(()).unwrap();
+                    resume_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                },
+                || {
+                    *worker_profile.lock().unwrap() = "wetype";
+                    Ok(())
+                },
+            )
+        });
+        let reached_settle = settled_receiver.recv_timeout(Duration::from_secs(5));
+        if reached_settle.is_ok() {
+            *active_profile.lock().unwrap() = "new_user_selection";
+        }
+        let resumed = resume_sender.send(());
+        let joined = worker.join();
+        reached_settle.unwrap();
+        resumed.unwrap();
+        joined.unwrap().unwrap();
+        assert_eq!(*active_profile.lock().unwrap(), "new_user_selection");
     }
 }
 

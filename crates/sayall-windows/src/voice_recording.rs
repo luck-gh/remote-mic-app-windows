@@ -524,7 +524,7 @@ fn default_root() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
     Some(
         PathBuf::from(base)
-            .join("SayAll")
+            .join("SayAllPersonal")
             .join("transcripts")
             .join("v1")
             .join("audio"),
@@ -542,6 +542,19 @@ pub fn is_safe_session_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(windows)]
+    #[test]
+    fn default_root_is_personal() {
+        let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert_eq!(
+            default_root().unwrap(),
+            base.join("SayAllPersonal")
+                .join("transcripts")
+                .join("v1")
+                .join("audio")
+        );
+    }
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("sayall-recording-test-{}", uuid::Uuid::new_v4()))

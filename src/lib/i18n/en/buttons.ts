@@ -1,5 +1,15 @@
 // English strings for buttons. Key = exact Chinese source passed to t().
 export default {
+  "当前模板": "Current template",
+  "未能刷新模板列表，请重新打开下拉菜单重试。": "Unable to refresh templates. Reopen the list to try again.",
+  "上一次关闭的完成状态尚未确认，当前无法继续开启，正在自动检查恢复结果。": "The previous shutdown is unconfirmed. Checking recovery before enabling again.",
+  "暂时无法确认当前状态，正在自动重试读取，稍后可再操作。": "Unable to confirm the current state. Retrying automatically; please wait before trying again.",
+  "尚未确认关闭结果，正在自动检查。": "Shutdown is not yet confirmed. Checking automatically.",
+  "全按键支持尚未恢复，可关闭后重试或重新授权并启动。": "Full-key support has not recovered. Turn it off and try again, or authorize and start it again.",
+  "全按键支持未启动，请再次开启并确认 Windows 授权。": "Full-key support did not start. Enable it again and confirm Windows authorization.",
+  "正在断开…": "Disconnecting…",
+  "断开请求已提交，正在等待连接释放": "Disconnect requested; waiting for the connection to close",
+  "未能断开遥控器，请到连接与语音页查看状态后重试。": "Unable to disconnect. Check the Connection and Voice page and try again.",
   "未连接遥控器": "No remote connected",
   "保存锁定当前按键设置失败，请重试。": "Could not save the Lock Current Button setting. Try again.",
   "总开关已更新": "Master switch updated",
