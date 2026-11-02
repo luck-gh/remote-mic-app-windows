@@ -126,6 +126,11 @@ const audio = ref<AudioSnapshot>(emptyAudio());
 const audioRoute = ref<AudioRouteSnapshot | null>(null);
 const routeError = ref("");
 const showAdvancedAudio = ref(false);
+const showAudioDevices = ref(false);
+function toggleAudioDevices() {
+  showAudioDevices.value = !showAudioDevices.value;
+  reportFrontendEvent({ event: 'audio_device_disclosure', phase: 'completed', result: 'passed', reason: showAudioDevices.value ? 'opened' : 'closed' });
+}
 let audioRouteRequest = 0;
 let reportedAudioRoute = "";
 function reportAudioRoute(phase: string, reason: string | null) {
@@ -240,7 +245,10 @@ async function changeCaptureInput(enabled: boolean, endpointId = pendingCapture.
     captureMessage.value = String(error);
     // Keep the user's explicit target as an unsaved draft, separate from runtime.
     pendingCapture.value = targetChanged && endpoint ? config : null;
-    if (pendingCapture.value) showAdvancedAudio.value = true;
+    if (pendingCapture.value) {
+      showAdvancedAudio.value = true;
+      showAudioDevices.value = true;
+    }
     try { captureInput.value = await getCaptureInput(); } catch { /* keep last confirmed state */ }
   }
   finally { captureBusy.value = false; }
@@ -1272,21 +1280,8 @@ async function scanAudio() {
   await refreshDefaultCaptureInputs();
 }
 
-async function changeAudioOutput(event: Event) {
-  const control = event.target as HTMLSelectElement;
-  const requested = control.value;
-  control.value = audio.value.selectedEndpointId ?? "";
-  const endpoint = audioEndpoints.value.find(item => item.id === requested);
-  if (!endpoint) {
-    audioActionError.value = t("所选声音写入设备当前不可用");
-    reportFrontendEvent({ event: "audio_output_select", phase: "completed", result: "failed", reason: "endpoint_unavailable" });
-    return;
-  }
-  await chooseAudioEndpoint(endpoint);
-}
-
 async function chooseAudioEndpoint(endpoint: AudioEndpoint) {
-  if (captureBusy.value || selectingEndpointId.value || audioBusy.value || captureInput.value.recoveryPending) return;
+  if (scanningAudio.value || !props.runtime?.platform.windowsApiAvailable || captureBusy.value || selectingEndpointId.value || audioBusy.value || captureInput.value.recoveryPending) return;
   selectingEndpointId.value = endpoint.id;
   audioMessage.value = t("正在打开语音设备…");
   audioActionError.value = '';
@@ -1415,6 +1410,7 @@ onUnmounted(() => {
     </header>
 
     <!-- ============ 设备：遥控器 + 语音设备 ============ -->
+    <div class="device-columns">
       <article class="card remote-connection-card">
         <div class="card-title-row">
           <div>
@@ -1482,10 +1478,11 @@ onUnmounted(() => {
             </button>
           </li>
         </ul>
-      <section class="voice-device-section" aria-labelledby="voice-devices-title">
+      </article>
+      <article class="card voice-device-section" aria-labelledby="voice-devices-title">
         <div class="card-title-row">
           <div>
-            <h3 id="voice-devices-title">{{ t("声音传输与麦克风") }}</h3>
+            <h2 id="voice-devices-title">{{ t("语音设备") }}</h2>
           </div>
           <button
             class="secondary-button"
@@ -1498,87 +1495,19 @@ onUnmounted(() => {
         </div>
 
         <section class="audio-output-settings" :aria-label="t('声音写入设备')">
-        <div class="audio-output-heading">
-          <label for="audio-output-target">{{ t("声音写入设备") }}</label>
-        <div class="status-panel audio-route-status" aria-live="polite">
-          <div class="status-copy">
-            <div class="status-heading">
-              <span class="status-dot" :class="audioTone"></span>
-              <strong>{{ t(audioRouteTitle) }}</strong>
+          <div class="status-panel audio-route-status" aria-live="polite">
+            <div class="status-copy">
+              <div class="status-heading"><span class="status-dot" :class="audioTone"></span><strong :title="audio.selectedEndpointName ?? undefined">{{ audio.selectedEndpointName || t("请选择声音写入设备") }}</strong></div>
+              <small>{{ t(audioRouteTitle) }}</small>
             </div>
           </div>
-        </div>
-        </div>
-        <select id="audio-output-target" :value="audio.selectedEndpointId ?? ''" :disabled="scanningAudio || captureBusy || Boolean(selectingEndpointId) || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending" @change="changeAudioOutput">
-          <option value="" disabled>{{ t("请选择声音写入设备") }}</option>
-          <option v-if="audio.selectedEndpointId && !audioEndpoints.some(endpoint => endpoint.id === audio.selectedEndpointId)" :value="audio.selectedEndpointId" disabled>{{ audio.selectedEndpointName }}</option>
-          <option v-for="endpoint in audioEndpoints" :key="endpoint.id" :value="endpoint.id">{{ endpoint.name }}</option>
-        </select>
-        <p class="audio-output-feedback scan-summary muted" role="status" aria-live="polite" :tabindex="audioActionError || audioMessage || audio.lastError || routeError || audioRoute?.phase === 'unavailable' ? 0 : undefined">{{ audioActionError || (audio.lastError ? audioDetail : routeError || audioRoute?.phase === 'unavailable' ? t(audioRouteDetail) : audioMessage) }}</p>
-        </section>
-
-        <details class="windows-default-settings" @toggle="reportFrontendEvent({ event: 'capture_settings_disclosure', phase: 'completed', result: 'passed', reason: ($event.target as HTMLDetailsElement).open ? 'opened' : 'closed' })">
-          <summary>{{ t("Windows 默认麦克风（可选）") }}<span class="capture-summary-feedback" aria-live="polite" :title="captureSummaryMessage">{{ captureSummaryMessage }}</span></summary>
-        <section class="capture-input-settings" :aria-label="t('Windows 默认麦克风（可选）')">
-          <div class="capture-input-target">
-          <div class="capture-target-heading">
-            <label for="capture-input-target">{{ t("目标麦克风输入") }}</label>
-            <small class="capture-target-help muted" :title="t('立即生效，自动切换设置不变')">{{ t('立即生效，自动切换设置不变') }}</small>
+          <p class="scan-summary muted">{{ audioMessage }}</p>
+          <div class="button-row audio-device-actions">
+            <button type="button" class="secondary-button" :aria-expanded="showAudioDevices" @click="toggleAudioDevices">{{ showAudioDevices ? t("收起列表") : t("更换设备") }}</button>
+            <small class="muted">{{ t("共 {count} 个设备可选", { count: audioEndpoints.length }) }}</small>
           </div>
-          <div class="button-row">
-            <select id="capture-input-target" :value="selectedCaptureId" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending"
-              @change="selectCaptureTarget">
-              <option value="">{{ t("请选择输入设备") }}</option>
-              <option v-if="captureInput.settings.endpointId && !captureEndpoints.some(e => e.id === captureInput.settings.endpointId)" :value="captureInput.settings.endpointId">{{ captureInput.settings.endpointName }}</option>
-              <option v-for="endpoint in captureEndpoints" :key="endpoint.id" :value="endpoint.id">{{ endpoint.name }}</option>
-            </select>
-            <button id="set-windows-default-input" type="button" class="secondary-button" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || connection.voiceState !== 'idle' || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending || !captureEndpoints.some(endpoint => endpoint.id === selectedCaptureId)" @click="applyWindowsDefaultInput">{{ t('设为 Windows 默认') }}</button>
-          </div>
-          </div>
-          <div class="capture-input-behavior">
-          <label class="setting-row" for="capture-input-switch">
-            <span>{{ t("语音开始时切换麦克风") }}</span>
-            <input id="capture-input-switch" type="checkbox" :checked="captureInput.settings.enabled"
-              :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || !selectedCaptureId || captureInput.recoveryPending"
-              @change="changeCaptureSwitch" />
-          </label>
-          <label class="setting-row capture-input-restore" for="capture-input-restore" :aria-disabled="captureRestoreDisabled">
-            <span>{{ t("语音结束时恢复麦克风") }}</span>
-            <input id="capture-input-restore" type="checkbox" :checked="captureInput.settings.enabled && !captureInput.settings.keepSelected"
-              :disabled="captureRestoreDisabled"
-              @change="changeCaptureRestore" />
-          </label>
-          <div class="capture-input-feedback capture-input-status" aria-live="polite">
-            <p class="capture-feedback-text muted" role="status" :title="captureFeedbackText">{{ captureFeedbackText }}</p>
-          </div>
-          </div>
-        </section>
-        </details>
-        <details class="audio-advanced" :open="showAdvancedAudio" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open">
-          <summary>{{ t("高级：声音传输诊断") }}</summary>
-          <template v-if="showAdvancedAudio">
-          <div class="capture-input-diagnostics" tabindex="0">
-          <button v-if="captureInput.settings.enabled && audioRoute?.phase === 'unavailable' && captureInput.settings.endpointId" type="button" class="secondary-button" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending" @click="changeCaptureInput(captureInput.settings.enabled)">{{ t("重新连接声音通道") }}</button>
-          <p v-if="captureErrorText" role="status">{{ captureErrorText }}</p>
-          <p v-else-if="capturePhase">{{ t(capturePhase) }}</p>
-          <p v-if="pendingCapture" role="status">{{ t("所选麦克风尚未保存。请在高级诊断中明确选择同一条音频线的声音写入端，两端将一起保存。") }}</p>
-          <div v-if="captureInput.recoveryPending" class="info-callout warning">
-            <p>{{ t("上次退出未能确认输入设备恢复。如果此后改过麦克风，请保留当前选择。恢复只处理仍符合原会话记录的设备。") }}</p>
-            <div class="button-row">
-              <button type="button" :disabled="captureBusy" @click="recoverCaptureInput(false)">{{ t("保留当前选择") }}</button>
-              <button type="button" class="secondary-button" :disabled="captureBusy" @click="recoverCaptureInput(true)">{{ t("尝试恢复会话前设备") }}</button>
-            </div>
-          </div>
-          </div>
-          <dl class="windows-default-inputs" aria-live="polite" tabindex="0" :aria-label="t('当前 Windows 默认麦克风')">
-            <div><dt>{{ t('普通输入') }}</dt><dd :title="defaultCaptureName('console')">{{ defaultCaptureName('console') }}</dd></div>
-            <div><dt>{{ t('媒体输入') }}</dt><dd :title="defaultCaptureName('multimedia')">{{ defaultCaptureName('multimedia') }}</dd></div>
-            <div><dt>{{ t('通信输入') }}</dt><dd :title="defaultCaptureName('communications')">{{ defaultCaptureName('communications') }}</dd></div>
-          </dl>
-          <p v-if="routeError || audioRoute?.phase === 'unavailable'" data-audio-route-error role="status">{{ t(audioRouteDetail) }}</p>
-          <button type="button" class="secondary-button" :disabled="captureBusy || !runtime?.platform.windowsApiAvailable" @click="scanCaptureInputs">{{ t("读取输入设备") }}</button>
-          <p v-if="audioActionError || audio.lastError" role="status">{{ audioActionError || audioDetail }}</p>
-        <ul v-if="audioEndpoints.length" class="device-list endpoint-list">
+          <p class="audio-output-feedback" role="status" aria-live="polite" tabindex="0">{{ audioActionError || (audio.lastError ? audioDetail : routeError || audioRoute?.phase === 'unavailable' ? t(audioRouteDetail) : '') }}</p>
+        <ul v-if="showAudioDevices && audioEndpoints.length" class="device-list endpoint-list">
           <li v-for="endpoint in audioEndpoints" :key="endpoint.id">
             <div>
               <strong>{{ endpoint.name }}</strong>
@@ -1592,7 +1521,7 @@ onUnmounted(() => {
             </div>
             <button
               type="button"
-              :disabled="captureBusy || captureInput.recoveryPending || audioBusy || Boolean(selectingEndpointId) || (!pendingCapture && audio.selectedEndpointId === endpoint.id && audioRoute?.phase !== 'unavailable')"
+              :disabled="scanningAudio || !runtime?.platform.windowsApiAvailable || captureBusy || captureInput.recoveryPending || audioBusy || Boolean(selectingEndpointId) || (!pendingCapture && audio.selectedEndpointId === endpoint.id && audioRoute?.phase !== 'unavailable')"
               @click="chooseAudioEndpoint(endpoint)"
             >
               {{
@@ -1607,9 +1536,8 @@ onUnmounted(() => {
             </button>
           </li>
         </ul>
-          <VbCableMaintenance />
-          </template>
-        </details>
+
+        </section>
 
         <div class="gain-row">
           <label class="gain-label" for="audio-gain">{{ t("增益") }}</label>
@@ -1647,8 +1575,81 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
-      </section>
+
       </article>
+    </div>
+
+    <details class="card audio-advanced windows-default-settings" :open="showAdvancedAudio" @toggle="showAdvancedAudio = ($event.target as HTMLDetailsElement).open; reportFrontendEvent({ event: 'capture_settings_disclosure', phase: 'completed', result: 'passed', reason: showAdvancedAudio ? 'opened' : 'closed' })">
+      <summary>{{ t("高级选项与驱动") }}<span class="capture-summary-feedback" aria-live="polite" :title="captureSummaryMessage">{{ captureSummaryMessage }}</span></summary>
+      <div class="advanced-columns">
+        <div class="advanced-left">
+          <VbCableMaintenance v-if="showAdvancedAudio" />
+          <section class="windows-microphone-settings">
+        <h3>{{ t("Windows 麦克风设置") }}</h3>
+        <section class="capture-input-settings" :aria-label="t('Windows 默认麦克风（可选）')">
+          <div class="capture-input-target">
+          <div class="capture-target-heading">
+            <label for="capture-input-target">{{ t("目标麦克风输入") }}</label>
+            <small class="capture-target-help muted" :title="t('立即生效，自动切换设置不变')">{{ t('立即生效，自动切换设置不变') }}</small>
+          </div>
+          <div class="button-row">
+            <select id="capture-input-target" :value="selectedCaptureId" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending"
+              @change="selectCaptureTarget">
+              <option value="">{{ t("请选择输入设备") }}</option>
+              <option v-if="captureInput.settings.endpointId && !captureEndpoints.some(e => e.id === captureInput.settings.endpointId)" :value="captureInput.settings.endpointId">{{ captureInput.settings.endpointName }}</option>
+              <option v-for="endpoint in captureEndpoints" :key="endpoint.id" :value="endpoint.id">{{ endpoint.name }}</option>
+            </select>
+            <button id="set-windows-default-input" type="button" class="secondary-button" :disabled="captureBusy || Boolean(selectingEndpointId) || audioBusy || connection.voiceState !== 'idle' || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending || !captureEndpoints.some(endpoint => endpoint.id === selectedCaptureId)" @click="applyWindowsDefaultInput">{{ t('设为 Windows 默认') }}</button>
+          </div>
+          </div>
+          <div class="capture-input-behavior">
+          <label class="setting-row" for="capture-input-switch">
+            <span>{{ t("语音开始时切换麦克风") }}</span>
+            <input id="capture-input-switch" type="checkbox" :checked="captureInput.settings.enabled"
+              :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || !selectedCaptureId || captureInput.recoveryPending"
+              @change="changeCaptureSwitch" />
+          </label>
+          <label class="setting-row capture-input-restore" for="capture-input-restore" :aria-disabled="captureRestoreDisabled">
+            <span>{{ t("语音结束时恢复麦克风") }}</span>
+            <input id="capture-input-restore" type="checkbox" :checked="captureInput.settings.enabled && !captureInput.settings.keepSelected"
+              :disabled="captureRestoreDisabled"
+              @change="changeCaptureRestore" />
+          </label>
+          <div class="capture-input-feedback capture-input-status" aria-live="polite">
+            <p class="capture-feedback-text muted" role="status" :title="captureFeedbackText">{{ captureFeedbackText }}</p>
+          </div>
+          </div>
+        </section>
+
+          </section>
+        </div>
+        <section v-if="showAdvancedAudio" class="advanced-right" tabindex="0" :aria-label="t('声音传输诊断')">
+          <h3>{{ t("声音传输诊断") }}</h3>
+          <div class="capture-input-diagnostics" tabindex="0">
+          <button v-if="captureInput.settings.enabled && audioRoute?.phase === 'unavailable' && captureInput.settings.endpointId" type="button" class="secondary-button" :disabled="captureBusy || audioBusy || !runtime?.platform.windowsApiAvailable || captureInput.recoveryPending" @click="changeCaptureInput(captureInput.settings.enabled)">{{ t("重新连接声音通道") }}</button>
+          <p v-if="captureErrorText && captureErrorText !== t('已设为 Windows 默认麦克风')" role="status">{{ captureErrorText }}</p>
+          <p v-else-if="!captureErrorText && capturePhase">{{ t(capturePhase) }}</p>
+          <p v-if="pendingCapture" role="status">{{ t("所选麦克风尚未保存。请在上方语音设备列表中选择同一条音频线的声音写入端，两端将一起保存。") }}</p>
+          <div v-if="captureInput.recoveryPending" class="info-callout warning">
+            <p>{{ t("上次退出未能确认输入设备恢复。如果此后改过麦克风，请保留当前选择。恢复只处理仍符合原会话记录的设备。") }}</p>
+            <div class="button-row">
+              <button type="button" :disabled="captureBusy" @click="recoverCaptureInput(false)">{{ t("保留当前选择") }}</button>
+              <button type="button" class="secondary-button" :disabled="captureBusy" @click="recoverCaptureInput(true)">{{ t("尝试恢复会话前设备") }}</button>
+            </div>
+          </div>
+          </div>
+          <h4>{{ t("当前 Windows 麦克风状态") }}</h4>
+          <dl class="windows-default-inputs" aria-live="polite" tabindex="0" :aria-label="t('当前 Windows 默认麦克风')">
+            <div><dt>{{ t('普通输入') }}</dt><dd :title="defaultCaptureName('console')">{{ defaultCaptureName('console') }}</dd></div>
+            <div><dt>{{ t('媒体输入') }}</dt><dd :title="defaultCaptureName('multimedia')">{{ defaultCaptureName('multimedia') }}</dd></div>
+            <div><dt>{{ t('通信输入') }}</dt><dd :title="defaultCaptureName('communications')">{{ defaultCaptureName('communications') }}</dd></div>
+          </dl>
+          <p v-if="routeError || audioRoute?.phase === 'unavailable'" data-audio-route-error role="status">{{ t(audioRouteDetail) }}</p>
+          <p v-if="audioActionError || audio.lastError" role="status">{{ audioActionError || audioDetail }}</p>
+
+        </section>
+      </div>
+    </details>
 
     <!-- ============ 语音输入设置（三步） ============ -->
     <article class="card setup-card">
@@ -1971,29 +1972,41 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.remote-connection-card { margin-bottom: 14px; }
+.device-columns { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 16px; margin-bottom: 16px; align-items: stretch; }
+.device-columns > .card { min-width: 0; margin-bottom: 0; }
+.remote-connection-card { align-self: stretch; }
+.advanced-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; margin-top: 16px; }
+.advanced-left, .advanced-right { min-width: 0; }
+.advanced-left h3, .advanced-right h3 { margin: 0 0 12px; font-size: 15px; }
+.windows-microphone-settings { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.advanced-right { padding-left: 24px; border-left: 1px solid var(--border); contain: size; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.advanced-right:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.advanced-right h4 { font-size: 13px; margin: 12px 0 6px; }
+.audio-advanced { margin-bottom: 16px; }
+.audio-device-actions { align-items: center; gap: 8px; }
+@media (max-width: 1000px) { .device-columns, .advanced-columns { grid-template-columns: minmax(0, 1fr); } .advanced-right { padding-left: 0; padding-top: 16px; border-left: 0; border-top: 1px solid var(--border); contain: none; height: 18rem; } }
 .remote-pairing { margin-top: 12px; font-size: 13px; }
 .remote-pairing summary { cursor: pointer; color: var(--muted); }
 .remote-pairing p { margin: 8px 0; }
-.connection-feedback { height: 1.4em; font-size: 13px; line-height: 1.4; margin: 8px 0; overflow: auto; overflow-wrap: anywhere; }
+.connection-feedback { height: 1.4em; font-size: 13px; line-height: 1.4; margin: 4px 0; overflow: auto; overflow-wrap: anywhere; }
 .connection-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.voice-device-section { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.voice-device-section { margin-top: 0; }
 .voice-device-section h3 { margin: 0; font-size: 16px; }
 .audio-output-settings { margin-top: 12px; min-width: 0; }
-.audio-output-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
-.audio-output-heading > label { font-size: 13px; font-weight: 600; }
-.audio-output-settings > select { width: 100%; min-width: 0; min-height: 34px; }
+.audio-output-settings > .scan-summary { height: 2.8em; line-height: 1.4; margin: 8px 0; overflow: auto; overflow-wrap: anywhere; }
 .audio-output-feedback { height: 1.4em; margin: 4px 0 0; font-size: 12.5px; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
 .audio-output-feedback:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.audio-route-status { margin: 0; padding: 0; border: 0; background: transparent; min-width: 0; font-size: 12px; }
-.windows-default-settings { margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; }
+.audio-route-status { min-width: 0; }
+.audio-route-status strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.audio-route-status .status-heading { min-width: 0; }
+.windows-default-settings { font-size: 13px; }
 .windows-default-settings > summary { color: var(--muted); cursor: pointer; line-height: 1.4; }
 .windows-default-settings > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .capture-summary-feedback { float: right; max-width: 45%; height: 1.4em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.capture-input-settings { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
-.windows-default-inputs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; height: 4.4em; margin: 10px 0; font-size: 13px; overflow: auto; overflow-wrap: anywhere; }
+.capture-input-settings { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin-top: 12px; }
+.windows-default-inputs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 10px 0; font-size: 13px; overflow: auto; overflow-wrap: anywhere; }
 .windows-default-inputs dt { color: var(--muted); font-size: 12px; }
-.windows-default-inputs dd { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 3px 0 0; }
+.windows-default-inputs dd { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; height: 2.8em; line-height: 1.4; overflow: hidden; margin: 3px 0 0; }
 .windows-default-inputs:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .capture-input-target, .capture-input-behavior { min-width: 0; }
 .capture-target-heading { display: flex; align-items: baseline; gap: 8px; min-height: 22px; margin-bottom: 8px; }
@@ -2015,7 +2028,4 @@ onUnmounted(() => {
 .audio-advanced { margin-top: 14px; font-size: 13px; }
 .audio-advanced > summary { color: var(--muted); cursor: pointer; }
 .audio-advanced > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-@media (max-width: 1020px) {
-  .capture-input-settings { grid-template-columns: minmax(0, 1fr); }
-}
 </style>

@@ -130,21 +130,21 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   steps.push("RC001 连接 command 返回 16 kHz ATVV 就绪状态");
 
   const advancedAudio = await waitFor(() => document.querySelector<HTMLDetailsElement>(".audio-advanced"), "高级声音诊断");
-  assert(!advancedAudio.open, "声音写入端不应默认出现在常规界面");
-  assert(document.querySelector("#capture-input-target"), "常规界面缺少目标麦克风选择");
-  assert(!document.querySelector(".endpoint-list"), "常规界面泄漏了播放设备列表");
-  // 仿真后端不提供真实 Capture 拓扑，显式高级选择仅验证原有 WASAPI 通道。
-  advancedAudio.open = true;
-  advancedAudio.dispatchEvent(new Event("toggle"));
-  const renderChoice = await waitFor(() => document.querySelector<HTMLButtonElement>(".audio-advanced .endpoint-list button"), "高级手动写入端");
+  assert(!advancedAudio.open, "高级选项与驱动应默认折叠");
+  assert(document.querySelector("#capture-input-target"), "高级区缺少目标麦克风选择");
+  assert(!document.querySelector(".endpoint-list"), "声音写入列表应等待显式展开");
+  // 仿真后端不提供真实 Capture 拓扑, 主语音卡的显式选择仅验证原有 WASAPI 通道。
+  const changeDevice = await waitFor(() => document.querySelector<HTMLButtonElement>(".voice-device-section .audio-device-actions button"), "语音设备更换入口");
+  changeDevice.click();
+  const renderChoice = await waitFor(() => document.querySelector<HTMLButtonElement>(".voice-device-section .endpoint-list button"), "主语音卡声音写入端");
   if (!renderChoice.disabled) renderChoice.click();
-  await waitFor(() => document.querySelector<HTMLButtonElement>(".audio-advanced .endpoint-list button")?.textContent?.trim() === "当前设备" ? true : null, "手动声音写入端确认");
+  await waitFor(() => document.querySelector<HTMLButtonElement>(".voice-device-section .endpoint-list button")?.textContent?.trim() === "当前设备" ? true : null, "手动声音写入端确认");
   const endpoints = await listAudioEndpoints();
   assert(endpoints.length === 1, "仿真音频端点数量异常");
   const audio = await getAudioSnapshot();
   assert(audio.phase === "ready", "仿真音频端点没有进入 WASAPI 就绪");
   assert(audio.selectedEndpointId === endpoints[0].id, "仿真 CABLE Input 没有被明确选择");
-  steps.push("连接页面仅常规展示目标麦克风；高级显式选择仿真声音写入端，真实通道配对 deferred");
+  steps.push("主语音卡显式展开并选择仿真声音写入端, 高级选项默认折叠, 真实通道配对 deferred");
 
   // 语音增益（2026-10-04，对齐 Mac 设置页「增益」滑块）：0 dB = 原始音量。
   // 拖动（input）只改显示、松手（change）才落盘——这里按真实手势派发两个事件，

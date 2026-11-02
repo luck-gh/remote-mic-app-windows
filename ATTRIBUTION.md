@@ -582,6 +582,7 @@
 
 ## 2026-11-01 页面入口分工对照
 
+- 2026-11-02 按用户提供的两张上游截图和同一固定源码继续复用双主卡/顶部控制的视觉分工: 连接页保留遥控连接与语音设备两卡, 个人版 Windows 麦克风策略/官方维护/三角色诊断集中在独立折叠高级区; 按键页当前模板与全按键控制相邻。只调整布局和原公开操作的入口, 不吸收该提交的 BLE 机制或改写个人版监听、编辑及语音生命周期。
 - 只读核对上游 `GetSayAll/remote-mic-app-windows` 的 `859833dd54b798d48ef034afeacac52433da4d5f`: [导航表](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/navigation.ts)、[按键页](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/pages/ButtonsPage.vue#L2362)、[连接页](https://github.com/GetSayAll/remote-mic-app-windows/blob/859833dd54b798d48ef034afeacac52433da4d5f/src/pages/ConnectionPage.vue#L1360)。上游没有独立驱动页, 全按键主入口位于按键页, 连接页提供 VB-CABLE 官网安装提示及同一接管设置的语音别名。
 - 复用页面职责, 未复制上游控制时序: 个人版将原真实接管/恢复面板迁回按键页, 独有官方安装/卸载向导放连接页高级区域, 配对说明与系统设置放遥控器卡片。保留原模型/来源隔离、授权及清理契约; 本次对照不等于吸收该上游提交的 BLE 修改。
 

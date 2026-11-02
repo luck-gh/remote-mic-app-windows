@@ -1,5 +1,10 @@
 // English strings for connection. Key = exact Chinese source passed to t().
 export default {
+  "高级选项与驱动": "Advanced options and drivers",
+  "Windows 麦克风设置": "Windows microphone settings",
+  "声音传输诊断": "Audio routing diagnostics",
+  "当前 Windows 麦克风状态": "Current Windows microphone status",
+  "所选麦克风尚未保存。请在上方语音设备列表中选择同一条音频线的声音写入端，两端将一起保存。": "Microphone selection is not saved. Select the matching cable output in the voice device list above to save both ends together.",
   "配对与重新连接": "Pairing and reconnection",
   "RC003：同时长按菜单和主页进入配对模式；RC001 请按随附说明书操作。": "RC003: hold Menu and Home to enter pairing mode. For RC001, follow the included instructions.",
   "打开 Windows 蓝牙设置": "Open Windows Bluetooth settings",

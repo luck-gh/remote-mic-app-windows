@@ -38,6 +38,18 @@ async function expandAudioDiagnostics(wrapper: VueWrapper): Promise<void> {
   await flushPromises();
 }
 
+async function expandAudioDevices(wrapper: VueWrapper): Promise<void> {
+  const button = wrapper.get('.audio-device-actions button');
+  if (button.attributes('aria-expanded') !== 'true') await button.trigger('click');
+  await flushPromises();
+}
+async function chooseOutput(wrapper: VueWrapper, id: string): Promise<void> {
+  await expandAudioDevices(wrapper);
+  const index = mocks.endpoints.findIndex(endpoint => endpoint.id === id);
+  await wrapper.findAll('.endpoint-list li button')[index].trigger('click');
+  await flushPromises();
+}
+
 /** 当前选中（高亮）的输入工具卡片。 */
 function selectedToolCard(wrapper: VueWrapper): string {
   return wrapper.find(".tool-card.selected").find("strong").text();
@@ -249,9 +261,9 @@ describe("VB-CABLE first-launch guidance", () => {
   it("exposes separate upstream output and optional Windows microphone controls", async () => {
     mocks.endpoints = [cableEndpoint];
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
-    expect(wrapper.get('.audio-output-settings').text()).toContain('声音写入设备');
-    expect(wrapper.get('.windows-default-settings > summary').text()).toContain('Windows 默认麦克风');
-    expect(wrapper.find('#audio-output-target').exists()).toBe(true);
+    expect(wrapper.get('.audio-output-settings').attributes('aria-label')).toBe('声音写入设备');
+    expect(wrapper.get('.windows-default-settings > summary').text()).toContain('高级选项与驱动');
+    expect(wrapper.find('.audio-device-actions button').exists()).toBe(true);
     expect(wrapper.find('.audio-advanced #audio-output-target').exists()).toBe(false);
     expect(wrapper.find('.voice-device-columns').exists()).toBe(false);
     expect(wrapper.find('.voice-device-section > .gain-row').exists()).toBe(true);
@@ -261,10 +273,42 @@ describe("VB-CABLE first-launch guidance", () => {
   it("selects the upstream output without configuring the Windows microphone", async () => {
     mocks.endpoints = [cableEndpoint];
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
-    await wrapper.get('#audio-output-target').setValue(cableEndpoint.id); await flushPromises();
+    await chooseOutput(wrapper, cableEndpoint.id); await flushPromises();
     expect(mocks.selectAudioEndpoint).toHaveBeenCalledExactlyOnceWith(cableEndpoint.id);
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
-    expect((wrapper.get('#audio-output-target').element as HTMLSelectElement).value).toBe(cableEndpoint.id);
+    expect(wrapper.get('.audio-route-status').text()).toContain(cableEndpoint.name);
+    wrapper.unmount();
+  });
+
+  it('blocks stale writer choices until a delayed device refresh completes', async () => {
+    mocks.endpoints = [cableEndpoint];
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    await expandAudioDevices(wrapper);
+    let finish!: (endpoints: AudioEndpoint[]) => void;
+    mocks.listAudioEndpoints.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await wrapper.findAll('button').find(button => button.text() === '刷新设备列表')!.trigger('click');
+    const choice = wrapper.get<HTMLButtonElement>('.endpoint-list button');
+    expect(choice.element.disabled).toBe(true);
+    choice.element.dispatchEvent(new MouseEvent('click', {bubbles: true})); await flushPromises();
+    expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
+    finish([cableEndpoint]); await flushPromises();
+    expect(choice.element.disabled).toBe(false);
+    await choice.trigger('click'); await flushPromises();
+    expect(mocks.selectAudioEndpoint).toHaveBeenCalledExactlyOnceWith(cableEndpoint.id);
+    wrapper.unmount();
+  });
+
+  it('blocks displayed writer choices when Windows APIs become unavailable', async () => {
+    mocks.endpoints = [cableEndpoint];
+    const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
+    await expandAudioDevices(wrapper);
+    await wrapper.setProps({runtime: {...runtime, platform: {...runtime.platform, windowsApiAvailable: false}}});
+    const choice = wrapper.get<HTMLButtonElement>('.endpoint-list button');
+    expect(choice.element.disabled).toBe(true);
+    choice.element.dispatchEvent(new MouseEvent('click', {bubbles: true})); await flushPromises();
+    expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
+    expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 
@@ -273,8 +317,8 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.getAudioSnapshot.mockResolvedValue({ ...emptyAudio, phase: 'ready', selectedEndpointId: cableEndpoint.id, selectedEndpointName: cableEndpoint.name });
     mocks.selectAudioEndpoint.mockRejectedValueOnce(new Error('output unavailable'));
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
-    await wrapper.get('#audio-output-target').setValue('second-output'); await flushPromises();
-    expect((wrapper.get('#audio-output-target').element as HTMLSelectElement).value).toBe(cableEndpoint.id);
+    await chooseOutput(wrapper, 'second-output'); await flushPromises();
+    expect(wrapper.get('.audio-route-status').text()).toContain(cableEndpoint.name);
     expect(wrapper.get('.audio-output-feedback').text()).toContain('操作没有完成');
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
@@ -286,7 +330,7 @@ describe("VB-CABLE first-launch guidance", () => {
     mocks.getAudioRouteSnapshot.mockResolvedValue({phase: 'unavailable', reason: 'render_missing', captureEndpointId: null, captureEndpointName: null, renderEndpointId: cableEndpoint.id, renderEndpointName: cableEndpoint.name});
     mocks.selectAudioEndpoint.mockRejectedValueOnce(new Error('output selection failed'));
     const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
-    await wrapper.get('#audio-output-target').setValue('second-output'); await flushPromises();
+    await chooseOutput(wrapper, 'second-output'); await flushPromises();
     expect(wrapper.get('.audio-output-feedback').text()).toContain('操作没有完成');
     await expandAudioDiagnostics(wrapper);
     expect(wrapper.get('.audio-advanced').text()).toContain('操作没有完成');
@@ -306,7 +350,7 @@ describe("VB-CABLE first-launch guidance", () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
     (wrapper.get('.audio-advanced').element as HTMLDetailsElement).open = true;
     await wrapper.get('.audio-advanced').trigger('toggle'); await flushPromises();
-    expect(wrapper.get('#audio-output-target').text()).toContain('请选择声音写入设备');
+    expect(wrapper.get('.audio-route-status').text()).toContain('请选择声音写入设备');
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
     wrapper.unmount();
   });
@@ -369,6 +413,8 @@ describe("VB-CABLE first-launch guidance", () => {
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
     await expandAudioDiagnostics(wrapper);
     expect(wrapper.get('.windows-default-inputs').text()).toContain('CABLE Output');
+    expect(wrapper.get('.advanced-right').text()).not.toContain('已设为 Windows 默认麦克风');
+    expect(wrapper.get('.capture-summary-feedback').text()).toContain('已设为 Windows 默认麦克风');
     expect(wrapper.get<HTMLInputElement>('#capture-input-switch').element.checked).toBe(false);
     wrapper.unmount();
   });
@@ -429,7 +475,7 @@ describe("VB-CABLE first-launch guidance", () => {
     const wrapper = mount(ConnectionPage, {props: {runtime}}); await flushPromises();
     const disclosure = wrapper.get<HTMLDetailsElement>('details.windows-default-settings');
     expect(disclosure.element.open).toBe(false);
-    expect(disclosure.get('summary').text()).toContain('Windows 默认麦克风');
+    expect(disclosure.get('summary').text()).toContain('高级选项与驱动');
     for (const open of [true, false, true]) {
       disclosure.element.open = open;
       await disclosure.trigger('toggle'); await flushPromises();
@@ -498,14 +544,21 @@ describe("VB-CABLE first-launch guidance", () => {
     wrapper.unmount();
   });
 
-  it("keeps voice devices inside the remote connection card and input-tool setup separate", async () => {
+  it("places upstream device cards above the personal advanced section and input-tool setup", async () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } });
     await flushPromises();
     const connectionCard = wrapper.findAll("article.card").find(card => card.find("h2").text() === "遥控器连接")!;
-    expect(connectionCard.find('section[aria-labelledby="voice-devices-title"]').exists()).toBe(true);
-    expect(connectionCard.get('#voice-devices-title').text()).toBe("声音传输与麦克风");
-    expect(connectionCard.find('#capture-input-target').exists()).toBe(true);
-    expect(connectionCard.get('details.audio-advanced').attributes('open')).toBeUndefined();
+    expect(connectionCard.find('#voice-devices-title').exists()).toBe(false);
+    expect(wrapper.get('.device-columns > .voice-device-section #voice-devices-title').text()).toBe("语音设备");
+    expect(wrapper.get('.audio-advanced > summary').text()).toContain('高级选项与驱动');
+    expect(wrapper.get('.audio-advanced').attributes('open')).toBeUndefined();
+    await expandAudioDiagnostics(wrapper);
+    expect(wrapper.find('.advanced-left .vb-cable-maintenance').exists()).toBe(true);
+    expect(wrapper.find('.advanced-left #capture-input-target').exists()).toBe(true);
+    expect(wrapper.get('.advanced-right').text()).toContain('当前 Windows 麦克风状态');
+    expect(wrapper.get('.advanced-right').attributes('tabindex')).toBe('0');
+    expect(wrapper.find('.advanced-right .endpoint-list').exists()).toBe(false);
+    expect(wrapper.findAll('.advanced-right button').some(button => button.text() === '读取输入设备')).toBe(false);
     expect(connectionCard.find('.setup-card').exists()).toBe(false);
     expect(wrapper.get('.setup-card h2').text()).toBe("语音输入设置");
     expect(mocks.setCaptureInput).not.toHaveBeenCalled();
@@ -520,7 +573,7 @@ describe("VB-CABLE first-launch guidance", () => {
     await flushPromises();
 
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
-    expect((wrapper.get('#audio-output-target').element as HTMLSelectElement).value).toBe('');
+    expect(wrapper.get('.audio-route-status').text()).toContain('请选择声音写入设备');
     expect(wrapper.get('details.audio-advanced').attributes('open')).toBeUndefined();
     expect(wrapper.text()).toContain("请选择声音写入设备");
     expect(wrapper.text()).not.toContain("需要安装 VB-CABLE");
@@ -665,7 +718,7 @@ describe("VB-CABLE first-launch guidance", () => {
     expect((wrapper.get('#capture-input-target').element as HTMLSelectElement).value).toBe('capture');
     await wrapper.get('details.audio-advanced').trigger('toggle');
     await flushPromises();
-    await wrapper.findAll('.audio-advanced button').find(button => button.text().includes('选择'))!.trigger('click');
+    await wrapper.findAll('.endpoint-list button').find(button => button.text().includes('选择'))!.trigger('click');
     await flushPromises();
     expect(mocks.setCaptureInput).toHaveBeenLastCalledWith({ enabled: true, keepSelected: false, endpointId: 'capture', endpointName: 'CABLE Output' }, cableEndpoint.id);
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
@@ -682,7 +735,7 @@ describe("VB-CABLE first-launch guidance", () => {
     await flushPromises();
     await wrapper.get('#capture-input-target').setValue('capture');
     await flushPromises();
-    const choose = wrapper.findAll('.audio-advanced button').find(button => button.text().includes('选择'))!;
+    const choose = wrapper.findAll('.endpoint-list button').find(button => button.text().includes('选择'))!;
     await choose.trigger('click');
     await flushPromises();
     expect(wrapper.text()).toContain('尚未保存');
@@ -767,7 +820,10 @@ describe("VB-CABLE first-launch guidance", () => {
 
     expect(mocks.selectAudioEndpoint).not.toHaveBeenCalled();
     expect(wrapper.find('.endpoint-list').exists()).toBe(false);
-    expect(wrapper.get('#audio-output-target').text()).toContain("扬声器 (Realtek Audio)");
+    await expandAudioDiagnostics(wrapper);
+    expect(wrapper.find('.endpoint-list').exists()).toBe(false);
+    await expandAudioDevices(wrapper);
+    expect(wrapper.get('.endpoint-list').text()).toContain("扬声器 (Realtek Audio)");
     const advanced = wrapper.get('details.audio-advanced');
     (advanced.element as HTMLDetailsElement).open = true;
     await advanced.trigger('toggle');
@@ -815,6 +871,7 @@ describe("VB-CABLE first-launch guidance", () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } }); await flushPromises();
     (wrapper.get('.audio-advanced').element as HTMLDetailsElement).open = true;
     await wrapper.get('.audio-advanced').trigger('toggle'); await flushPromises();
+    await expandAudioDevices(wrapper);
     const retry = wrapper.get('.endpoint-list button');
     expect(retry.attributes('disabled')).toBeUndefined();
     await retry.trigger('click'); await flushPromises();
