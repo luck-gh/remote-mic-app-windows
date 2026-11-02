@@ -79,23 +79,23 @@ const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
 const READONLY_ICON = "M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3";
 const emit = defineEmits<{ navigate: [page: string] }>();
 
-/** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 640，宽度流式
+/** 画布几何：紧凑高度固定 580，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
  * 与 Mac cardWidth(for:) 同公式；容器不足最小画布 800px 时由 CSS
  * --map-scale 连续缩放兜底（小于最小窗口的恢复态窗口）。 */
 const CANVAS_MIN_WIDTH = 800;
-const CANVAS_HEIGHT = 640;
+const CANVAS_HEIGHT = 580;
 const REMOTE_WIDTH = 202;
 const REMOTE_HEIGHT = 410;
 const CARD_HEIGHT = 72;
 const REMOTE_TOP = (CANVAS_HEIGHT - REMOTE_HEIGHT) / 2;
-const VOICE_CARD_TOP = 8;
-const CARD_ROW_GAP = 16;
+const VOICE_CARD_TOP = 0;
+const CARD_ROW_GAP = 12;
 const ORDINARY_ROWS_TOP = VOICE_CARD_TOP + CARD_HEIGHT + CARD_ROW_GAP;
 
 /** 语音独占顶部一行；普通六行在其下等距排列，卡片均使用同一尺寸。 */
 function rowTarget(row: number): number {
-  const step = (CANVAS_HEIGHT - VOICE_CARD_TOP - ORDINARY_ROWS_TOP - CARD_HEIGHT) / 5;
+  const step = CARD_HEIGHT + CARD_ROW_GAP;
   return (ORDINARY_ROWS_TOP + row * step + CARD_HEIGHT / 2) / CANVAS_HEIGHT;
 }
 
@@ -1179,7 +1179,7 @@ onUnmounted(() => {
     <article class="card capture-support-card"><ComponentSupportPanel /></article>
 
     <div id="global-mapping-panel">
-    <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px`, '--mapping-card-height': `${CARD_HEIGHT}px` }">
+    <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px`, '--mapping-canvas-height': `${CANVAS_HEIGHT}px`, '--mapping-card-height': `${CARD_HEIGHT}px` }">
       <svg
         class="mapping-connections"
         :width="canvasWidth"
@@ -1497,6 +1497,10 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.mapping-canvas {
+  --map-scale: min(1, (100vw - 152px) / 800px, 100vh / var(--mapping-canvas-height));
+  margin-bottom: calc(-1 * var(--mapping-canvas-height) * (1 - var(--map-scale)));
+}
 .capture-support-card { margin-bottom: 16px; }
 .mapping-card { border-width: 2px; padding: 5px 8px; }
 .mapping-card.mapping-readonly { cursor: default; border-color: transparent; outline: none; box-shadow: none; }
@@ -1557,6 +1561,7 @@ onUnmounted(() => {
 .current-template-display select { min-height: 36px; min-width: 0; width: 100%; }
 .save-template-field { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
 .mapping-header {
+  margin-bottom: 0;
   display: grid;
   gap: 10px;
   align-items: start;

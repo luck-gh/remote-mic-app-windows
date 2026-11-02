@@ -748,10 +748,10 @@ describe("buttons mapping page", () => {
     expect(rightCards.map((card) => card.find("strong").text())).toEqual(["右", "确定", "下", "音量+", "音量−", "TV"]);
     expect(wrapper.findAll(".mapping-card")).toHaveLength(13);
     expect(wrapper.find(".voice-card.center").exists()).toBe(true);
-    expect(wrapper.find(".voice-card").attributes("style")).toContain("top: 8px");
-    expect(wrapper.find(".remote-photo").attributes("style")).toContain("top: 115px");
+    expect(Number.parseFloat((wrapper.get('.voice-card').element as HTMLElement).style.top)).toBeLessThanOrEqual(4);
     const canvasStyle = (wrapper.find(".mapping-canvas").element as HTMLElement).style;
     const cardHeight = Number.parseFloat(canvasStyle.getPropertyValue("--mapping-card-height"));
+    expect(Number.parseFloat(canvasStyle.height)).toBeLessThanOrEqual(600);
     const voiceStyle = (wrapper.find(".voice-card").element as HTMLElement).style;
     expect(cardHeight).toBeGreaterThan(0);
     expect(voiceStyle.width).toBe((leftCards[0]!.element as HTMLElement).style.width);
@@ -760,6 +760,7 @@ describe("buttons mapping page", () => {
       expect(leftCards[index]!.attributes("style")).toContain(rightCards[index]!.attributes("style")!.match(/top: [^;]+/)![0]);
       const top = Number.parseFloat((leftCards[index]!.element as HTMLElement).style.top);
       expect(top).toBeGreaterThan(previousBottom);
+      expect(top - previousBottom).toBeLessThanOrEqual(14);
       previousBottom = top + cardHeight;
       expect(previousBottom).toBeLessThan(Number.parseFloat(canvasStyle.height));
       const endpoint = wrapper.findAll(".mapping-connections path")[index]!.attributes("d")!.match(/ ([0-9.]+) ([0-9.]+)$/)!;
