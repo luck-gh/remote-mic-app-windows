@@ -13,7 +13,9 @@
 - 最终release/Vite和真实9资源嵌入验证passed, runtimeSimulation=false; 未签名本地包 `无线麦个人版_1.8.2.12_x64-setup.exe`, SHA-256 `38ebe81783cef720d6d5feeae13ae6a0b13a1b20c3e4fd8f23da526a53178ae2`, 仅位于既有 `target/release/bundle/nsis/`。构建源码基线为检查点 `198c5db2213245f45814a03e653917cbe2792ab3`, 实际内容为待提交双parent工作树, dirty/included指纹 `db1e312d79713fc7ed19066846a98ae99e690e5f753fd1ec989f234891775196`; 不能把检查点单独当作新包完整源码。
 - 正常覆盖安装exit0、cleanup passed、Helper/Gadget与本轮载荷匹配, 八份配置哈希保持(运行统计排除); 安装主程序SHA-256 `f54c8ef565eaf92bd214ad19c0f84d6e0742f5600857c21bb8a93ffd28f1f7b9`。真实Explorer普通用户启动elevated=false, 实际运行指纹匹配; 原生UI确认个人顶栏/当前模板/目录只读刷新、双主卡和默认折叠高级区及八配置保持passed。未执行实际驱动维护、麦克风setter、模板改选、遥控断连或物理语音矩阵。
 
-真实两版交接恢复、冷态/闲置后首键、连续/快速语音及RC001/其他PC继续未验, 不因源码/构建通过标记G1/G2或旧BLE故障完成。过程复用 `target/dev/upstream-integration/`, 当前包与测试必要身份保留至验收收口, 临时暂存脚本收尾回收; 不推送或发布。
+- 用户随后确认同一1.8.2.12安装版的遥控Menu、返回、TV及连续两次按住语音后松开均正常, 本机基本按键/语音复验passed。源码已形成双parent本地提交 `c8ca2518ea5b056c9f4f6d1bc39943138368f3d7`, 父提交为上述检查点及完整上游输入; 提交后按实际构建使用的Windows PowerShell复算代码指纹仍与安装包相同, 未推送。
+
+真实两版交接恢复、冷态/闲置后首键、更多连续/快速语音边界及RC001/其他PC继续未验, 不因本次基本功能通过标记G1/G2或旧BLE故障完成。过程复用 `target/dev/upstream-integration/`, 当前包与测试必要身份保留至验收收口, 临时暂存脚本已回收; 不推送或发布。
 
 ## 2026-11-02 按键示意区紧凑布局
 
