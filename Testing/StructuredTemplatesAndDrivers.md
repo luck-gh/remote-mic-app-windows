@@ -509,3 +509,11 @@ Menu 不读取区域配置：single 固定打开程序列表、double 固定 Dis
 未覆盖: RC001/RC003 新候选真实按键与语音、冷态首用、完整 G1/G2、双版本资源交接、关机取消和第三方 MCP 连接均为 deferred；原 G1 failed 与 G2 缺口保持。上游“持键来源一致性”不是选定遥控器身份核验。
 
 补充: Rust workspace check、runtime-simulation check、fmt passed；可选组件各 1 passed。Helper 真实 release 自检原有中文措辞断言曾误报端口拒绝失败, 系统实际返回 10048 且有 --port 操作提示；改核固定系统码与操作参数后, 独立日志读回全部自检 passed。没有改变端口绑定行为或产品超时。
+
+最终交付与部署边界:
+
+- 源码融合本地提交 `290bd9c3ed2f4809c2e9d1cd49e485d8070d57aa`, 上游 `8a5ed9953348dc2bc02c38ab5a9a9935be7a642c` 已为祖先。未推送、发布或重写历史；三份原有维护文档改动保持且未纳入提交。
+- 最终生产构建、真实 NSIS 打包、八个前端嵌入资源与仿真隔离检查 passed。五项实际载荷及许可与 staging 回执一致。公开版本 `1.9.0.13`, 前三段对应本轮上游 `1.9.0`；内部 `1.9.0+13` 仅用于 Tauri 格式适配。
+- 本地未签名测试包 `target/release/bundle/nsis/无线麦个人版_1.9.0.13_x64-setup.exe`, SHA-256 `f39fa12f3a9d89a5ecbb4db7afcc547e119721371b72370f69c2d61f722cb348`。构建基线为上述源码提交, sourceState=dirty/sourceCommit=null（原维护文档未提交）, fingerprint=`cd8b8e34134be3519e287c755a5f0bb8b3f871751d6ba4c7074bbe73c56cd52b`, local/included。
+- 用户确认全部松开后, 通过现有事件正常退出旧版, 进程退出和旧 Helper 的新停止回执 status=passed 已观察。旧 WUDFHost 仍存活, 本轮 Agent 新代次无法据此证明安全加载；不借自动强杀/PnP 重建换代, 覆盖安装 deferred, 实际未启动新包安装器。旧安装版 `1.8.2.12` 已由 Explorer 恢复, TokenElevation=false、窗口可响应；这不是新候选硬件或加载通过。
+- 保留该唯一交付包及包 metadata, 用于后续安全加载和本机验收；临时脚本回收, 独有失败日志按原问题保留。普通测试夹具位于忽略的开发目录；含 junction 的极小夹具保留作为安全边界回归对象, 本轮未扩展到链接对象操作。
