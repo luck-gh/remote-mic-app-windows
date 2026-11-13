@@ -209,6 +209,12 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(sendInput.submittedEvents === 4, "Ctrl+C 仿真没有生成四个按下/释放事件");
   steps.push("映射保存、热加载和 SendInput 记录器通过真实 Tauri IPC");
 
+  mark("apps_page");
+  await openPage("APP 适配");
+  await waitFor(() => document.querySelector(".apps-page"), "APP 适配页面加载");
+  assert(document.body.textContent?.includes("输入框聚焦与翻页滚动按 APP 生效") === true, "APP 适配页缺少作用域说明");
+  steps.push("APP 适配页通过真实 IPC 加载公共应用聚焦与翻页设置");
+
   mark("templates_page");
   await openPage("模板");
   await waitFor(
@@ -255,7 +261,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   steps.push("按键页显示真实接管入口，连接页保留配对与组件维护；未启动提权Helper或官方向导");
 
   mark("permissions_page");
-  await openPage("权限");
+  await openPage("设置");
   // 诊断摘要 2026-10-01 从关于页迁回权限页（用户指定）：状态与取证入口同页，
   // 用户看到某一项不对时不必跳页。
   await clickButton("生成摘要");
@@ -310,7 +316,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     document.querySelectorAll<HTMLElement>(".settings-section .section-title"),
   ).map((element) => element.textContent?.trim());
   assert(
-    sectionTitles.join(" / ") === "通用 / 首次设置",
+    sectionTitles.join(" / ") === "权限 / 通用 / 首次设置 / 诊断与日志",
     `设置页分组标题异常：${sectionTitles.join(" / ")}`,
   );
   const wizardEntry = Array.from(
@@ -397,7 +403,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   );
   assert(restoredGainSlider.value === "12", "增益没有从持久化设置恢复");
   steps.push("重新进入连接页后增益从持久化设置恢复为 12 dB");
-  steps.push("七个侧栏页面均在 Windows WebView 中完成导航和渲染");
+  steps.push("个人侧栏页面均在 Windows WebView 中完成导航和渲染");
 
   mark("voice_session");
   const voice = await invoke<PlatformSnapshot>("run_runtime_simulation_voice_session");

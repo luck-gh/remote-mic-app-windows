@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, toRef, watch } from "vue";
 import {
   deleteAllTranscripts,
   deleteTranscript,
@@ -13,7 +13,6 @@ import {
   subscribeTranscriptCaptured,
   subscribeTranscriptRecordingFinished,
   type TranscriptApplicationSummary,
-  type TranscriptHistorySnapshot,
   type TranscriptRecordView,
   type TranscriptRecordingView,
 } from "../lib/bridge";
@@ -30,6 +29,9 @@ import {
   visibleTranscripts,
 } from "./reflections-view";
 import { t } from "../lib/i18n";
+import { effectiveLanguage } from "../lib/language-state";
+import { reflectionsViewSession } from "./reflections-view-session";
+import ReflectionsAgentAccess from "./ReflectionsAgentAccess.vue";
 
 const UNKNOWN_APPLICATION_KEY = "__unknown__";
 
@@ -45,16 +47,21 @@ interface RecordingDayGroup {
   recordings: TranscriptRecordingView[];
 }
 
-const snapshot = ref<TranscriptHistorySnapshot | null>(null);
-const loading = ref(true);
+// 快照挂在模块级会话上：切走再回来时先用上一次的内容同步渲染（不闪加载态），
+// loadHistory 仍然照常执行，新记录在后台静默刷新进来。
+const snapshot = toRef(reflectionsViewSession, "historySnapshot");
+const loading = ref(reflectionsViewSession.historySnapshot === null);
 const loadingCardVisible = ref(false);
 const loadError = ref("");
 const operationError = ref("");
 const busy = ref(false);
 const deleting = ref(false);
-const selectedApplicationKey = ref<string | null>(null);
-const applicationSwitcherExpanded = ref(false);
-const expandedDayKeys = ref<Set<string>>(new Set());
+// 浏览状态放在模块级：切换侧边栏会卸载本页，组件内 ref 会连同用户的选择一起销毁。
+const selectedApplicationKey = toRef(reflectionsViewSession, "selectedApplicationKey");
+const applicationSwitcherExpanded = toRef(reflectionsViewSession, "applicationSwitcherExpanded");
+const pageRoot = ref<HTMLElement | null>(null);
+const expandedDayKeys = toRef(reflectionsViewSession, "expandedDayKeys");
+const dayExpansionSettled = toRef(reflectionsViewSession, "dayExpansionSettled");
 const copiedRecordId = ref<string | null>(null);
 const deleteRequest = ref<DeleteRequest | null>(null);
 const deleteDialog = ref<HTMLDialogElement | null>(null);
@@ -151,7 +158,7 @@ const selectedCountLabel = computed(() =>
 );
 const privacyText = computed(
   () =>
-    `${t("文字和原始录音仅在对应开关开启时保存在本机；不保存输入框全文、窗口标题、文档名或网址。")}\n${t("删除内容会移到回收站，可手动恢复。")}`,
+    `${t("文字和原始录音仅在对应开关开启时保存在本机；不保存输入框全文、窗口标题、文档名或网址。")}${t("删除内容会移到回收站，可手动恢复。")}`,
 );
 const dialogTitle = computed(() => {
   switch (deleteRequest.value?.kind) {
@@ -235,11 +242,27 @@ function normalizeExpandedDays(): void {
     ...dayGroups.value.map((group) => group.key),
     ...recordingDayGroups.value.map((group) => group.key),
   ]);
+  // 没有任何分组（还没读到数据 / 记录为空）时不做任何事，尤其不能把 settled
+  // 置真：空数据时的空集合是「还没展开过」，不是「用户折叠了全部」——把它标成
+  // 已定过，第一批记录到来就不会自动展开，页面看起来像一直在刷新。
+  if (valid.size === 0) {
+    return;
+  }
+  const hadExpanded = expandedDayKeys.value.size > 0;
   const next = new Set([...expandedDayKeys.value].filter((key) => valid.has(key)));
-  if (next.size === 0) {
+  // 只有「还没定过」（首次进入、刚切换应用）才默认展开最新一天。否则用户折叠全部
+  // 日期后留下的空集合会被当成"还没展开过"而重新展开，跨页面切换就丢状态。
+  // 已展开的那天因记录被删掉而消失（hadExpanded 但过滤后为空）时仍回落到最新一天。
+  if (!dayExpansionSettled.value || (hadExpanded && next.size === 0)) {
     for (const key of newestExpandableDayKeys()) next.add(key);
   }
   expandedDayKeys.value = next;
+  dayExpansionSettled.value = true;
+}
+
+function resetDayExpansion(): void {
+  expandedDayKeys.value = new Set();
+  dayExpansionSettled.value = false;
 }
 
 async function loadHistory(): Promise<void> {
@@ -398,7 +421,7 @@ function exportRecordingAsset(recording: TranscriptRecordingView): Promise<void>
 
 function selectApplication(key: string | null): void {
   selectedApplicationKey.value = key;
-  expandedDayKeys.value = new Set();
+  resetDayExpansion();
   normalizeExpandedDays();
 }
 
@@ -478,7 +501,7 @@ async function confirmDelete(): Promise<void> {
 }
 
 watch(selectedApplicationKey, () => {
-  expandedDayKeys.value = new Set();
+  resetDayExpansion();
 });
 
 watch(dayGroups, () => {
@@ -490,6 +513,14 @@ watch(recordingDayGroups, () => {
 });
 
 onMounted(() => {
+  void nextTick().then(() => {
+    // 切走时页面被卸载，.content 的高度塌下去、scrollTop 被钳回 0；重挂载后
+    // 恢复到离开时的位置。快照缓存让首帧就有完整高度，恢复的落点是准的。
+    const container = scrollContainer();
+    if (container && reflectionsViewSession.scrollTop > 0) {
+      container.scrollTop = reflectionsViewSession.scrollTop;
+    }
+  });
   void loadHistory();
   void subscribeTranscriptCaptured(() => {
     if (!disposed) void loadHistory();
@@ -512,6 +543,23 @@ onMounted(() => {
   }, 60_000);
 });
 
+/** 页面挂在 App 的 `<main class="content">` 里，滚动发生在容器上而不是页面内。 */
+function scrollContainer(): HTMLElement | null {
+  return (
+    (pageRoot.value?.closest(".content") as HTMLElement | null) ??
+    document.querySelector<HTMLElement>(".content")
+  );
+}
+
+onBeforeUnmount(() => {
+  // onUnmounted 时子树已被移除，.content 高度塌陷、scrollTop 被钳回 0——
+  // 必须在卸载前读。
+  const container = scrollContainer();
+  if (container) {
+    reflectionsViewSession.scrollTop = container.scrollTop;
+  }
+});
+
 onUnmounted(() => {
   disposed = true;
   stopPlayback();
@@ -525,13 +573,13 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="reflections-page">
+  <section ref="pageRoot" class="reflections-page">
     <header class="page-header reflections-header">
-      <div class="reflections-title">
-        <h1>{{ t("回眸") }}</h1>
-        <p class="privacy-note">{{ privacyText }}</p>
-      </div>
-      <div class="record-toggles" :class="{ settled: togglesSettled }">
+      <div class="reflections-heading">
+        <div class="reflections-title">
+          <h1>{{ t("回眸") }}</h1>
+        </div>
+        <div class="record-toggles" :class="{ settled: togglesSettled }">
         <label class="toggle-row record-toggle">
           <span>{{ t("记录回眸") }}</span>
           <input
@@ -556,7 +604,12 @@ onUnmounted(() => {
             @change="toggleAudioEnabled"
           />
         </label>
+        </div>
       </div>
+      <p
+        class="privacy-note"
+        :class="{ 'privacy-note-nowrap': effectiveLanguage === 'zh-Hans' }"
+      >{{ privacyText }}</p>
     </header>
 
     <p v-if="loadError" class="page-error" role="alert">
@@ -927,13 +980,16 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <footer class="history-footer">
-        <p>{{ t("把语音实际写入目标输入框的文字和原始录音保存在本机，并按应用和日期整理。") }}</p>
-        <button class="danger-link" type="button" @click="openDelete({ kind: 'all' })">
-          {{ t("全部删除") }}
-        </button>
-      </footer>
     </template>
+
+    <ReflectionsAgentAccess />
+
+    <footer v-if="hasRecords" class="history-footer">
+      <p>{{ t("把语音实际写入目标输入框的文字和原始录音保存在本机，并按应用和日期整理。") }}</p>
+      <button class="danger-link" type="button" @click="openDelete({ kind: 'all' })">
+        {{ t("全部删除") }}
+      </button>
+    </footer>
 
     <dialog
       ref="deleteDialog"
@@ -957,13 +1013,20 @@ onUnmounted(() => {
 
 <style scoped>
 .reflections-page {
-  min-height: calc(100vh - 48px);
+  min-height: 100%;
   display: flex;
   flex-direction: column;
 }
 .reflections-header {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.reflections-heading {
+  display: flex;
   align-items: center;
   gap: 14px;
+  min-width: 0;
 }
 .reflections-title {
   display: flex;
@@ -977,13 +1040,16 @@ onUnmounted(() => {
   margin: 0;
 }
 .privacy-note {
-  max-width: 566px;
+  max-width: none;
   margin: 0;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 11.5px;
   line-height: 1.4;
   letter-spacing: 0.01em;
-  white-space: pre-line;
+  white-space: normal;
+}
+.privacy-note-nowrap {
+  white-space: nowrap;
 }
 .record-toggles {
   display: flex;
@@ -1040,8 +1106,8 @@ onUnmounted(() => {
   padding: 2px 4px 0;
 }
 .history-summary-copy {
-  /* 页头 h1 有全局 14px 左内边距；这里补上父级 4px 之外的 10px，保持「回眸」与「全部记录」左对齐。 */
-  padding-left: 10px;
+  /* 页头已去掉额外左内边距；这里不再补偏移，保持「回眸」与「全部记录」左对齐。 */
+  padding-left: 0;
 }
 .history-summary-copy h2 {
   margin: 0;
@@ -1083,10 +1149,10 @@ onUnmounted(() => {
   color: var(--accent-dark);
 }
 .danger-link {
-  color: var(--danger-text, var(--error-text));
+  color: var(--delete-text);
 }
 .danger-link:hover {
-  color: var(--danger-hover, var(--error-text));
+  color: var(--delete-text-hover);
 }
 .chevron {
   width: 14px;
@@ -1095,6 +1161,13 @@ onUnmounted(() => {
 }
 .chevron.up {
   transform: rotate(180deg);
+}
+/* 回眸页卡片与设置页共用同一层材料：浅/深色都直接使用主题 --card，
+   不再在深色下保留浅色渐变或硬编码白底。 */
+.card {
+  background: var(--card);
+  border-color: var(--border);
+  box-shadow: 0 8px 30px var(--shadow-card);
 }
 .app-switcher {
   padding: 12px 14px;
@@ -1114,11 +1187,13 @@ onUnmounted(() => {
 }
 .app-chip {
   min-width: 0;
-  height: 48px;
+  min-height: 48px;
+  height: auto;
   display: flex;
   align-items: center;
   gap: 9px;
-  flex: 0 0 auto;
+  /* 名称过长时让 chip 收缩并换行，而不是把文字裁成省略号（2026-11-06 用户报告）。 */
+  flex: 0 1 auto;
   padding: 7px 9px;
   border: 0;
   border-radius: 10px;
@@ -1135,10 +1210,14 @@ onUnmounted(() => {
   background: var(--accent-surface);
 }
 .app-chip-all {
-  width: 156px;
+  width: auto;
+  min-width: 156px;
 }
 .app-chip-app {
-  width: 148px;
+  width: auto;
+  min-width: 120px;
+  /* 足够容纳「腾讯电脑管家截图工具」这类长产品名；窗口变窄时由 flex 收缩并换行。 */
+  max-width: 190px;
 }
 .app-switcher-grid .app-chip {
   width: auto;
@@ -1200,9 +1279,9 @@ onUnmounted(() => {
   gap: 2px;
 }
 .app-chip-label strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* 应用名必须完整显示：允许换行，不做省略号截断（2026-11-06 用户截图报告）。 */
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-size: 13px;
   font-weight: 600;
   line-height: 1.15;
@@ -1333,7 +1412,7 @@ onUnmounted(() => {
 .transcript-row {
   position: relative;
   display: grid;
-  grid-template-columns: 54px 126px minmax(0, 1fr) auto;
+  grid-template-columns: 54px 164px minmax(0, 1fr) auto;
   align-items: start;
   gap: 12px;
   padding: 9px 0;
@@ -1369,9 +1448,8 @@ onUnmounted(() => {
 }
 .row-app-name {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1.35;
@@ -1412,8 +1490,11 @@ onUnmounted(() => {
   color: var(--text-primary);
   background: var(--surface-subtle);
 }
+.icon-button.danger {
+  color: var(--delete-text);
+}
 .icon-button.danger:hover {
-  color: var(--danger-text, var(--error-text));
+  color: var(--delete-text-hover);
   background: var(--error-surface);
 }
 .icon-button svg {
@@ -1498,20 +1579,19 @@ onUnmounted(() => {
 .danger-button {
   min-height: 30px;
   padding: 5px 12px;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: 8px;
-  color: #fff;
-  background: var(--danger, #b3261e);
+  color: var(--delete-text);
+  background: var(--delete-surface);
   cursor: pointer;
   font-size: 13.5px;
+  font-weight: 600;
 }
 .danger-button:hover {
-  background: var(--danger-hover, #8c1d18);
+  color: var(--delete-text-hover);
+  background: color-mix(in srgb, var(--delete-text) 16%, transparent);
 }
 @media (max-width: 1000px) {
-  .privacy-note {
-    max-width: 430px;
-  }
   .app-switcher-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

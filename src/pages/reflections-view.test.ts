@@ -70,6 +70,32 @@ describe("reflections view helpers", () => {
     expect(displayApplicationName("Weixin")).toBe("WeChat");
   });
 
+  it("shows the Tencent PC Manager screenshot tool by its product name", () => {
+    expect(displayApplicationName("QMCapture64")).toBe("腾讯电脑管家截图工具");
+    expect(displayApplicationName("腾讯电脑管家截图工具")).toBe(
+      "腾讯电脑管家截图工具",
+    );
+    effectiveLanguage.value = "en";
+    expect(displayApplicationName("QMCapture64")).toBe(
+      "Tencent PC Manager Screenshot",
+    );
+    expect(displayApplicationName("腾讯电脑管家截图工具")).toBe(
+      "Tencent PC Manager Screenshot",
+    );
+  });
+
+  it("shows legacy file names as product names", () => {
+    expect(displayApplicationName("chrome")).toBe("Chrome 浏览器");
+    expect(displayApplicationName("Chrome")).toBe("Chrome 浏览器");
+    expect(displayApplicationName("Chrome 浏览器")).toBe("Chrome 浏览器");
+    expect(displayApplicationName("notepad")).toBe("记事本");
+    expect(displayApplicationName("记事本")).toBe("记事本");
+    effectiveLanguage.value = "en";
+    expect(displayApplicationName("chrome")).toBe("Chrome");
+    expect(displayApplicationName("notepad")).toBe("Notepad");
+    expect(displayApplicationName("记事本")).toBe("Notepad");
+  });
+
   it("formats dates and times without depending on the current locale", () => {
     expect(formatDayLabel("2026-10-25")).toBe("2026年10月25日");
     expect(formatDayLabel("not-a-date")).toBe("not-a-date");

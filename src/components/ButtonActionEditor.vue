@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
-import RegisteredAppsDialog from "./RegisteredAppsDialog.vue";
+import RegisteredAppsBatchDialog from "./RegisteredAppsBatchDialog.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import {
   actionSummary,
@@ -20,6 +20,7 @@ import {
   learnFocusTarget, learnFocusPoint, testAppFocus,
   type AppFocusProfile, type FocusStrategy,
 } from "../lib/bridge";
+import type { NavigationRequest } from "../navigation";
 import { settingsComponent as commonPhraseSettingsComponent } from "../private/windows-common-phrases";
 
 const props = defineProps<{
@@ -36,6 +37,7 @@ const emit = defineEmits<{
   update: [action: ButtonAction];
   status: [message: string];
   applications: [apps: AppLibraryEntry[]];
+  navigate: [request: NavigationRequest];
   focusProfile: [target: string, profile: AppFocusProfile];
 }>();
 
@@ -193,9 +195,14 @@ const groups: Array<{ label: string; items: Array<{ label: string; keys: KeyCode
 ];
 
 function selected(keys: KeyCode[]): boolean {
+  if (action.value.type === "app_switcher") return keys.join("+") === "alt+tab";
   return action.value.type === "shortcut" && action.value.chord.keys.join("+") === keys.join("+");
 }
-function apply(next: ButtonAction): void { emit("update", next); }
+function apply(next: ButtonAction): void {
+  if (!props.shortcutsOnly && next.type === "shortcut" && next.chord.keys.join("+") === "alt+tab") {
+    emit("update", { type: "app_switcher" });
+  } else emit("update", next);
+}
 async function addCustomApp(): Promise<void> {
   const pick = await pickCustomApp();
   if (pick) apply({ type: "open_app", target: pick.path });
@@ -519,6 +526,12 @@ onUnmounted(() => {
 
         <section v-if="!shortcutsOnly" class="action-section">
           <h4 class="action-section-title">鼠标滚轮</h4>
+          <div v-if="!shortcutsOnly" class="preset-grid">
+            <button class="chip" type="button" @click="apply({ type: 'page_up' })">向上翻页</button>
+            <button class="chip" type="button" @click="apply({ type: 'page_down' })">向下翻页</button>
+            <button class="chip" type="button" @click="apply({ type: 'scroll_to_top' })">滚到顶部</button>
+            <button class="chip" type="button" @click="apply({ type: 'scroll_to_bottom' })">滚到底部</button>
+          </div>
           <div class="preset-grid">
             <button v-for="direction in (['up', 'down'] as const)" :key="direction" class="chip"
               :class="{ selected: isActiveScroll(direction) }" type="button" title="在鼠标当前位置滚动"
@@ -605,6 +618,7 @@ onUnmounted(() => {
               :class="{ selected: (action.type === 'open_app' ? action.target : null) === app.path }"
               :title="app.name" @click="apply({ type: 'open_app', target: app.path })">{{ app.name }}</button>
           </div>
+          <button v-if="focusTarget" type="button" class="link-button" @click="emit('navigate', { page: 'apps', params: { appTarget: focusTarget } })">去 APP 适配配置聚焦和翻页</button>
           <div v-if="focusTarget" class="app-focus-editor">
             <label>打开应用后
               <select aria-label="应用聚焦方式" :value="focusStrategy" :disabled="busy || learningFocus || capturingShortcut || captureStarting" @change="changeFocusStrategy">
@@ -684,7 +698,7 @@ onUnmounted(() => {
         </section>
       </div>
 
-    <RegisteredAppsDialog v-if="appPickerOpen" :known-apps="mappings.applications ?? []" :saving="false" :save-error="null" @close="appPickerOpen = false" @add="addScannedApps" />
+    <RegisteredAppsBatchDialog v-if="appPickerOpen" :known-apps="mappings.applications ?? []" :saving="false" :save-error="null" @close="appPickerOpen = false" @add="addScannedApps" />
   </div>
 </template>
 

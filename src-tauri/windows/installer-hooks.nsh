@@ -49,6 +49,8 @@ Var SayAllRestoreDesktopShortcut
     StrCpy $SayAllInstallStage gadget
   !else if "${_name}" == "sayall-helper.exe"
     StrCpy $SayAllInstallStage helper
+  !else if "${_name}" == "sayall-mcp.exe"
+    StrCpy $SayAllInstallStage mcp
   !else if "${_name}" == "sayall-helper-arm64.exe"
     StrCpy $SayAllInstallStage helper_arm64
   !else if "${_name}" == "frida-gadget-arm64.dll"
@@ -429,16 +431,43 @@ Var SayAllRestoreDesktopShortcut
 
 !macroend
 
+; External AI clients can keep MCP mapped after the main app has exited.
+!macro SayAllVerifyPayloadAccess _directory
+  InitPluginsDir
+  StrCpy $SayAllInstallStage payload_access_verifier
+  ClearErrors
+  File /oname=$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1 "${SAYALL_RETIRED_RECYCLER}"
+  !insertmacro SayAllRequireWriteSuccess payload_access_verifier
+  StrCpy $SayAllInstallStage payload_access
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\SayAllRecycleRetiredFiles.ps1" -InstallDirectory "${_directory}" -CheckProductAccess'
+  Pop $R8
+  Pop $R9
+  DetailPrint "$R9"
+  ${If} $R8 != 0
+    !insertmacro SayAllLogInstallResult a blocked payload_access
+    SetErrorLevel 1639
+    ${IfNot} ${Silent}
+      MessageBox MB_ICONINFORMATION|MB_OK "产品文件仍被占用或当前权限无法修改，本次操作尚未更改产品文件。请先在 AI 工具中断开本地 Agent 连接，再重试。$\r$\nProduct files are in use or cannot be modified. No product files have been changed. Disconnect the local Agent connection in your AI tool and retry."
+    ${EndIf}
+    Abort "Product payload access is blocked. No product files have been changed."
+  ${EndIf}
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro SayAllValidateUpgrade
   ; 版本校验通过后才请正在运行的实例优雅退出：升级路径的关键一步。
   !insertmacro SayAllRequestGracefulExit install
+  !insertmacro SayAllVerifyPayloadAccess "$INSTDIR"
+  ${If} $SayAllReinstall = 1
+    !insertmacro SayAllVerifyPayloadAccess "$SayAllPreviousInstallDirectory"
+  ${EndIf}
   !insertmacro SayAllVerifyCaptureCleanup
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
   ; 卸载同样不得强杀正在连接的应用（AGENTS.md 同一条规则）。
   !insertmacro SayAllRequestGracefulExit uninstall
+  !insertmacro SayAllVerifyPayloadAccess "$INSTDIR"
   !insertmacro SayAllVerifyCaptureCleanup
 !macroend
 

@@ -42,11 +42,11 @@ describe("私有功能页接入点", () => {
 
     expect(merged.map((item) => item.id)).toEqual([
       "buttons",
+      "apps",
       "templates",
       "macros",
       "connection",
       "reflections",
-      "permissions",
       "settings",
       "profile",
       "membership",
@@ -63,12 +63,12 @@ describe("私有功能页接入点", () => {
     ]);
     expect(merged.map((item) => item.id)).toEqual([
       "buttons",
+      "apps",
       "templates",
       "macros",
       "membership",
       "connection",
       "reflections",
-      "permissions",
       "settings",
       "profile",
     ]);

@@ -15,7 +15,10 @@ import {
   enableRc003Capture,
   endKeyObservation,
   getAudioSnapshot,
+  getCaptureSupport,
   getDiagnosticReport,
+  getImeStatus,
+  getRc003BridgeSnapshot,
   getOnboardingState,
   getOtherVoiceHotkey,
   getRc003TaskStatus,
@@ -44,6 +47,8 @@ import {
   type CaptureInputSnapshot,
   type AudioSnapshot,
   type ButtonEdge,
+  type CaptureSupport,
+  type ImeStatus,
   type KeyChord,
   type KeyCode,
   type PairedRemote,
@@ -54,10 +59,10 @@ import {
   type VoiceInputTool,
   type VokieInstallation,
 } from "../lib/bridge";
+import { t } from "../lib/i18n";
 import { reportOnboardingEvent } from "../onboarding/diagnostics";
 import { onboardingExternalState, registerOnboardingCleanup, trackOnboardingExternalOperation, waitForOnboardingCleanup } from "../onboarding/lifecycle";
-import { t } from "../lib/i18n";
-import { normalizeCaptureHealth } from "../lib/capture-switch";
+import { captureFailureText, normalizeCaptureHealth } from "../lib/capture-switch";
 import { normalizeVoiceAudioHealth, voiceAudioDegradedText } from "../lib/voice-audio-health";
 import {
   CONNECTED_PHASES,
@@ -84,6 +89,7 @@ import {
 import AudioStep from "../onboarding/steps/AudioStep.vue";
 import CompleteStep from "../onboarding/steps/CompleteStep.vue";
 import ControlsStep from "../onboarding/steps/ControlsStep.vue";
+import FullKeyStep from "../onboarding/steps/FullKeyStep.vue";
 import RemoteStep from "../onboarding/steps/RemoteStep.vue";
 import VoiceTestStep from "../onboarding/steps/VoiceTestStep.vue";
 import VoiceToolStep from "../onboarding/steps/VoiceToolStep.vue";
@@ -155,6 +161,10 @@ function heartbeatDetail(): string | undefined {
   switch (step.value) {
     case "remote":
       return `obs_${remoteButtonObserved.value ? 1 : 0}_n${devices.value.length}`;
+    case "full_key":
+      return `capture_${rc003Status.value?.enabled ? 1 : 0}_available_${
+        captureSupport.value?.available === false ? 0 : 1
+      }`;
     case "controls":
       return `n${observedButtons.value.size}`;
     case "voice_test":
@@ -219,6 +229,8 @@ const openingVbCablePage = ref(false);
 
 // ---- 输入工具步骤 ----
 const stagedTool = ref<VoiceInputTool | null>(null);
+/** 本次加载是否已读过输入工具配置（重启后落在⑥步时补读一次，见步骤 watcher）。 */
+let voiceToolStateLoaded = false;
 /** 完成页读到的正式配置（本会话未经过步骤④时的回退来源）。 */
 const configuredTool = ref<VoiceInputTool | null>(null);
 const currentHotkey = ref<KeyChord | null>(null);
@@ -227,6 +239,21 @@ const rc003Status = ref<Rc003TaskStatus | null>(null);
 const captureBusy = ref(false);
 const showCaptureConfirm = ref(false);
 const captureHint = ref("");
+/** 「全按键支持」本机支持情况；null = 尚未读到，按可用处理（与按键页同口径）。 */
+const captureSupport = ref<CaptureSupport | null>(null);
+const captureStatusLoading = ref(false);
+const captureLoadFailed = ref(false);
+/** 迟到回调保护：每次进入第④步都换一代，旧读取结果不得覆盖新状态。 */
+let fullKeyLoadGeneration = 0;
+const CAPTURE_FAILURE_NAME = "全按键支持";
+const captureUnavailable = computed(() => captureSupport.value?.available === false);
+/** 第④步开关旁唯一允许出现的文字：操作失败优先，其次读取失败。 */
+const fullKeyFailure = computed(() => {
+  if (captureLoadFailed.value) {
+    return t("读取全按键支持状态失败；可以重新进入这一步，或先继续。");
+  }
+  return captureFailureText(captureHint.value, CAPTURE_FAILURE_NAME);
+});
 const vokie = ref<VokieInstallation | null>(null);
 const vokieBusy = ref(false);
 const toolMessage = ref("");
@@ -239,7 +266,7 @@ const observedButtons = ref<Map<RemoteButton, number>>(new Map());
 const observedList = computed(() =>
   [...observedButtons.value.entries()].map(([button, count]) => ({ button, count })),
 );
-/** 第⑤步真实验证通过（会话级事实；步骤⑤接入后由 attempt 终态置位）。 */
+/** 第⑥步真实验证通过（会话级事实；步骤⑥接入后由 attempt 终态置位）。 */
 const voiceVerified = ref(false);
 const mappingSuspended = ref(false);
 let mappingSuspensionTarget = false;
@@ -293,11 +320,12 @@ const currentPhase = computed(() => phaseOf(step.value));
 /** 阶段进度条（设计稿 2026-10-05）：只画位置感，不写步数与百分比。 */
 const PROGRESS_PERCENT: Record<OnboardingStep, number> = {
   welcome: 4,
-  remote: 18,
-  audio: 34,
-  voice_tool: 50,
-  voice_test: 67,
-  controls: 84,
+  remote: 16,
+  audio: 30,
+  full_key: 44,
+  voice_tool: 58,
+  voice_test: 72,
+  controls: 87,
   complete: 100,
 };
 const progressPercent = computed(() => PROGRESS_PERCENT[step.value]);
@@ -322,6 +350,7 @@ const sidePanel = computed(() => {
     tool,
     hotkeyReady: tool !== null && (tool !== "other" || otherKeys.value !== null),
     captureEnabled: rc003Status.value?.enabled === true,
+    captureAvailable: captureSupport.value?.available !== false,
     vokieRunning: vokie.value?.running === true,
     voicePhase: voicePhase.value,
     voiceTerminalCode: voiceResult.value?.code ?? null,
@@ -342,6 +371,8 @@ const sidePanel = computed(() => {
 const BLOCK_COPY: Record<OnboardingBlockCode, string> = {
   "remote.not_connected": "先连接遥控器，再继续。",
   "remote.listener_not_ready": "按键监听正在启动，请稍等一下。",
+  "remote.hid_interface_missing":
+    "Windows 还没有识别到这支遥控器的按键通道。打开蓝牙设置重新配对。",
   "remote.button_not_ready": "连接已就绪。按一下遥控器上的普通按键（比如主页键），不要按语音键。",
   "audio.install_required": "这台电脑还没有 VB-CABLE 语音设备，先安装再继续。",
   "audio.not_selected": "选择带「推荐」标记的语音设备，再继续。",
@@ -394,7 +425,7 @@ watch(
 );
 
 // 步骤进入的副作用：遥控器/普通按键步骤订阅按键边沿；语音设备步骤刷新端点；
-// 按键检测步骤（②遥控器 / ⑥普通按键）期间暂挂映射执行（离开恢复）；切换步骤时
+// 按键检测步骤（②遥控器 / ⑦普通按键）期间暂挂映射执行（离开恢复）；切换步骤时
 // 清除误按提示。
 watch(
   step,
@@ -416,6 +447,9 @@ watch(
     if (current === "remote" || current === "controls") {
       void startButtonObservation();
     }
+    if (current === "full_key") {
+      void prepareFullKeyStep();
+    }
     if (current === "audio") {
       void refreshAudioDevices(true);
     }
@@ -423,6 +457,11 @@ watch(
       void prepareVoiceToolStep();
     }
     if (current === "voice_test") {
+      // 重启后直接落在⑥步时补读工具配置（2026-10-13 现场：不补读会显示"你选的输入工具"，
+      // 甚至从没选过工具也能停在⑥步）。只在本次加载还没读过时读一次，避免与⑤步重复。
+      if (!voiceToolStateLoaded) {
+        void prepareVoiceToolStep();
+      }
       void startVoiceTestSession();
     }
     if (observingButtons) {
@@ -1021,6 +1060,58 @@ async function openDownloadPage(): Promise<void> {
   }
 }
 
+// ---- 全按键支持步骤（可选增强）----
+
+/**
+ * 进入第④步时读取开关与本机支持情况。读取失败不阻断继续（这一步是可选增强），
+ * 但要在开关旁说明；迟到结果按代数丢弃，不得覆盖重新进入后的新状态。
+ */
+async function prepareFullKeyStep(): Promise<void> {
+  const generation = ++fullKeyLoadGeneration;
+  captureStatusLoading.value = true;
+  captureLoadFailed.value = false;
+  captureHint.value = "";
+  const started = performance.now();
+  reportStepAction("full_key", "read_capture_state", "unknown");
+  try {
+    const [status, support] = await Promise.all([
+      getRc003TaskStatus(),
+      getCaptureSupport().catch(() => null),
+    ]);
+    if (generation !== fullKeyLoadGeneration || step.value !== "full_key") {
+      // 用户已离开：迟到结果丢弃，但仍要给本次 action 一个终态（begin/end 必须成对）。
+      reportStepAction("full_key", "read_capture_state", "passed", {
+        detail: "stale",
+        elapsedMs: actionElapsed(started),
+      });
+      return;
+    }
+    rc003Status.value = status;
+    if (support) captureSupport.value = support;
+    reportStepAction("full_key", "read_capture_state", "passed", {
+      detail: `enabled_${status.enabled ? 1 : 0}_available_${support?.available === false ? 0 : 1}`,
+      elapsedMs: actionElapsed(started),
+    });
+  } catch (error) {
+    if (generation !== fullKeyLoadGeneration || step.value !== "full_key") {
+      reportStepAction("full_key", "read_capture_state", "failed", {
+        detail: "stale",
+        elapsedMs: actionElapsed(started),
+      });
+      return;
+    }
+    logRawError("read_capture_state", error);
+    captureLoadFailed.value = true;
+    reportStepAction("full_key", "read_capture_state", "failed", {
+      elapsedMs: actionElapsed(started),
+    });
+  } finally {
+    if (generation === fullKeyLoadGeneration) {
+      captureStatusLoading.value = false;
+    }
+  }
+}
+
 // ---- 输入工具步骤 ----
 
 /** 各工具的固定语音键（与连接页同一口径：选卡即自动落该组合）。 */
@@ -1043,7 +1134,7 @@ async function prepareVoiceToolStep(): Promise<void> {
   const generation = stepGeneration;
   toolMessage.value = "";
   const started = performance.now();
-  // 该调用同时服务第④步与第⑤步（重启后直接落在第⑤步时补读配置），故按当前步骤记录。
+  // 该调用同时服务第⑤步与第⑥步（重启后直接落在第⑥步时补读配置），故按当前步骤记录。
   reportStepAction(step.value, "read_tool_state", "unknown");
   try {
     const [tool, hotkey, other, rc003, vokieState] = await Promise.all([
@@ -1054,6 +1145,7 @@ async function prepareVoiceToolStep(): Promise<void> {
       getVokieInstallation().catch(() => null),
     ]);
     if (!isCurrent(generation)) return;
+    voiceToolStateLoaded = true;
     stagedTool.value = tool;
     currentHotkey.value = hotkey;
     otherKeys.value = other;
@@ -1062,6 +1154,13 @@ async function prepareVoiceToolStep(): Promise<void> {
     reportStepAction(step.value, "read_tool_state", "passed", {
       elapsedMs: actionElapsed(started),
     });
+    // ⑥步需要"已经选过工具"才成立（核对卡、输入法检查、语音键都按它来）。重启后若
+    // 直接落在⑥步而磁盘上从未选过工具（2026-10-13 现场：⑥步显示"你选的输入工具"），
+    // 就退回⑤步补选——不能让人在缺前置状态的一页上做验证。
+    if (step.value === "voice_test" && tool === null && !skippedSteps.has("voice_tool")) {
+      reportStepAction("voice_test", "tool_missing_fallback", "failed", { detail: "to_tool_step" });
+      await setStep("voice_tool", "fix");
+    }
   } catch (error) {
     logRawError("read_tool_state", error);
     toolMessage.value = t("读取语音工具设置失败，请重试。");
@@ -1072,7 +1171,7 @@ async function prepareVoiceToolStep(): Promise<void> {
 }
 
 /**
- * 选卡即暂存：落回滚快照 + 应用正式配置与运行时（Rust 事务），保证第⑤步
+ * 选卡即暂存：落回滚快照 + 应用正式配置与运行时（Rust 事务），保证第⑥步
  * 真实验证可用；退出未完成流程 / 重跑向导会回滚（设计稿 §5.4）。
  */
 async function selectTool(tool: VoiceInputTool): Promise<void> {
@@ -1087,6 +1186,7 @@ async function selectTool(tool: VoiceInputTool): Promise<void> {
   const hotkey = hotkeyForTool(tool);
   const previous = stagedTool.value;
   const previousHotkey = currentHotkey.value;
+  voiceToolStateLoaded = true;
   stagedTool.value = tool;
   currentHotkey.value = hotkey;
   toolMessage.value = "";
@@ -1153,6 +1253,16 @@ async function chooseOtherKeys(keys: KeyCode[]): Promise<void> {
   }
 }
 
+/**
+ * 开关操作日志的目标（2026-11-05）：同一个开关现在有两个入口——第④步说明页
+ * 与第⑤步豆包卡片。按发起时所在步骤记录，别把第④步的操作记成 doubao。
+ */
+function captureLogTarget(): { step: OnboardingStep; detail: string } {
+  return step.value === "full_key"
+    ? { step: "full_key", detail: "full_key" }
+    : { step: "voice_tool", detail: "doubao" };
+}
+
 function requestCaptureToggle(): void {
   if (captureBusy.value || onboardingExternalState.value === "pending" || leaving.value || unmounted || navigating.value || completing.value) return;
   // 每次开启都先弹确认（2026-10-03 定稿）；关闭方向直接执行。
@@ -1166,13 +1276,14 @@ function requestCaptureToggle(): void {
 async function applyCaptureToggle(): Promise<void> {
   if (captureBusy.value || onboardingExternalState.value === "pending" || leaving.value || unmounted || navigating.value || completing.value) return;
   captureBusy.value = true;
+  const target = captureLogTarget();
   const wasEnabled = rc003Status.value?.enabled === true;
   reportOnboardingEvent({
     kind: "authorization",
     result: "unknown",
     reason: wasEnabled ? "disable_requested" : "enable_requested",
-    step: "voice_tool",
-    detail: "doubao",
+    step: target.step,
+    detail: target.detail,
   });
   try {
     const next = await trackOnboardingExternalOperation(wasEnabled ? disableRc003Capture() : enableRc003Capture());
@@ -1182,8 +1293,8 @@ async function applyCaptureToggle(): Promise<void> {
         kind: "authorization",
         result: "failed",
         reason: "switch_failed",
-        step: "voice_tool",
-        detail: "doubao",
+        step: target.step,
+        detail: target.detail,
       });
       return;
     }
@@ -1191,8 +1302,8 @@ async function applyCaptureToggle(): Promise<void> {
       kind: "authorization",
       result: "passed",
       reason: next.enabled ? "enabled" : "disabled",
-      step: "voice_tool",
-      detail: "doubao",
+      step: target.step,
+      detail: target.detail,
     });
     if (unmounted || leaving.value) return;
     rc003Status.value = next;
@@ -1202,8 +1313,8 @@ async function applyCaptureToggle(): Promise<void> {
       kind: "authorization",
       result: "failed",
       reason: "switch_error",
-      step: "voice_tool",
-      detail: "doubao",
+      step: target.step,
+      detail: target.detail,
     });
     if (unmounted || leaving.value) return;
     captureHint.value = error instanceof Error ? error.message : String(error);
@@ -1466,6 +1577,11 @@ async function copyDiagnostics(): Promise<void> {
     } catch {
       // 保持页面状态。
     }
+    const [ime, bridge, captureStatus] = await Promise.all([
+      getImeStatus().catch(() => null),
+      getRc003BridgeSnapshot().catch(() => null),
+      getRc003TaskStatus().catch(() => null),
+    ]);
     const recommended = endpoints.filter(endpoint => endpoint.isVirtualCableCandidate);
     const selectedId = capture?.settings.endpointId ?? null;
     const chord =
@@ -1481,6 +1597,20 @@ async function copyDiagnostics(): Promise<void> {
       blocked: !gate.value.ok,
       model: platform?.connection.remoteModel ?? "unknown",
       connectionPhase: platform?.connection.phase ?? "idle",
+      connectionErrorPresent: Boolean(props.runtime?.platform.connection.lastError),
+      remoteButtonObserved: remoteButtonObserved.value,
+      rawInputMatchedDeviceCount: props.runtime?.platform.rawInput.matchedDeviceCount ?? 0,
+      rawInputRawEventCount: props.runtime?.platform.rawInput.rawEventCount ?? 0,
+      rawInputSemanticEdgeCount: props.runtime?.platform.rawInput.semanticEdgeCount ?? 0,
+      rawInputStaleEventCount: props.runtime?.platform.rawInput.staleRemoteEventCount ?? 0,
+      audioErrorPresent: Boolean(props.runtime?.platform.audio.lastError),
+      captureHealth: normalizeCaptureHealth(bridge?.captureHealth),
+      voiceTestPhase: voicePhase.value,
+      voiceTerminalCode: voiceStepTerminalCode.value,
+      voiceLateAccepted: false,
+      imeDetected: ime?.detected === true,
+      imeMatchesExpected: ime?.matchesExpected ?? null,
+      imeInstalledCount: ime?.installed.length ?? 0,
       bleVoiceReady: platform?.bleVoiceReady ?? false,
       rawInputPhase: platform?.rawInput.phase ?? "stopped",
       reconnectAttempt: platform?.connection.reconnectAttempt ?? 0,
@@ -1490,7 +1620,7 @@ async function copyDiagnostics(): Promise<void> {
       queuedSamples: audio?.queuedSamples ?? platform?.audio.queuedSamples ?? 0,
       tool: stagedTool.value ?? configuredTool.value ?? "unset",
       hotkey: hotkeyTokens,
-      captureEnabled: rc003Status.value?.enabled === true,
+      captureEnabled: (captureStatus ?? rc003Status.value)?.enabled === true,
       vokieInstalled: vokie.value?.installed === true,
       vokieRunning: vokie.value?.running === true,
       distinctButtonCount: observedButtons.value.size,
@@ -1521,7 +1651,7 @@ async function copyDiagnostics(): Promise<void> {
   }
 }
 
-// ---- 按住说话验证（第⑤步）----
+// ---- 按住说话验证（第⑥步）----
 
 /** 键位名 → Windows 虚拟键码（观察窗口排除集；与捕获协议同口径）。 */
 const VOICE_KEY_CODE_VKS: Record<string, number> = {
@@ -1565,6 +1695,8 @@ const voicePhase = ref<VoiceAttemptState>("waiting_start");
 const voiceResult = ref<VoiceAttemptTerminal | null>(null);
 const voiceFailureMessage = ref("");
 const voiceFocused = ref(false);
+const imeHint = ref("");
+let imeCheckRunning = false;
 const transcriptObserved = ref(false);
 let voiceTracker: VoiceAttemptTracker | null = null;
 let voicePollTimer: number | null = null;
@@ -1575,7 +1707,8 @@ let voiceAttemptCount = 0;
 let voiceSnapshotErrorLogged = false;
 let lastVoiceFrameToken = "";
 let lastVoiceSnapshot: RuntimeSnapshot | null = null;
-
+const voiceStepResult = computed(() => voiceResult.value?.result ?? null);
+const voiceStepTerminalCode = computed(() => voiceResult.value?.code ?? null);
 const voiceToolLabel = computed(() => {
   switch (stagedTool.value) {
     case "doubao":
@@ -1684,7 +1817,7 @@ async function startVoiceTestSession(): Promise<void> {
   voicePhase.value = "waiting_start";
   voiceSnapshotErrorLogged = false;
   if (!stagedTool.value) {
-    // 应用重启后直接落在第⑤步：读一次正式配置，供核对卡与排除集使用。
+    // 应用重启后直接落在第⑥步：读一次正式配置，供核对卡与排除集使用。
     await prepareVoiceToolStep();
   }
   if (unmounted || serial !== voiceAttemptSerial || step.value !== "voice_test") return;
@@ -1697,6 +1830,7 @@ async function startVoiceTestSession(): Promise<void> {
     snapshot = runtime;
     if (unmounted || serial !== voiceAttemptSerial || step.value !== "voice_test") return;
     // 验证始终绑定正式读回，而不是失败或迟到的选卡草稿。
+    voiceToolStateLoaded = true;
     stagedTool.value = tool;
     currentHotkey.value = hotkey;
   } catch (error) {
@@ -1744,7 +1878,7 @@ function stopVoiceTestSession(): void {
   transcriptObserved.value = false;
   voicePollBusy = false;
   if (hadActiveSession) {
-    // 会话被中止（离开第⑤步/重开）：attempt 无终态就结束，日志记 unknown 便于定位。
+    // 会话被中止（离开第⑥步/重开）：attempt 无终态就结束，日志记 unknown 便于定位。
     reportOnboardingEvent({
       kind: "voice_attempt",
       result: "cancelled",
@@ -1855,6 +1989,7 @@ async function pollVoiceTest(): Promise<void> {
 
 function reportVoiceFrame(snapshot: RuntimeSnapshot, reason: "armed_frame" | "runtime_frame"): void {
   lastVoiceSnapshot = snapshot;
+  if (reason === "runtime_frame" && snapshot.platform.connection.voiceState !== "idle" && voicePhase.value === "waiting_start") void checkVoiceIme("voice_key");
   const frame = voiceAttemptInput(snapshot);
   const pair = isPairedAudioRoute(audioRoute.value, captureInput.value, snapshot.platform.audio);
   const code = `v_${frame.voiceState}_a_${frame.audioPhase}_p${pair ? 1 : 0}_e${frame.audioLastError ? 1 : 0}`;
@@ -1915,7 +2050,44 @@ async function onVoiceInput(): Promise<void> {
 
 function onVoiceBoxFocus(): void {
   voiceFocused.value = true;
+  void checkVoiceIme("focus");
 }
+
+async function checkVoiceIme(trigger: "focus" | "voice_key"): Promise<void> {
+  if (imeCheckRunning) return;
+  imeCheckRunning = true;
+  try {
+    const status = await getImeStatus();
+    if (unmounted || leaving.value || step.value !== "voice_test") return;
+    const expected = status.expected ?? "";
+    const active = status.active ?? "";
+    if (!status.detected || !expected || status.matchesExpected === null) {
+      imeHint.value = "";
+      reportStepAction("voice_test", "ime_check", "unknown", { detail: trigger });
+      return;
+    }
+    if (status.matchesExpected) {
+      imeHint.value = "";
+      reportStepAction("voice_test", "ime_check", "passed", { detail: trigger });
+      return;
+    }
+    imeHint.value = active
+      ? t("输入法还没切到“{expected}”：现在系统里选的是“{active}”。请在桌面右下角把输入法切成“{expected}”，或者回到上一步改选你的工具。", {
+          expected,
+          active,
+        })
+      : t("输入法还没切到“{expected}”。请在桌面右下角把输入法切成“{expected}”，或者回到上一步改选你的工具。", {
+          expected,
+        });
+    reportStepAction("voice_test", "ime_check", "failed", { detail: `${trigger}_mismatch` });
+  } catch {
+    imeHint.value = "";
+    reportStepAction("voice_test", "ime_check", "unknown", { detail: `${trigger}_error` });
+  } finally {
+    imeCheckRunning = false;
+  }
+}
+
 
 function onVoiceBoxBlur(): void {
   voiceFocused.value = false;
@@ -2016,6 +2188,15 @@ async function retryVoiceTest(): Promise<void> {
             @connect="connectDevice"
             @open-bluetooth-settings="openBluetoothSettings"
           />
+          <FullKeyStep
+            v-else-if="step === 'full_key'"
+            :enabled="rc003Status?.enabled === true"
+            :available="!captureUnavailable"
+            :busy="captureBusy"
+            :loading="captureStatusLoading"
+            :failure-text="fullKeyFailure"
+            @toggle="requestCaptureToggle"
+          />
           <AudioStep
             v-else-if="step === 'audio'"
             :endpoints="audioEndpoints"
@@ -2062,6 +2243,8 @@ async function retryVoiceTest(): Promise<void> {
             :failure-message="voiceFailureMessage"
             :focused="voiceFocused"
             :tool-label="voiceToolLabel"
+            :show-ime-checklist="stagedTool === 'wechat' || stagedTool === 'doubao'"
+            :ime-hint="imeHint"
             :microphone-name="captureInput?.settings.endpointName ?? '第③步选择的目标麦克风'"
             :hotkey-text="hotkeyLabel"
             :audio-text="voiceAudioText"
@@ -2145,7 +2328,12 @@ async function retryVoiceTest(): Promise<void> {
 .onboarding-shell {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  /* 高度由窗口壳的 .window-body 分配（顶部还有 32px 自定义标题栏）；
+     根元素自 2026-11-05 起不可滚（见 styles.css 的 html/body 规则），
+     所以向导壳必须撑满剩余高度，让 .onboarding-body / .onboarding-content
+     的内部滚动生效。 */
+  flex: 1 1 auto;
+  min-height: 0;
   box-sizing: border-box;
   background: var(--surface-canvas);
   color: var(--text-primary);
@@ -2822,9 +3010,58 @@ async function retryVoiceTest(): Promise<void> {
   font-size: 16px;
   line-height: 1.5;
 }
-.onboarding-voice-input:focus {
-  outline: 2px solid var(--accent-border);
-  outline-offset: 1px;
+.onboarding-voice-input:focus,
+.onboarding-voice-input:focus-visible {
+  /* 2026-10-14 现场定稿（Andy 选定"统一为细边框"）：⑥步输入框聚焦时不显示焦点环，
+     只保留 1.5px 细边框。
+     起因（2026-10-13 现场两轮）：这个输入框由向导自动聚焦——"第一次进来"（重启后直接落在
+     ⑥步、还没用鼠标）会显示焦点环（先是一圈"断框"样式、后合成一整圈），而"从上一个页面
+     进来"（点过"继续"）被全应用 `body.pointer-nav` 约定抑制、只剩细边框：同一个聚焦状态
+     两种外观。统一：`:focus` 与 `:focus-visible` 都置 none（压过全局
+     `input:focus-visible` 的 2px 焦点环；指针模态下本来就是 none）。
+     取舍说明：本框自动聚焦、步骤文案已引导用户点击，键盘用户不依赖该焦点环；
+     其余控件的全局焦点环约定不变。 */
+  outline: none;
+}
+
+/* ---- 全按键支持页（第④步）---- */
+/* 「建议开启」强调条（2026-11-05）：可选步骤也要让用户一眼看到收益；
+   使用强调色底 + 实心标签，但不做成警告样式（不阻断继续）。 */
+.onboarding-recommend {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  background: var(--accent-surface);
+  color: var(--text-control);
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+.onboarding-recommend-tag {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+/* 开关旁只允许一句状态文案（与 2026-10-10 定稿一致）：失败原因用告警色，
+   已开启用成功色，其余沿用正文的次要色。 */
+.onboarding-card .onboarding-capture-note,
+.onboarding-card .onboarding-capture-failure {
+  margin-top: 12px;
+}
+.onboarding-card .onboarding-capture-ok {
+  color: var(--success-text, #1a7f4b);
+  font-weight: 600;
+}
+.onboarding-card .onboarding-capture-failure {
+  color: var(--error-text, #b3261e);
 }
 
 /* ---- 输入工具页 ---- */
@@ -2835,6 +3072,12 @@ async function retryVoiceTest(): Promise<void> {
   margin-top: 16px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
+}
+/* 第④步的开关是卡片第一项：不画上方分隔线，也不留额外上边距。 */
+.onboarding-switch-row--first {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
 }
 /* 文字与开关：同一行内垂直居中，间距固定（原先 label 是行内布局，靠空格分隔）。 */
 .onboarding-switch {

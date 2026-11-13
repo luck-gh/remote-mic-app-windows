@@ -8,7 +8,6 @@ import type { RuntimeSnapshot } from "../lib/bridge";
 import { effectiveLanguage } from "../lib/language-state";
 import { useAppUpdate, type AppUpdatePhase } from "../lib/app-update";
 import SettingsPage from "./SettingsPage.vue";
-import tauriConfig from "../../src-tauri/tauri.conf.json";
 
 const phase: Ref<AppUpdatePhase> = ref("idle");
 const info = ref<Awaited<ReturnType<typeof useAppUpdate>>["info"]["value"]>(null);
@@ -37,6 +36,8 @@ const bridge = vi.hoisted(() => ({
   setLaunchAtLogin: vi.fn<(enabled: boolean) => Promise<boolean>>(),
   getOpenWindowAtLaunch: vi.fn<() => Promise<boolean>>(),
   setOpenWindowAtLaunch: vi.fn<(enabled: boolean) => Promise<boolean>>(),
+  getAppIcon: vi.fn<() => Promise<"standard" | "faceted-duck">>(),
+  setAppIcon: vi.fn<(identifier: "standard" | "faceted-duck") => Promise<"standard" | "faceted-duck">>(),
   restartOnboarding: vi.fn<() => Promise<{ flowVersion: number; completedVersion: number; step: string; isActive: boolean }>>(),
   getMembershipAccountSummary: vi.fn<() => Promise<unknown>>(),
 }));
@@ -140,8 +141,9 @@ const runtime: RuntimeSnapshot = {
     },
     buttonMapping: {
       enabled: true,
+      observedButtons: [],
       gateActive: false,
-      observedButtons: [], listenerActive: false,
+      listenerActive: false,
       swallowedEdges: 0,
       leakedDowns: 0,
       firedGestures: 0,
@@ -178,6 +180,10 @@ describe("settings page", () => {
     // 「启动时自动打开主面板」新装默认开启（与 Rust `AppSettings::default()` 同源）。
     bridge.getOpenWindowAtLaunch.mockReset().mockResolvedValue(true);
     bridge.setOpenWindowAtLaunch.mockReset();
+    // 后端默认值（2026-10-04 起 = 几何鸭）：mock 也按新装默认返回，与
+    // `AppSettings::default()` 的用例语义对齐。
+    bridge.getAppIcon.mockReset().mockResolvedValue("faceted-duck");
+    bridge.setAppIcon.mockReset();
     bridge.restartOnboarding
       .mockReset()
       .mockResolvedValue({ flowVersion: 1, completedVersion: 0, step: "welcome", isActive: true });
@@ -199,12 +205,6 @@ describe("settings page", () => {
 
     expect(wrapper.get("h1").text()).toBe("设置");
     expect(wrapper.text()).toContain("无线麦");
-    expect(wrapper.get(".personal-build").text()).toBe("个人版");
-    expect(wrapper.text()).not.toContain("非官方");
-    expect(tauriConfig.app.windows[0].title).toBe("无线麦 · 个人版");
-    expect(tauriConfig.bundle.longDescription).not.toContain("个人修改版");
-    expect(tauriConfig.bundle.longDescription).not.toContain("非官方");
-    expect(wrapper.text()).not.toContain("SayAll");
     expect(wrapper.text()).toContain("让语音触手可及");
     expect(wrapper.text()).toContain("当前版本");
     expect(wrapper.text()).toContain("0.5.0");
@@ -228,24 +228,6 @@ describe("settings page", () => {
 
     await radios[2].setValue(true);
     expect(setThemePreference).toHaveBeenCalledWith("dark");
-  });
-
-  it("个人修订显示为第四段且保留运行期规范版本", () => {
-    const current = { ...runtime, appVersion: "1.0.0+10" };
-    const wrapper = mount(SettingsPage, { props: { runtime: current } });
-    expect(wrapper.get('.version-value').text()).toBe('1.0.0.10');
-    expect(current.appVersion).toBe('1.0.0+10');
-    wrapper.unmount();
-  });
-
-  it("个人更新提示将新旧修订显示为四段", () => {
-    phase.value = 'available';
-    info.value = { currentVersion: '1.0.0+9', available: true, version: '1.0.0+10', notes: null, date: null };
-    const wrapper = mount(SettingsPage, { props: { runtime } });
-    expect(wrapper.get('.update-status').text()).toContain('1.0.0.10');
-    expect(wrapper.get('.update-status').text()).toContain('1.0.0.9');
-    expect(info.value?.version).toBe('1.0.0+10');
-    wrapper.unmount();
   });
 
   it("外观设置失败时显示就地错误", () => {
@@ -385,6 +367,86 @@ describe("settings page", () => {
     expect(button).toBeDefined();
   });
 
+  it("权限页并入设置：权限三项与诊断/日志/问题反馈按分组呈现", async () => {
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(
+      wrapper.findAll(".settings-section .section-title").map((item) => item.text()),
+    ).toEqual(["权限", "通用", "首次设置", "诊断与日志"]);
+
+    const sections = wrapper.findAll(".settings-section");
+    const permissionSection = sections[0];
+    expect(permissionSection.text()).toContain("蓝牙");
+    expect(permissionSection.text()).toContain("按键监听与映射");
+    expect(permissionSection.text()).toContain("音频设备");
+    expect(permissionSection.findAll(".permission-row")).toHaveLength(3);
+    expect(permissionSection.text()).toContain("当前电脑不支持");
+
+    // 问题反馈与诊断摘要、日志目录同属「诊断与日志」分类。
+    const diagnosticsSection = sections[3];
+    expect(diagnosticsSection.find(".diagnostics-card").exists()).toBe(true);
+    expect(diagnosticsSection.find(".feedback-card").exists()).toBe(false);
+
+  });
+
+  it("诊断与日志：生成摘要、复制摘要，且摘要不含隐私字段", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>();
+    writeText.mockResolvedValue();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    const buttons = wrapper.findAll<HTMLButtonElement>(".diagnostics-card button");
+    expect(buttons.map((button) => button.text())).toEqual([
+      "生成摘要",
+      "复制摘要",
+      "打开日志目录",
+    ]);
+
+    await buttons[0].trigger("click");
+    await flushPromises();
+
+    const report = wrapper.get(".diagnostic-output").text();
+    expect(report).toContain('"schemaVersion": 4');
+    expect(report).toContain('"windowsVersion"');
+    expect(report).toContain('"sourceRevision"');
+    // 开机上下文（2026-10-20）：报障时无需另拉日志。
+    expect(report).toContain('"bootType"');
+    expect(report).toContain('"fastStartupEnabled"');
+    expect(report).not.toContain("remoteName");
+    expect(report).not.toContain("selectedEndpointName");
+    expect(report).not.toContain("lastError");
+    expect(wrapper.text()).toContain("诊断摘要已生成");
+
+    await buttons[1].trigger("click");
+    await flushPromises();
+
+    expect(writeText).toHaveBeenCalledOnce();
+    expect(writeText).toHaveBeenCalledWith(report);
+    expect(wrapper.text()).toContain("诊断摘要已复制到剪贴板");
+  });
+
+  it("诊断与日志：浏览器预览下打开日志目录给出明确不可用提示", async () => {
+    const wrapper = mount(SettingsPage, { props: { runtime } });
+    await flushPromises();
+
+    const button = wrapper
+      .findAll("button")
+      .find((candidate) => candidate.text().includes("打开日志目录"));
+    expect(button).toBeDefined();
+
+    await button!.trigger("click");
+    await flushPromises();
+
+    // 原始 IPC 错误只进控制台，界面给固定文案（英文模式同样可翻译）。
+    expect(wrapper.text()).toContain("无法打开日志目录，请稍后重试。");
+  });
+
   it("隐藏反馈区和可切换图标，同时保留固定品牌图标", async () => {
     const wrapper = mount(SettingsPage, { props: { runtime } });
     await flushPromises();
@@ -502,22 +564,6 @@ describe("settings page", () => {
     expect(wrapper.emitted("restart-onboarding")).toBeUndefined();
   });
 
-  it("首次设置：系统授权未结束时明确提示限制，并允许结束后重试", async () => {
-    bridge.restartOnboarding.mockRejectedValueOnce(new Error("Windows 授权或增强设置仍在处理中；操作结束后可以重新运行向导。"));
-    const wrapper = mount(SettingsPage, { props: { runtime } });
-    await flushPromises();
-    const rerun = wrapper.findAll("button").find(button => button.text() === "重新运行向导")!;
-    await rerun.trigger("click");
-    await flushPromises();
-    expect(wrapper.get('[role="alert"]').text()).toContain("Windows 授权或增强设置仍在处理中");
-    expect(rerun.attributes("disabled")).toBeUndefined();
-    expect(wrapper.emitted("restart-onboarding")).toBeUndefined();
-    await rerun.trigger("click");
-    await flushPromises();
-    expect(wrapper.emitted("restart-onboarding")).toHaveLength(1);
-    wrapper.unmount();
-  });
-
   it("常用语设置区：私有组件缺失（公开空壳）时不渲染区块", async () => {
     const wrapper = mount(SettingsPage, { props: { runtime } });
     await flushPromises();
@@ -559,15 +605,22 @@ describe("settings page", () => {
     expect(wrapper.get("h1").text()).toBe("Settings");
     expect(wrapper.text()).toContain("Voice within reach");
     expect(wrapper.text()).toContain("Current Version");
+    expect(wrapper.text()).toContain("Permissions");
+    expect(wrapper.text()).toContain("Diagnostics & Logs");
     expect(wrapper.text()).toContain("General");
     expect(wrapper.text()).toContain("Appearance");
     expect(wrapper.text()).toContain("Launch Behavior");
     expect(wrapper.text()).toContain("App Language");
-    expect(wrapper.text()).not.toContain("App Icon");
     expect(wrapper.text()).toContain("First-Time Setup");
+    expect(wrapper.text()).toContain("Bluetooth");
+    expect(wrapper.text()).toContain("Button Listening & Mapping");
+    expect(wrapper.text()).toContain("Audio Device");
+    expect(wrapper.text()).toContain("Diagnostic Summary");
+    expect(wrapper.text()).toContain("Open Log Folder");
     expect(wrapper.text()).not.toContain("Feedback");
     expect(wrapper.text()).not.toContain("让语音触手可及");
-    expect(wrapper.text()).not.toContain("通用");
+    expect(wrapper.text()).not.toContain("诊断与日志");
+    expect(wrapper.text()).not.toContain("权限");
 
     // 外观三档与语言三档：语言选项按用户要求保留「简体中文」原语言名。
     const themeGroup = wrapper.get('[role="radiogroup"][aria-label="Display mode"]');

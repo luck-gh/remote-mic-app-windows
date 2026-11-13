@@ -4,7 +4,8 @@
  * 规范来源：Mac 仓 origin/main `feature/first-run-onboarding/PRODUCT_SPEC.md`
  * 与 Windows 设计稿 `artifacts/design/2026-10-04-onboarding-design.html`：
  * - 步骤顺序按 D1 确认的 Mac 可见顺序（欢迎 → 遥控器 → 语音设备 → 输入工具
- *   → 按住说话验证 → 普通按键体验 → 完成）；
+ *   → 按住说话验证 → 普通按键体验 → 完成）；2026-11-05 在遥控器之后加入
+ *   「全按键支持」说明页（可选增强，不阻断继续；放在语音设备之后、输入工具之前）；
  * - 每一步「能否继续」都由实时能力状态决定（页面访问与点击不是通过条件）；
  * - 阻断一律返回稳定失败码（小写 token），供页面显示与结构化日志使用。
  */
@@ -14,6 +15,7 @@ export type OnboardingStep =
   | "welcome"
   | "remote"
   | "audio"
+  | "full_key"
   | "voice_tool"
   | "voice_test"
   | "controls"
@@ -26,6 +28,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
   "welcome",
   "remote",
   "audio",
+  "full_key",
   "voice_tool",
   "voice_test",
   "controls",
@@ -36,6 +39,7 @@ const PHASES: Record<OnboardingStep, OnboardingPhase> = {
   welcome: "prepare",
   remote: "setup",
   audio: "setup",
+  full_key: "setup",
   voice_tool: "setup",
   voice_test: "try_it",
   controls: "try_it",
@@ -46,6 +50,7 @@ const PHASES: Record<OnboardingStep, OnboardingPhase> = {
 export type OnboardingBlockCode =
   | "remote.not_connected"
   | "remote.listener_not_ready"
+  | "remote.hid_interface_missing"
   | "remote.button_not_ready"
   | "audio.install_required"
   | "audio.not_selected"
@@ -147,6 +152,10 @@ export function evaluateGate(step: OnboardingStep, context: OnboardingContext): 
       return pass();
     case "remote":
       return evaluateRemote(context.remote);
+    case "full_key":
+      // 全按键支持是可选增强：基础语音与普通按键不依赖系统授权。这里只做说明与
+      // 引导，开关状态不参与「继续」判定（ARM64 等不可用场景也必须能走完向导）。
+      return pass();
     case "audio":
       return evaluateAudio(context.audio);
     case "voice_tool":
@@ -172,6 +181,13 @@ function evaluateRemote(remote: OnboardingContext["remote"]): StepGate {
   // 若先查监听器就绪，界面会一直写「按键监听正在启动」并把「继续」锁死。
   if (remote.remoteButtonObserved) {
     return pass();
+  }
+  // 「监听器还在启动」与「监听器在跑、但系统里没有匹配这支遥控器的 HID 接口」
+  // 是两种不同的阻断：前者等一下就好，后者按多少次都不会有按键。2026-11-06 现场
+  // （1.8.0、RC003 已连接、`Raw input: phase=awaiting matched=0 raw_events=0`）
+  // 界面一直写「按键监听正在启动，请稍等一下」，用户没有任何可执行动作。
+  if (remote.rawInputPhase === "awaiting") {
+    return block("remote.hid_interface_missing");
   }
   if (remote.rawInputPhase !== "ready") {
     return block("remote.listener_not_ready");

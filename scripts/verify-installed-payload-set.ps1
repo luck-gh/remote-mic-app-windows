@@ -20,11 +20,12 @@
 $receiptPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'target/dev/bundle-staging/payloads.json'
 $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
 $payloadNames = @($receipt.resources | ForEach-Object { $_.name })
-if ($payloadNames -notcontains 'sayall-helper.exe' -or $payloadNames -notcontains 'frida-gadget.dll') {
+if ($payloadNames -notcontains 'sayall-helper.exe' -or $payloadNames -notcontains 'frida-gadget.dll' -or $payloadNames -notcontains 'sayall-mcp.exe') {
     throw 'Staging receipt is missing required x64 payloads'
 }
 # 只有助手有架构要求；Gadget 的架构由它自己的锁定文件摘要锁定。
 $expectedMachines = @{
+    "sayall-mcp.exe"          = 0x8664
     "sayall-helper.exe"       = 0x8664
     "sayall-helper-arm64.exe" = 0xAA64
 }

@@ -77,9 +77,10 @@ import {
   type ShortcutCaptureEdge,
 } from "../lib/bridge";
 
-const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+import type { NavigationRequest } from "../navigation";
+const props = defineProps<{ runtime: RuntimeSnapshot | null; initialEditor?: { button: RemoteButton; trigger: ButtonTrigger; editingSource?: "common" } | null }>();
 const READONLY_ICON = "M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5zM12 14v3";
-const emit = defineEmits<{ navigate: [page: string] }>();
+const emit = defineEmits<{ navigate: [page: string | NavigationRequest] }>();
 
 /** 画布几何：紧凑高度固定 580，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
@@ -331,6 +332,8 @@ const menuModeError = ref<string | null>(null);
 let menuConfigurationRevision = 0;
 const templateCatalog = ref<TemplateCatalogEntry[]>([]);
 const editingSource = ref<EditingSource>("common");
+// 导航只选择编辑目标, 不改变实际应用中的模板。
+const navigationEditingSource = ref<EditingSource | null>(props.initialEditor?.editingSource ?? null);
 const retainedDrafts = ref(new Map<EditingSource, { mappings: ButtonMappings; saved: ButtonMappings }>());
 let discardedSource: EditingSource | null = null;
 /** 已安装的预设应用（打开应用动作可选列表）。 */
@@ -576,6 +579,7 @@ async function selectActiveTemplate(event: Event): Promise<void> {
     }
   }
   await currentTemplate.activate(requested);
+  if (!currentTemplate.error.value && currentTemplate.templateId.value === requested) navigationEditingSource.value = null;
   await nextTick();
   discardedSource = null;
   reportFrontendEvent({ event: "button_mapping_template_switch", phase: "completed", result: currentTemplate.error.value ? "failed" : currentTemplate.templateId.value === requested ? "passed" : "skipped", reason: currentTemplate.error.value ? "engine_rejected" : currentTemplate.templateId.value === requested ? "engine_confirmed" : "superseded" });
@@ -609,9 +613,23 @@ function loadEditingSource(source: EditingSource): boolean {
   return true;
 }
 
-watch([currentTemplate.applied, configuration], () => {
+function openRequestedEditor(request: NonNullable<typeof props.initialEditor>): void {
+  if (!configuration.value) return;
+  const source = request.editingSource ?? (currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`);
+  if (!loadEditingSource(source)) return;
+  selectedButton.value = request.button;
+  editingTarget.value = { button: request.button, trigger: request.trigger };
+  reportFrontendEvent({ event: "button_mapping_editor_target", phase: "completed", result: "passed", reason: request.editingSource ? "navigation_common_binding" : "navigation_applied_template" });
+}
+
+watch(() => props.initialEditor, request => {
+  navigationEditingSource.value = request?.editingSource ?? null;
+  if (request) openRequestedEditor(request);
+});
+
+watch([currentTemplate.applied, configuration, navigationEditingSource], () => {
   if (!currentTemplate.applied.value || !configuration.value) return;
-  const source: EditingSource = currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`;
+  const source: EditingSource = navigationEditingSource.value ?? (currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`);
   if (source === editingSource.value) return;
   if (dirty.value) {
     if (discardedSource !== editingSource.value) {
@@ -723,7 +741,7 @@ const REPEAT_MODIFIER_KEYS = new Set<KeyCode>([
 
 /** 动作是否可连续执行（与 Rust `ButtonAction::allows_repeat` 同源口径）。 */
 function actionAllowsRepeat(action: ButtonAction): boolean {
-  if (action.type === "scroll" || action.type === "mouse_move") return true;
+  if (action.type === "scroll" || action.type === "mouse_move" || action.type === "app_switcher" || action.type === "page_up" || action.type === "page_down") return true;
   if (action.type !== "shortcut") return false;
   return action.chord.keys.length === 1 && !REPEAT_MODIFIER_KEYS.has(action.chord.keys[0]);
 }
@@ -942,7 +960,7 @@ async function persist(message?: string): Promise<boolean> {
   const request = ++saveSequence;
   const source = editingSource.value;
   const payload = cloneMappings(mappings.value);
-  payload.schemaVersion = 2;
+  payload.schemaVersion ??= 5;
   busy.value = true;
   statusMessage.value = null;
   reportFrontendEvent({ event: "button_mapping_editor_save", phase: "started", result: "passed", reason: source === "common" ? "common" : "template" });
@@ -1061,7 +1079,7 @@ async function saveAsTemplate(): Promise<void> {
   const started = performance.now();
   reportFrontendEvent({ event: "button_template_create", phase: "started", result: "passed", reason: editingSource.value === "common" ? "common_draft" : "template_draft" });
   try {
-    const template = await saveButtonMappingTemplate(name, { ...cloneMappings(mappings.value), schemaVersion: 2 });
+    const template = await saveButtonMappingTemplate(name, { ...cloneMappings(mappings.value), schemaVersion: mappings.value.schemaVersion ?? 5 });
     if (configuration.value) {
       configuration.value = {
         ...configuration.value,
@@ -1180,9 +1198,10 @@ onMounted(async () => {
   registerPresetAppNames(presetApps.value);
   configuration.value = loaded;
   templateCatalog.value = catalog;
-  loadEditingSource(currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`);
+  loadEditingSource(navigationEditingSource.value ?? (currentTemplate.templateId.value === null ? "common" : `template:${currentTemplate.templateId.value}`));
   mappingSnapshot.value = snapshot;
   activeButtons.value = new Set(snapshot.observedButtons);
+  if (props.initialEditor) openRequestedEditor(props.initialEditor);
 
   const stopEdges = await subscribeButtonEdges((edge: ButtonEdge) => {
     const next = new Set(activeButtons.value);
@@ -1480,6 +1499,7 @@ onUnmounted(() => {
         </div>
       </div>
       <ButtonActionEditor
+        @navigate="emit('navigate', $event)"
         :key="`${editingSource}:${editingTarget.button}:${editingTarget.trigger}`"
         :shortcuts-only="editingSource !== 'common'"
         :mappings="mappings"

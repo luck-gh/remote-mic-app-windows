@@ -129,7 +129,7 @@ if (process.argv.includes("--check-arm64")) {
   process.exit(0);
 }
 
-console.log("[inputs] 1/4 构建助手（release，x86_64-pc-windows-msvc）");
+console.log("[inputs] 1/5 构建助手（release，x86_64-pc-windows-msvc）");
 execFileSync("cargo", ["build", "--release", "--locked", "--manifest-path", helperManifest], {
   cwd: root,
   env: helperEnv,
@@ -137,7 +137,7 @@ execFileSync("cargo", ["build", "--release", "--locked", "--manifest-path", help
 });
 
 if (arm64Toolchain.ready) {
-  console.log("[inputs] 2/4 构建助手（release，aarch64-pc-windows-msvc）");
+  console.log("[inputs] 2/5 构建助手（release，aarch64-pc-windows-msvc）");
   execFileSync(
     "cargo",
     ["build", "--release", "--locked", "--target", ARM64_RUSTUP_TARGET, "--manifest-path", helperManifest],
@@ -147,8 +147,16 @@ if (arm64Toolchain.ready) {
   reportArm64Unavailable(arm64Toolchain.missing);
 }
 
+// 只读 MCP 服务（回眸「本地 Agent 访问」）与主程序一起发布；只出 x64，
+// ARM64 上由系统仿真运行，协议与数据格式不受架构影响。
+console.log("[inputs] 3/5 构建只读 MCP 服务（release，x86_64-pc-windows-msvc）");
+execFileSync("cargo", ["build", "--release", "--locked", "-p", "sayall-mcp", "--target-dir", path.join(root, "target")], {
+  cwd: root,
+  stdio: "inherit",
+});
+
 console.log(
-  "[inputs] 3/4 按锁文件获取并校验 frida-gadget（" +
+  "[inputs] 4/5 按锁文件获取并校验 frida-gadget（" +
     (arm64Toolchain.ready ? "x86_64 + arm64：--all" : "仅 x86_64：默认，保持向后兼容") +
     "）",
 );
@@ -157,9 +165,10 @@ execFileSync("python", arm64Toolchain.ready ? [fetchScript, "--all"] : [fetchScr
   stdio: "inherit",
 });
 
-console.log("[inputs] 4/4 落地到 src-tauri（本轮载荷及必需许可）");
+console.log("[inputs] 5/5 落地到 src-tauri（本轮载荷及必需许可）");
 const arm64 = arm64Toolchain.ready;
 const pairs = [
+  ["target/release/sayall-mcp.exe", "sayall-mcp.exe"],
   ["hardware/RC003/helper/target/release/sayall-helper.exe", "sayall-helper.exe"],
   ["hardware/RC003/helper/vendor/frida-gadget.dll", "frida-gadget.dll"],
   ["hardware/RC003/helper/vendor/Frida-COPYING.txt", "licenses/Frida-COPYING.txt"],

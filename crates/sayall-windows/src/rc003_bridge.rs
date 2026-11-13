@@ -87,9 +87,8 @@ use serde::Serialize;
 use crate::button_mapping::EngineMessage;
 use crate::raw_input::{button_for_usage, ButtonEdge, ENHANCED_CAPTURE_BUTTON_USAGES};
 
-/// 语音键的 HID 键盘 usage：遥控器语音键同时以键盘 **F5（0x003E）** 上报
-/// （与 key_suppressor 的知识同源）。ATVV 语音会话走 BLE 协议层，不经这个
-/// usage；且它在 Windows 输入流本来就未映射——报告层替换它零损失。
+/// 语音键的 HID 键盘 usage (F5)。产品报告目标始终排除它;
+/// 语音继续由 ATVV + 本地成对 SendInput 管理, 不扩大报告层吞键范围。
 pub const VOICE_KEY_HID_USAGE: u16 = 0x003E;
 
 /// 桥接描述文件名。约定路径见 [`default_bridge_dir`]。

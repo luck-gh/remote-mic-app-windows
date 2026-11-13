@@ -12,9 +12,28 @@ const props = defineProps<{
   hotkeyText: string;
   audioText: string;
   microphoneName: string;
+  /**
+   * 核对项（2026-10-13 现场定稿）：有输入法可切（微信 / 豆包）时三项、"输入法"排第一；
+   * 其余工具（Vokie / 其他）两项——它们不依赖切换输入法。
+   */
+  showImeChecklist: boolean;
+  /** 输入法兜底提示（2026-10-13 现场）：非空时显示一张说明卡，空串不显示。 */
+  imeHint: string;
 }>();
 
-defineEmits<{ input: []; focus: []; blur: []; retry: [] }>();
+const checklist = computed(() => {
+  const items: string[] = [];
+  if (props.showImeChecklist) {
+    items.push(t("输入法切到“{tool}”。", { tool: props.toolLabel }));
+  }
+  items.push(
+    t("麦克风选 {microphone}（在“{tool}”的语音输入设置里）。", { microphone: props.microphoneName, tool: props.toolLabel }),
+  );
+  items.push(t("工具里的语音键和这次设置一致（{hotkey}）。", { hotkey: props.hotkeyText }));
+  return items;
+});
+
+const emit = defineEmits<{ input: []; focus: []; blur: []; retry: [] }>();
 
 const box = ref<HTMLInputElement | null>(null);
 
@@ -32,6 +51,24 @@ const statusText = computed(() => {
       return t("等待你按住遥控器语音键。");
   }
 });
+
+function onFocus(): void {
+  emit("focus");
+}
+
+/**
+ * 2026-10-13 现场：**文字已经上屏，却提示"输入框没有聚焦"**。
+ *
+ * 别的窗口盖上来（工具自己的语音条、系统弹窗…）时，浏览器会给输入框补一个 blur 事件，
+ * 但输入框**仍然持有 DOM 焦点**（`document.activeElement` 没变）——文字照样落在它里面。
+ * 这种"窗口级 blur"不能当成"输入框失去焦点"：只有元素**真的**不再持有焦点（用户点到
+ * 别处）才算。
+ */
+function onBlur(): void {
+  const element = box.value;
+  if (element && document.activeElement === element) return;
+  emit("blur");
+}
 
 function focusBox(): void {
   box.value?.focus();
@@ -55,18 +92,24 @@ defineExpose({ focusBox, clearBox, hasText });
     </p>
 
     <div class="onboarding-card warn">
-      <h4>开始之前，按你选的工具核对两件事</h4>
+      <h4>
+        {{
+          checklist.length === 3
+            ? t("开始之前，按你选的工具核对三件事")
+            : t("开始之前，按你选的工具核对两件事")
+        }}
+      </h4>
       <ul class="onboarding-numlist">
-        <li>
-          <span class="onboarding-num">1</span>
-          <span>麦克风选 {{ microphoneName }}（在“{{ toolLabel }}”的声音设置里）。</span>
-        </li>
-        <li>
-          <span class="onboarding-num">2</span>
-          <span>工具里的语音键和这次设置一致（{{ hotkeyText }}）。</span>
+        <li v-for="(item, index) in checklist" :key="item">
+          <span class="onboarding-num">{{ index + 1 }}</span>
+          <span>{{ item }}</span>
         </li>
       </ul>
       <p>{{ t("本次设置快捷键：{hotkey}（“本次设置”）；语音设备：{audio}。", { hotkey: hotkeyText, audio: audioText }) }}</p>
+    </div>
+
+    <div v-if="imeHint" class="onboarding-card warn">
+      <p>{{ imeHint }}</p>
     </div>
 
     <input
@@ -77,8 +120,8 @@ defineExpose({ focusBox, clearBox, hasText });
       autocomplete="off"
       spellcheck="false"
       @input="$emit('input')"
-      @focus="$emit('focus')"
-      @blur="$emit('blur')"
+      @focus="onFocus"
+      @blur="onBlur"
     />
 
     <p v-if="statusText" class="onboarding-status-line">

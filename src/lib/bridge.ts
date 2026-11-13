@@ -1,6 +1,7 @@
-import { invoke } from "@tauri-apps/api/core";
 import { assertOnboardingCanRestart, onboardingExternalState, waitForOnboardingCleanup } from "../onboarding/lifecycle";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { effectiveLanguage, type EffectiveLanguage } from "./language-state";
@@ -173,7 +174,12 @@ export type ButtonAction =
   | { type: "open_app"; target: string }
   | { type: "focus_input" }
   | { type: "run_macro"; macroId: string; macroVersion: string }
-  | { type: "open_common_phrases" };
+  | { type: "open_common_phrases" }
+  | { type: "app_switcher" }
+  | { type: "page_up" }
+  | { type: "page_down" }
+  | { type: "scroll_to_top" }
+  | { type: "scroll_to_bottom" };
 
 // ===== 组合动作（Rust `sayall_core::macros` 的 camelCase 镜像）=====
 
@@ -280,6 +286,8 @@ export interface PresetAppInfo {
   id: string;
   name: string;
   installed: boolean;
+  /** 探测到的真实可执行文件路径；Store 应用或未安装时为 null/缺省。 */
+  path?: string | null;
 }
 
 /** 打开应用后的聚焦方式（对齐 Rust `FocusStrategy`）。 */
@@ -355,6 +363,32 @@ export interface ButtonMappings {
   actions: Partial<Record<RemoteButton, ButtonActions>>;
   applications?: AppLibraryEntry[];
   focusProfiles?: Record<string, AppFocusProfile>;
+  /** 滚动区域档案：键与 `focusProfiles` 相同；只含 UIA 结构特征。 */
+  scrollRegions?: Record<string, ScrollRegionTarget>;
+}
+
+/** APP 级滚动区域记录（Rust `ScrollRegionTarget` 的 camelCase 镜像）。 */
+export interface ScrollRegionTarget {
+  controlType: string;
+  automationId?: string;
+  className?: string;
+  normalizedRect?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+}
+
+export type ScrollCommand = "page_up" | "page_down" | "to_top" | "to_bottom";
+
+/** 一次翻页测试的可观察结果。 */
+export interface ScrollOutcome {
+  method: "scroll_pattern" | "wheel";
+  beforePercent?: number;
+  afterPercent?: number;
+  moved: boolean;
+  atEdge: boolean;
 }
 
 export interface CaptureInputSettings {
@@ -1050,6 +1084,27 @@ export async function hideMainWindow(): Promise<void> {
   await invoke("hide_main_window");
 }
 
+/**
+ * 自定义标题栏的三枚窗口按钮。最小化/最大化走 Tauri 窗口 API；关闭走与
+ * Ctrl+W / 原生 X 相同的 Rust hide 命令，保持“收进托盘”而不是退出进程。
+ *
+ * 浏览器预览下静默 no-op，便于页面本身继续逐屏检查。
+ */
+export async function minimizeMainWindow(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await getCurrentWindow().minimize();
+}
+
+export async function toggleMaximizeMainWindow(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await getCurrentWindow().toggleMaximize();
+}
+
+export async function hideMainWindowFromTitleBar(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invoke("hide_main_window_from_title_bar");
+}
+
 export async function scanPairedRemotes(): Promise<PairedRemote[]> {
   if (!isTauriRuntime()) {
     throw new Error("当前是浏览器预览，无法读取已配对设备");
@@ -1268,7 +1323,7 @@ export async function cancelVoiceTest(): Promise<void> {
 }
 
 /**
- * 第④步暂存语音绑定：落回滚快照 + 应用正式配置与运行时（设计稿 §5.4）。
+ * 第⑤步暂存语音绑定：落回滚快照 + 应用正式配置与运行时（设计稿 §5.4）。
  * 只有向导进行中可调用；退出未完成流程/重跑向导会回滚到进入向导前的配置。
  */
 export async function stageOnboardingVoiceBinding(
@@ -1390,7 +1445,7 @@ export interface Rc003BridgeSnapshot {
 export type Rc003BridgePhase = "stopped" | "listening" | "connected" | "failed";
 
 /**
- * 向导第⑥步：按键映射临时暂挂（只观察、不注入；内存态、不改用户配置）。
+ * 向导第⑦步：按键映射临时暂挂（只观察、不注入；内存态、不改用户配置）。
  * 进入「普通按键体验」时暂挂，离开时恢复；进程退出后自然复位。
  */
 export async function setMappingSuspension(suspended: boolean): Promise<boolean> {
@@ -1401,7 +1456,7 @@ export async function setMappingSuspension(suspended: boolean): Promise<boolean>
 }
 
 /**
- * 向导第⑤步前置（探针④）：打开物理键观察窗口。
+ * 向导第⑥步前置（探针④）：打开物理键观察窗口。
  * 返回窗口 id；0 = 当前环境不可用（仿真/钩子未运行），调用方按未知处理。
  * excludeVks：不计入的虚拟键码——「按住说话」和弦由报告层以非注入形态
  * 送进 OS（必须到达输入法），不属于手动输入。
@@ -1414,7 +1469,7 @@ export async function beginKeyObservation(excludeVks: number[]): Promise<number>
 }
 
 /**
- * 向导第⑤步前置（探针④）：关闭物理键观察窗口并取回计数。
+ * 向导第⑥步前置（探针④）：关闭物理键观察窗口并取回计数。
  * 计数 = 窗口内「可能进入 OS 的物理按下沿」（非注入、未被门控吞下、不在
  * 排除集内）。返回 null = 计量不可靠（窗口过期/钩子停止）——fail-open，
  * 不得据此判定手动输入。
@@ -1625,6 +1680,12 @@ export async function testButtonMapping(
   return invoke<SendInputSnapshot>("test_button_mapping", { button, trigger });
 }
 
+/** 读取可执行文件的真实图标（PNG data URL）；浏览器预览返回 null。 */
+export async function getApplicationIcon(path: string): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<string | null>("get_application_icon", { path });
+}
+
 export async function listPresetApps(): Promise<PresetAppInfo[]> {
   if (!isTauriRuntime()) {
     // 浏览器预览：展示完整预设表（仅渲染验证）。
@@ -1696,6 +1757,30 @@ export async function testAppFocus(target: string): Promise<void> {
     throw new Error("当前是浏览器预览，无法测试打开与聚焦");
   }
   return invoke<void>("test_app_focus", { target });
+}
+
+/**
+ * 「学习滚动区域」：激活目标应用后，最多 3 秒内捕获用户点击的滚动容器。
+ *
+ * 调用方应先通过 [`activateAppForLearning`] 打开目标应用；后端只保存 UIA
+ * 结构特征与归一化区域，不读取内容、不移动焦点或鼠标。
+ */
+export async function learnScrollRegion(): Promise<ScrollRegionTarget> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法学习滚动区域");
+  }
+  return invoke<ScrollRegionTarget>("learn_scroll_region");
+}
+
+/** 「测试滚动」：打开目标应用后按命令执行一次翻页并读回可观察结果。 */
+export async function testScrollRegion(
+  target: string,
+  command: ScrollCommand,
+): Promise<ScrollOutcome> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法测试滚动");
+  }
+  return invoke<ScrollOutcome>("test_scroll_region", { target, command });
 }
 
 export async function getButtonMappingSnapshot(): Promise<ButtonMappingSnapshot> {
@@ -2134,6 +2219,10 @@ export function buttonTriggerLabel(trigger: ButtonTrigger): string {
 
 const keyLabels: Record<string, string> = {
   ...voiceHotkeyKeyLabels,
+  // 普通快捷键的显示与预设芯片一致：Win 不区分左右（`Win + D`，不写「左 Win」）。
+  // 语音键需要保留左右，走 `voiceHoldHotkeyLabel`（它直接读 voiceHotkeyKeyLabels）。
+  left_windows: "Win",
+  right_windows: "Win",
   // 组合动作用 `return` 作为 Enter 的稳定存储名；界面统一显示键帽上的 "Enter"。
   return: "Enter",
   // 用厂商印在键帽上的英文名，避免“退格/删除”在中文里被混为一谈。
@@ -2176,17 +2265,78 @@ export function keyLabel(code: KeyCode): string {
   return code.toUpperCase();
 }
 
+export const identityShortcutByButton: Partial<Record<RemoteButton, KeyCode>> = {
+  ok: "enter", up: "up", down: "down", left: "left", right: "right", home: "home",
+};
+
 export function chordLabel(chord: KeyChord): string {
   return chord.keys.map(keyLabel).join(" + ");
 }
 
-/** 预设应用显示名（页面加载 listPresetApps 后更新；测试可注入）。 */
-const presetAppNames: Map<string, string> = new Map();
+/**
+ * 预设应用显示名（页面加载 `listPresetApps` 后更新；测试可注入）。
+ *
+ * 两条 2026-11-06 现场反馈的约束（Bugs/2026-11-06-sidebar-switch-label-refresh.md）：
+ * 1. **合并而不是清空**：按键页 / 组合动作页 / 我的页各自带着不同的列表调用这里
+ *    （按键页只有「已安装 + 自定义」，另外两页是全量预设），先到的名字不能被后到的
+ *    部分列表清掉——否则回到按键页会先显示 `netease_music` 这类内部 id，等 IPC 回来
+ *    才跳成「网易云音乐」。
+ * 2. **本地缓存 + 同步恢复**：页面每次切换都会重建，首帧必须能直接拿到上次已知的名字，
+ *    不必等 1 秒级的 `listPresetApps` 扫描。缓存只是首帧优化，localStorage 不可用时
+ *    静默降级（与按键开关缓存同款处理）。
+ */
+const PRESET_APP_NAMES_CACHE_KEY = "sayall.preset-app-names.v1";
+
+function readPresetAppNamesCache(): Array<[string, string]> {
+  try {
+    const raw = localStorage.getItem(PRESET_APP_NAMES_CACHE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const pairs: Array<[string, string]> = [];
+    for (const entry of parsed) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [id, name] = entry;
+      if (typeof id !== "string" || typeof name !== "string" || !id || !name) continue;
+      pairs.push([id, name]);
+    }
+    return pairs;
+  } catch {
+    return [];
+  }
+}
+
+const presetAppNames: Map<string, string> = new Map(readPresetAppNamesCache());
+
+function writePresetAppNamesCache(): void {
+  try {
+    localStorage.setItem(PRESET_APP_NAMES_CACHE_KEY, JSON.stringify([...presetAppNames]));
+  } catch {
+    // 缓存只影响首帧文案；写入失败（隐私模式/配额）时下次仍走 IPC 刷新。
+  }
+}
 
 export function registerPresetAppNames(apps: Array<{ id: string; name: string }>): void {
-  presetAppNames.clear();
+  let changed = false;
   for (const app of apps) {
-    presetAppNames.set(app.id, app.name);
+    const id = typeof app?.id === "string" ? app.id.trim() : "";
+    const name = typeof app?.name === "string" ? app.name.trim() : "";
+    if (!id || !name) continue;
+    if (presetAppNames.get(id) !== name) {
+      presetAppNames.set(id, name);
+      changed = true;
+    }
+  }
+  if (changed) writePresetAppNamesCache();
+}
+
+/** 清空名称表（测试重置模块级缓存用；运行时不需要）。 */
+export function clearPresetAppNames(): void {
+  presetAppNames.clear();
+  try {
+    localStorage.removeItem(PRESET_APP_NAMES_CACHE_KEY);
+  } catch {
+    // 忽略：缓存清理失败不影响内存表。
   }
 }
 
@@ -2267,10 +2417,43 @@ export function openAppLabel(name: string): string {
     : t("打开{name}", { name: trimmed });
 }
 
+// 用 Record 而不是 Set<string>：新增 ButtonAction 类型时 TypeScript 会在这里
+// 报缺少键，避免运行时把它误判成“来自更新版本”（2026-11-11 评审）。
+const KNOWN_ACTION_TYPES: Record<ButtonAction["type"], true> = {
+  task_switch: true,
+  disabled: true,
+  shortcut: true,
+  scroll: true,
+  mouse_click: true,
+  mouse_move: true,
+  open_app: true,
+  focus_input: true,
+  run_macro: true,
+  open_common_phrases: true,
+  app_switcher: true,
+  page_up: true,
+  page_down: true,
+  scroll_to_top: true,
+  scroll_to_bottom: true,
+};
+
+/**
+ * 运行时类型守卫：更高版本写入的未知动作在 TS 类型上不存在，但会原样
+ * 出现在配置里（2026-11-11 前向兼容）。不能按 `disabled` 处理，也不要求
+ * 用户理解内部类型名。
+ */
+export function isKnownButtonAction(action: ButtonAction): boolean {
+  return Object.prototype.hasOwnProperty.call(KNOWN_ACTION_TYPES, action.type);
+}
+
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return t("未设置");
   if (action.type === "task_switch") return action.view === "applications" ? "任务切换" : "任务视图";
+  if (!isKnownButtonAction(action)) return t("不支持的动作（来自更新版本）");
   if (action.type === "focus_input") return t("聚焦输入框");
+  // 与预设芯片、按键格保持一致：只显示实际组合键；动作名「切换应用」
+  // 只保留在悬停提示和文档里。
+  if (action.type === "app_switcher") return "Alt + Tab";
   if (action.type === "open_common_phrases") {
     // 缺私有组件（公开构建）时如实标注，不静默替换成含义不同的动作。
     return commonPhrasesAvailable ? t("打开常用语") : t("打开常用语（当前不可用）");
@@ -2280,6 +2463,10 @@ export function actionSummary(action: ButtonAction | undefined): string {
     const steps = action.steps ?? 1;
     return steps === 1 ? label : t("{label} {steps} 格", { label, steps });
   }
+  if (action.type === "page_up") return t("向上翻页");
+  if (action.type === "page_down") return t("向下翻页");
+  if (action.type === "scroll_to_top") return t("滚到顶部");
+  if (action.type === "scroll_to_bottom") return t("滚到底部");
   if (action.type === "mouse_click") return mouseClickLabels[action.kind];
   if (action.type === "mouse_move") return `${mouseMoveLabels[action.direction]} ${action.distance} px`;
   if (action.type === "open_app") {
@@ -2479,6 +2666,19 @@ export function macroChordLabel(chord: MacroChord): string {
     .map((modifier) => macroModifierLabels[modifier]);
   const key = chord.key.length === 1 ? chord.key.toUpperCase() : keyLabel(chord.key);
   return [...modifiers, key].join(" + ");
+}
+
+/**
+ * 组合动作里的 Alt + Tab 不是一次性按键：执行时启动应用切换器会话。
+ * 组合动作与键位方案共用这一判定；左右 Alt 在 MacroModifier 里都归为 alt。
+ */
+export function isAppSwitcherMacroChord(chord: MacroChord | undefined): boolean {
+  return Boolean(
+    chord &&
+      chord.modifiers.length === 1 &&
+      chord.modifiers[0] === "alt" &&
+      chord.key.toLowerCase() === "tab",
+  );
 }
 
 /** 步骤摘要（列表与详情共用一行说明）。 */

@@ -217,7 +217,7 @@
 
 失败判定：artifact 无法绑定精确 commit、存在多个候选安装器、SHA-256 不一致、CI 包意外带未知签名、静默安装非零退出、安装到当前用户目录之外、卸载条目或开始菜单入口不唯一、应用进程立即退出、静默卸载残留程序文件或误删设置标记、安装器要求全局管理员权限、把未签名 artifact 当作公开发布包。
 
-当前自动化状态：第 2 项生命周期矩阵此前失败在降级用例：Tauri 2.11.1 的 `/S` 静默模式不会执行负责设置版本比较结果的重装页，`/S /P` 仍属于 silent，因而内置 `allowDowngrades=false` 检查均未阻止 predecessor。现已在既有 preinstall hook 中直接读取本产品 `DisplayVersion` 并以 Tauri SemVer 比较器拒绝旧版本，静默拒绝约定退出码为 1638；Windows CI 已通过，详见下方 Run 记录。该结果仍不替代真机验收。
+当前自动化状态：第 2 项生命周期矩阵此前失败在降级用例：Tauri 2.11.1 的 `/S` 静默模式不会执行负责设置版本比较结果的重装页，`/S /P` 仍属于 silent，因而内置 `allowDowngrades=false` 检查均未阻止 predecessor。现已在既有 preinstall hook 中直接读取本产品 `DisplayVersion` 并以 Tauri SemVer 比较器拒绝旧版本。Tauri 2.12.x 起，静默模式的内置检查会在该钩子之前先以退出码 2（NSIS `Abort` 默认值）中止，因此矩阵同时接受 2 与 1638 两种拒绝码；真正的判据是当前版本与文件未被替换。该结果仍不替代真机验收。
 
 已完成：Windows CI Run [`33637195089`](https://github.com/GetSayAll/remote-mic-app-windows/actions/runs/33637195089) 通过全部生命周期步骤。`0.0.1` predecessor 以 `/S` 安装，`0.1.0` 以 `/S /UPDATE` 升级；随后 predecessor `/S` 被 preinstall SemVer 门禁拒绝并返回 1638，安装版本仍为 `0.1.0`，主程序、设置、映射、统计和单一安装身份均未变化；最终静默卸载移除程序、快捷方式和卸载条目并保留用户数据。该 Run 仍不替代可见安装界面、SmartScreen、Windows 10 1809 / Windows 11 真机或历史二进制兼容性验收。第 3 项 Authenticode 演练可在此矩阵通过后开始。
 
@@ -252,7 +252,7 @@
 1. 以 `runtime-simulation` Cargo feature 和 `VITE_SAYALL_RUNTIME_SIMULATION=1` 构建专用测试程序；普通构建不得包含仿真前端入口或仿真专用 Tauri command。
 2. 在 `windows-latest` 启动该程序，并设置唯一的运行报告路径；不得向真实桌面发送 SendInput，也不得尝试扫描真实 BLE、音频或 HID 设备。
 3. 由实际 Windows WebView JavaScript 依次通过 Tauri IPC 读取运行快照、首次检测并自动选择唯一仿真 CABLE Input、渲染 RC001/RC003 扫描结果、连接 RC001、启动 Raw Input、保存并显式测试 Ctrl+C 映射。
-4. 依次打开驱动、按键、模板、权限、设置和连接页面；在权限页生成诊断摘要，确认平台明确标记为 `windows-ci-simulation`；在设置页确认顶部（应用标识 / 当前版本 / 检查更新）与“通用”“问题反馈”分组标题，切换“应用图标”并确认 IPC 与持久化往返，再点击“官网”“GitHub”两个入口。页面无成功提示只验证交互，IPC 成功只证明系统打开请求已提交；实际浏览器结果须在用例十四核对。被 opener capability 拒绝（`Not allowed to open url`）判失败，runner 上没有可用默认浏览器则如实记为 deferred。
+4. 依次打开按键、APP 适配、模板、设置和连接页面；在设置的“诊断与日志”生成摘要，确认平台标记为 `windows-ci-simulation`。权限入口归设置，个人版固定图标，不提供上游推广入口；IPC、持久化和实际系统副作用分项验收。
 5. 通过测试专用 command 驱动纯 Rust ATVV 管线完成首次 `STREAM_START → 40 + 80 AUDIO → STREAM_STOP → DRAIN`，确认得到 240 个采样、generation 为 1、连接和音频均回到 ready。
 6. 停止 Raw Input 并断开，确认最终快照为 `rawInput.phase = stopped` 和 `connection.phase = disconnected`；程序写入报告并自行以成功退出码结束。
 
@@ -266,10 +266,10 @@
 2. 静默安装 predecessor，确认只有一个 HKCU 卸载条目和一个开始菜单入口，安装位置位于当前用户目录。
 3. 在本应用配置目录写入有效的 `settings.json`、`button-mappings.json` 和保留标记；设置夹具包含遥控器选择、音频端点、增益和每日使用统计，并记录两个 JSON 的 SHA-256。
 4. 静默安装当前版本，确认版本升级、安装位置不变、卸载条目和快捷方式仍各一个，两个 JSON 的 SHA-256 逐字节不变；启动升级后程序并确认持续运行 8 秒。
-5. 以 `/S` 再次运行 predecessor 安装器，确认退出码为 1638，且当前版本、当前主程序 SHA-256、设置、映射、统计和单一安装身份均未被替换。
+5. 以 `/S` 再次运行 predecessor 安装器，确认被拒绝（Tauri 2.12.x 的内置静默检查会先以退出码 2 中止，preinstall SemVer 门禁返回 1638；两者都算拒绝），且当前版本、当前主程序 SHA-256、设置、映射、统计和单一安装身份均未被替换。
 6. 通过当前卸载条目的真实静默命令卸载，确认程序目录、快捷方式和卸载条目移除，而设置、映射和保留标记继续存在。
 
-预期：同一产品身份只存在一个当前用户安装；覆盖升级不改变本应用用户数据；较低版本安装器在复制文件前由 preinstall SemVer 门禁以退出码 1638 拒绝，不能把当前版本降级；最终卸载边界与现有约定一致。
+预期：同一产品身份只存在一个当前用户安装；覆盖升级不改变本应用用户数据；较低版本安装器在复制文件前被拒绝（Tauri 2.12.x 内置静默检查返回 2；preinstall SemVer 门禁返回 1638），不能把当前版本降级；最终卸载边界与现有约定一致。
 
 失败判定：使用当前版本直接覆盖当前版本冒充升级；升级后出现两个安装条目或快捷方式；设置、映射或统计被重写；降级后版本或主程序发生变化；卸载残留程序身份或误删用户数据；把同源码 predecessor fixture 表述为真实历史版本兼容性验收。
 
@@ -490,7 +490,7 @@
 
 - Windows CI Run [`33611750471`](https://github.com/GetSayAll/remote-mic-app-windows/actions/runs/33611750471) 使用 Tauri CLI 构建仅测试 feature 程序，并在真实 Windows WebView 中完成 11 个结构化步骤；
 - WebView JavaScript 通过真实 Tauri IPC 读取仿真快照，渲染 RC001/RC003 扫描结果，连接 RC001、选择仿真 CABLE Input、启动 Raw Input、保存映射并由非注入式 SendInput 记录器验证 Ctrl+C 四事件；
-- 五个侧栏页面均完成导航和挂载，权限页生成平台标记为 `windows-ci-simulation` 的去标识化诊断摘要，统计 IPC 返回最近七天结构；
+- 五个侧栏页面均完成导航和挂载（该次 CI 针对旧版结构；2026-10-31 起权限并入设置页，侧栏条目已变化，新结构的 CI 复跑 deferred），权限页生成平台标记为 `windows-ci-simulation` 的去标识化诊断摘要，统计 IPC 返回最近七天结构；
 - 首次 `STREAM_START → 40 + 80 AUDIO → STREAM_STOP → DRAIN` 通过纯 Rust ATVV 管线得到 240 个采样和 generation 1，随后 Raw Input 与连接状态均完成释放；
 - 同一 Run 重新构建普通 NSIS，二进制和前端资源均确认不含仿真平台名或仿真 command，并继续通过静默安装/卸载回归；
 - Run [`33610428178`](https://github.com/GetSayAll/remote-mic-app-windows/actions/runs/33610428178) 首次暴露直接 `cargo build` 生成开发协议程序会等待 Vite dev server；改为 `tauri build --no-bundle --features runtime-simulation` 后修复；
@@ -529,8 +529,8 @@
 
 2026-09-01 在 Apple Silicon Mac 上完成：
 
-- Vue 导航、连接阶段映射、诊断格式和权限页复制组件测试、类型检查和 Vite 生产构建；
-- 900 × 620 与 1080 × 720 浏览器界面检查，全部五个侧栏入口可打开；权限页无横向溢出，诊断摘要可在页面内生成和滚动；
+- Vue 导航、连接阶段映射、诊断格式和诊断/权限分组组件测试、类型检查和 Vite 生产构建；
+- 900 × 620 与 1080 × 720 浏览器界面检查，全部五个侧栏入口可打开（旧版结构；2026-10-31 后的侧栏条目与设置页分组需重新走查）；权限页无横向溢出，诊断摘要可在页面内生成和滚动；
 - 浏览器控制台零错误；
 - `sayall-core` 22 项测试；macOS `sayall-windows` 20 项平台边界、退避、Raw Input 和 SendInput 纯逻辑测试；Tauri 设置与诊断 4 项测试；Windows CI 额外运行 WASAPI generation、有界队列、持久端点身份、重连调度、电源回调转发、Raw Input 纯逻辑测试和完整 Tauri Host 编译；
 - 诊断隐私测试使用设备名称、蓝牙地址、端点身份、用户路径、HID 路径和后端错误作为敏感夹具，序列化摘要均未包含这些值；浏览器生成摘要也未出现 `remoteName`、`selectedEndpointId`、`selectedEndpointName` 或 `lastError` 字段；

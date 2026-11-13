@@ -16,6 +16,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 use tauri::{Emitter, Manager};
 
 mod accent;
+mod agent_access;
 mod app_icon;
 mod button_profiles;
 mod common_phrase_panel;
@@ -45,6 +46,44 @@ use usage::{build_usage_profile, UsageProfile, UsageStore, UsageSync};
 
 /// 主窗口标签（`tauri.conf.json` 里由配置创建的唯一窗口）。
 const MAIN_WINDOW_LABEL: &str = "main";
+
+/// 主窗口最小尺寸（逻辑像素），与 `tauri.conf.json` 的
+/// `width` / `height` / `minWidth` / `minHeight` 保持一致。
+const MAIN_WINDOW_MIN_WIDTH: f64 = 1066.67;
+const MAIN_WINDOW_MIN_HEIGHT: f64 = 800.0;
+const MAIN_WINDOW_DEFAULT_HEIGHT: f64 = 800.0;
+
+/// 内容区最小尺寸换算到物理像素。`WM_GETMINMAXINFO` / `WM_WINDOWPOSCHANGING`
+/// 使用窗口外框尺寸，调用方再补上非客户区边框。
+fn min_window_inner_size(scale_factor: f64) -> (i32, i32) {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (
+        (MAIN_WINDOW_MIN_WIDTH * scale).round() as i32,
+        (MAIN_WINDOW_MIN_HEIGHT * scale).round() as i32,
+    )
+}
+
+#[cfg(test)]
+mod main_window_size_tests {
+    use super::*;
+
+    #[test]
+    fn converts_minimum_to_physical_pixels() {
+        assert_eq!(min_window_inner_size(1.0), (1067, 800));
+        assert_eq!(min_window_inner_size(2.0), (2133, 1600));
+        assert_eq!(min_window_inner_size(1.5), (1600, 1200));
+    }
+
+    #[test]
+    fn invalid_scale_falls_back_to_one_x() {
+        assert_eq!(min_window_inner_size(0.0), (1067, 800));
+        assert_eq!(min_window_inner_size(f64::NAN), (1067, 800));
+    }
+}
 
 fn main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
     app.get_webview_window(MAIN_WINDOW_LABEL)
@@ -392,6 +431,138 @@ fn application_startup_settings(
             }
         }
     }
+}
+
+/// 主窗口最小尺寸的子类化实例 ID。
+#[cfg(windows)]
+const WINDOW_MIN_SIZE_SUBCLASS_ID: usize = 0x5A13;
+
+/// 在原生窗口消息层限制主窗口最小尺寸。
+///
+/// 仅在 Tauri `Resized` 回调里调用 `set_size` 会在拖动过程中反复改尺寸，
+/// 底部会闪。这里在窗口真正改变位置/大小之前修改 `WINDOWPOS`，并补齐
+/// `WM_GETMINMAXINFO`，拖动时窗口不会先缩小再弹回。
+#[cfg(windows)]
+fn install_window_min_size_subclass(window: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+
+    let Ok(raw) = window.hwnd() else {
+        sayall_windows::gatt_note(
+            "window_resize action=install_min_size_subclass terminal_result=failed reason=hwnd_missing"
+                .to_owned(),
+        );
+        return;
+    };
+    let installed = unsafe {
+        SetWindowSubclass(
+            HWND(raw.0),
+            Some(window_min_size_subclass),
+            WINDOW_MIN_SIZE_SUBCLASS_ID,
+            0,
+        )
+        .as_bool()
+    };
+    sayall_windows::gatt_note(format!(
+        "window_resize action=install_min_size_subclass terminal_result={}",
+        if installed { "passed" } else { "failed" }
+    ));
+}
+
+/// 主窗口最小外框尺寸（物理像素）。
+///
+/// `tauri.conf.json` 的 `minHeight` 是内容区高度；Windows 的
+/// `WINDOWPOS` / `MINMAXINFO` 使用窗口外框，所以要补上非客户区边框。
+#[cfg(windows)]
+fn min_window_outer_size(hwnd: windows::Win32::Foundation::HWND) -> (i32, i32) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+    let (minimum_width, minimum_height) = min_window_inner_size(scale);
+
+    let mut window_rect = RECT::default();
+    let mut client_rect = RECT::default();
+    let window_ok = unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_ok();
+    let client_ok = unsafe { GetClientRect(hwnd, &mut client_rect) }.is_ok();
+    let frame_width = if window_ok && client_ok {
+        ((window_rect.right - window_rect.left) - (client_rect.right - client_rect.left)).max(0)
+    } else {
+        0
+    };
+    let frame_height = if window_ok && client_ok {
+        ((window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top)).max(0)
+    } else {
+        0
+    };
+
+    (minimum_width + frame_width, minimum_height + frame_height)
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn window_min_size_subclass(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _ref_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MINMAXINFO, SWP_NOSIZE, WINDOWPOS, WM_ENDSESSION, WM_GETMINMAXINFO, WM_NCDESTROY,
+        WM_QUERYENDSESSION, WM_WINDOWPOSCHANGING,
+    };
+
+    if message == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(
+            hwnd,
+            Some(window_min_size_subclass),
+            WINDOW_MIN_SIZE_SUBCLASS_ID,
+        );
+        return DefSubclassProc(hwnd, message, wparam, lparam);
+    }
+
+    // 比 SM_SHUTTINGDOWN 更早的关机信号：helper 常驻对账在关机开始时可能
+    // 仍会醒来，先置标志让 run_schtasks() 拒绝拉起 schtasks.exe。
+    // 必须继续走 DefSubclassProc：不改变窗口对系统关机询问的应答。
+    if message == WM_QUERYENDSESSION {
+        crate::rc003_task::note_query_end_session();
+        sayall_windows::gatt_note(
+            "app_exit session_end phase=observed reason=query_end_session".to_owned(),
+        );
+    } else if message == WM_ENDSESSION {
+        if wparam.0 == 0 {
+            // 关机被其他应用取消：清除标志，恢复常驻对账。
+            crate::rc003_task::clear_query_end_session();
+            sayall_windows::gatt_note(
+                "app_exit session_end phase=cancelled reason=end_session_cancelled".to_owned(),
+            );
+        } else {
+            sayall_windows::gatt_note(
+                "app_exit session_end phase=confirmed reason=end_session".to_owned(),
+            );
+        }
+    }
+
+    if message == WM_GETMINMAXINFO && lparam.0 != 0 {
+        let (minimum_width, minimum_height) = min_window_outer_size(hwnd);
+        let info = &mut *(lparam.0 as *mut MINMAXINFO);
+        info.ptMinTrackSize.x = minimum_width;
+        info.ptMinTrackSize.y = minimum_height;
+    } else if message == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
+        let (minimum_width, minimum_height) = min_window_outer_size(hwnd);
+        let position = &mut *(lparam.0 as *mut WINDOWPOS);
+        if position.flags.0 & SWP_NOSIZE.0 == 0 && position.cx > 0 && position.cy > 0 {
+            position.cx = position.cx.max(minimum_width);
+            position.cy = position.cy.max(minimum_height);
+        }
+    }
+
+    DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
 /// 界面未能正常显示时写进窗口标题的文案（2026-10-07 定稿，见 docs/product-copy.md）。
@@ -888,6 +1059,8 @@ struct AppState {
     update_completed_version: std::sync::Mutex<Option<String>>,
     /// 回眸本地归档（`%LOCALAPPDATA%\SayAll\transcripts\v1`）。
     transcripts: Arc<transcripts::TranscriptStore>,
+    /// 回眸「本地 Agent 访问」的授权状态（`%LOCALAPPDATA%\SayAll\mcp\v1`）。
+    agent_access: Arc<agent_access::AgentAccessStore>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1708,12 +1881,21 @@ mod windows_settings_tests {
 /// 日志只落结果、可见性与耗时，不含窗口标题或任何用户信息。
 #[tauri::command]
 fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    hide_main_window_with_source(app, "ctrl_w")
+}
+
+/// 自定义标题栏关闭按钮：与 Ctrl+W 同一隐藏动作，仅日志来源不同。
+#[tauri::command]
+fn hide_main_window_from_title_bar(app: tauri::AppHandle) -> Result<(), String> {
+    hide_main_window_with_source(app, "titlebar")
+}
+
+fn hide_main_window_with_source(app: tauri::AppHandle, source: &str) -> Result<(), String> {
     let started = std::time::Instant::now();
     let Some(window) = main_window(&app) else {
-        sayall_windows::gatt_note(
-            "window_close action=hide_to_tray source=ctrl_w phase=completed terminal_result=failed error_domain=window error_code=not_found retryable=true reason=main_window_missing"
-                .to_owned(),
-        );
+        sayall_windows::gatt_note(format!(
+            "window_close action=hide_to_tray source={source} phase=completed terminal_result=failed error_domain=window error_code=not_found retryable=true reason=main_window_missing"
+        ));
         return Err("主窗口不存在".to_owned());
     };
     // `hide()` 的返回值只说明"消息已投递"，不代表窗口真的隐藏了（见
@@ -1723,7 +1905,7 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let result = window.hide().map_err(|error| error.to_string());
     let visible_after = window.is_visible().unwrap_or(true);
     sayall_windows::gatt_note(format!(
-        "window_close action=hide_to_tray source=ctrl_w phase=completed terminal_result={} visible_before={visible_before} visible_after={visible_after} elapsed_ms={}",
+        "window_close action=hide_to_tray source={source} phase=completed terminal_result={} visible_before={visible_before} visible_after={visible_after} elapsed_ms={}",
         if result.is_ok() { "passed" } else { "failed" },
         started.elapsed().as_millis()
     ));
@@ -3257,6 +3439,82 @@ async fn duplicate_button_mapping_template(
     .map_err(|error| format!("复制按键模板任务失败：{error}"))?
 }
 
+// 调用方已持有设置事务锁, 始终基于磁盘最新模板更新。
+fn update_template_from_editor(
+    configuration: &mut sayall_windows::templates::MappingConfiguration,
+    template_id: &str,
+    mut mappings: ButtonMappings,
+) -> Result<sayall_windows::templates::MappingTemplate, String> {
+    if let Some(existing) = configuration.template_mappings(template_id) {
+        settings::merge_mapping_extras(&mut mappings, &existing);
+    }
+    configuration.update_button_mapping_template(template_id, mappings)
+}
+
+#[cfg(test)]
+mod template_editor_schema_tests {
+    use super::*;
+    use sayall_windows::templates::{MappingConfiguration, MappingTemplate};
+
+    fn fixture() -> (MappingConfiguration, ButtonMappings) {
+        let existing: ButtonMappings = serde_json::from_value(serde_json::json!({
+            "schemaVersion":99,"enabled":true,"futureTop":{"keep":1},
+            "actions":{"up":{
+                "single":{"type":"shortcut","chord":{"keys":["a"]},"futureAction":{"keep":2}},
+                "double":{"type":"future_action","payload":{"keep":3}},
+                "long":{"type":"disabled"},"futureCell":{"keep":4}
+            }}
+        }))
+        .unwrap();
+        let payload: ButtonMappings = serde_json::from_value(serde_json::json!({
+            "schemaVersion":2,"enabled":true,
+            "actions":{"up":{
+                "single":{"type":"shortcut","chord":{"keys":["a"]}},
+                "double":{"type":"future_action","payload":{"keep":3}},
+                "long":{"type":"disabled"}
+            }}
+        }))
+        .unwrap();
+        let mut configuration = MappingConfiguration::default();
+        configuration.templates.push(MappingTemplate {
+            id: "future-template".into(),
+            name: "future".into(),
+            mappings: existing,
+        });
+        (configuration, payload)
+    }
+
+    #[test]
+    fn ordinary_template_save_preserves_future_schema_and_unchanged_fields() {
+        let (mut configuration, payload) = fixture();
+        let saved =
+            update_template_from_editor(&mut configuration, "future-template", payload).unwrap();
+        let value = serde_json::to_value(saved.mappings).unwrap();
+        assert_eq!(value["schemaVersion"], 99);
+        assert_eq!(value["futureTop"]["keep"], 1);
+        assert_eq!(value["actions"]["up"]["futureCell"]["keep"], 4);
+        assert_eq!(value["actions"]["up"]["single"]["futureAction"]["keep"], 2);
+        assert_eq!(value["actions"]["up"]["double"]["payload"]["keep"], 3);
+    }
+
+    #[test]
+    fn replacing_a_template_action_drops_its_previous_unknown_fields() {
+        let (mut configuration, mut payload) = fixture();
+        payload.actions.get_mut(&RemoteButton::Up).unwrap().single = ButtonAction::Shortcut {
+            chord: KeyChord {
+                keys: vec![sayall_windows::send_input::KeyCode::B],
+            },
+        };
+        let saved =
+            update_template_from_editor(&mut configuration, "future-template", payload).unwrap();
+        let value = serde_json::to_value(saved.mappings).unwrap();
+        assert!(value["actions"]["up"]["single"]
+            .get("futureAction")
+            .is_none());
+        assert_eq!(value["actions"]["up"]["double"]["payload"]["keep"], 3);
+    }
+}
+
 #[tauri::command]
 async fn update_button_mapping_template(
     template_id: String,
@@ -3270,7 +3528,7 @@ async fn update_button_mapping_template(
     let platform = Arc::clone(&state.platform);
     let result = tauri::async_runtime::spawn_blocking(move || {
         let (_, template) = settings.update_mapping_configuration(
-            |configuration| configuration.update_button_mapping_template(&template_id, mappings),
+            |configuration| update_template_from_editor(configuration, &template_id, mappings),
             |saved| apply_mapping_configuration(platform.as_ref(), saved),
         )?;
         Ok(template)
@@ -3597,7 +3855,7 @@ async fn reset_button_mappings(
     let platform = Arc::clone(&state.platform);
     let result =
         match tauri::async_runtime::spawn_blocking(move || -> Result<ButtonMappings, String> {
-            settings.save_button_mappings_with(ButtonMappings::default(), |saved| {
+            settings.replace_button_mappings_with(ButtonMappings::default(), |saved| {
                 apply_mapping_configuration(platform.as_ref(), saved);
             })
         })
@@ -3958,11 +4216,14 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut open_app_count = 0_usize;
     let mut focus_input_count = 0_usize;
     let mut common_phrases_count = 0_usize;
+    let mut app_switcher_count = 0_usize;
     let mut scroll_count = 0_usize;
+    let mut page_scroll_count = 0_usize;
     let mut mouse_count = 0_usize;
     let mut task_switch_count = 0_usize;
     let mut macro_count = 0_usize;
     let mut disabled_count = 0_usize;
+    let mut unsupported_count = 0_usize;
     for actions in mappings.actions.values() {
         for action in [&actions.single, &actions.double, &actions.long] {
             match action {
@@ -3971,18 +4232,25 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
                 ButtonAction::FocusInput => focus_input_count += 1,
                 ButtonAction::OpenCommonPhrases => common_phrases_count += 1,
+                ButtonAction::AppSwitcher => app_switcher_count += 1,
                 ButtonAction::Scroll { .. } => scroll_count += 1,
+                ButtonAction::PageUp
+                | ButtonAction::PageDown
+                | ButtonAction::ScrollToTop
+                | ButtonAction::ScrollToBottom => page_scroll_count += 1,
                 ButtonAction::MouseClick { .. } | ButtonAction::MouseMove { .. } => {
                     mouse_count += 1
                 }
                 ButtonAction::RunMacro { .. } => macro_count += 1,
                 ButtonAction::Disabled => disabled_count += 1,
+                ButtonAction::Unsupported(_) => unsupported_count += 1,
             }
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} common_phrases_count={common_phrases_count} scroll_count={scroll_count} mouse_count={mouse_count} macro_count={macro_count} task_switch_count={task_switch_count} disabled_cell_count={disabled_count}",
+        "enabled={} schema_version={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} focus_input_count={focus_input_count} common_phrases_count={common_phrases_count} app_switcher_count={app_switcher_count} scroll_count={scroll_count} page_scroll_count={page_scroll_count} mouse_count={mouse_count} task_switch_count={task_switch_count} macro_count={macro_count} disabled_cell_count={disabled_count} unsupported_count={unsupported_count}",
         mappings.enabled,
+        mappings.schema_version,
         mappings.actions.len()
     )
 }
@@ -4051,6 +4319,20 @@ async fn test_button_mapping(
         ButtonAction::OpenCommonPhrases => {
             Err("「打开常用语」不在试一下范围内：请绑定按键后到目标应用里使用".to_owned())
         }
+        ButtonAction::AppSwitcher => Err(
+            "「切换应用」需要真实按下绑定的遥控器按键：打开切换器后用方向键选择、按“确定”确认、返回取消"
+                .to_owned(),
+        ),
+        ButtonAction::Unsupported(_) => {
+            Err("这个动作来自更新版本，当前版本不支持；请升级无线麦后重试".to_owned())
+        }
+        ButtonAction::PageUp
+        | ButtonAction::PageDown
+        | ButtonAction::ScrollToTop
+        | ButtonAction::ScrollToBottom => Err(
+            "翻页测试请在 APP 适配页点击“测试向上翻页/测试向下翻页”；试一下无法确定目标 APP"
+                .to_owned(),
+        ),
     }
 }
 
@@ -4064,6 +4346,30 @@ fn list_preset_apps(
 #[tauri::command]
 fn list_running_apps() -> Vec<sayall_windows::app_launcher::RunningAppInfo> {
     sayall_windows::app_launcher::list_running_apps()
+}
+
+/// 从可执行文件或快捷方式提取真实应用图标（PNG data URL）。失败返回 None，由前端显示通用图标。
+#[tauri::command]
+fn get_application_icon(path: String) -> Option<String> {
+    let shell = path.to_ascii_lowercase().starts_with("shell:appsfolder");
+    let png = if shell {
+        sayall_windows::transcript_capture_windows::icon_png_for_shell_item(&path).or_else(|| {
+            sayall_windows::registered_apps::resolve_registered_executable_path(&path).and_then(
+                |executable| {
+                    sayall_windows::transcript_capture_windows::icon_png_for_executable(&executable)
+                },
+            )
+        })
+    } else {
+        // 程序选择可以是 `.lnk`：`PrivateExtractIconsW` 对快捷方式常拿不到图标，
+        // 再向 Shell 要一次（与开始菜单/资源管理器同源），失败才回退首字母。
+        sayall_windows::transcript_capture_windows::icon_png_for_executable(&path)
+            .or_else(|| sayall_windows::transcript_capture_windows::icon_png_for_shell_item(&path))
+    }?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    ))
 }
 
 /// 「学习输入框」第一步：先打开/激活目标应用，不改变它的输入焦点。
@@ -4125,6 +4431,37 @@ async fn test_app_focus(target: String, state: tauri::State<'_, AppState>) -> Re
         .await
         .map_err(|error| format!("测试打开与聚焦任务失败：{error}"))?
         .map_err(|error| error.to_string())
+}
+
+/// 「学习滚动区域」：阻塞至多 3 秒等待用户点击目标窗口的可滚动内容区。
+#[tauri::command]
+async fn learn_scroll_region(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::scroll_region::ScrollRegionTarget, String> {
+    let platform = Arc::clone(&state.platform);
+    let result = tauri::async_runtime::spawn_blocking(move || platform.learn_scroll_region())
+        .await
+        .map_err(|error| format!("学习滚动区域任务失败：{error}"))?;
+    refocus_main_window_soon(app);
+    result.map_err(|error| error.to_string())
+}
+
+/// 「测试滚动」：打开/激活目标应用后执行一次翻页并读回结果。
+#[tauri::command]
+async fn test_scroll_region(
+    app: tauri::AppHandle,
+    target: String,
+    command: sayall_windows::scroll_region::ScrollCommand,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::scroll_region::ScrollOutcome, String> {
+    let platform = Arc::clone(&state.platform);
+    let result =
+        tauri::async_runtime::spawn_blocking(move || platform.test_scroll_region(target, command))
+            .await
+            .map_err(|error| format!("测试滚动任务失败：{error}"))?;
+    refocus_main_window_soon(app);
+    result.map_err(|error| error.to_string())
 }
 
 /// 原生文件选择器：选择自定义应用（.exe/.lnk）。用户取消返回 null。
@@ -4650,6 +4987,77 @@ fn transcript_audio_enabled(state: &AppState) -> bool {
             false
         }
     }
+}
+
+// ---- 回眸「本地 Agent 访问」 ----
+
+#[tauri::command]
+fn get_agent_access_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> agent_access::AgentAccessSnapshot {
+    state.agent_access.snapshot()
+}
+
+#[tauri::command]
+async fn set_agent_access_enabled(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.set_enabled(enabled))
+        .await
+        .map_err(|_| agent_access::AgentAccessCommandError::new("access_update_failed"))?
+}
+
+#[tauri::command]
+async fn create_agent_authorization(
+    display_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::CreatedAgentAuthorization, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.create_manual(&display_name))
+        .await
+        .map_err(|_| agent_access::AgentAccessCommandError::new("authorization_failed"))?
+}
+
+#[tauri::command]
+async fn revoke_agent_authorization(
+    client_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.revoke(&client_id))
+        .await
+        .map_err(|_| agent_access::AgentAccessCommandError::new("revoke_failed"))?
+}
+
+#[tauri::command]
+async fn connect_agent_client(
+    client: agent_access::AgentClientId,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.connect(client))
+        .await
+        .map_err(|_| {
+            agent_access::AgentAccessCommandError::for_client("integration_failed", client)
+        })?
+}
+
+#[tauri::command]
+async fn remove_agent_client(
+    client: agent_access::AgentClientId,
+    state: tauri::State<'_, AppState>,
+) -> Result<agent_access::AgentAccessSnapshot, agent_access::AgentAccessCommandError> {
+    let store = Arc::clone(&state.agent_access);
+    tauri::async_runtime::spawn_blocking(move || store.disconnect(client))
+        .await
+        .map_err(|_| {
+            agent_access::AgentAccessCommandError::for_client(
+                "configuration_removal_failed",
+                client,
+            )
+        })?
 }
 
 #[tauri::command]
@@ -5490,14 +5898,14 @@ fn webview_unavailable_title(app: &tauri::AppHandle) -> &'static str {
 #[cfg(windows)]
 fn apply_native_language(app: &tauri::AppHandle, preference: AppLanguage) {
     let language = effective_app_language(preference);
-    // 窗口标题统一为「SayAll 版本号」：去掉「无线麦」前缀，版本号紧随其后（2026-10-24 用户要求）。
+    // 个人版标题和托盘统一保留产品身份。
     let title = format!(
-        "SayAll {}",
+        "无线麦 {} · 个人版",
         updater::public_version(&app.package_info().version)
     );
     let (show_label, quit_label, tooltip) = match language {
-        AppLanguage::SimplifiedChinese => ("显示主界面", "退出", "无线麦 SayAll"),
-        _ => ("Show Main Window", "Quit", "SayAll"),
+        AppLanguage::SimplifiedChinese => ("显示主界面", "退出", "无线麦 · 个人版"),
+        _ => ("Show Main Window", "Quit", "无线麦 · 个人版"),
     };
     let title_result = match main_window(app) {
         Some(window) => window.set_title(&title).is_ok(),
@@ -6766,6 +7174,20 @@ pub fn run() {
             sayall_windows::gatt_note(
                 "app_lifecycle event=tauri_setup phase=started result=passed".to_owned(),
             );
+            // tauri.conf 的窗口尺寸在部分高 DPI 会话里按创建时 DPI 解释，可能落到
+            // 540×404 逻辑像素。这里显式按逻辑像素设一次默认尺寸与最小尺寸，
+            // 保证 1066×800 的设计窗口在各缩放比例下一致。
+            if let Some(window) = main_window(app.handle()) {
+                let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+                    MAIN_WINDOW_MIN_WIDTH,
+                    MAIN_WINDOW_MIN_HEIGHT,
+                )));
+                let _ = window.set_size(tauri::LogicalSize::new(
+                    MAIN_WINDOW_MIN_WIDTH,
+                    MAIN_WINDOW_DEFAULT_HEIGHT,
+                ));
+                let _ = window.center();
+            }
             // 常用语浮层窗口（可选私有组件）：窗口先建好并隐藏；组件未注入时能力不可用。
             let common_phrases_available = common_phrase_panel::install(app.handle());
             sayall_windows::gatt_note(format!(
@@ -7180,6 +7602,22 @@ pub fn run() {
                     .join("v1")
             });
             let transcript_store = Arc::new(transcripts::TranscriptStore::new(transcript_root));
+            // 本地 Agent 访问：授权状态独立于 settings.json（安装生命周期会哈希断言设置文件）。
+            let agent_access_root =
+                agent_access::AgentAccessStore::default_root().unwrap_or_else(|_| {
+                    sayall_windows::gatt_note(
+                        "agent_access action=resolve_root phase=completed result=fallback reason=localappdata_unavailable"
+                            .to_owned(),
+                    );
+                    app.path()
+                        .app_local_data_dir()
+                        .unwrap_or_else(|_| std::env::temp_dir())
+                        .join("SayAllPersonal")
+                        .join("mcp")
+                        .join("v1")
+                });
+            let agent_access_store =
+                Arc::new(agent_access::AgentAccessStore::new(agent_access_root));
             let capture_store = Arc::clone(&transcript_store);
             let capture_app = app.handle().clone();
             platform.set_transcript_capture_sink(Arc::new(
@@ -7275,6 +7713,7 @@ pub fn run() {
                 update_completed_version: std::sync::Mutex::new(
                     completed_update.then(|| app.package_info().version.to_string()),
                 ),
+                agent_access: agent_access_store,
             });
             create_scene_overlay(app)?;
             #[cfg(windows)]
@@ -7320,7 +7759,10 @@ pub fn run() {
 
             let _ = sayall_windows::key_host::start_global();
             #[cfg(windows)]
-            if let Some(window) = main_window(app.handle()) { install_window_key_subclass(&window); }
+            if let Some(window) = main_window(app.handle()) {
+                install_window_key_subclass(&window);
+                install_window_min_size_subclass(&window);
+            }
             #[cfg(windows)]
             if let Some(webview) = main_webview(app.handle()) { install_ctrl_w_accelerator(&webview); }
             // 安装/升级前的优雅退出监听（2026-09-16）：安装器会先请求退出、
@@ -7352,6 +7794,37 @@ pub fn run() {
                             "app_lifecycle event=self_show_sync trigger=app_launcher_self window_available=false result=failed reason=main_window_missing".to_owned()
                         );
                     }
+                });
+            }
+            // "打开别的应用"前把自身主窗口退出置顶。自身若带 `WS_EX_TOPMOST`，
+            // 前台焦点虽然切给了目标，Z 序上却永远压着它——日志 `foreground_observed`
+            // 全绿、用户只看到无线麦（2026-11-05 现场）。产品从未主动置顶主窗口，
+            // 该样式来自外部工具或历史状态，所以这里不追来源，直接按结果兜底。
+            {
+                let handle = app.handle().clone();
+                sayall_windows::app_launcher::set_self_drop_topmost(move || {
+                    let Some(window) = main_window(&handle) else {
+                        return false;
+                    };
+                    let Ok(hwnd) = window.hwnd() else {
+                        return false;
+                    };
+                    // 先读 Win32 样式：绝大多数按键窗口本来就没置顶，这里零开销地
+                    // 返回 false，不产生任何跨线程 dispatch（本回调在引擎线程上、
+                    // 且一次按键可能被多个候选窗口各调一次）。
+                    let dropped =
+                        sayall_windows::app_launcher::drop_window_topmost(hwnd.0 as isize);
+                    if dropped {
+                        // 样式已清，同步让 tao 的 `ALWAYS_ON_TOP` flag 归零：否则它
+                        // 下一次 `set_window_flags`（show/hide/聚焦都会走）会按旧 flag
+                        // 把 `WS_EX_TOPMOST` 再 OR 回来，撤顶变成一次性的。
+                        let _ = window.set_always_on_top(false);
+                        sayall_windows::gatt_note(
+                            "app_launcher action=drop_self_topmost terminal_result=passed"
+                                .to_owned(),
+                        );
+                    }
+                    dropped
                 });
             }
             sayall_windows::gatt_note(
@@ -7446,6 +7919,7 @@ pub fn run() {
         open_log_directory,
         open_windows_settings,
         hide_main_window,
+        hide_main_window_from_title_bar,
         scan_paired_remotes,
         get_connection_snapshot,
         connect_remote,
@@ -7525,9 +7999,12 @@ pub fn run() {
         common_phrase_panel::select_common_phrase,
         common_phrase_panel::common_phrase_dispatch,
         test_app_focus,
+        learn_scroll_region,
+        test_scroll_region,
         activate_app_for_learning,
         list_preset_apps,
         list_running_apps,
+        get_application_icon,
         pick_custom_app,
         scan_registered_apps,
         get_button_mapping_snapshot,
@@ -7541,6 +8018,12 @@ pub fn run() {
         get_ime_status,
         get_gain_db,
         set_gain_db,
+        get_agent_access_snapshot,
+        set_agent_access_enabled,
+        create_agent_authorization,
+        revoke_agent_authorization,
+        connect_agent_client,
+        remove_agent_client,
         get_transcript_history,
         set_transcript_history_enabled,
         set_transcript_audio_recording_enabled,
@@ -7616,6 +8099,7 @@ pub fn run() {
         open_log_directory,
         open_windows_settings,
         hide_main_window,
+        hide_main_window_from_title_bar,
         scan_paired_remotes,
         get_connection_snapshot,
         connect_remote,
@@ -7695,9 +8179,12 @@ pub fn run() {
         common_phrase_panel::select_common_phrase,
         common_phrase_panel::common_phrase_dispatch,
         test_app_focus,
+        learn_scroll_region,
+        test_scroll_region,
         activate_app_for_learning,
         list_preset_apps,
         list_running_apps,
+        get_application_icon,
         pick_custom_app,
         scan_registered_apps,
         get_button_mapping_snapshot,
@@ -7711,6 +8198,12 @@ pub fn run() {
         get_ime_status,
         get_gain_db,
         set_gain_db,
+        get_agent_access_snapshot,
+        set_agent_access_enabled,
+        create_agent_authorization,
+        revoke_agent_authorization,
+        connect_agent_client,
+        remove_agent_client,
         get_transcript_history,
         set_transcript_history_enabled,
         set_transcript_audio_recording_enabled,
@@ -8114,6 +8607,18 @@ mod lifecycle_tests {
     }
 
     impl PlatformRuntime for TestPlatform {
+        fn learn_scroll_region(
+            &self,
+        ) -> Result<sayall_windows::scroll_region::ScrollRegionTarget, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+        fn test_scroll_region(
+            &self,
+            _target: String,
+            _command: sayall_windows::scroll_region::ScrollCommand,
+        ) -> Result<sayall_windows::scroll_region::ScrollOutcome, PlatformError> {
+            Err(PlatformError::UnsupportedPlatform)
+        }
         fn capture_config_gate(&self) -> Arc<Mutex<()>> {
             self.test_capture_gate.clone()
         }
@@ -9035,6 +9540,20 @@ mod tests {
         assert!(!super::application_startup_settings(Ok(disabled)).rc003_capture_enabled);
     }
     use super::*;
+
+    /// 手动回归（2026-11-10 用户现场）：程序选择返回的 `.lnk` 也必须能拿到 Shell 图标。
+    /// 运行：
+    ///   $env:SAYALL_TEST_SHORTCUT_PATH='C:\...\shortcut.lnk'
+    ///   cargo test -p sayall-windows-app application_icon_from_shortcut -- --ignored
+    #[test]
+    #[ignore]
+    fn application_icon_from_shortcut_returns_data_url() {
+        let path = std::env::var("SAYALL_TEST_SHORTCUT_PATH")
+            .expect("set SAYALL_TEST_SHORTCUT_PATH to a real .lnk");
+        let icon = get_application_icon(path).expect("shortcut icon should be extracted");
+        assert!(icon.starts_with("data:image/png;base64,"));
+        assert!(icon.len() > 1000);
+    }
 
     /// 安装器钩子源码。契约测试要在**构建期**读它：这些断言存在的理由就是
     /// "有人改了一侧、忘了另一侧"（2026-09-16 的僵死 Bug 正是文档写了规则、

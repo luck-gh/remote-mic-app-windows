@@ -108,6 +108,13 @@ pub trait MacroStepper: Send {
         timeout_ms: u64,
     ) -> StepOutcome;
     fn send_shortcut(&mut self, chord: &MacroChord) -> StepOutcome;
+    /// 启动系统应用切换器会话（组合动作里的 Alt+Tab）。
+    ///
+    /// 会话由按键映射引擎持有；平台实现只负责把启动请求送达引擎。
+    /// 默认实现用于不支持该能力的平台/测试替身。
+    fn start_app_switcher(&mut self) -> StepOutcome {
+        StepOutcome::Unknown
+    }
     fn focus_input(&mut self, target: &str, timeout_ms: u64) -> StepOutcome;
     /// 聚焦当前前台应用的输入框（不切换应用）。
     fn focus_frontmost(&mut self, timeout_ms: u64) -> StepOutcome;
@@ -236,6 +243,12 @@ pub fn execute_macro(
             }
             StepOutcome::Failed => return finish(MacroTerminalResult::StepFailed, steps),
         }
+        // 取消在步骤边界生效：当前步骤返回后若取消标志已置位，必须如实报告
+        // Cancelled，而不是把最后一步的成功当成 Completed。单步宏尤其明显，
+        // 且这一步必须放在失败终态之后，保留原有失败诊断的优先级。
+        if cancel.load(Ordering::Relaxed) {
+            return finish(MacroTerminalResult::Cancelled, steps);
+        }
     }
     finish(
         if cancel.load(Ordering::Acquire) {
@@ -255,6 +268,14 @@ pub fn execute_macro(
 enum StepRun {
     Outcome(StepOutcome),
     Terminal(MacroTerminalResult, u64, &'static str),
+}
+
+/// 组合动作里的 Alt+Tab 不是一次性按键：启动应用切换器会话。
+/// 只认单独的 Alt 修饰键 + Tab（左右 Alt 在 MacroModifier 里都归为 alt）。
+fn is_app_switcher_chord(chord: &MacroChord) -> bool {
+    chord.modifiers.len() == 1
+        && chord.modifiers[0] == MacroModifier::Alt
+        && chord.key.eq_ignore_ascii_case("tab")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -283,6 +304,7 @@ fn run_step(
             ),
         ),
         MacroAction::SendShortcut => StepRun::Outcome(match &parameters.chord {
+            Some(chord) if is_app_switcher_chord(chord) => stepper.start_app_switcher(),
             Some(chord) => stepper.send_shortcut(chord),
             // 校验层已保证 chord 存在；损坏配置防御。
             None => StepOutcome::Failed,
@@ -293,6 +315,7 @@ fn run_step(
         )),
         MacroAction::FocusFrontmost => StepRun::Outcome(stepper.focus_frontmost(step_timeout_ms)),
         MacroAction::SystemAction => StepRun::Outcome(match &parameters.chord {
+            Some(chord) if is_app_switcher_chord(chord) => stepper.start_app_switcher(),
             Some(chord) => stepper.send_shortcut(chord),
             None => StepOutcome::Failed,
         }),
@@ -1146,6 +1169,13 @@ impl MacroStepper for WindowsMacroStepper {
         }
     }
 
+    fn start_app_switcher(&mut self) -> StepOutcome {
+        match self.injector.start_app_switcher() {
+            Ok(()) => StepOutcome::Done,
+            Err(_error) => StepOutcome::Failed,
+        }
+    }
+
     fn focus_frontmost(&mut self, timeout_ms: u64) -> StepOutcome {
         self.focus_task(crate::focus_service::FocusTask::Frontmost, timeout_ms)
     }
@@ -1323,6 +1353,9 @@ mod tests {
         fn send_shortcut(&mut self, chord: &MacroChord) -> StepOutcome {
             self.record("send_shortcut", &chord.key, 0)
         }
+        fn start_app_switcher(&mut self) -> StepOutcome {
+            self.record("start_app_switcher", "", 0)
+        }
         fn focus_input(&mut self, target: &str, timeout_ms: u64) -> StepOutcome {
             self.record("focus_input", target, timeout_ms)
         }
@@ -1457,6 +1490,52 @@ mod tests {
         assert_eq!(calls[0].action, "open_application");
         assert_eq!(calls[1].action, "send_shortcut");
         assert_eq!(calls[1].arg, "n");
+    }
+
+    #[test]
+    fn alt_tab_shortcut_starts_the_app_switcher_session() {
+        let definition = make_definition(
+            "macro.aaaaaaa",
+            vec![make_step(
+                MacroAction::SendShortcut,
+                MacroParameters {
+                    chord: Some(MacroChord {
+                        modifiers: vec![MacroModifier::Alt],
+                        key: "tab".to_owned(),
+                    }),
+                    ..MacroParameters::default()
+                },
+            )],
+        );
+        let (report, calls) = run(
+            &definition,
+            std::slice::from_ref(&definition),
+            vec![],
+            60_000,
+        );
+        assert_eq!(report.result, MacroTerminalResult::Completed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].action, "start_app_switcher");
+    }
+
+    #[test]
+    fn only_alt_tab_uses_the_app_switcher_session() {
+        assert!(is_app_switcher_chord(&MacroChord {
+            modifiers: vec![MacroModifier::Alt],
+            key: "tab".to_owned(),
+        }));
+        assert!(!is_app_switcher_chord(&MacroChord {
+            modifiers: vec![MacroModifier::Control, MacroModifier::Alt],
+            key: "tab".to_owned(),
+        }));
+        assert!(!is_app_switcher_chord(&MacroChord {
+            modifiers: vec![MacroModifier::Alt],
+            key: "escape".to_owned(),
+        }));
+        assert!(!is_app_switcher_chord(&MacroChord {
+            modifiers: vec![],
+            key: "tab".to_owned(),
+        }));
     }
 
     #[test]

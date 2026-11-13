@@ -36,6 +36,9 @@ const mocks = vi.hoisted(() => ({
   getOtherVoiceHotkey: vi.fn(),
   setOtherVoiceHotkey: vi.fn(),
   getRc003TaskStatus: vi.fn(),
+  getCaptureSupport: vi.fn(),
+  getRc003BridgeSnapshot: vi.fn(),
+  getImeStatus: vi.fn(),
   enableRc003Capture: vi.fn(),
   disableRc003Capture: vi.fn(),
   getVokieInstallation: vi.fn(),
@@ -87,6 +90,9 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     getOtherVoiceHotkey: mocks.getOtherVoiceHotkey,
     setOtherVoiceHotkey: mocks.setOtherVoiceHotkey,
     getRc003TaskStatus: mocks.getRc003TaskStatus,
+    getCaptureSupport: mocks.getCaptureSupport,
+    getRc003BridgeSnapshot: mocks.getRc003BridgeSnapshot,
+    getImeStatus: mocks.getImeStatus,
     enableRc003Capture: mocks.enableRc003Capture,
     disableRc003Capture: mocks.disableRc003Capture,
     getVokieInstallation: mocks.getVokieInstallation,
@@ -307,6 +313,9 @@ function resetWizardMocks(): void {
     mocks.getOtherVoiceHotkey.mockReset();
     mocks.setOtherVoiceHotkey.mockReset();
     mocks.getRc003TaskStatus.mockReset();
+    mocks.getImeStatus.mockResolvedValue(null);
+    mocks.getRc003BridgeSnapshot.mockResolvedValue(null);
+    mocks.getCaptureSupport.mockResolvedValue({ available: true, nativeArch: "x64", helperExpected: "sayall-helper.exe", reason: null });
     mocks.enableRc003Capture.mockReset();
     mocks.disableRc003Capture.mockReset();
     mocks.getVokieInstallation.mockReset();
@@ -755,7 +764,7 @@ describe("Onboarding wizard shell", () => {
     // 继续 → 步骤④（输入工具）。
     await continueButton.trigger("click");
     await flushPromises();
-    expect(wrapper.text()).toContain("选择你要用的输入工具");
+    expect(wrapper.text()).toContain("开启全按键支持");
   });
 
   it("keeps a recoverable state-read error with a retry entry", async () => {
@@ -819,7 +828,7 @@ describe("Onboarding diagnostics copy", () => {
     expect(text).toContain("App version: 0.5.0");
     expect(text).toContain("Build: fe326f8a1b2c3d4e5f60718293a4b5c6d7e8f901");
     expect(text).toContain("Windows version: 10.0.26100");
-    expect(text).toContain("Wizard step: remote (2/7)");
+    expect(text).toContain("Wizard step: remote (2/8)");
     expect(text).toContain("Gate: remote.not_connected");
     expect(text).toContain("Blocked: yes");
     expect(text).toContain("Audio: phase=ready recommended=1 selected=yes");
@@ -1040,6 +1049,7 @@ describe("Onboarding controls & completion steps", () => {
   });
 
   it("navigates back from controls to the voice test step and releases the suspension", async () => {
+    mocks.getVoiceInputTool.mockResolvedValue("wechat");
     mocks.getOnboardingState.mockResolvedValue(activeState("controls"));
     const wrapper = await mountWizard(connectedRuntime());
 
@@ -1104,6 +1114,7 @@ describe("Onboarding controls & completion steps", () => {
 
 describe("Onboarding voice test step", () => {
   installWizardHooks();
+  beforeEach(() => { mocks.getVoiceInputTool.mockResolvedValue("wechat"); });
 
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
@@ -1170,7 +1181,7 @@ describe("Onboarding voice test step", () => {
     );
     const wrapper = await mountWizard(connectedRuntime(), { attach: true });
     try {
-      await wrapper.get("input.onboarding-voice-input").trigger("blur");
+      (wrapper.get("input.onboarding-voice-input").element as HTMLInputElement).blur();
       await vi.advanceTimersByTimeAsync(200);
       await wrapper.get("input.onboarding-voice-input").setValue("模拟识别结果");
       await vi.advanceTimersByTimeAsync(400);
@@ -1209,7 +1220,7 @@ describe("Onboarding voice test step", () => {
     // 2026-10-05 要求：通过提示用绿色成功样式 + 对勾。
     expect(wrapper.find(".onboarding-card.success .onboarding-success .ok-mark").exists()).toBe(true);
     // 2026-10-05 改版定稿：核对卡是提示行（编号），不设勾选框——通过判据只有真实文字上屏。
-    expect(wrapper.text()).toContain("按你选的工具核对两件事");
+    expect(wrapper.text()).toContain("按你选的工具核对三件事");
     expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
     const continueButton = wrapper.find(".onboarding-actions .primary-button");
     expect(continueButton.attributes("data-gate-ready")).toBe("true");
@@ -1308,7 +1319,7 @@ describe("Onboarding voice test step", () => {
     queueSnapshots(runtimeWith(), streamingFrame({ decodedSamples: 80, submittedSamples: 100 }));
 
     const wrapper = await mountWizard(connectedRuntime(), { attach: true });
-    await wrapper.find("input.onboarding-voice-input").trigger("blur");
+    (wrapper.find("input.onboarding-voice-input").element as HTMLInputElement).blur();
     await flushPromises();
     await vi.advanceTimersByTimeAsync(200);
     await flushPromises();
@@ -1494,6 +1505,7 @@ describe("Onboarding strict audio pairing and cleanup", () => {
 
 describe("Onboarding skip and defer", () => {
   installWizardHooks();
+  beforeEach(() => { mocks.getVoiceInputTool.mockResolvedValue("wechat"); });
 
   it.each([false, true])("shows the external operation pending and late terminal on the main screen (failed=%s)", async failed => {
     mocks.getOnboardingState.mockResolvedValue({ ...activeState("voice_tool"), isActive: false, completedVersion: 1 });
@@ -1593,7 +1605,7 @@ describe("Onboarding skip and defer", () => {
   it("skips every blocked step and leaves a blocked completion page without forging passes", async () => {
     const wrapper = await mountWizard(runtimeWith());
     try {
-      const steps = ["remote", "audio", "voice_tool", "voice_test", "controls", "complete"];
+      const steps = ["remote", "audio", "full_key", "voice_tool", "voice_test", "controls", "complete"];
       for (const target of steps) {
         await wrapper.get(".onboarding-skip").trigger("click");
         await flushPromises();
@@ -1605,7 +1617,7 @@ describe("Onboarding skip and defer", () => {
       expect(mocks.dismissOnboarding).toHaveBeenCalledOnce();
       expect(mocks.completeOnboarding).not.toHaveBeenCalled();
       expect(onboardingEvents("step_passed")).toHaveLength(0);
-      expect(onboardingEvents("step_skipped")).toHaveLength(7);
+      expect(onboardingEvents("step_skipped")).toHaveLength(8);
       expect(mocks.cancelVoiceTest).toHaveBeenCalled();
       expect(wrapper.emitted("completed")).toHaveLength(1);
     } finally { wrapper.unmount(); }
@@ -1780,5 +1792,27 @@ describe("Onboarding skip and defer", () => {
     expect(mocks.saveOnboardingStep).toHaveBeenLastCalledWith("voice_test");
     wrapper.unmount();
     await flushPromises();
+  });
+});
+
+
+describe("personal wizard full-key stage integration", () => {
+  installWizardHooks();
+  it("renders the optional full-key stage between audio and input tools", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("full_key"));
+    const wrapper = await mountWizard(runtimeWith());
+    expect(wrapper.text()).toContain("开启全按键支持");
+    await wrapper.get(".onboarding-actions .primary-button").trigger("click");
+    await flushPromises();
+    expect(mocks.saveOnboardingStep).toHaveBeenLastCalledWith("voice_tool");
+    wrapper.unmount();
+  });
+  it("leaves full-key unavailable without blocking setup", async () => {
+    mocks.getOnboardingState.mockResolvedValue(activeState("full_key"));
+    mocks.getCaptureSupport.mockResolvedValue({ available: false, nativeArch: "arm64", helperExpected: "sayall-helper.exe", reason: "arch_unsupported" });
+    const wrapper = await mountWizard(runtimeWith());
+    expect(wrapper.find("input[type=checkbox]").attributes("disabled")).toBeDefined();
+    expect(wrapper.get(".onboarding-actions .primary-button").attributes("disabled")).toBeUndefined();
+    wrapper.unmount();
   });
 });

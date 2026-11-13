@@ -11,20 +11,29 @@ import {
 } from "./navigation";
 
 describe("Windows navigation", () => {
-  it("starts with buttons and keeps capabilities on their existing pages", () => {
-    expect(navigationItems.map((item) => item.id)).toEqual([
+  it("keeps the approved Mac-derived page order without empty entries", () => {
+    // 2026-10-25 用户指定：推荐放在连接上方；2026-10-24 个人中心固定在最后。
+    // 私有构建可能追加自己的页面；这里只核对公开页面的相对顺序。
+    const publicIds = new Set(publicNavigationItems.map((item) => item.id));
+    const items = navigationItems.filter((item) => publicIds.has(item.id));
+    expect(items.map((item) => item.id)).toEqual([
       "buttons",
+      "apps",
       "templates",
       "macros",
       "connection",
       "reflections",
-      "permissions",
       "settings",
       "profile",
     ]);
-    expect(navigationItems.find(item => item.id === "settings")?.icon).toBe("gear");
-    expect(navigationItems.at(-1)?.id).toBe("profile");
-    expect(navigationItems.every(item => item.label.length > 0)).toBe(true);
+    // 2026-11-09：APP 适配紧跟在按键之后（对齐 Mac SettingsSection.applications）。
+    expect(items[1].label).toBe("APP 适配");
+    expect(items[1].icon).toBe("apps");
+    expect(items.find(item => item.id === "templates")?.icon).toBe("template");
+    expect(items.find(item => item.id === "connection")?.label).toBe("连接与语音");
+    expect(items.find(item => item.id === "settings")?.icon).toBe("gear");
+    expect(items.at(-1)?.id).toBe("profile");
+    expect(items.every((item) => item.label.length > 0)).toBe(true);
   });
 
   it("shows the combination actions entry after the buttons page", () => {
@@ -55,10 +64,14 @@ describe("active page persistence (webview reload recovery)", () => {
     // 旧版本持久化的 "about" 在改名后不再是合法页 id：回落默认页，不做迁移映射。
     localStorage.setItem("sayall.activePage", "about");
     expect(loadPersistedPage()).toBeNull();
-    localStorage.setItem("sayall.activePage", "drivers");
-    expect(loadPersistedPage()).toBeNull();
     localStorage.setItem("sayall.activePage", "");
     expect(loadPersistedPage()).toBeNull();
+  });
+
+  it("旧版本的「权限」页迁移到设置页（2026-10-31 权限并入设置）", () => {
+    localStorage.setItem("sayall.activePage", "permissions");
+    // 不能静默落回默认页：用户升级后应停在权限现在所在的位置。
+    expect(loadPersistedPage()).toBe("settings");
   });
 });
 

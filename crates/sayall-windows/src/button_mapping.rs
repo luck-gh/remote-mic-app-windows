@@ -33,14 +33,15 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::app_switcher::{self, AppSwitcherCommand, AppSwitcherIo, AppSwitcherSession, EndReason};
 use crate::button_gestures::GestureRecognizer;
 use crate::key_gate;
 use crate::raw_input::{
     ButtonEdge, ButtonStateMerger, RawInputSnapshot, RawKeyboardEvent, RemoteButton,
 };
 use crate::send_input::{
-    native_key, ButtonAction, ButtonMappings, ButtonTrigger, HoldRepeat, KeyChord, KeyCode,
-    MouseClickKind, MoveDirection, ScrollDirection,
+    native_key, ButtonAction, ButtonActions, ButtonMappings, ButtonTrigger, HoldRepeat, KeyChord,
+    KeyCode, MouseClickKind, MoveDirection, ScrollDirection,
 };
 use crate::UsageCounters;
 
@@ -60,21 +61,28 @@ fn mapping_note(note: String) {
 static MAPPING_TEST_NOTES: Mutex<Option<Vec<String>>> = Mutex::new(None);
 /// 「打开应用」实际使用的聚焦档案。
 ///
-/// 预设应用（「打开应用」分组的默认列表）在用户没有显式选择时使用产品默认聚焦
-/// 方式（Chrome / 网易云用快捷键，其余自动选择输入框）；用户显式保存的档案优先。
+/// 预设应用（含用户手动添加的预设路径）直接使用产品默认聚焦方式
+/// （Chrome / 网易云用快捷键，其余自动选择输入框）。
 /// 自定义应用仍按用户保存的档案执行，没有档案时只打开。
 fn open_app_effective_profile(
     mappings: &ButtonMappings,
     target: &str,
 ) -> Option<crate::focus::AppFocusProfile> {
-    // 用户显式选过的档案优先；没有档案时预设应用使用产品默认聚焦方式。
-    if let Some(profile) = mappings.focus_profiles.get(target) {
-        return Some(profile.clone());
+    focus_profile_for_target(&mappings.focus_profiles, target)
+}
+
+/// 目标对应的实际聚焦档案：预设优先（含手动添加的预设路径），其余读取用户档案。
+///
+/// 组合动作的聚焦步骤与按键页的「打开应用 + 聚焦」必须使用同一判定，
+/// 否则手动添加的预设路径会在组合动作里退化成「只打开」。
+pub(crate) fn focus_profile_for_target(
+    profiles: &std::collections::BTreeMap<String, crate::focus::AppFocusProfile>,
+    target: &str,
+) -> Option<crate::focus::AppFocusProfile> {
+    if let Some(app) = crate::app_launcher::preset_app_for_target(target) {
+        return Some(preset_focus_profile(app.id));
     }
-    if crate::app_launcher::preset_app(target).is_some() {
-        return Some(preset_focus_profile(target));
-    }
-    None
+    profiles.get(target).cloned()
 }
 
 /// 预设应用的默认聚焦入口。
@@ -104,6 +112,92 @@ pub(crate) fn preset_focus_profile(target: &str) -> crate::focus::AppFocusProfil
             strategy: crate::focus::FocusStrategy::AutoComposer,
             ..Default::default()
         },
+    }
+}
+
+/// 每次「只打开」请求递增；后台前台保障任务据此判断自己是否已被更新的一次
+/// 打开取代，避免旧任务在用户已经切走后继续抢焦点。
+static OPEN_ONLY_FOREGROUND_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 「只打开应用」策略的冷启动前台保障：先有界等；仍未到前台时**只激活已存在的
+/// 可见窗口**，绝不重新启动应用。
+///
+/// 不依赖私有键位方案宿主是否可用——公开构建也必须执行这段等待，否则冷启动
+/// `launched_without_foreground` 后窗口会停在后台（2026-11-12 飞书现场）。
+///
+/// 重试必须是“激活”而不是“启动”：用户可能已经把刚打开的窗口关掉，再次调用
+/// `launch_app` 会把应用重新拉起，表现为“关掉后又自己打开”（2026-11-12 现场）。
+///
+/// `canceled` 每次循环前检查：产生更新的一次打开后，旧任务不再激活任何窗口。
+fn ensure_open_only_foreground(
+    target: &str,
+    rounds: u32,
+    mut canceled: impl FnMut() -> bool,
+    mut wait: impl FnMut(&str, std::time::Duration) -> bool,
+    mut activate_existing: impl FnMut(&str) -> bool,
+) -> bool {
+    // 先做一次零等待检查：正常托盘恢复/已在前台时直接返回，不引入额外延迟。
+    if wait(target, std::time::Duration::ZERO) {
+        crate::ble::gatt_note(
+            "open_app_profile_foreground phase=completed target_result=passed".to_owned(),
+        );
+        return true;
+    }
+    // 冷启动时不要先干等固定超时：每 500ms 检查一次，只要出现可见窗口就立刻
+    // 激活；没有可见窗口（应用还没出现，或用户已经关掉）就只继续观察，绝不启动。
+    for _ in 0..rounds {
+        if canceled() {
+            crate::ble::gatt_note(
+                "open_app_profile_foreground phase=completed target_result=superseded".to_owned(),
+            );
+            return false;
+        }
+        if activate_existing(target) {
+            crate::ble::gatt_note(
+                "open_app_profile_foreground phase=retry_activate target_result=passed".to_owned(),
+            );
+        }
+        if canceled() {
+            crate::ble::gatt_note(
+                "open_app_profile_foreground phase=completed target_result=superseded".to_owned(),
+            );
+            return false;
+        }
+        if wait(target, std::time::Duration::from_millis(500)) {
+            crate::ble::gatt_note(
+                "open_app_profile_foreground phase=completed target_result=passed".to_owned(),
+            );
+            return true;
+        }
+    }
+    crate::ble::gatt_note(
+        "open_app_profile_foreground phase=completed target_result=skipped".to_owned(),
+    );
+    false
+}
+
+/// 在后台执行「只打开」前台保障。最长 4 秒的等待不能占住引擎线程，否则后续
+/// 按键会排队（2026-11-12 评审）。每次调用递增 generation，旧任务在下一轮
+/// 检查时退出，不会在新一次打开之后继续抢焦点。
+fn schedule_open_only_foreground(target: &str) {
+    let generation = OPEN_ONLY_FOREGROUND_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let target = target.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("sayall-open-only-fg".to_owned())
+        .spawn(move || {
+            ensure_open_only_foreground(
+                &target,
+                8,
+                || OPEN_ONLY_FOREGROUND_GENERATION.load(Ordering::Relaxed) != generation,
+                |target, timeout| crate::app_launcher::wait_for_target_foreground(target, timeout),
+                |target| crate::app_launcher::activate_existing_window(target),
+            );
+        });
+    if spawned.is_err() {
+        crate::ble::gatt_note(
+            "open_app_profile_foreground phase=completed target_result=skipped reason=thread_unavailable"
+                .to_owned(),
+        );
     }
 }
 
@@ -140,7 +234,19 @@ pub enum EngineMessage {
     MappingNotice(MappingNoticeCallback),
     /// 临时暂挂（向导第⑥步"只看不动"）：仍观察边沿与手势，但不执行任何动作。
     /// 内存态、不落盘；进程结束自然消失。
+    CaptureMappingsChanged {
+        execution: ButtonMappings,
+        recognition: ButtonMappings,
+        enhanced: bool,
+    },
     SetSuspended(bool),
+    /// 语音键开始（MIC_OPEN / STREAM_START）：应用切换器会话必须释放 Alt，
+    /// 否则按住说话快捷键会带着按住的 Alt 进入输入法。
+    VoiceSessionStarted(Sender<bool>),
+    /// 组合动作步骤请求启动应用切换器会话（Alt+Tab）。
+    StartAppSwitcher,
+    /// 退出前同步收尾应用切换器（带 ack：宿主必须等到 Alt 真的释放）。
+    ReleaseAppSwitcherForExit(Sender<bool>),
     Shutdown,
 }
 
@@ -156,6 +262,15 @@ impl std::fmt::Debug for MappingNoticeCallback {
 pub trait MappingInjector: Send + Sync {
     fn tap(&self, chord: &KeyChord) -> Result<(), String>;
     fn scroll(&self, direction: ScrollDirection, steps: u16) -> Result<(), String>;
+    /// APP 级翻页：优先 `ScrollPattern`，没有档案时由后端找当前前台窗口的
+    /// 最大可滚动区域；最后才退到不移动光标的滚轮消息。
+    fn scroll_region(
+        &self,
+        _target: Option<&crate::scroll_region::ScrollRegionTarget>,
+        _command: crate::scroll_region::ScrollCommand,
+    ) -> Result<crate::scroll_region::ScrollOutcome, String> {
+        Err("当前平台不支持翻页".to_owned())
+    }
     fn mouse_click(&self, kind: MouseClickKind) -> Result<(), String>;
     fn mouse_move(&self, direction: MoveDirection, distance: u16) -> Result<(), String>;
     /// 打开/激活预设应用（生产实现调用 app_launcher）。
@@ -198,6 +313,45 @@ pub trait MappingInjector: Send + Sync {
     /// 未安装时返回空实现：常用语不可用，且不影响任何按键行为。
     fn common_phrase_host(&self) -> Arc<dyn crate::common_phrases::CommonPhraseHost> {
         crate::common_phrases::current_common_phrase_host()
+    }
+
+    /// 应用切换器会话的原始按键注入（默认不支持；生产实现走 SendInput）。
+    fn app_switcher_submit(&self, _command: AppSwitcherCommand) -> Result<(), String> {
+        Err("当前平台不支持应用切换".to_owned())
+    }
+
+    /// 系统 Alt+Tab 切换器当前是否存在（布尔判定，不记录窗口身份）。
+    fn app_switcher_present(&self) -> bool {
+        false
+    }
+
+    /// 左 Alt 是否仍在系统键态（释放后的读回判据）。
+    fn app_switcher_alt_down(&self) -> bool {
+        false
+    }
+
+    /// 组合动作里的 Alt+Tab：请求映射引擎启动应用切换器会话。
+    ///
+    /// 目标会话在引擎线程中执行；该方法只保证启动请求已送达。
+    fn start_app_switcher(&self) -> Result<(), String> {
+        Err("当前平台不支持组合动作里的应用切换".to_owned())
+    }
+}
+
+/// 把注入器接缝适配成 [`AppSwitcherIo`]，避免状态机依赖整个映射引擎。
+struct InjectorAppSwitcherIo<'a>(&'a dyn MappingInjector);
+
+impl AppSwitcherIo for InjectorAppSwitcherIo<'_> {
+    fn submit(&self, command: AppSwitcherCommand) -> Result<(), String> {
+        self.0.app_switcher_submit(command)
+    }
+
+    fn switcher_present(&self) -> bool {
+        self.0.app_switcher_present()
+    }
+
+    fn alt_down(&self) -> bool {
+        self.0.app_switcher_alt_down()
     }
 }
 
@@ -346,6 +500,23 @@ impl MappingInjector for SendInputInjector {
             .map_err(|error| error.to_string())
     }
 
+    fn scroll_region(
+        &self,
+        target: Option<&crate::scroll_region::ScrollRegionTarget>,
+        command: crate::scroll_region::ScrollCommand,
+    ) -> Result<crate::scroll_region::ScrollOutcome, String> {
+        #[cfg(windows)]
+        {
+            crate::scroll_region_windows::scroll_foreground(target.cloned(), command)
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (target, command);
+            Err("当前平台不支持翻页".to_owned())
+        }
+    }
+
     fn mouse_click(&self, kind: MouseClickKind) -> Result<(), String> {
         self.runtime
             .mouse_click(kind)
@@ -410,27 +581,14 @@ impl MappingInjector for SendInputInjector {
                 // 会让新窗口停在后面，单靠等待永远等不到；已运行应用的第二次
                 // activate_or_launch 会走「恢复已有窗口并置前」，与 AppShortcut
                 // 分支同一路径，能把目标真正拿到前台。
-                if crate::button_profiles::is_button_profile_host_available() {
-                    let mut foreground = crate::app_launcher::wait_for_target_foreground(
-                        target,
-                        std::time::Duration::from_millis(3000),
-                    );
-                    if !foreground {
-                        crate::ble::gatt_note(
-                            "open_app_profile_foreground phase=retry reason=target_not_foreground"
-                                .to_owned(),
-                        );
-                        let _ = self.launch_app(target);
-                        foreground = crate::app_launcher::wait_for_target_foreground(
-                            target,
-                            std::time::Duration::from_millis(2500),
-                        );
-                    }
-                    crate::ble::gatt_note(format!(
-                        "open_app_profile_foreground phase=completed target_result={}",
-                        if foreground { "passed" } else { "skipped" }
-                    ));
-                }
+                //
+                // 这段等待**不能**按「私有键位方案宿主是否可用」门控：公开构建
+                // 不注入私有宿主，门控会让冷启动首按完全跳过等待/重试。2026-11-12
+                // 飞书现场：菜单键冷启动 `launched_without_foreground` 后无任何
+                // `focus_wait_foreground`/重试日志，窗口停在后台。
+                // 等待与激活放到后台，避免最长 4 秒阻塞引擎线程；每次打开递增
+                // generation，旧任务在用户发起下一次打开后退出。
+                schedule_open_only_foreground(target);
                 Ok(())
             }
             crate::focus::FocusStrategy::AutoComposer => {
@@ -590,6 +748,58 @@ impl MappingInjector for SendInputInjector {
             return crate::common_phrases::current_common_phrase_host();
         }
         local
+    }
+
+    fn app_switcher_submit(&self, command: AppSwitcherCommand) -> Result<(), String> {
+        if command == AppSwitcherCommand::AltDown && crate::ime::voice_session_active() {
+            crate::ble::gatt_note(
+                "app_switcher_inject phase=start result=rejected reason=voice_active".to_owned(),
+            );
+            return Err("语音会话中暂不打开应用切换器".to_owned());
+        }
+
+        let chord = match command {
+            AppSwitcherCommand::AltDown | AppSwitcherCommand::AltUp => KeyChord {
+                keys: vec![KeyCode::LeftAlt],
+            },
+            AppSwitcherCommand::Tab => KeyChord {
+                keys: vec![KeyCode::Tab],
+            },
+            AppSwitcherCommand::ReverseTab => KeyChord {
+                keys: vec![KeyCode::LeftShift, KeyCode::Tab],
+            },
+            AppSwitcherCommand::Escape => KeyChord {
+                keys: vec![KeyCode::Escape],
+            },
+        };
+        let result = match command {
+            AppSwitcherCommand::AltDown => self.runtime.press(&chord),
+            AppSwitcherCommand::AltUp => self.runtime.release(&chord),
+            AppSwitcherCommand::Tab
+            | AppSwitcherCommand::ReverseTab
+            | AppSwitcherCommand::Escape => self.runtime.tap(chord),
+        };
+        match &result {
+            Ok(_) => crate::ble::gatt_note(format!(
+                "app_switcher_inject command={command:?} result=submitted"
+            )),
+            Err(error) => crate::ble::gatt_note(format!(
+                "app_switcher_inject command={command:?} result=failed error_domain=send_input retryable=true error={error}"
+            )),
+        }
+        result.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    fn app_switcher_present(&self) -> bool {
+        crate::foreground::alt_tab_switcher_present()
+    }
+
+    fn app_switcher_alt_down(&self) -> bool {
+        crate::send_input_windows::left_alt_down()
+    }
+
+    fn start_app_switcher(&self) -> Result<(), String> {
+        request_app_switcher_start()
     }
 }
 
@@ -784,12 +994,37 @@ fn effective_action(
     base.action_for(button, trigger)
 }
 
+/// 单个按键的有效三列配置（覆盖层优先，否则基础映射）。
+///
+/// 应用切换器会话在按下沿即时认领“任何一列绑定为切换应用”的键，不能只看
+/// 当前触发方式——按住的方向键没有手势判定时间。
+fn effective_actions(
+    base: &ButtonMappings,
+    overlay: Option<&ButtonMappings>,
+    button: RemoteButton,
+) -> ButtonActions {
+    if base.enabled {
+        if let Some(overlay) = overlay {
+            if let Some(actions) = overlay.actions.get(&button) {
+                return actions.clone();
+            }
+        }
+    }
+    base.actions(button)
+}
+
+fn action_is_app_switcher(actions: &ButtonActions) -> bool {
+    [&actions.single, &actions.double, &actions.long]
+        .iter()
+        .any(|action| matches!(action, ButtonAction::AppSwitcher))
+}
+
 /// 按键映射引擎运行时。持有句柄即运行；线程在 `Shutdown` 或通道关闭时退出。
 pub struct ButtonMappingRuntime {
     observation: Arc<ButtonObservation>,
-    configuration: Mutex<InputConfiguration>,
-    capture_bridge: Mutex<std::sync::Weak<crate::rc003_bridge::Rc003Bridge>>,
-    capture_enabled: std::sync::atomic::AtomicBool,
+    configuration: Arc<Mutex<InputConfiguration>>,
+    capture_bridge: Arc<Mutex<std::sync::Weak<crate::rc003_bridge::Rc003Bridge>>>,
+    capture_enabled: Arc<std::sync::atomic::AtomicBool>,
     sender: Sender<EngineMessage>,
     receiver: Mutex<Option<Receiver<EngineMessage>>>,
     state: Arc<Mutex<EngineState>>,
@@ -824,6 +1059,7 @@ impl InputConfiguration {
         )
         .mapped_mask()
             | self.scene_mappings.mapped_mask()
+            | key_gate::app_switcher_mask()
     }
 
     fn apply_input_capabilities(&self, mut mappings: ButtonMappings) -> ButtonMappings {
@@ -958,11 +1194,21 @@ impl ButtonMappingRuntime {
         let gesture_callbacks = Arc::new(RwLock::new(Vec::new()));
         let gesture_handler = Arc::new(RwLock::new(None));
 
+        // BLE 语音开始（MIC_OPEN / STREAM_START）经这个端点取消应用切换器会话。
+        // 进程内只有一个映射引擎；测试并行创建时后创建的会覆盖，发送失败是安全的空操作。
+        if let Ok(mut slot) = voice_session_sender_slot().lock() {
+            *slot = Some(sender.clone());
+        }
+        // 组合动作里的 Alt+Tab 经同一引擎通道启动应用切换器会话。
+        if let Ok(mut slot) = app_switcher_sender_slot().lock() {
+            *slot = Some(sender.clone());
+        }
+
         let runtime = Self {
             observation: Arc::clone(&observation),
-            configuration: Mutex::new(InputConfiguration::default()),
-            capture_bridge: Mutex::new(std::sync::Weak::new()),
-            capture_enabled: std::sync::atomic::AtomicBool::new(false),
+            configuration: Arc::new(Mutex::new(InputConfiguration::default())),
+            capture_bridge: Arc::new(Mutex::new(std::sync::Weak::new())),
+            capture_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Arc::clone(&state),
@@ -974,6 +1220,26 @@ impl ButtonMappingRuntime {
             worker: None,
         };
 
+        key_gate::set_capture_mask_sink(Arc::new({
+            let configuration = Arc::clone(&runtime.configuration);
+            let capture_bridge = Arc::clone(&runtime.capture_bridge);
+            let enabled = Arc::clone(&runtime.capture_enabled);
+            move || {
+                let bridge = capture_bridge.lock().unwrap().upgrade();
+                if let Some(bridge) = bridge {
+                    let configuration = configuration.lock().unwrap();
+                    let mask = if configuration.connected
+                        && configuration.model == crate::RemoteModel::Rc003
+                    {
+                        configuration.requested_mask()
+                    } else {
+                        0
+                    };
+                    drop(configuration);
+                    bridge.set_capture_targets(enabled.load(Ordering::Acquire), mask);
+                }
+            }
+        }));
         let worker = std::thread::Builder::new()
             .name("sayall-button-mapping".to_owned())
             .spawn({
@@ -1022,6 +1288,22 @@ impl ButtonMappingRuntime {
             .send(EngineMessage::MappingNotice(MappingNoticeCallback(
                 Box::new(callback),
             )));
+    }
+
+    /// 退出前同步释放应用切换器会话（等引擎确认已经释放 Alt）。
+    ///
+    /// Tauri 退出收尾是 `std::process::exit`，不执行析构；宿主必须在进程结束前
+    /// 调用本方法并等待 ack，否则应用切换器会话可能把 Alt 留在系统键态。
+    pub fn release_app_switcher_for_exit(&self, timeout: Duration) -> bool {
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .sender
+            .send(EngineMessage::ReleaseAppSwitcherForExit(sender))
+            .is_err()
+        {
+            return false;
+        }
+        receiver.recv_timeout(timeout).unwrap_or(false)
     }
 
     /// 更新按键映射：热加载到引擎 + 同步门控吞键配置。
@@ -1191,7 +1473,7 @@ impl ButtonMappingRuntime {
         configuration.captured_mask = mask;
         configuration.enhanced = mask != 0;
         let (execution, recognition) = configuration.effective_mappings();
-        let _ = self.sender.send(EngineMessage::MappingsChanged {
+        let _ = self.sender.send(EngineMessage::CaptureMappingsChanged {
             execution,
             recognition,
             enhanced: mask != 0,
@@ -1246,6 +1528,7 @@ impl ButtonMappingRuntime {
     /// 私有组件只在前后台切换/方案保存时调用；公开构建没有私有组件，永远不会调用。
     /// `None` 表示没有方案生效，引擎完全走基础映射。
     pub fn set_profile_overlay(&self, overlay: Option<ButtonMappings>) {
+        let overlay = overlay.map(ButtonMappings::promote_app_switcher_shortcuts);
         let mut configuration = self.configuration.lock().unwrap_or_else(|p| p.into_inner());
         if configuration.profile_overlay == overlay {
             return;
@@ -1394,6 +1677,11 @@ impl Drop for ButtonMappingRuntime {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        // 引擎已经退出：任何应用切换器遮蔽都必须 fail-open。
+        key_gate::set_app_switcher_mask(0);
+        if let Ok(mut slot) = voice_session_sender_slot().lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -1520,6 +1808,90 @@ fn finish_all_repeat_runs(repeat_runs: &mut RepeatRuns, reason: &str) {
     }
 }
 
+/// 应用切换器会话收尾：写终态日志、清门控遮蔽，并在 Alt 未释放时留下错误状态。
+///
+/// 每次引擎调用会话后都要调用一次；`EndReport` 每个终态只产生一次。
+fn drain_app_switcher_end(session: &mut AppSwitcherSession, state: &Arc<Mutex<EngineState>>) {
+    let Some(end) = session.take_last_end() else {
+        return;
+    };
+    key_gate::set_app_switcher_mask(0);
+    crate::ble::gatt_note(format!(
+        "map_app_switcher operation={} phase=end reason={} escape={} alt_release={} alt_down_after={} switcher_opened={} duration_ms={} tab_count={} previous_count={} confirm_count={}",
+        end.operation_id,
+        end.reason.as_str(),
+        end.escape_submitted,
+        if end.alt_release_ok { "submitted" } else { "failed" },
+        end.alt_still_down,
+        end.switcher_opened,
+        end.duration.as_millis(),
+        end.tabs,
+        end.previous,
+        end.confirmations
+    ));
+    if end.alt_still_down {
+        lock_state(state).last_error =
+            Some("应用切换器没能释放 Alt，请按一次键盘 Alt 键恢复".to_owned());
+    }
+}
+
+/// BLE 层在语音键 `MIC_OPEN` / `STREAM_START` 时调用：取消应用切换器会话。
+///
+/// 为什么需要：语音键不经过按键映射引擎；按住说话快捷键必须在没有 Alt 按住的
+/// 状态下注入，否则输入法可能把组合键判成 Alt 系快捷键。未创建引擎时是空操作。
+pub(crate) fn note_voice_session_started() -> Result<(), String> {
+    let sender = voice_session_sender_slot().lock().unwrap().clone();
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+    release_switcher_before_voice(&sender, Duration::from_millis(60))
+}
+
+fn release_switcher_before_voice(
+    sender: &Sender<EngineMessage>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (ack, receiver) = mpsc::channel();
+    sender
+        .send(EngineMessage::VoiceSessionStarted(ack))
+        .map_err(|_| "语音开始前无法联系应用切换器".to_owned())?;
+    match receiver.recv_timeout(timeout) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("语音开始前 Alt 尚未释放".to_owned()),
+        Err(_) => Err("语音开始前应用切换器释放确认超时".to_owned()),
+    }
+}
+
+static VOICE_SESSION_SENDER: std::sync::OnceLock<Mutex<Option<Sender<EngineMessage>>>> =
+    std::sync::OnceLock::new();
+
+fn voice_session_sender_slot() -> &'static Mutex<Option<Sender<EngineMessage>>> {
+    VOICE_SESSION_SENDER.get_or_init(|| Mutex::new(None))
+}
+
+/// 组合动作（宏）启动应用切换器的引擎通道。
+///
+/// 进程内只有一个映射引擎；测试并行创建时后创建的会覆盖，发送失败是
+/// 安全的空操作（组合动作步骤报失败，不影响按键与语音）。
+static APP_SWITCHER_SENDER: std::sync::OnceLock<Mutex<Option<Sender<EngineMessage>>>> =
+    std::sync::OnceLock::new();
+
+fn app_switcher_sender_slot() -> &'static Mutex<Option<Sender<EngineMessage>>> {
+    APP_SWITCHER_SENDER.get_or_init(|| Mutex::new(None))
+}
+
+fn request_app_switcher_start() -> Result<(), String> {
+    let slot = app_switcher_sender_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(sender) = slot.as_ref() else {
+        return Err("app_switcher_engine_unavailable".to_owned());
+    };
+    sender
+        .send(EngineMessage::StartAppSwitcher)
+        .map_err(|_| "app_switcher_engine_disconnected".to_owned())
+}
+
 /// 把定时器到期的**连续拍**并入聚合；`advance_with_ticks` 的第二返回值以外
 /// 的手势（双击窗补发的单击、首次长按）是一次性手势，不进聚合
 /// （2026-10-05 评审发现 1：避免把点按记成 `map_repeat`，污染拍数与时长）。
@@ -1564,11 +1936,34 @@ fn engine_worker(
     let mut phrase_claimed: BTreeSet<RemoteButton> = BTreeSet::new();
     // OK 键上下文点击：最近一次由遥控器注入成功的鼠标移动时刻（5 秒窗口）。
     let mut last_remote_move_at: Option<Instant> = None;
+    // 应用切换器（Alt+Tab）临时会话：状态与计时都留在引擎线程，避免跨线程锁。
+    let mut app_switcher = AppSwitcherSession::new();
 
     loop {
-        let timeout = recognizer
+        // 消息密集时 recv_timeout 可能一直不超时；在每条消息前补一次会话心跳，
+        // 保证 15 秒自动取消与切换器存在性轮询不会因为消息不断而饿死。
+        let now = Instant::now();
+        if app_switcher
             .next_deadline()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let io = InjectorAppSwitcherIo(injector.as_ref());
+            let tick = app_switcher.tick(now, &io);
+            if tick.opened_now {
+                crate::ble::gatt_note(format!(
+                    "map_app_switcher operation={} phase=open switcher_seen=true",
+                    app_switcher.operation_id()
+                ));
+            }
+            drain_app_switcher_end(&mut app_switcher, &state);
+        }
+
+        let timeout = match (recognizer.next_deadline(), app_switcher.next_deadline()) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let message = match timeout {
             Some(timeout) => match receiver.recv_timeout(timeout) {
                 Ok(message) => message,
@@ -1582,6 +1977,7 @@ fn engine_worker(
                         if fire_gesture(
                             button,
                             trigger,
+                            now,
                             &mappings,
                             &recognition_mappings,
                             &state,
@@ -1591,6 +1987,7 @@ fn engine_worker(
                             &mut native_pending,
                             &mut last_remote_move_at,
                             &macro_runtime,
+                            &mut app_switcher,
                         ) {
                             reset_after_terminal_action(
                                 "lock_workstation",
@@ -1604,11 +2001,25 @@ fn engine_worker(
                             break;
                         }
                     }
+                    {
+                        let io = InjectorAppSwitcherIo(injector.as_ref());
+                        let tick = app_switcher.tick(now, &io);
+                        if tick.opened_now {
+                            crate::ble::gatt_note(format!(
+                                "map_app_switcher operation={} phase=open switcher_seen=true",
+                                app_switcher.operation_id()
+                            ));
+                        }
+                        drain_app_switcher_end(&mut app_switcher, &state);
+                    }
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // 引擎线程收尾：把仍在进行中的连续触发聚合日志补齐
-                    // （2026-10-05 评审发现 2）。
+                    // 引擎线程收尾：先释放应用切换器的 Alt，再补齐连续触发聚合日志。
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    app_switcher.cancel(EndReason::EngineStopped, Instant::now(), &io);
+                    drain_app_switcher_end(&mut app_switcher, &state);
+                    key_gate::set_app_switcher_mask(0);
                     finish_all_repeat_runs(&mut repeat_runs, "shutdown");
                     break;
                 }
@@ -1616,12 +2027,17 @@ fn engine_worker(
             None => match receiver.recv() {
                 Ok(message) => message,
                 Err(_) => {
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    app_switcher.cancel(EndReason::EngineStopped, Instant::now(), &io);
+                    drain_app_switcher_end(&mut app_switcher, &state);
+                    key_gate::set_app_switcher_mask(0);
                     finish_all_repeat_runs(&mut repeat_runs, "shutdown");
                     break;
                 }
             },
         };
 
+        let capture_reconfig = matches!(&message, EngineMessage::CaptureMappingsChanged { .. });
         match message {
             EngineMessage::CaptureContinuityReset { old_owned_mask } => {
                 let active = merger.active_button_set();
@@ -1705,6 +2121,7 @@ fn engine_worker(
                     &mut phrase_claimed,
                     &mut last_remote_move_at,
                     &macro_runtime,
+                    &mut app_switcher,
                 );
             }
             EngineMessage::HidUsages(usages) => {
@@ -1743,6 +2160,7 @@ fn engine_worker(
                     &mut phrase_claimed,
                     &mut last_remote_move_at,
                     &macro_runtime,
+                    &mut app_switcher,
                 );
             }
             EngineMessage::GateEdge(edge) | EngineMessage::DriverEdge(edge) => {
@@ -1776,6 +2194,7 @@ fn engine_worker(
                     &mut phrase_claimed,
                     &mut last_remote_move_at,
                     &macro_runtime,
+                    &mut app_switcher,
                 );
             }
             EngineMessage::ListenerStopped | EngineMessage::DeviceRemoved => {
@@ -1787,6 +2206,17 @@ fn engine_worker(
                     _ => "device_removed",
                 };
                 crate::ble::gatt_note(format!("map_reset source={reason}"));
+                // 应用切换器：来源失效时先取消会话并释放 Alt（Esc 只在切换器仍
+                // 存在时发送），再把按住状态复位。
+                {
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    let end_reason = match message {
+                        EngineMessage::ListenerStopped => EndReason::ListenerStopped,
+                        _ => EndReason::DeviceRemoved,
+                    };
+                    app_switcher.cancel(end_reason, Instant::now(), &io);
+                    drain_app_switcher_end(&mut app_switcher, &state);
+                }
                 // 常用语面板（可选私有组件）：来源失效（断连、监听停止、睡眠
                 // 唤醒后的 HID 接口移除）时关闭面板并清认领状态；未接入时空操作。
                 injector.common_phrase_host().reset(reason);
@@ -1802,7 +2232,17 @@ fn engine_worker(
                 execution,
                 recognition,
                 enhanced,
+            }
+            | EngineMessage::CaptureMappingsChanged {
+                execution,
+                recognition,
+                enhanced,
             } => {
+                if !capture_reconfig {
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    app_switcher.cancel(EndReason::MappingsChanged, Instant::now(), &io);
+                    drain_app_switcher_end(&mut app_switcher, &state);
+                }
                 mapping_revision = mapping_revision.wrapping_add(1);
                 let (repeat_single, repeat_long, repeat_auto, repeat_off) =
                     crate::raw_input::ALL_BUTTONS.iter().fold(
@@ -1881,6 +2321,9 @@ fn engine_worker(
                 }
             }
             EngineMessage::Shutdown => {
+                let io = InjectorAppSwitcherIo(injector.as_ref());
+                app_switcher.cancel(EndReason::Shutdown, Instant::now(), &io);
+                drain_app_switcher_end(&mut app_switcher, &state);
                 injector.close_focus();
                 finish_all_repeat_runs(&mut repeat_runs, "shutdown");
                 observation.clear();
@@ -1893,9 +2336,69 @@ fn engine_worker(
             EngineMessage::SetSuspended(suspended) => {
                 if suspended {
                     injector.cancel_focus();
+                    // 暂挂（向导“只看不动”）不得遗留按住的 Alt。
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    app_switcher.cancel(EndReason::Suspended, Instant::now(), &io);
+                    drain_app_switcher_end(&mut app_switcher, &state);
                 }
                 lock_state(&state).suspended = suspended;
                 crate::ble::gatt_note(format!("map_suspension suspended={suspended}"));
+            }
+            EngineMessage::VoiceSessionStarted(ack) => {
+                let io = InjectorAppSwitcherIo(injector.as_ref());
+                if app_switcher.cancel(EndReason::VoiceStarted, Instant::now(), &io) {
+                    drain_app_switcher_end(&mut app_switcher, &state);
+                }
+                let _ = ack.send(app_switcher.release_confirmed());
+            }
+            EngineMessage::StartAppSwitcher => {
+                if lock_state(&state).suspended {
+                    crate::ble::gatt_note(
+                        "map_app_switcher phase=start result=ignored reason=suspended source=macro"
+                            .to_owned(),
+                    );
+                } else {
+                    let now = Instant::now();
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    let was_active = app_switcher.is_active();
+                    if !was_active {
+                        key_gate::set_app_switcher_mask(app_switcher::control_mask());
+                        injector.common_phrase_host().close("app_switcher");
+                    }
+                    let result = if was_active {
+                        app_switcher.advance(now, &io)
+                    } else {
+                        // 组合动作没有物理触发键；用 TV 作为会话来源占位，
+                        // 日志用 source=macro 区分真实按键触发。
+                        app_switcher.start(RemoteButton::Tv, now, &io)
+                    };
+                    match result {
+                        Ok(operation) => crate::ble::gatt_note(format!(
+                            "map_app_switcher phase={} operation={operation} result=submitted source=macro",
+                            if was_active { "tab" } else { "start" }
+                        )),
+                        Err(error) => {
+                            crate::ble::gatt_note(format!(
+                                "map_app_switcher phase={} result=failed source=macro error_domain=send_input retryable=true error={error}",
+                                if was_active { "tab" } else { "start" }
+                            ));
+                            lock_state(&state).last_error =
+                                Some("打开应用切换器失败，请重试".to_owned());
+                        }
+                    }
+                    drain_app_switcher_end(&mut app_switcher, &state);
+                    if !app_switcher.is_active() {
+                        // AltDown/Tab 注入失败或会话立即收尾：遮蔽必须 fail-open。
+                        key_gate::set_app_switcher_mask(0);
+                    }
+                }
+            }
+            EngineMessage::ReleaseAppSwitcherForExit(ack) => {
+                let io = InjectorAppSwitcherIo(injector.as_ref());
+                app_switcher.cancel(EndReason::Shutdown, Instant::now(), &io);
+                drain_app_switcher_end(&mut app_switcher, &state);
+                key_gate::set_app_switcher_mask(0);
+                let _ = ack.send(app_switcher.release_confirmed());
             }
         }
     }
@@ -1948,6 +2451,7 @@ fn handle_edges(
     phrase_claimed: &mut BTreeSet<RemoteButton>,
     last_remote_move_at: &mut Option<Instant>,
     macro_runtime: &Arc<crate::macro_runtime::MacroRuntime>,
+    app_switcher: &mut AppSwitcherSession,
 ) {
     if edges.is_empty() {
         return;
@@ -1994,6 +2498,9 @@ fn handle_edges(
                 edge.button, edge.is_pressed,
             ));
             native_pending.remove(&edge.button);
+            if !edge.is_pressed {
+                app_switcher.release(edge.button);
+            }
             continue;
         }
         #[cfg(windows)]
@@ -2007,6 +2514,46 @@ fn handle_edges(
             ));
         }
         let fired = if edge.is_pressed {
+            // 应用切换器（Alt+Tab）：会话期间在按下沿即时认领 OK/返回/方向/TV、
+            // 启动键以及任何绑定为“切换应用”的键；不进入手势识别，也不执行
+            // 原映射。门控遮蔽（key_gate::set_app_switcher_mask）保证原生键
+            // 不会漏进系统切换器或前台应用。
+            if app_switcher.is_active() {
+                let is_trigger = app_switcher::is_control_button(edge.button)
+                    || app_switcher.origin_button() == Some(edge.button)
+                    || {
+                        let base = read_lock(mappings);
+                        action_is_app_switcher(&base.actions(edge.button))
+                    };
+                if is_trigger {
+                    let io = InjectorAppSwitcherIo(injector.as_ref());
+                    let result = app_switcher.press(edge.button, now, &io);
+                    if let Some(action) = result.action {
+                        crate::ble::gatt_note(format!(
+                            "map_app_switcher operation={} phase=press button={:?} action={action:?}",
+                            app_switcher.operation_id(),
+                            edge.button
+                        ));
+                    }
+                    if let Some(error) = result.error {
+                        crate::ble::gatt_note(format!(
+                            "map_app_switcher operation={} phase=press button={:?} result=failed error_domain=send_input retryable=true error={error}",
+                            app_switcher.operation_id(),
+                            edge.button
+                        ));
+                        lock_state(state).last_error =
+                            Some(format!("应用切换器按键发送失败：{error}"));
+                    }
+                    drain_app_switcher_end(app_switcher, state);
+                    if result.claimed {
+                        // 被会话认领的按下不继承旧手势状态；其释放沿由会话的
+                        // claimed 集合配对消费（见下方释放分支）。
+                        phrase_claimed.remove(&edge.button);
+                        recognizer.cancel_press(edge.button);
+                        continue;
+                    }
+                }
+            }
             // 常用语面板（可选私有组件）：在手势识别之前认领本次边沿。
             // 面板打开期间这六个键不区分单击/双击/长按，按下即响应；
             // 命中即结束，不进入 recognizer，也不执行原映射。
@@ -2049,6 +2596,12 @@ fn handle_edges(
                 }
             }
         } else {
+            // 释放沿：应用切换器会话认领过的按下必须配对消费（即使会话已在
+            // 按下沿结束，例如 OK 确认 / 返回取消）。
+            if app_switcher.release(edge.button) {
+                finish_repeat_run(repeat_runs, edge.button, "app_switcher");
+                continue;
+            }
             // 释放沿：先问面板（保持组件内部在按状态同步），再按公开侧记账
             // 决定是否消费——被认领的按下，其释放沿必须配对吞下。
             let claimed_press = phrase_claimed.remove(&edge.button);
@@ -2096,6 +2649,7 @@ fn handle_edges(
             if fire_gesture(
                 edge.button,
                 trigger,
+                now,
                 mappings,
                 recognition_mappings,
                 state,
@@ -2105,6 +2659,7 @@ fn handle_edges(
                 native_pending,
                 last_remote_move_at,
                 macro_runtime,
+                app_switcher,
             ) {
                 reset_after_terminal_action(
                     "lock_workstation",
@@ -2162,10 +2717,24 @@ fn reset_after_terminal_action(
     }
 }
 
+/// 当前前台 APP 对应的滚动区域档案；只在 Windows 生产路径使用。
+#[cfg(windows)]
+fn scroll_target_for_foreground(
+    mappings: &ButtonMappings,
+) -> Option<crate::scroll_region::ScrollRegionTarget> {
+    let executable = crate::focus_windows::foreground_executable_path()?;
+    mappings
+        .scroll_regions
+        .iter()
+        .find(|(target, _)| crate::app_launcher::target_matches_executable(target, &executable))
+        .map(|(_, target)| target.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fire_gesture(
     button: RemoteButton,
     trigger: ButtonTrigger,
+    now: Instant,
     mappings: &Arc<RwLock<ButtonMappings>>,
     recognition_mappings: &Arc<RwLock<ButtonMappings>>,
     state: &Arc<Mutex<EngineState>>,
@@ -2175,6 +2744,7 @@ fn fire_gesture(
     native_pending: &mut BTreeSet<RemoteButton>,
     last_remote_move_at: &mut Option<Instant>,
     macro_runtime: &Arc<crate::macro_runtime::MacroRuntime>,
+    app_switcher: &mut AppSwitcherSession,
 ) -> bool {
     let fired = FiredGesture { button, trigger };
     let suspended = {
@@ -2227,6 +2797,16 @@ fn fire_gesture(
         return false;
     }
     let action = mappings.action_for(button, trigger);
+    let scroll_target: Option<crate::scroll_region::ScrollRegionTarget> = {
+        #[cfg(windows)]
+        {
+            scroll_target_for_foreground(&mappings)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    };
     if action == ButtonAction::Disabled {
         mapping_note(format!(
             "map_skip_inject reason=action_disabled button={:?} trigger={:?}",
@@ -2259,12 +2839,50 @@ fn fire_gesture(
             crate::gatt_note("task_switch phase=rejected reason=router_unavailable".to_owned());
             lock_state(state).last_error = Some("任务切换控制器不可用".to_owned());
         }
+        ButtonAction::Unsupported(raw) => {
+            crate::ble::gatt_note(format!(
+                "map_skip_inject reason=unsupported_action_type button={button:?} trigger={trigger:?} action_type={}",
+                raw.log_token()
+            ));
+        }
         ButtonAction::Scroll { direction, steps } => {
             crate::ble::gatt_note(format!(
                 "map_fire button={button:?} trigger={trigger:?} action=scroll direction={direction:?} steps={steps}"
             ));
             if let Err(error) = injector.scroll(direction, steps) {
                 lock_state(state).last_error = Some(format!("滚轮事件发送失败：{error}"));
+            }
+        }
+        ButtonAction::PageUp
+        | ButtonAction::PageDown
+        | ButtonAction::ScrollToTop
+        | ButtonAction::ScrollToBottom => {
+            let command = match &action {
+                ButtonAction::PageUp => crate::scroll_region::ScrollCommand::PageUp,
+                ButtonAction::PageDown => crate::scroll_region::ScrollCommand::PageDown,
+                ButtonAction::ScrollToTop => crate::scroll_region::ScrollCommand::ToTop,
+                _ => crate::scroll_region::ScrollCommand::ToBottom,
+            };
+            crate::ble::gatt_note(format!(
+                "map_fire button={button:?} trigger={trigger:?} action={} target_recorded={}",
+                command.as_str(),
+                scroll_target.is_some()
+            ));
+            match injector.scroll_region(scroll_target.as_ref(), command) {
+                Ok(outcome) => crate::ble::gatt_note(format!(
+                    "map_scroll result=ok command={} method={} moved={} at_edge={}",
+                    command.as_str(),
+                    outcome.method.as_str(),
+                    outcome.moved,
+                    outcome.at_edge
+                )),
+                Err(error) => {
+                    crate::ble::gatt_note(format!(
+                        "map_scroll result=err command={} reason={error}",
+                        command.as_str()
+                    ));
+                    lock_state(state).last_error = Some(format!("翻页失败：{error}"));
+                }
             }
         }
         ButtonAction::MouseClick { kind } => {
@@ -2413,7 +3031,50 @@ fn fire_gesture(
                 }
             }
         }
+        ButtonAction::AppSwitcher => {
+            let io = InjectorAppSwitcherIo(injector.as_ref());
+            let was_active = app_switcher.is_active();
+            if !was_active {
+                // 会话期间 OK/返回/方向/TV 由门控直接吞下：这些键即使没有
+                // 映射，原生动作也会漏进系统切换器或目标应用。
+                key_gate::set_app_switcher_mask(app_switcher::control_mask());
+                // 常用语面板也认领方向/OK；两个短时窗口不能同时存在。
+                injector.common_phrase_host().close("app_switcher");
+            }
+            let result = if was_active {
+                app_switcher.advance(now, &io)
+            } else {
+                app_switcher.start(button, now, &io)
+            };
+            match result {
+                Ok(operation) => crate::ble::gatt_note(format!(
+                    "map_fire button={button:?} trigger={trigger:?} action=app_switcher phase={} operation={operation} result=submitted",
+                    if was_active { "tab" } else { "start" }
+                )),
+                Err(error) => {
+                    crate::ble::gatt_note(format!(
+                        "map_fire button={button:?} trigger={trigger:?} action=app_switcher phase={} result=failed error_domain=send_input retryable=true error={error}",
+                        if was_active { "tab" } else { "start" }
+                    ));
+                    lock_state(state).last_error = Some("打开应用切换器失败，请重试".to_owned());
+                }
+            }
+            drain_app_switcher_end(app_switcher, state);
+            if !app_switcher.is_active() {
+                // AltDown/Tab 注入失败或会话立即收尾：遮蔽必须 fail-open。
+                key_gate::set_app_switcher_mask(0);
+            }
+        }
         ButtonAction::OpenCommonPhrases => {
+            if app_switcher.is_active() {
+                // 切换器显示期间打开常用语面板会让面板与系统切换器争夺
+                // 方向/OK；直接忽略本次动作，会话仍可用返回键取消。
+                crate::ble::gatt_note(format!(
+                    "map_app_switcher operation={} phase=panel_ignored reason=session_active button={button:?} trigger={trigger:?}",
+                    app_switcher.operation_id()
+                ));
+                return false;
+            }
             let host = injector.common_phrase_host();
             // 同一按键再按 = 收起面板（对齐 macOS：isVisible 且来源相同 → close(toggle_button)）。
             // 面板打开时也消费这次按键（不重复触发打开动作）。
@@ -2527,6 +3188,46 @@ mod tests {
 
     // Production has one process-wide gate; test runtimes must own it exclusively.
     use crate::key_gate::GATE_TEST_LOCK;
+
+    #[test]
+    fn switcher_controls_extend_report_targets_without_changing_saved_mappings() {
+        let _gate_lock = crate::key_gate::lock_gate_tests();
+        key_gate::set_app_switcher_mask(0);
+        let configuration = InputConfiguration::default();
+        let before = configuration.requested_mask();
+        key_gate::set_app_switcher_mask(app_switcher::control_mask());
+        assert_eq!(
+            configuration.requested_mask(),
+            before | app_switcher::control_mask()
+        );
+        assert_eq!(configuration.mappings, ButtonMappings::default());
+        key_gate::set_app_switcher_mask(0);
+        assert_eq!(configuration.requested_mask(), before);
+    }
+
+    #[test]
+    fn voice_barrier_requires_release_ack_and_rejects_timeout() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            if let EngineMessage::VoiceSessionStarted(ack) = receiver.recv().unwrap() {
+                ack.send(false).unwrap();
+            } else {
+                panic!("expected voice release barrier");
+            }
+        });
+        assert!(release_switcher_before_voice(&sender, Duration::from_millis(60)).is_err());
+        worker.join().unwrap();
+        let (sender, _blocked_receiver) = mpsc::channel();
+        assert!(release_switcher_before_voice(&sender, Duration::ZERO).is_err());
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            if let EngineMessage::VoiceSessionStarted(ack) = receiver.recv().unwrap() {
+                ack.send(true).unwrap();
+            }
+        });
+        assert!(release_switcher_before_voice(&sender, Duration::from_millis(60)).is_ok());
+        worker.join().unwrap();
+    }
 
     #[test]
     fn mapping_diagnostics_explain_each_received_edge_without_changing_execution() {
@@ -3840,6 +4541,9 @@ mod tests {
         learn_results: StdMutex<Vec<Result<crate::focus::RecordedFocusTarget, String>>>,
         /// 常用语组件槽：测试独立注入，不碰进程级槽位（避免用例间互相污染）。
         phrase_host: PhraseHostSlot,
+        app_switcher_commands: StdMutex<Vec<AppSwitcherCommand>>,
+        app_switcher_present: std::sync::atomic::AtomicBool,
+        app_switcher_alt_down: std::sync::atomic::AtomicBool,
         fail: bool,
     }
 
@@ -3970,6 +4674,33 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::common_phrases::DisabledCommonPhraseHost))
         }
+
+        fn app_switcher_submit(&self, command: AppSwitcherCommand) -> Result<(), String> {
+            if self.fail {
+                return Err("app switcher injection failed (test)".to_owned());
+            }
+            self.app_switcher_commands.lock().unwrap().push(command);
+            match command {
+                AppSwitcherCommand::AltDown => self
+                    .app_switcher_alt_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst),
+                AppSwitcherCommand::AltUp => self
+                    .app_switcher_alt_down
+                    .store(false, std::sync::atomic::Ordering::SeqCst),
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn app_switcher_present(&self) -> bool {
+            self.app_switcher_present
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn app_switcher_alt_down(&self) -> bool {
+            self.app_switcher_alt_down
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     fn mappings_with_single(button: RemoteButton, key: KeyCode) -> ButtonMappings {
@@ -3989,7 +4720,11 @@ mod tests {
     fn hid_usages_of(button: RemoteButton) -> BTreeSet<u16> {
         let usage = match button {
             RemoteButton::Ok => 0x0028,
+            RemoteButton::Tv => 0x0035,
+            RemoteButton::Left => 0x0050,
+            RemoteButton::Right => 0x004F,
             RemoteButton::Up => 0x0052,
+            RemoteButton::Down => 0x0051,
             RemoteButton::Back => 0x00F1,
             _ => 0x0028,
         };
@@ -4088,6 +4823,8 @@ mod tests {
                 long: ButtonAction::Disabled,
                 hold_repeat: None,
                 ok_context_click: false,
+                extra: BTreeMap::new(),
+                ..ButtonActions::default()
             },
         );
         // 电源→Win+L：锁屏会让真实 UP 延迟到解锁后，引擎须在成功请求锁屏后
@@ -4393,6 +5130,284 @@ mod tests {
         drop(gate);
     }
 
+    /// 应用切换器集成：启动键打开会话；方向键在会话内被认领并改为 Tab；
+    /// OK 确认后释放 Alt、清门控遮蔽，且不触发原映射。
+    #[test]
+    fn app_switcher_session_owns_controls_and_releases_alt_on_confirm() {
+        use std::sync::atomic::Ordering;
+        let _gate_lock = crate::key_gate::lock_gate_tests();
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        injector.app_switcher_present.store(true, Ordering::SeqCst);
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+            Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                crate::macro_runtime::UnsupportedStepperSource,
+            ))),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Tv,
+            ButtonActions {
+                single: ButtonAction::AppSwitcher,
+                ..ButtonActions::default()
+            },
+        );
+        // 左键原本是退格：会话期间必须改为上一项（Shift+Tab），不得漏出原动作。
+        mappings.actions.insert(
+            RemoteButton::Left,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Backspace],
+                    },
+                },
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+        let sender = runtime.sender();
+        let commands = || injector.app_switcher_commands.lock().unwrap().clone();
+        let press = |button| {
+            sender
+                .send(EngineMessage::HidUsages(hid_usages_of(button)))
+                .unwrap()
+        };
+        let release = || {
+            sender
+                .send(EngineMessage::HidUsages(BTreeSet::new()))
+                .unwrap()
+        };
+
+        press(RemoteButton::Tv);
+        release();
+        assert!(
+            wait_until(
+                || commands() == vec![AppSwitcherCommand::AltDown, AppSwitcherCommand::Tab],
+                Duration::from_millis(500)
+            ),
+            "启动应只按一次 Alt 并发送第一次 Tab：{:?}",
+            commands()
+        );
+        // 命令入队与门控遮蔽分属两个线程，满载时可能先后到达；等待遮蔽
+        // 落位，而不是在命令列表刚变化时立刻读原子量（CI/本机满载 flake）。
+        assert!(
+            wait_until(
+                || crate::key_gate::app_switcher_mask() != 0,
+                Duration::from_millis(500)
+            ),
+            "会话期间控制键必须由门控直接遮蔽"
+        );
+
+        press(RemoteButton::Left);
+        release();
+        assert!(
+            wait_until(
+                || commands().last() == Some(&AppSwitcherCommand::ReverseTab),
+                Duration::from_millis(500)
+            ),
+            "左键应改为 Shift+Tab：{:?}",
+            commands()
+        );
+        assert!(
+            injector.taps.lock().unwrap().is_empty(),
+            "被会话认领的左键不得执行原退格映射"
+        );
+
+        press(RemoteButton::Ok);
+        release();
+        assert!(
+            wait_until(
+                || commands().last() == Some(&AppSwitcherCommand::AltUp),
+                Duration::from_millis(500)
+            ),
+            "OK 应释放 Alt：{:?}",
+            commands()
+        );
+        assert_eq!(
+            crate::key_gate::app_switcher_mask(),
+            0,
+            "确认收尾后遮蔽必须清零（fail-open）"
+        );
+        assert!(injector.taps.lock().unwrap().is_empty());
+        assert!(runtime.snapshot().last_error.is_none());
+
+        // 重新启动会话后按语音键：引擎必须先取消切换器并释放 Alt，再让 BLE
+        // 线程注入按住说话快捷键。
+        injector.app_switcher_commands.lock().unwrap().clear();
+        press(RemoteButton::Tv);
+        release();
+        assert!(
+            wait_until(
+                || commands() == vec![AppSwitcherCommand::AltDown, AppSwitcherCommand::Tab],
+                Duration::from_millis(500)
+            ),
+            "第二次启动应重新按 Alt 并发送 Tab：{:?}",
+            commands()
+        );
+        release_switcher_before_voice(&sender, Duration::from_millis(60)).unwrap();
+        assert!(
+            wait_until(
+                || {
+                    let current = commands();
+                    current.last() == Some(&AppSwitcherCommand::AltUp)
+                        && current.contains(&AppSwitcherCommand::Escape)
+                },
+                Duration::from_millis(500)
+            ),
+            "语音开始应 Esc 取消并释放 Alt：{:?}",
+            commands()
+        );
+        assert!(
+            wait_until(
+                || crate::key_gate::app_switcher_mask() == 0,
+                Duration::from_millis(500)
+            ),
+            "语音开始取消后遮蔽必须清零：{}",
+            crate::key_gate::app_switcher_mask()
+        );
+
+        drop(runtime);
+        drop(gate);
+    }
+
+    /// 组合动作里的 Alt+Tab：宏步骤只负责请求引擎启动会话；会话仍由
+    /// 方向/OK/返回控制，确认后释放 Alt 并清门控遮蔽。
+    #[test]
+    fn app_switcher_macro_start_opens_the_session() {
+        use std::sync::atomic::Ordering;
+        let _gate_lock = crate::key_gate::lock_gate_tests();
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        injector.app_switcher_present.store(true, Ordering::SeqCst);
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+            Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                crate::macro_runtime::UnsupportedStepperSource,
+            ))),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let sender = runtime.sender();
+        let commands = || injector.app_switcher_commands.lock().unwrap().clone();
+
+        sender.send(EngineMessage::StartAppSwitcher).unwrap();
+        assert!(
+            wait_until(
+                || commands() == vec![AppSwitcherCommand::AltDown, AppSwitcherCommand::Tab],
+                Duration::from_millis(500)
+            ),
+            "宏启动应让引擎按 Alt 并发送第一次 Tab：{:?}",
+            commands()
+        );
+        assert_ne!(
+            crate::key_gate::app_switcher_mask(),
+            0,
+            "宏启动的会话也必须遮蔽控制键"
+        );
+
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        assert!(
+            wait_until(
+                || commands().last() == Some(&AppSwitcherCommand::AltUp),
+                Duration::from_millis(500)
+            ),
+            "OK 应确认并释放 Alt：{:?}",
+            commands()
+        );
+        assert_eq!(
+            crate::key_gate::app_switcher_mask(),
+            0,
+            "确认收尾后遮蔽必须清零"
+        );
+
+        drop(runtime);
+        drop(gate);
+    }
+
+    /// 键位方案覆盖层里的 Alt+Tab：即使私有页仍写成一次性快捷键，覆盖层
+    /// 加载时也应升级为 app_switcher 会话；基础映射不受影响。
+    #[test]
+    fn profile_overlay_alt_tab_shortcut_opens_the_app_switcher_session() {
+        use std::sync::atomic::Ordering;
+        let _gate_lock = crate::key_gate::lock_gate_tests();
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        injector.app_switcher_present.store(true, Ordering::SeqCst);
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+            Arc::new(crate::macro_runtime::MacroRuntime::new(Arc::new(
+                crate::macro_runtime::UnsupportedStepperSource,
+            ))),
+        );
+        runtime.set_input_context(crate::RemoteModel::Rc001, true);
+        let mut overlay = ButtonMappings::default();
+        overlay.actions.insert(
+            RemoteButton::Tv,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::Alt, KeyCode::Tab],
+                    },
+                },
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_profile_overlay(Some(overlay));
+        let sender = runtime.sender();
+        let commands = || injector.app_switcher_commands.lock().unwrap().clone();
+
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Tv)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        assert!(
+            wait_until(
+                || commands() == vec![AppSwitcherCommand::AltDown, AppSwitcherCommand::Tab],
+                Duration::from_millis(500)
+            ),
+            "键位方案的 Alt+Tab 应启动会话：{:?}",
+            commands()
+        );
+        assert_ne!(
+            crate::key_gate::app_switcher_mask(),
+            0,
+            "会话期间控制键必须遮蔽"
+        );
+
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        assert!(
+            wait_until(
+                || commands().last() == Some(&AppSwitcherCommand::AltUp),
+                Duration::from_millis(500)
+            ),
+            "OK 应确认并释放 Alt：{:?}",
+            commands()
+        );
+        assert_eq!(crate::key_gate::app_switcher_mask(), 0);
+
+        drop(runtime);
+        drop(gate);
+    }
+
     /// 打开应用动作：门控运行时，手势触发应调用 launch_app 而非 tap。
     #[test]
     fn open_app_action_launches_instead_of_tap() {
@@ -4581,7 +5596,46 @@ mod tests {
     }
 
     #[test]
-    fn open_app_effective_profile_prefers_explicit_preset_override() {
+    fn focus_profile_for_target_prefers_presets_and_keeps_custom_profiles() {
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "chrome".to_owned(),
+            crate::focus::AppFocusProfile {
+                strategy: crate::focus::FocusStrategy::OpenOnly,
+                shortcut: None,
+                recorded: None,
+                point: None,
+            },
+        );
+        // 旧显式档案不能覆盖预设能力，否则组合动作会与 UI 摘要不一致。
+        assert_eq!(
+            focus_profile_for_target(&profiles, "chrome")
+                .expect("Chrome 预设档案")
+                .strategy,
+            crate::focus::FocusStrategy::AppShortcut
+        );
+
+        let custom = r"C:\Tools\Editor.exe";
+        profiles.insert(
+            custom.to_owned(),
+            crate::focus::AppFocusProfile {
+                strategy: crate::focus::FocusStrategy::OpenOnly,
+                shortcut: None,
+                recorded: None,
+                point: None,
+            },
+        );
+        assert_eq!(
+            focus_profile_for_target(&profiles, custom)
+                .expect("自定义档案")
+                .strategy,
+            crate::focus::FocusStrategy::OpenOnly
+        );
+        assert!(focus_profile_for_target(&profiles, r"C:\Tools\Missing.exe").is_none());
+    }
+
+    #[test]
+    fn open_app_effective_profile_keeps_explicit_profile_for_custom_paths() {
         let mut mappings = ButtonMappings::default();
         assert_eq!(
             open_app_effective_profile(&mappings, "notepad")
@@ -4589,16 +5643,19 @@ mod tests {
                 .strategy,
             crate::focus::FocusStrategy::AutoComposer
         );
+
+        // 同名但不在预设探测路径里的自定义程序不能被误认成预设。
+        let custom_path = r"C:\Tools\notepad.exe";
         mappings.focus_profiles.insert(
-            "chrome".to_owned(),
+            custom_path.to_owned(),
             crate::focus::AppFocusProfile {
                 strategy: crate::focus::FocusStrategy::RecordedElement,
                 ..Default::default()
             },
         );
         assert_eq!(
-            open_app_effective_profile(&mappings, "chrome")
-                .expect("显式档案优先")
+            open_app_effective_profile(&mappings, custom_path)
+                .expect("自定义路径保留显式档案")
                 .strategy,
             crate::focus::FocusStrategy::RecordedElement
         );
@@ -4654,6 +5711,106 @@ mod tests {
             &["notepad".to_owned()]
         );
         drop(gate);
+    }
+
+    /// 「只打开」的冷启动前台保障不得依赖私有键位方案宿主：公开构建里宿主
+    /// 不可用，仍必须先等、再按应用入口重试一次（2026-11-12 飞书现场）。
+    #[test]
+    fn open_only_foreground_retries_without_private_button_profile_host() {
+        use std::cell::Cell;
+        let waits = Cell::new(0);
+        let activations = Cell::new(0);
+        let observed = ensure_open_only_foreground(
+            "target",
+            2,
+            || false,
+            |_, _| {
+                waits.set(waits.get() + 1);
+                waits.get() >= 2
+            },
+            |_| {
+                activations.set(activations.get() + 1);
+                true
+            },
+        );
+        assert!(observed);
+        assert_eq!(waits.get(), 2);
+        assert_eq!(activations.get(), 1);
+        assert!(
+            !crate::button_profiles::is_button_profile_host_available(),
+            "公开构建默认没有私有宿主，测试必须覆盖这个前提"
+        );
+    }
+
+    /// 正常托盘恢复/已在前台时不得先做可见窗口激活或等待，直接返回。
+    #[test]
+    fn open_only_foreground_returns_immediately_when_already_foreground() {
+        use std::cell::Cell;
+        let waits = Cell::new(0);
+        let activations = Cell::new(0);
+        let observed = ensure_open_only_foreground(
+            "target",
+            8,
+            || false,
+            |_, _| {
+                waits.set(waits.get() + 1);
+                true
+            },
+            |_| {
+                activations.set(activations.get() + 1);
+                true
+            },
+        );
+        assert!(observed);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(activations.get(), 0);
+    }
+
+    /// 用户把刚打开的窗口关掉后，补偿路径只能尝试激活“已存在的可见窗口”；
+    /// 没有可见窗口时必须保持关闭，不能再次启动应用。
+    #[test]
+    fn open_only_foreground_never_relaunches_a_closed_target() {
+        use std::cell::Cell;
+        let activations = Cell::new(0);
+        let observed = ensure_open_only_foreground(
+            "target",
+            2,
+            || false,
+            |_, _| false,
+            |_| {
+                activations.set(activations.get() + 1);
+                false
+            },
+        );
+        assert!(!observed);
+        // 每轮只尝试激活一次，绝不启动。
+        assert_eq!(activations.get(), 2);
+    }
+
+    /// 新的打开请求产生后，旧的前台保障任务必须在下一轮检查时退出：
+    /// 否则后台线程会在用户已经切到别的应用后继续抢焦点。
+    #[test]
+    fn open_only_foreground_stops_when_superseded_by_a_newer_open() {
+        use std::cell::Cell;
+        let waits = Cell::new(0);
+        let activations = Cell::new(0);
+        let observed = ensure_open_only_foreground(
+            "target",
+            8,
+            || waits.get() >= 2,
+            |_, _| {
+                waits.set(waits.get() + 1);
+                false
+            },
+            |_| {
+                activations.set(activations.get() + 1);
+                false
+            },
+        );
+        assert!(!observed);
+        // 零等待检查 + 一轮 500ms 等待后，第二轮开始前发现已被取代。
+        assert_eq!(waits.get(), 2);
+        assert_eq!(activations.get(), 1);
     }
 
     /// 自定义应用没有聚焦档案时保持「只打开」，不擅自抢焦点。
@@ -4801,6 +5958,8 @@ mod tests {
                 long: ButtonAction::Disabled,
                 hold_repeat: None,
                 ok_context_click: false,
+                extra: BTreeMap::new(),
+                ..ButtonActions::default()
             },
         );
         runtime.set_mappings(mappings);
@@ -5165,6 +6324,8 @@ mod tests {
                 long: ButtonAction::Disabled,
                 hold_repeat: Some(HoldRepeat::Single),
                 ok_context_click: false,
+                extra: BTreeMap::new(),
+                ..ButtonActions::default()
             },
         );
         let mut recognizer = GestureRecognizer::new();
@@ -5625,6 +6786,7 @@ mod tests {
     /// 未认领时照常触发（对照）。
     #[test]
     fn phrase_claim_precedes_gesture_recognition() {
+        let _gate_lock = crate::key_gate::lock_gate_tests();
         let injector = Arc::new(RecordingInjector::default());
         let host = Arc::new(MockPhraseHost::default());
         injector
@@ -5680,6 +6842,7 @@ mod tests {
     /// 从未开始的按压做判定，污染下一轮为「幽灵双击」。
     #[test]
     fn phrase_claimed_press_release_is_consumed_without_ghost_gestures() {
+        let _gate_lock = crate::key_gate::lock_gate_tests();
         let injector = Arc::new(RecordingInjector::default());
         let host = Arc::new(MockPhraseHost::default());
         injector
@@ -5738,6 +6901,7 @@ mod tests {
     /// 长按计时在 550ms 后引爆「幽灵长按」。
     #[test]
     fn panel_claimed_release_without_a_recorded_press_clears_stale_state() {
+        let _gate_lock = crate::key_gate::lock_gate_tests();
         let injector = Arc::new(RecordingInjector::default());
         let host = Arc::new(MockPhraseHost::default());
         injector
@@ -5785,6 +6949,7 @@ mod tests {
     /// 关闭面板并清认领状态（评审 B2 的公开侧调用点，2026-10-15）。
     #[test]
     fn device_removed_and_listener_stopped_reset_the_phrase_host() {
+        let _gate_lock = crate::key_gate::lock_gate_tests();
         let injector = Arc::new(RecordingInjector::default());
         let host = Arc::new(MockPhraseHost::default());
         injector
@@ -5831,6 +6996,7 @@ mod tests {
     /// 补发一次幽灵单击）。
     #[test]
     fn phrase_claimed_press_survives_a_source_loss_without_ghost_gestures() {
+        let _gate_lock = crate::key_gate::lock_gate_tests();
         let injector = Arc::new(RecordingInjector::default());
         let host = Arc::new(MockPhraseHost::default());
         injector

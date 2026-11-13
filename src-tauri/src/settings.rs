@@ -3,7 +3,9 @@ use sayall_core::{
     validate_library, AppLanguage, AppSettings, MacroLibraryDocument, ThemePreference,
     UsageStatistics, VoiceInputTool, MACRO_LIBRARY_FORMAT_VERSION, PORTABLE_MAX_BYTES,
 };
-use sayall_windows::send_input::{ButtonAction, ButtonMappings, KeyChord, KeyCode};
+use sayall_windows::send_input::{
+    ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, KeyCode, BUTTON_MAPPINGS_SCHEMA_VERSION,
+};
 use sayall_windows::templates::{
     new_template_id, ApplicationBinding, ImportedTemplatePreview, MappingConfiguration,
     MappingConfigurationImportPreview, MappingTemplate, TemplateImportPreview,
@@ -11,7 +13,7 @@ use sayall_windows::templates::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -509,10 +511,30 @@ impl SettingsStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(MappingConfiguration::default());
             }
-            Err(error) => return Err(format!("读取按键映射失败：{error}")),
+            Err(error) => {
+                if error.kind() == ErrorKind::InvalidData {
+                    backup_unreadable_button_mappings(&path)?;
+                }
+                return Err(format!("读取按键映射失败：{error}"));
+            }
         };
-        let value: serde_json::Value = serde_json::from_str(&contents)
-            .map_err(|error| format!("解析按键映射失败：{error}"))?;
+        let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+            let backup = backup_unreadable_button_mappings(&path);
+            sayall_windows::gatt_note(format!("template_configuration action=preserve_unreadable terminal_result={} reason=parse_failed", if backup.is_ok() { "passed" } else { "failed" }));
+            match backup {
+                Ok(Some(backup)) => unreadable_button_mappings_message(backup.file_name().unwrap().to_str().unwrap()),
+                Ok(None) => format!("解析按键映射失败: {error}"),
+                Err(backup_error) => backup_error,
+            }
+        })?;
+        let version = mapping_configuration_max_schema(&value);
+        if version > u64::from(BUTTON_MAPPINGS_SCHEMA_VERSION) {
+            let bytes = contents.as_bytes();
+            let backup = path.with_extension(format!("json.v{version}.bak"));
+            atomic_write(&backup, bytes)
+                .map_err(|error| format!("保留更高版本按键映射失败: {error}"))?;
+            sayall_windows::gatt_note(format!("template_configuration action=backup schema_version={version} terminal_result=passed"));
+        }
         let configuration = if value.get("commonMappings").is_some() {
             serde_json::from_value::<MappingConfiguration>(value)
         } else if value.get("enabled").is_some() && value.get("actions").is_some() {
@@ -531,8 +553,37 @@ impl SettingsStore {
             .map_err(|error| format!("按键映射无效：{error}"))
     }
 
+    /// 普通保存：若磁盘上的现有文件确实无法读取（损坏、非 UTF-8 或当前
+    /// 字段校验失败），拒绝覆盖并保留时间戳备份。更高结构版本不再属于
+    /// 此列——它走前向兼容读取，保存时保留未知内容与版本号
+    /// （2026-11-11 用户反馈）。
     pub fn save_button_mappings(&self, mappings: ButtonMappings) -> Result<ButtonMappings, String> {
         self.save_button_mappings_with(mappings, |_| {})
+    }
+
+    pub fn replace_button_mappings_with(
+        &self,
+        mappings: ButtonMappings,
+        apply: impl FnOnce(&MappingConfiguration),
+    ) -> Result<ButtonMappings, String> {
+        let _guard = lock(&self.access);
+        let mut configuration = match self.load_mapping_configuration_unlocked() {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                // 显式恢复已获用户授权; 只有成功保留原始字节后才允许替换。
+                backup_unreadable_button_mappings(&self.button_mappings_path())?;
+                sayall_windows::gatt_note(
+                    "template_configuration action=replace_unreadable terminal_result=backed_up"
+                        .to_owned(),
+                );
+                let _ = error;
+                MappingConfiguration::default()
+            }
+        };
+        configuration.common_mappings = mappings;
+        let saved = self.save_mapping_configuration_unlocked(configuration)?;
+        apply(&saved);
+        Ok(saved.common_mappings)
     }
 
     pub fn save_button_mappings_with(
@@ -542,6 +593,8 @@ impl SettingsStore {
     ) -> Result<ButtonMappings, String> {
         let (configuration, ()) = self.update_mapping_configuration(
             |configuration| {
+                let mut mappings = mappings;
+                merge_mapping_extras(&mut mappings, &configuration.common_mappings);
                 configuration.common_mappings = mappings;
                 Ok(())
             },
@@ -566,6 +619,7 @@ impl SettingsStore {
         // A mapping editor may have opened before the menu preference changed.
         // Only the dedicated preference transaction owns this setting.
         let latest = self.load_mapping_configuration_unlocked()?;
+        merge_configuration_extras(&mut configuration, &latest);
         configuration.menu_update_default = latest.menu_update_default;
         configuration.remembered_template_id = if configuration.button_mapping_follow_enabled
             != latest.button_mapping_follow_enabled
@@ -1486,6 +1540,139 @@ fn parse_settings(contents: &str) -> Result<AppSettings, String> {
 
 fn serialize_settings(settings: &AppSettings) -> Result<Vec<u8>, String> {
     serde_json::to_vec_pretty(settings).map_err(|error| format!("序列化应用设置失败：{error}"))
+}
+
+fn merge_forward_compatible_extras(target: &mut ButtonMappings, existing: &ButtonMappings) {
+    for (key, value) in &existing.extra {
+        target
+            .extra
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    for (button, existing_actions) in &existing.actions {
+        let Some(target_actions) = target.actions.get_mut(button) else {
+            // 按键已从配置中删除：不要复活它。
+            continue;
+        };
+        for (key, value) in &existing_actions.extra {
+            target_actions
+                .extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        for (trigger, existing_action) in [
+            (ButtonTrigger::Single, &existing_actions.single),
+            (ButtonTrigger::Double, &existing_actions.double),
+            (ButtonTrigger::Long, &existing_actions.long),
+        ] {
+            if target_actions.trigger(trigger) != existing_action {
+                continue;
+            }
+            let Some(extras) = existing_actions.action_extras.get(&trigger) else {
+                continue;
+            };
+            let target_extras = target_actions.action_extras.entry(trigger).or_default();
+            for (key, value) in extras {
+                target_extras
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+}
+
+fn backup_unreadable_button_mappings(path: &Path) -> Result<Option<PathBuf>, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("保留按键映射备份失败，已停止保存以免覆盖：{error}")),
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("button-mappings.json");
+    let prefix = format!("{name}.unreadable-");
+    if let Some(parent) = path.parent() {
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let candidate = entry.path();
+                let matching = candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.starts_with(&prefix));
+                if matching
+                    && fs::read(&candidate)
+                        .map(|existing| existing == contents)
+                        .unwrap_or(false)
+                {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    for attempt in 0..1000 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let backup = path.with_file_name(format!("{name}.unreadable-{millis}{suffix}.bak"));
+        if backup.exists() {
+            continue;
+        }
+        atomic_write(&backup, &contents)
+            .map_err(|error| format!("保留按键映射备份失败: {error}"))?;
+        return Ok(Some(backup));
+    }
+    Err("保留按键映射备份失败：备份文件名冲突".to_owned())
+}
+
+fn unreadable_button_mappings_message(backup_name: &str) -> String {
+    format!(
+        "按键配置文件无法读取，当前版本不会覆盖它。已保留备份（{backup_name}）；请恢复默认或导入配置后再保存。"
+    )
+}
+
+fn mapping_configuration_max_schema(value: &serde_json::Value) -> u64 {
+    let common = value.get("commonMappings").unwrap_or(value);
+    std::iter::once(common)
+        .chain(
+            value
+                .get("templates")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|template| template.get("mappings")),
+        )
+        .filter_map(|mappings| {
+            mappings
+                .get("schemaVersion")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn merge_mapping_extras(target: &mut ButtonMappings, existing: &ButtonMappings) {
+    target.schema_version = target.schema_version.max(existing.schema_version);
+    merge_forward_compatible_extras(target, existing);
+}
+
+fn merge_configuration_extras(target: &mut MappingConfiguration, existing: &MappingConfiguration) {
+    merge_mapping_extras(&mut target.common_mappings, &existing.common_mappings);
+    for template in &mut target.templates {
+        if let Some(previous) = existing
+            .templates
+            .iter()
+            .find(|previous| previous.id == template.id)
+        {
+            merge_mapping_extras(&mut template.mappings, &previous.mappings);
+        }
+    }
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
@@ -3050,6 +3237,7 @@ mod tests {
                 },
                 hold_repeat: None,
                 ok_context_click: false,
+                ..ButtonActions::default()
             },
         );
         let encoded = serde_json::to_string(&mappings).unwrap();
@@ -3098,6 +3286,7 @@ mod tests {
                 long: ButtonAction::Disabled,
                 hold_repeat: None,
                 ok_context_click: false,
+                ..ButtonActions::default()
             },
         );
 
@@ -3635,7 +3824,7 @@ mod tests {
         let legacy = r#"{"enabled":true,"actions":{"back":{"single":{"type":"shortcut","chord":{"keys":["backspace"]}},"double":{"type":"disabled"},"long":{"type":"disabled"}}}}"#;
         std::fs::write(&path, legacy).unwrap();
         let loaded = store.load_button_mappings().unwrap();
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, BUTTON_MAPPINGS_SCHEMA_VERSION);
         assert_eq!(loaded.actions(RemoteButton::Back).hold_repeat, None);
         assert_eq!(
             loaded
@@ -3662,16 +3851,22 @@ mod tests {
     }
 
     #[test]
-    fn newer_mapping_schema_is_rejected_without_overwriting_original() {
+    fn newer_mapping_schema_preserves_version_and_unknown_content() {
         let store = template_test_store();
         let path = store.button_mappings_path();
-        let newer = r#"{"schemaVersion":9,"enabled":true,"actions":{}}"#;
-        std::fs::write(&path, newer).unwrap();
-        assert!(store.load_button_mappings().is_err());
-        assert!(store
+        let newer = r#"{"schemaVersion":9,"enabled":true,"actions":{},"future":{"keep":true}}"#;
+        fs::write(&path, newer).unwrap();
+        assert_eq!(store.load_button_mappings().unwrap().schema_version, 9);
+        let saved = store
             .save_button_mappings(ButtonMappings::default())
-            .is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+            .unwrap();
+        assert_eq!(saved.schema_version, 9);
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["commonMappings"]["future"]["keep"], true);
+        assert_eq!(
+            fs::read_to_string(path.with_extension("json.v9.bak")).unwrap(),
+            newer
+        );
     }
 
     #[test]
@@ -3726,8 +3921,14 @@ mod tests {
         let exported: serde_json::Value =
             serde_json::from_slice(&fs::read(&exported_path).unwrap()).unwrap();
         assert_eq!(exported["formatVersion"], 3);
-        assert_eq!(exported["commonMappings"]["schemaVersion"], 2);
-        assert_eq!(exported["templates"][0]["mappings"]["schemaVersion"], 2);
+        assert_eq!(
+            exported["commonMappings"]["schemaVersion"],
+            BUTTON_MAPPINGS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            exported["templates"][0]["mappings"]["schemaVersion"],
+            BUTTON_MAPPINGS_SCHEMA_VERSION
+        );
         assert_eq!(
             exported["commonMappings"]["actions"]["back"]["holdRepeat"],
             "off"
@@ -3756,45 +3957,70 @@ mod tests {
         assert_eq!(destination.load_mapping_configuration().unwrap(), imported);
     }
 
+    /// 更高结构版本不再拒载：已知动作可用，未知动作与顶层字段在
+    /// load → save 后仍原样保留，版本号不降级（2026-11-11 用户反馈）。
     #[test]
-    fn nested_future_mapping_schema_rejects_save_export_and_import_without_writing() {
-        let store = template_test_store();
-        let mut configuration = MappingConfiguration::default();
-        configuration.create_template("测试模板".into()).unwrap();
-        let saved = store.save_mapping_configuration(configuration).unwrap();
-        let original = fs::read(store.button_mappings_path()).unwrap();
-        let export = store.path.with_file_name("future-export.json");
-        store
-            .export_mapping_configuration(&export, saved.clone(), None)
-            .unwrap();
-        let original_export = fs::read(&export).unwrap();
-        let incoming = store.path.with_file_name("future-import.json");
+    fn nested_future_mapping_schema_survives_save_export_and_import() {
         for common in [true, false] {
-            let mut invalid = saved.clone();
-            if common {
-                invalid.common_mappings.schema_version = 3;
+            let store = template_test_store();
+            let mut configuration = MappingConfiguration::default();
+            configuration.create_template("测试模板".into()).unwrap();
+            let mappings = if common {
+                &mut configuration.common_mappings
             } else {
-                invalid.templates[0].mappings.schema_version = 3;
-            }
-            assert!(store.save_mapping_configuration(invalid.clone()).is_err());
-            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), original);
-            assert!(store
-                .export_mapping_configuration(&export, invalid, None)
-                .is_err());
-            assert_eq!(fs::read(&export).unwrap(), original_export);
-
-            let mut document: serde_json::Value = serde_json::from_slice(&original_export).unwrap();
-            if common {
-                document["commonMappings"]["schemaVersion"] = 3.into();
-            } else {
-                document["templates"][0]["mappings"]["schemaVersion"] = 3.into();
-            }
-            fs::write(&incoming, serde_json::to_vec(&document).unwrap()).unwrap();
-            assert!(store
-                .preview_mapping_configuration_import(&incoming)
-                .is_err());
-            assert_eq!(fs::read(store.button_mappings_path()).unwrap(), original);
+                &mut configuration.templates[0].mappings
+            };
+            mappings.schema_version = 9;
+            mappings.extra.insert(
+                "future".into(),
+                sayall_windows::send_input::RawJson(r#"{"keep":true}"#.into()),
+            );
+            let saved = store.save_mapping_configuration(configuration).unwrap();
             assert_eq!(store.load_mapping_configuration().unwrap(), saved);
+            let export = store.path.with_file_name("future-export.json");
+            store
+                .export_mapping_configuration(&export, saved, None)
+                .unwrap();
+            let destination = template_test_store();
+            let preview = destination
+                .preview_mapping_configuration_import(&export)
+                .unwrap();
+            let imported = destination
+                .apply_mapping_configuration_import(&preview.token)
+                .unwrap();
+            let mappings = if common {
+                &imported.common_mappings
+            } else {
+                &imported.templates[0].mappings
+            };
+            assert_eq!(mappings.schema_version, 9);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&mappings.extra["future"].0).unwrap()
+                    ["keep"],
+                true
+            );
         }
+    }
+
+    #[test]
+    fn corrupt_mapping_save_preserves_bytes_and_explicit_reset_recovers() {
+        let store = template_test_store();
+        let path = store.button_mappings_path();
+        fs::write(&path, b"{broken").unwrap();
+        assert!(store
+            .save_button_mappings(ButtonMappings::default())
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{broken");
+        store
+            .replace_button_mappings_with(ButtonMappings::default(), |_| {})
+            .unwrap();
+        assert!(store.load_button_mappings().is_ok());
+        let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("unreadable-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].path()).unwrap(), b"{broken");
     }
 }

@@ -42,7 +42,7 @@ $statusResult = Invoke-GitText @('status', '--porcelain', '--untracked-files=all
 $gitAvailable = $null -ne $head -and $statusResult.ok
 $state = if (-not $gitAvailable) { 'unknown' } elseif ($statusResult.lines.Count -eq 0) { 'clean' } else { 'dirty' }
 
-$allowedExtensions = @('.rs', '.toml', '.json', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.vue', '.css', '.html', '.nsh', '.ps1', '.py', '.svg', '.png', '.ico', '.lock', '.yml', '.yaml')
+$allowedExtensions = @('.rs', '.toml', '.json', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.vue', '.css', '.html', '.nsh', '.nsi', '.ps1', '.py', '.svg', '.png', '.ico', '.lock', '.yml', '.yaml')
 $allowedRoots = @('src', 'src-tauri', 'crates', 'hardware', 'scripts', 'public', 'contracts')
 $rootInputs = @('Cargo.toml', 'Cargo.lock', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html', 'vite.config.ts', 'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json')
 $trackedResult = Invoke-GitText @('ls-files', '-co', '--exclude-standard')
@@ -66,7 +66,7 @@ if ($IncludePayloads -and -not (Test-Path -LiteralPath $receiptPath -PathType Le
 if ($IncludePayloads) {
     $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
     $resources = @($receipt.resources | Sort-Object name)
-    if ($resources.Count -eq 0 -or @($resources | Where-Object { $_.name -eq 'sayall-helper.exe' }).Count -ne 1 -or @($resources | Where-Object { $_.name -eq 'frida-gadget.dll' }).Count -ne 1) {
+    if ($resources.Count -eq 0 -or @($resources | Where-Object { $_.name -eq 'sayall-helper.exe' }).Count -ne 1 -or @($resources | Where-Object { $_.name -eq 'frida-gadget.dll' }).Count -ne 1 -or @($resources | Where-Object { $_.name -eq 'sayall-mcp.exe' }).Count -ne 1) {
         throw 'Current bundle receipt does not contain the required x64 payload set'
     }
     foreach ($resource in $resources) {

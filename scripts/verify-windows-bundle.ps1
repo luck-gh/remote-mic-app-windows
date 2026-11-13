@@ -84,7 +84,11 @@ foreach ($resource in $receipt.resources) {
     if ($actual -ne $resource.sha256) { throw "Staged resource changed: $($resource.name)" }
 }
 $stagedPayloads = @($payloadNames | Where-Object { Test-Path -LiteralPath (Join-Path $srcTauriDir $_) -PathType Leaf })
-if ($stagedPayloads -notcontains "sayall-helper.exe" -or $stagedPayloads -notcontains "frida-gadget.dll") {
+if (
+    $stagedPayloads -notcontains "sayall-helper.exe" -or
+    $stagedPayloads -notcontains "frida-gadget.dll" -or
+    $stagedPayloads -notcontains "sayall-mcp.exe"
+) {
     throw "x64 bundle resources were not staged in src-tauri: $srcTauriDir"
 }
 $arm64PayloadNames = @("sayall-helper-arm64.exe", "frida-gadget-arm64.dll")
@@ -93,20 +97,21 @@ if ($stagedArm64.Count -ne 0 -and $stagedArm64.Count -ne $arm64PayloadNames.Coun
     throw "Incomplete arm64 payload staging: $($stagedArm64 -join ', ')"
 }
 $arm64PayloadConfigPath = Join-Path $srcTauriDir "tauri.arm64-payload.conf.json"
+$declaredPayloads = @($config.bundle.resources)
 if ($stagedArm64.Count -eq $arm64PayloadNames.Count) {
     if (-not (Test-Path -LiteralPath $arm64PayloadConfigPath -PathType Leaf)) {
         throw "arm64 payloads are staged but tauri.arm64-payload.conf.json is missing: the installer would silently omit them"
     }
     $arm64PayloadConfig = Get-Content -Raw -Encoding UTF8 $arm64PayloadConfigPath | ConvertFrom-Json
     $declaredPayloads = @($arm64PayloadConfig.bundle.resources)
-    foreach ($name in $payloadNames) {
-        if ($declaredPayloads -notcontains $name) {
-            throw "arm64 payload override must declare $name"
-        }
+}
+foreach ($name in $payloadNames) {
+    if ($declaredPayloads -notcontains $name) {
+        throw "Effective bundle configuration must declare $name"
     }
-    if ($declaredPayloads.Count -ne $payloadNames.Count) {
-        throw "arm64 payload override must declare exactly $($payloadNames.Count) payloads, observed $($declaredPayloads.Count)"
-    }
+}
+if ($declaredPayloads.Count -ne $payloadNames.Count) {
+    throw "Effective bundle configuration must declare exactly $($payloadNames.Count) resources, observed $($declaredPayloads.Count)"
 }
 if ($env:SAYALL_REQUIRE_ARM64_PAYLOAD -eq "1" -and $stagedArm64.Count -ne $arm64PayloadNames.Count) {
     throw "SAYALL_REQUIRE_ARM64_PAYLOAD=1 but arm64 payloads were not staged: the published installer must carry them"

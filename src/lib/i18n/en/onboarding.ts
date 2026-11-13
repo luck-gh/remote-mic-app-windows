@@ -26,8 +26,8 @@ export default {
     "Press and hold the TV button for about 3 seconds until the indicator light (on the bottom of the Xiaomi Bluetooth Voice Remote 2 Pro) starts flashing. This puts the remote in pairing mode.",
   "同时长按「主页」+「菜单」直到指示灯快速闪烁——重置遥控器的蓝牙并重新进入配对模式。":
     "Press and hold Home + Menu together until the indicator flashes quickly. This resets the remote's Bluetooth and returns it to pairing mode.",
-  "选中「小米蓝牙语音遥控器」，等待配对完成，列表里找不到设备时，先点开「显示所有设备」。":
-    "Select Xiaomi Bluetooth Voice Remote and wait for pairing to finish. If it is not listed, first select Show all devices.",
+  "选中「小米蓝牙语音遥控器」，等待配对完成，列表里找不到设备时，打开高级设置或者点开「显示所有设备」。":
+    "Select Xiaomi Bluetooth Voice Remote and wait for pairing to finish. If it is not listed, open Advanced settings or select Show all devices.",
   "配对失败，或遥控器以前配对过别的设备：回到第 4 步重置蓝牙后重新配对。":
     "If pairing fails, or the remote was paired with another device before, go back to step 4, reset Bluetooth, and pair again.",
 
@@ -48,6 +48,8 @@ export default {
   "找到 {count} 个已配对的小米遥控器": "Paired Xiaomi remotes found: {count}",
   "按一下遥控器上的普通按键（比如主页键），不要按语音键。":
     "Press a regular button on the remote, such as Home. Do not press the voice button.",
+  "先按一下普通按键；仍无反应时，按下面的步骤重新配对。":
+    "Press a regular button first. If nothing happens, follow the steps below to pair the remote again.",
   "按键已收到。还差一步：点“扫描已配对设备”选中遥控器连接。":
     "Button received. One more step: select Scan for Paired Devices and choose the remote to connect.",
   "按键已收到。还差一步：点遥控器一行右侧的“连接”。":
@@ -67,6 +69,9 @@ export default {
   "还没有已配对的遥控器": "No paired remote yet",
   "没有找到遥控器": "Remote not found",
   "连接没有成功": "Connection failed",
+  "没有识别到遥控器的按键通道": "Remote button channel not detected",
+  "应用已经连上遥控器，但 Windows 还没有提供它的按键通道。先按一下普通按键；仍无反应时，在蓝牙设置里删除这支遥控器，再按「TV」键 3 秒重新配对；还是不行就重启这台电脑（用「重启」，不要用「关机」再开机）。":
+    "The app is connected to the remote, but Windows is not providing its button channel yet. Press a regular button first. If nothing happens, remove this remote in Bluetooth settings, then hold the TV button for 3 seconds to pair it again. If that does not help, restart the computer (use Restart, not Shut down and turn it back on).",
   "当前没有已配对设备，请先按照上一步完成设备配对。":
     "No paired devices found. Complete the pairing step first.",
   "读取已配对设备失败，请重试。": "Could not read paired devices. Try again.",
@@ -76,7 +81,29 @@ export default {
     "Bluetooth settings opened. After pairing, come back and select Scan for Paired Devices.",
   "无法打开蓝牙设置，请重试。": "Could not open Bluetooth settings. Try again.",
 
-  // ---- Step 3: audio device ----
+  // ---- Step 3: full-key support (optional) ----
+  "开启全按键支持": "Turn on Full-key support",
+  "建议开启": "Recommended",
+  "开启后，返回 / 音量+ / 音量− 才能自定义；豆包语音输入也需要它。":
+    "When on, Back, Volume+, and Volume− can be customized, and Doubao voice input needs it too.",
+  "开启后，遥控器上的所有按键都能设置自定义功能，包括 Windows 默认收不到的返回 / 音量+ / 音量−。":
+    "When it is on, every button on the remote can have its own action, including Back, Volume+, and Volume−, which Windows does not normally receive.",
+  "已开启。返回 / 音量+ / 音量− 现在也能自定义。":
+    "On. Back, Volume+, and Volume− can now be customized too.",
+  "现在不开启也可以继续；以后可以在“按键”页随时打开。":
+    "You can continue without turning it on and enable it later on the Buttons page.",
+  "开启时 Windows 会弹出授权窗口，请选择“是”。":
+    "When you turn it on, Windows asks for authorization. Select Yes.",
+  "只读取这支遥控器的按键，不收集其他内容。":
+    "SayAll reads only this remote's buttons and collects nothing else.",
+  "个别游戏带有防作弊保护，玩这类游戏前建议先关闭全按键支持。":
+    "Some games use anti-cheat protection. Turn off Full-key support before playing them.",
+  "读取全按键支持状态失败；可以重新进入这一步，或先继续。":
+    "Could not read the Full-key support status. Re-enter this step or continue for now.",
+  "全按键支持已开启": "Full-key support is on",
+  "这台电脑暂不支持全按键支持": "Full-key support is not available on this PC",
+
+  // ---- Step 4: audio device ----
   "选择语音设备": "Choose an audio device",
   "无线麦把遥控器的声音送到播放端（CABLE Input）；语音工具再从录音端（CABLE Output）读取声音。":
     "Wireless Mic sends the remote's audio to CABLE Input; your voice app reads it from CABLE Output.",
@@ -119,7 +146,7 @@ export default {
   "语音设备没准备好；重新选择或刷新设备列表后再试。":
     "The audio device is not ready. Choose it again or refresh the device list, then retry.",
 
-  // ---- Step 4: voice app ----
+  // ---- Step 5: voice app ----
   "选择你要用的输入工具": "Choose your voice app",
   "无线麦会替你按住它的语音键；选好后，下面显示这个工具还需要怎么设置。":
     "Wireless Mic holds the voice button for you. Once you choose an app, the steps below show what else it needs.",
@@ -188,7 +215,7 @@ export default {
   "Vokie 没有运行；打开它再重新检测。": "Vokie is not running. Open it, then check again.",
   "为「其他工具」选择语音键，再继续。": "Choose a voice trigger key for Other App to continue.",
 
-  // ---- Step 5: voice test ----
+  // ---- Step 6: voice test ----
   "按住遥控器语音键，试一句话": "Press and hold the remote's voice button and say a few words",
   "点一下下面的输入框，按住遥控器上的语音键说一句话，然后松开。文字应该会出现在输入框里。":
     "Select the field below, press and hold the remote's voice button, say a few words, then release. The text should appear in the field.",
@@ -197,6 +224,8 @@ export default {
   "输入法切到“{tool}”。": "Switch the input method to “{tool}”.",
   "麦克风选 CABLE Output（在“{tool}”的语音输入设置里）。":
     "Set the microphone to CABLE Output in {tool}'s voice input settings.",
+  "麦克风选 {microphone}（在“{tool}”的语音输入设置里）。":
+    "Set the microphone to {microphone} in {tool}'s voice input settings.",
   "工具里的语音键和这次设置一致（{hotkey}）。":
     "Match the app's voice trigger key to this setup ({hotkey}).",
   "本次设置快捷键：{hotkey}（“本次设置”）；语音设备：{audio}。":
@@ -239,7 +268,7 @@ export default {
     "“More Input Tools” is not active yet, and Wireless Mic is retrying automatically. If it does not recover, turn the switch off and on again, then test again.",
   "这次测试没有通过，再试一次。": "This test did not pass. Try again.",
 
-  // ---- Step 6: control buttons ----
+  // ---- Step 7: control buttons ----
   "按一下遥控器的普通按键": "Press a regular button on the remote",
   "请用遥控器上除语音键以外的按键，按 3 个不同的键（比如 主页 / OK / 方向键）。这一步只看按键能不能用，不会执行你以前配置的动作。":
     "Press three different buttons other than the voice button, such as Home, OK, or an arrow key. This step only checks that the buttons work; it does not run your configured actions.",
@@ -253,7 +282,7 @@ export default {
   "已按 3 个不同的普通按键": "Three different regular buttons pressed",
   "按键映射暂时暂停，完成后恢复": "Button mapping paused; restored when done",
 
-  // ---- Step 7: complete ----
+  // ---- Step 8: complete ----
   "设置完成": "Setup Complete",
   "开始使用前，再确认一次关键条件都还在。":
     "One last check that the key requirements are still in place.",
@@ -290,6 +319,8 @@ export default {
   // ---- Gate hints ----
   "先连接遥控器，再继续。": "Connect the remote to continue.",
   "按键监听正在启动，请稍等一下。": "Button detection is starting. Wait a moment.",
+  "Windows 还没有识别到这支遥控器的按键通道。打开蓝牙设置重新配对。":
+    "Windows has not detected this remote's button channel. Open Bluetooth settings and pair the remote again.",
   "连接已就绪。按一下遥控器上的普通按键（比如主页键），不要按语音键。":
     "The connection is ready. Press a regular button on the remote, such as Home, not the voice button.",
   "完成一次真实的语音上屏测试，再继续。":

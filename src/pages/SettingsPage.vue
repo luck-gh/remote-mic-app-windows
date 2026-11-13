@@ -8,6 +8,8 @@ import {
   setLaunchAtLogin,
   setOpenWindowAtLaunch,
 } from "../lib/bridge";
+import DiagnosticsSection from "./settings/DiagnosticsSection.vue";
+import PermissionsSection from "./settings/PermissionsSection.vue";
 import { appUpdateProgressText, useAppUpdate } from "../lib/app-update";
 import { displayAppVersion } from "../lib/app-version";
 import { useTheme } from "../lib/theme";
@@ -251,6 +253,14 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
       "M12 3.8c-4.8 0-8.7 3.1-8.7 7 0 2.3 1.3 4.3 3.3 5.6l-1 3.5 4-2.2c.8.2 1.6.3 2.4.3 4.8 0 8.7-3.1 8.7-7S16.8 3.8 12 3.8z",
     ],
   },
+  app_icon: {
+    // SF "app.badge" 近似：应用方块 + 右下角标
+    strokes: [
+      "M4.6 3.4h10.4a1.6 1.6 0 0 1 1.6 1.6v10.4a1.6 1.6 0 0 1-1.6 1.6H4.6A1.6 1.6 0 0 1 3 15.4V5a1.6 1.6 0 0 1 1.6-1.6z",
+      "M17.6 13.8a3.6 3.6 0 1 1 0 7.2 3.6 3.6 0 0 1 0-7.2z",
+    ],
+    fills: ["M17.6 15.9a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z"],
+  },
   onboarding: {
     // SF "arrow.triangle.2.circlepath" 近似：环形箭头（重新走一遍）
     strokes: ["M19.6 12a7.6 7.6 0 1 1-2.3-5.4", "M17.6 2.8v4h-4"],
@@ -359,6 +369,9 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
         </div>
       </div>
     </article>
+
+    <!-- 权限（2026-10-31 从侧栏「权限」页并入；对齐 Mac `inlinePermissionsSection`）。 -->
+    <PermissionsSection :runtime="runtime" />
 
     <!-- 通用（对齐 Mac 设置页的 settings.general 分组：标题 + 一张卡内多行 + 细分隔线）。 -->
     <section class="settings-section">
@@ -543,6 +556,8 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
       </div>
     </section>
 
+    <!-- 诊断与日志（2026-10-31 从侧栏「权限」页并入；问题反馈同属这个分类）。 -->
+    <DiagnosticsSection />
   </section>
 </template>
 
@@ -555,7 +570,7 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
   margin-bottom: 18px;
 }
 .overview-identity { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
-.overview-identity h2 { margin: 0; font-size: 16px; }
+.overview-identity h2 { margin: 0; font-family: var(--font-brand); font-size: 18px; font-weight: 600; }
 .overview-identity p { margin: 0; font-size: 13px; }
 .overview-update {
   min-width: 0;
@@ -578,9 +593,9 @@ const ROW_ICONS: Record<string, { strokes: string[]; fills?: string[] }> = {
 .update-status.pending { color: var(--muted); }
 .update-status.idle { color: var(--muted); }
 
-/* 分组：标题在卡外（Mac settings.general.title），卡内每行左侧图标、右侧操作。 */
-.settings-section { margin-bottom: 18px; }
-.section-title { margin: 0 0 8px; font-size: 16px; }
+/* 分组：标题在卡外（Mac settings.general.title），卡内每行左侧图标、右侧操作。
+   `.settings-section` / `.section-title` 放在全局 styles.css：子组件也会输出
+   这两个类，scoped 样式不会作用到子组件内部的标题。 */
 .settings-group { padding: 4px 16px; }
 .settings-row {
   display: grid;

@@ -490,3 +490,22 @@ Menu 不读取区域配置：single 固定打开程序列表、double 固定 Dis
 ```
 
 只有上述真机与真实应用步骤逐条完成并留下脱敏观察记录后，才可更新相应用例为 **passed**。
+
+## 2026-11-13 应用适配与输入生命周期集成
+
+被测输入: 个人版 `de5f08d14523a959d084b02483312ef831ab64a7` 与上游 `8a5ed9953348dc2bc02c38ab5a9a9935be7a642c` 的三方融合候选, 配置 `1.9.0+13`。构建/安装身份在包生成后另行读回；本节不把工作区 HEAD 当完整候选。来源及排除项见 ATTRIBUTION 同日条目。
+
+保留个人模板、关联、菜单及 Capture 默认切换事务。公共绑定导航显式读取通用编辑数据, 不切换实际模板且不被周期轮询重新打开。模板普通保存保护原 schema 与未知字段, 显式更换动作不粘旧字段；另存使用原草稿版本。切换器语音启动等 Alt 释放确认, 失败停止注入；释放失败继续周期清理。Agent 新来源状态不覆盖本地停止/合成完成确认, 不扩大清键范围至原生 F5。
+
+验证事实:
+
+- 前端首轮 822 passed / 1 failed / 10 skipped；缺失英文词条已补并定向 5/5 passed。随后公共绑定导航、版本保护、新动作连发与授权撤销提示补 RED→GREEN, 最终完整前端 51 文件 832 passed / 10 skipped, 类型检查与生产构建 passed。
+- Windows 平台首轮 808 passed / 2 failed / 27 ignored。模板 wire fixture 仍是 schema 2 而生产已为 5, 已按同一生产契约修正并定向 passed；另一项 `external_selection_after_alternative_must_not_be_overwritten` 是此前保留的 IME RED, 不跳过、不据本次整合宣称修复。
+- 宿主 277 passed / 2 ignored；核心 108、场景 4、MCP 单测 11 与 stdio 10 passed。Helper 109 passed / 3 ignored, Agent 159 passed。后续改动只影响相关证据时定向复验。
+- 真实 Edge 挂载当前 Vue/CSS, 272 个连接/按键布局状态 passed, 覆盖深浅色、中英文、窄窗、长设备名、成功/失败/忙态；没有配置写入或维护调用。该结果是渲染与 mock IPC, 不是硬件通过。
+- 安装新增 MCP 占用反例先 RED, 修复后运行中的隔离 MCP 映像与普通持锁文件都在首个回收前 blocked；原载荷字节保持, 释放后通过。真实回收站观察五个退役和九个产品夹具文件, 用户文件保持。四段版本比较 NSIS 夹具 passed。
+- 身份夹具先证实 `.nsi` 修改未影响 fingerprint、漏 MCP receipt 被接受；修复后 clean/dirty/证据排除/载荷缺失与篡改等全部 passed。授权事务四反例先 RED, 回滚/原子替换/严格 CLI 读回修复后 26 passed, 未改本机第三方配置。
+
+未覆盖: RC001/RC003 新候选真实按键与语音、冷态首用、完整 G1/G2、双版本资源交接、关机取消和第三方 MCP 连接均为 deferred；原 G1 failed 与 G2 缺口保持。上游“持键来源一致性”不是选定遥控器身份核验。
+
+补充: Rust workspace check、runtime-simulation check、fmt passed；可选组件各 1 passed。Helper 真实 release 自检原有中文措辞断言曾误报端口拒绝失败, 系统实际返回 10048 且有 --port 操作提示；改核固定系统码与操作参数后, 独立日志读回全部自检 passed。没有改变端口绑定行为或产品超时。

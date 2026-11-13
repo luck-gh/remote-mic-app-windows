@@ -15,10 +15,15 @@ export default {
   "好": "OK",
   "查看": "View",
   "忽略此提醒": "Dismiss this notice",
+  // 自定义标题栏
+  "最小化": "Minimize",
+  "最大化/还原": "Maximize / Restore",
   // 全按键支持确认弹窗
   "开启“全按键支持”？": "Enable Full-key support?",
   "开启后，无线麦会直接读取遥控器上已配置的按键，避免影响物理键盘上的同名按键；返回 / 音量+ / 音量−也需要开启后才能使用。每次开启都会弹出 Windows 授权窗口，请选择“是”；关闭开关即停。":
-    "When on, Wireless Mic reads this remote's configured keys directly, so they do not affect same-named keys on a physical keyboard. Back, Volume +, and Volume − also require this setting. Every time you turn it on, Windows asks for authorization—choose Yes. Turn the switch off to stop.",
+    "When on, SayAll reads this remote's configured keys directly, so they do not affect same-named keys on a physical keyboard. Back, Volume +, and Volume − also require this setting. Every time you turn it on, Windows asks for authorization—choose Yes. Turn the switch off to stop.",
+  "开启后会同时打开“支持更多输入工具”；只有打开它，才能用豆包输入法进行语音输入。":
+    "Turning this on also turns on “More Input Tools”. Doubao can only take voice input while it is on.",
   "个别杀毒软件可能把这个功能当成风险，拦截或关闭它，导致按键失灵、开启失败。":
     "Some antivirus apps may treat this feature as a risk and block or turn it off, which can make the keys stop working or prevent it from turning on.",
   "个别游戏带有防作弊保护，可能和这个功能合不来：表现为按键失灵、游戏打不开等。玩这类游戏前，建议先把全按键支持关掉。":
@@ -38,19 +43,43 @@ export default {
   // 更新完成提示（对齐 Mac update.completed.*）
   "无线麦已更新": "Wireless Mic Updated",
   "已成功更新到版本 {version}。": "Successfully updated to version {version}.",
-  // 本机应用选择器
-  "本机应用": "Installed Apps",
+  // 应用选择器（单一选择）
+  "选择应用": "Choose App",
+  "从本机扫描或手动选择程序。一次只能选择一个应用。":
+    "Scan this PC or choose a program. You can select one app.",
+  "本机扫描": "Local Scan",
+  "程序选择": "Program",
+  "手动": "Manual",
+  "{count} 个应用": "{count} apps",
+  "支持 .exe 和 .lnk": "Supports .exe and .lnk",
+  "适用于便携应用，或扫描列表里没有的程序。":
+    "For portable apps, or apps not in the scan list.",
+  "已选择应用。要重新选择，请先取消下方已选择的应用。":
+    "App selected. To choose another, cancel the selected app below first.",
+  "尚未选择应用。请从上方两个入口中选择一个。":
+    "No app selected. Choose one from the two sections above.",
+  "已选择": "Selected",
+  "还没有选择应用": "No app selected",
+  "取消选择": "Clear Selection",
+  "正在保存…": "Saving…",
+  "添加应用": "Add App",
+  "已选择：{name}": "Selected: {name}",
   "关闭应用选择": "Close app picker",
   "搜索本机应用": "Search installed apps",
   "搜索应用": "Search apps",
   "重新扫描": "Scan Again",
-  "全选当前结果": "Select all results",
-  "{count} 个应用 · 已选 {selected}": "{count} apps · {selected} selected",
   "正在扫描…": "Scanning…",
   "未找到匹配的应用": "No matching apps found",
   "已添加": "Added",
+  "选择程序或快捷方式": "Choose a program or shortcut",
+  "扫描本机应用，或选择任意程序或快捷方式":
+    "Scan installed apps, or choose any program or shortcut",
+  "无法读取本机应用列表，请稍后重试。": "Couldn't read the list of installed apps. Please try again later.",
+  // 兼容旧选择器的词条；当前界面不再使用。
+  "本机应用": "Installed Apps",
+  "全选当前结果": "Select all results",
+  "{count} 个应用 · 已选 {selected}": "{count} apps · {selected} selected",
   "正在添加…": "Adding…",
   "添加所选": "Add Selected",
   "（{count}）": " ({count})",
-  "无法读取本机应用列表，请稍后重试。": "Couldn't read the list of installed apps. Please try again later.",
 } as Record<string, string>;

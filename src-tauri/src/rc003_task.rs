@@ -3,6 +3,8 @@
 //! 每次手动开启都重新授权；保存为开启时重启应用可恢复。停止须取得本轮 agent
 //! 的释放回执，保留计划任务不代表下一次手动开启已获授权。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub const SCHEDULED_TASK_NAME: &str = "SayAll Personal RC003 Helper";
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -114,6 +116,52 @@ pub fn capture_support() -> CaptureSupport {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 测试专用覆盖：只替换**本线程**读到的任务文件路径，不碰 SystemRoot
+    /// 或其他进程级环境变量。生产构建编译期就删掉。
+    static TASK_FILE_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 计划任务 XML 的路径。任务文件是否存在与 `schtasks /query` 的成功/失败
+/// 是同一件事，但前者不需要启动子进程。
+fn task_file_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(path) = TASK_FILE_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return path;
+        }
+    }
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    std::path::Path::new(&root)
+        .join("System32")
+        .join("Tasks")
+        .join(SCHEDULED_TASK_NAME)
+}
+
+/// 任务文件是否存在。`None` = 判断不了（权限 / IO 错误），不是"不存在"。
+///
+/// 为什么不用 `Path::is_file()`：它把"无权限"和"不存在"都压成 `false`，
+/// 让调用方无法区分「明确不存在」与「需要回退查询」。
+fn task_file_present_at(path: &std::path::Path) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+fn task_file_present() -> Option<bool> {
+    task_file_present_at(&task_file_path())
+}
+
+/// 任务是否已注册（= 用户已授权）。只看退出码，不解析 GBK 输出。
+///
+/// 保留 `schtasks /query` 语义，供**启动对账与一次性操作**使用（任务文件存在
+/// 但调度器不可用时，这里仍应返回 false）。**每秒轮询的 `status()` 不调用
+/// 本函数**：系统关机时新进程初始化会失败（`0xc0000142`），`schtasks.exe`
+/// 会弹系统错误框并阻塞关机——2026-11-10 用户反馈的关机弹窗即由此产生。
 pub fn task_installed() -> bool {
     schtasks(&["/query", "/tn", SCHEDULED_TASK_NAME])
         .map(|ok| ok)
@@ -246,6 +294,9 @@ fn current_task_user_sid() -> windows::core::Result<String> {
 }
 
 pub fn task_install_elevated(helper: &std::path::Path) -> Result<(), String> {
+    if system_is_shutting_down() {
+        return Err("系统正在关机，已取消计划任务授权。".to_string());
+    }
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -1020,14 +1071,7 @@ fn clear_reauth_marker() {
 }
 
 fn task_xml() -> Option<String> {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    let bytes = std::fs::read(
-        std::path::Path::new(&root)
-            .join("System32")
-            .join("Tasks")
-            .join(SCHEDULED_TASK_NAME),
-    )
-    .ok()?;
+    let bytes = std::fs::read(task_file_path()).ok()?;
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -1168,7 +1212,7 @@ pub fn task_target_matches(helper_file_name: &str) -> Option<bool> {
 }
 
 pub fn status(enabled: bool) -> TaskStatus {
-    let installed = task_installed();
+    let installed = task_file_present().unwrap_or(false);
     let receipt = read_cleanup_receipt();
     let processes = helper_processes();
     let stop_requested = stop_signal_path().exists();
@@ -1221,12 +1265,49 @@ pub fn status(enabled: bool) -> TaskStatus {
     }
 }
 
+/// `WM_QUERYENDSESSION` 观测到的关机/注销意图。
+///
+/// 为什么不能只依赖 `SM_SHUTTINGDOWN`：helper 可能在系统置位该指标之前就被
+/// 结束，常驻对账先醒来就会抢跑一次 `schtasks /run`。窗口过程在
+/// `WM_QUERYENDSESSION` 时置位本标志，`run_schtasks` 就能更早拒绝子进程。
+/// 关机被取消时由 `WM_ENDSESSION(wParam=FALSE)` 清除，否则对账会一直被误拦。
+static QUERY_END_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// 窗口过程收到 `WM_QUERYENDSESSION` 时调用。
+pub(crate) fn note_query_end_session() {
+    QUERY_END_SESSION.store(true, Ordering::Release);
+}
+
+/// 窗口过程收到 `WM_ENDSESSION(wParam=FALSE)`（关机被取消）时调用。
+pub(crate) fn clear_query_end_session() {
+    QUERY_END_SESSION.store(false, Ordering::Release);
+}
+
+/// 当前会话是否正在关机 / 重启。
+///
+/// 先看窗口过程观测到的 `WM_QUERYENDSESSION`，再兜底系统指标
+/// `SM_SHUTTINGDOWN`。关机阶段系统会拒绝新进程初始化，`schtasks.exe`
+/// 起不来时由系统弹出「应用程序无法正常启动(0xc0000142)」错误框；每个框
+/// 都会拖住关机。任何后台线程（如常驻对账）都必须先问这里，不能再尝试
+/// 拉起子进程。
+fn system_is_shutting_down() -> bool {
+    if QUERY_END_SESSION.load(Ordering::Acquire) {
+        return true;
+    }
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+    // SAFETY: GetSystemMetrics 只读取当前会话的系统指标，无副作用。
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
 fn run_capture_task(
     command: &mut std::process::Command,
     pending: &std::sync::atomic::AtomicU64,
     now: u64,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
+    if system_is_shutting_down() {
+        return Err("系统正在关机，已跳过计划任务操作。".to_owned());
+    }
     let newly_pending = pending
         .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
@@ -1279,6 +1360,9 @@ fn run_capture_task(
 }
 
 fn schtasks(args: &[&str]) -> Option<bool> {
+    if system_is_shutting_down() {
+        return None;
+    }
     silent_command("schtasks")
         .args(args)
         .output()
@@ -2006,5 +2090,67 @@ mod tests {
         assert!(is_capture_helper_image("SAYALL-HELPER-ARM64.EXE"));
         assert!(!is_capture_helper_image("sayall-hid-host-helper.exe"));
         assert!(!is_capture_helper_image("other.exe"));
+    }
+
+    struct TaskFileGuard {
+        previous: Option<std::path::PathBuf>,
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl TaskFileGuard {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sayall-rc003-status-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("创建临时目录");
+            let path = dir.join(SCHEDULED_TASK_NAME);
+            let previous = TASK_FILE_OVERRIDE.with(|slot| slot.replace(Some(path.clone())));
+            Self {
+                previous,
+                dir,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TaskFileGuard {
+        fn drop(&mut self) {
+            TASK_FILE_OVERRIDE.with(|slot| *slot.borrow_mut() = self.previous.take());
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn status_reads_task_file_when_present() {
+        // 2026-11-10 关机弹窗回归：`status()` 每秒被界面调用，绝不能启动
+        // `schtasks.exe`。任务文件存在时应直接判 installed=true。
+        //
+        // 本测试与下一条合起来是"先红后绿"的回归：
+        // * 机器上有真实任务时，缺文件那条在旧实现下会返回 true；
+        // * 机器上没有真实任务时，有文件那条在旧实现下会返回 false。
+        let guard = TaskFileGuard::new("present");
+        std::fs::write(&guard.path, "<Task/>").expect("写临时任务文件");
+        assert!(status(false).installed);
+    }
+
+    #[test]
+    fn status_reports_not_installed_when_task_file_is_missing() {
+        let _guard = TaskFileGuard::new("missing");
+        assert!(!status(false).installed);
+    }
+
+    #[test]
+    fn query_end_session_flag_blocks_until_cancelled() {
+        // 窗口过程在 WM_QUERYENDSESSION 置位后，run_schtasks 必须立即拒绝；
+        // 关机被取消（WM_ENDSESSION false）后要恢复，否则对账会一直被误拦。
+        clear_query_end_session();
+        assert!(!system_is_shutting_down());
+        note_query_end_session();
+        assert!(system_is_shutting_down());
+        clear_query_end_session();
+        assert!(!system_is_shutting_down());
     }
 }

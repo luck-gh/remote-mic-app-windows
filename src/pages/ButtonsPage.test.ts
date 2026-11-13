@@ -30,7 +30,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     subscribeSceneEvents: vi.fn(async (handler: SceneHandler) => { sceneHandler = handler; return () => { sceneHandler = null; }; }),
     getMappingConfiguration: vi.fn(async () => ({
       menuTemplateSwitchEnabled: false, mappingNoticeEnabled: true, commonMappings: {
-        enabled: true,
+        schemaVersion: 2, enabled: true,
         actions: {
           ok: {
             single: { type: "shortcut", chord: { keys: ["enter"] } },
@@ -278,7 +278,7 @@ const runtime: RuntimeSnapshot = {
   },
 };
 
-async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003"): Promise<VueWrapper> {
+async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003", initialEditor?: { button: "ok"; trigger: "single"; editingSource: "common" }): Promise<VueWrapper> {
   // Each mounted page owns its listeners. Reset the captured callbacks so the
   // readiness check cannot be satisfied by a previous page in a navigation loop.
   edgeHandler = null;
@@ -293,7 +293,7 @@ async function mountPage(model: "rc001" | "rc003" | "unknown" = "rc003"): Promis
             connection: { ...runtime.platform.connection, remoteModel: model },
           },
         };
-  const wrapper = mount(ButtonsPage, { props: { runtime: snapshot } });
+  const wrapper = mount(ButtonsPage, { props: { runtime: snapshot, initialEditor } });
   await vi.waitFor(() => {
     if (!edgeHandler || !gestureHandler) throw new Error("事件订阅未完成");
     if (!wrapper.find('[aria-label="当前使用的按键模板"]').exists()) throw new Error("配置未加载");
@@ -1662,11 +1662,11 @@ describe("buttons mapping page", () => {
     shortcutCaptureHandler!({ key: "l", isPressed: true });
     expect(saveButtonMappings).not.toHaveBeenCalled();
     await vi.waitFor(() =>
-      expect(wrapper.text()).toContain("已录入 左 Win + L，松开全部按键后完成"),
+      expect(wrapper.text()).toContain("已录入 Win + L，松开全部按键后完成"),
     );
     shortcutCaptureHandler!({ key: "l", isPressed: false });
     await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：左 Win + L"));
+    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：Win + L"));
     await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
     await flushPromises();
     expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power?.single).toEqual({type: "shortcut", chord: {keys: ["left_windows", "l"]}});
@@ -2217,6 +2217,92 @@ describe("hold repeat and OK click in local editing drafts", () => {
       await ok.findAll(".mapping-cell")[0]!.trigger("click");
       expect(wrapper.find(".ok-click-toggle").exists()).toBe(false);
       expect(wrapper.get(".voice-card").find(".repeat-group").exists()).toBe(false);
+    } finally { wrapper.unmount(); }
+  });
+});
+
+
+describe("upstream APP adaptation in personal editor", () => {
+  it("provides the native app switcher and APP scroll actions", async () => {
+    const wrapper = await mountPage();
+    await wrapper.findAll(".mapping-card").find(card => card.text().includes("电源"))!.findAll(".mapping-cell")[0]!.trigger("click");
+    const chip = wrapper.findAll("button").find(button => button.text() === "Alt + Tab")!;
+    await chip.trigger("click");
+    await wrapper.findAll("button").find(button => button.text() === "保存当前配置")!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0].actions.power?.single).toEqual({ type: "app_switcher" });
+    expect(wrapper.text()).toContain("向上翻页");
+    expect(wrapper.text()).toContain("滚到底部");
+    wrapper.unmount();
+  });
+});
+
+
+describe("explicit public binding navigation", () => {
+  it("edits the requested common binding while a different template remains applied", async () => {
+    vi.mocked(getSceneSnapshot).mockResolvedValueOnce({ ...voiceSnapshot(false), templateId: "profile-a", mappingNotice: { kind: "direct", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
+    const wrapper = await mountPage("rc003", { button: "ok", trigger: "single", editingSource: "common" });
+    try {
+      await flushPromises();
+      const snapshotReads = vi.mocked(getButtonMappingSnapshot).mock.calls.length;
+      expect(wrapper.get(".mapping-editor").text()).toContain("当前：Enter");
+      expect((wrapper.get('select[aria-label="当前使用的按键模板"]').element as HTMLSelectElement).value).toBe("profile-a");
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappings).toHaveBeenLastCalledWith(expect.objectContaining({actions: expect.objectContaining({ok: expect.objectContaining({single: {type: "shortcut", chord: {keys: ["enter"]}}})})}));
+      expect(updateButtonMappingTemplate).not.toHaveBeenCalled();
+      expect(selectCurrentTemplate).not.toHaveBeenCalled();
+      await wrapper.findAll(".mapping-card").find(card => card.text().includes("电源"))!.findAll(".mapping-cell")[0]!.trigger("click");
+      await vi.waitFor(() => { expect(vi.mocked(getButtonMappingSnapshot).mock.calls.length).toBeGreaterThan(snapshotReads); }, { timeout: 2500 });
+      expect(wrapper.get(".mapping-editor").text()).toContain("电源 · 单击");
+      await wrapper.setProps({ initialEditor: { button: "ok", trigger: "single", editingSource: "common" } });
+      await flushPromises();
+      expect(wrapper.get(".mapping-editor").text()).toContain("确定 · 单击");
+    } finally { wrapper.unmount(); }
+  });
+  it("preserves the loaded future schema when editing an applied template", async () => {
+    const base = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({ ...base, templates: base.templates.map(template => ({...template, mappings: {...template.mappings, schemaVersion: 9}})) });
+    vi.mocked(getSceneSnapshot).mockResolvedValueOnce({ ...voiceSnapshot(false), templateId: "profile-a", mappingNotice: { kind: "direct", templateId: "profile-a", name: "模板 A", actionsAvailable: true } });
+    const wrapper = await mountPage();
+    try {
+      await flushPromises();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(updateButtonMappingTemplate).toHaveBeenLastCalledWith("profile-a", expect.objectContaining({schemaVersion: 9}));
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存为模板")!.trigger("click");
+      await wrapper.get(".save-template-field input").setValue("未来结构副本");
+      await wrapper.findAll("[role=dialog] button").find(button => button.text() === "保存模板")!.trigger("click");
+      await flushPromises();
+      expect(saveButtonMappingTemplate).toHaveBeenLastCalledWith("未来结构副本", expect.objectContaining({schemaVersion: 9}));
+    } finally { wrapper.unmount(); }
+  });
+});
+
+
+describe("upstream repeatable APP actions", () => {
+  it.each(["app_switcher", "page_up", "page_down"] as const)("preserves configured repeat for %s", async type => {
+    const base = await getMappingConfiguration();
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({...base, commonMappings: {...base.commonMappings, actions: { ...base.commonMappings.actions, up: {single: {type}, double: {type: "disabled"}, long: {type: "disabled"}, holdRepeat: "single"}}}});
+    const wrapper = await mountPage();
+    try {
+      await wrapper.findAll(".mapping-card").find(card => card.find("strong").text() === "上")!.findAll(".mapping-cell")[0]!.trigger("click");
+      wrapper.findComponent({name: "ButtonActionEditor"}).vm.$emit("update", {type});
+      await flushPromises();
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0].actions.up?.holdRepeat).toBe("single");
+    } finally { wrapper.unmount(); }
+  });
+  it("uses the current schema only when an imported draft has none", async () => {
+    const base = await getMappingConfiguration();
+    const {schemaVersion, ...unversioned} = base.commonMappings;
+    vi.mocked(getMappingConfiguration).mockResolvedValueOnce({...base, commonMappings: unversioned});
+    const wrapper = await mountPage();
+    try {
+      await wrapper.findAll(".mapping-actions button").find(button => button.text() === "保存当前配置")!.trigger("click");
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0].schemaVersion).toBe(5);
     } finally { wrapper.unmount(); }
   });
 });

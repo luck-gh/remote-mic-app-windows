@@ -617,7 +617,7 @@ mod imp {
     /// 合成命令的 from 恒为它，桥（S 行）只下发目标 usage。
     const VOICE_KEY_HID_USAGE: u16 = 0x003E;
 
-    /// agent 允许接管的全部语义按键白名单（语音键 0x003E 明确排除）。
+    /// agent 允许上报的语义按键白名单。产品不自动接管语音键 F5。
     const TARGET_USAGES: [u16; 13] = [
         0x00F1, 0x0028, 0x0035, 0x004A, 0x004F, 0x0050, 0x0051, 0x0052, 0x0065, 0x0066, 0x007F,
         0x0080, 0x0081,
@@ -8074,7 +8074,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         logger.line(
             "已武装。主程序会动态下发已配置按键；[CONFIG] / [HB] 的 report_usages 是当前实际目标。",
         );
-        logger.line("未列入 report_usages 的按键保持 Windows 原生行为；语音键不参与本链路。");
+        logger.line("未列入 report_usages 的按键保持 Windows 原生行为；语音键不自动加入捕获目标。");
         logger.line(&format!(
             "心跳（[HB]）只在状态变化或每 30 秒记一条（避免把日志刷爆）；Ctrl+C 或直接关掉本窗口结束\
              （会先给 agent 发 disarm；即使来不及，agent 也会在 {LEASE_MS} ms 租约到期后自行停止清键）。\
@@ -8450,9 +8450,8 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
         targets: &BridgeCaptureTargets,
         synth: Option<(u16, u16)>,
     ) -> io::Result<()> {
-        // 清空集合 = 上报集合 ∪ 哨兵键。哨兵键把"清空到底有没有生效"变成外部可观测的实验
-        // （详见 `--canary-usage` 的说明）。产品路径下目标来自主程序；无主程序时由
-        // 调用方显式传入历史三键默认值，agent 自身默认保持空集合（fail-open）。
+        // 清空集合仅包含动态目标与显式诊断哨兵。当前来源一致性不能证明
+        // 报告属于选定遥控器, 因而不得自动扩大到物理键盘也有的 F5。
         let mut clear = targets.usages.clone();
         for usage in canary {
             if !clear.contains(usage) {
@@ -10142,7 +10141,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             format!("同一轮内计数={n_same_round}（应为 0）开新轮后={n_new_round}（应为 1）"),
         );
 
-        // 19) 端口占用（10048）必须给出**可操作**文案，且判据是结构化的错误类型。
+        // 19) 端口占用必须保留系统错误码 10048 与可操作参数, 不依赖本机错误翻译。
         //     2026-09-23 真机撞到过：当时那条消息只说"失败"。用 0 让系统分配一个空闲端口，
         //     再绑同一端口必然失败。
         let port_case = match bind_listener(0) {
@@ -10150,7 +10149,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 let p = held.local_addr().map(|a| a.port()).unwrap_or(0);
                 match bind_listener(p) {
                     Ok(_) => (false, format!("第二次绑定 {p} 竟然成功了（本机应失败）")),
-                    Err(error) => (error.contains("占用"), error),
+                    Err(error) => (error.contains("10048") && error.contains("--port"), error),
                 }
             }
             Err(error) => (false, format!("首次绑定端口 0 失败：{error}")),
@@ -10290,6 +10289,21 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
                 "has_synthSetIn={} has_gate={}",
                 AGENT_JS.contains("function synthSetIn("),
                 AGENT_JS.contains("function synthSetIn("),
+            ),
+        );
+
+        // 23d) 语音键 clear-only（2026-11-12 报障：桌面图标被 F5 刷新）。
+        //      语音键只能进 clear 集合，不能进 report；canary 统计必须排除它。
+        check(
+            "内嵌 agent：语音键 clear-only 与 canary 排除",
+            AGENT_JS.contains("var VOICE_KEY_HID_USAGE = 0x003E;")
+                && AGENT_JS.contains("voice_clear_hits")
+                && AGENT_JS.contains("if (toClear[ci] === VOICE_KEY_HID_USAGE) continue;")
+                && AGENT_JS.contains("voice:clear n="),
+            format!(
+                "has_voice_constant={} has_canary_skip={}",
+                AGENT_JS.contains("var VOICE_KEY_HID_USAGE = 0x003E;"),
+                AGENT_JS.contains("if (toClear[ci] === VOICE_KEY_HID_USAGE) continue;"),
             ),
         );
 
@@ -10884,7 +10898,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
     /// 有了代次，接管旧实例时日志会打 `[AGENT-STALE]`，让这件事一眼可见。
     ///
     /// 旧/未知代次不允许接管；本助手不结束共享宿主来替换 DLL。
-    const AGENT_BUILD: &str = "2026-10-23.auth-lease";
+    const AGENT_BUILD: &str = "2026-11-13.personal-source-clear";
     /// 锁定文件在编译期内联。三重作用：
     /// 1) **缺失即编译失败**：锁定文件被删/路径写错，构建直接报错，不会产出"看起来正常、
     ///    实际没登记完整性"的二进制（本常量写错路径时已实测触发编译错误）；
@@ -12530,7 +12544,7 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert_eq!(VOICE_KEY_HID_USAGE, 0x003E);
             assert!(
                 !TARGET_USAGES.contains(&VOICE_KEY_HID_USAGE),
-                "语音键不能进接管白名单：ATVV 会话走 BLE 层，且合成命令的 from 就是它"
+                "语音键不能进 report 白名单：ATVV 会话走 BLE 层，且合成命令的 from 就是它；它只作为 clear-only 目标"
             );
         }
 
@@ -12557,6 +12571,55 @@ Raw Input 与键盘钩子同样拿不到它们（那正是 kbdhid 丢弃的直�
             assert!(message.contains("kind=ConnectionRefused"));
             assert!(message.contains("os=Some(10061)"));
             assert!(message.contains("elapsed_ms=37"));
+        }
+    }
+
+    #[cfg(test)]
+    mod product_voice_key_exclusion_tests {
+        use super::*;
+
+        fn assert_voice_excluded(bytes: &[u8], expected: &[u16]) {
+            let text = std::str::from_utf8(bytes).unwrap();
+            let target = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|line| line["type"] == "targets")
+                .unwrap();
+            let clear: Vec<u16> = serde_json::from_value(target["clear"].clone()).unwrap();
+            assert_eq!(clear, expected);
+            assert!(!clear.contains(&VOICE_KEY_HID_USAGE));
+        }
+
+        #[test]
+        fn initial_and_dynamic_product_targets_never_add_physical_f5() {
+            let logger = Logger::new(None);
+            for usages in [vec![], vec![0x00f1, 0x0080], vec![0x0028, 0x0066]] {
+                let targets = BridgeCaptureTargets {
+                    generation: 17,
+                    usages: usages.clone(),
+                };
+                let mut initial = Vec::new();
+                send_session_config(
+                    &mut initial,
+                    &logger,
+                    "fixture",
+                    false,
+                    false,
+                    &[],
+                    &targets,
+                    None,
+                )
+                .unwrap();
+                assert_voice_excluded(&initial, &usages);
+                let mut dynamic = Vec::new();
+                assert!(send_dynamic_targets(
+                    &mut dynamic,
+                    &logger,
+                    "fixture",
+                    &targets
+                ));
+                assert_voice_excluded(&dynamic, &usages);
+            }
         }
     }
 

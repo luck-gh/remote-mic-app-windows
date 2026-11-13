@@ -17,10 +17,11 @@ function Get-FixtureIdentity([string]$Root) {
 }
 
 try {
-    New-Item -ItemType Directory -Force -Path (Join-Path $fixtureRoot 'src'), (Join-Path $fixtureRoot 'artifacts') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixtureRoot 'src'), (Join-Path $fixtureRoot 'artifacts'), (Join-Path $fixtureRoot 'src-tauri/windows') | Out-Null
     Set-Content -LiteralPath (Join-Path $fixtureRoot 'src/input.rs') -Value 'one' -NoNewline
+    Set-Content -LiteralPath (Join-Path $fixtureRoot 'src-tauri/windows/installer.nsi') -Value 'installer one' -NoNewline
     & git -C $fixtureRoot init -q
-    & git -C $fixtureRoot -c user.name=Fixture -c user.email=fixture@example.invalid add src/input.rs
+    & git -C $fixtureRoot -c user.name=Fixture -c user.email=fixture@example.invalid add src/input.rs src-tauri/windows/installer.nsi
     & git -C $fixtureRoot -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
     $head = (& git -C $fixtureRoot rev-parse HEAD).Trim()
 
@@ -28,6 +29,10 @@ try {
     Remove-Item Env:SAYALL_BUILD_CHANNEL -ErrorAction SilentlyContinue
     $clean = Get-FixtureIdentity $fixtureRoot
     if ($clean.sourceState -ne 'clean' -or $clean.sourceCommit -ne $head -or $clean.sourceFingerprint -notmatch '^[0-9a-f]{64}$') { throw 'Clean identity did not report an exact commit and fingerprint' }
+    Set-Content -LiteralPath (Join-Path $fixtureRoot 'src-tauri/windows/installer.nsi') -Value 'installer two' -NoNewline
+    $installerChanged = Get-FixtureIdentity $fixtureRoot
+    if ($installerChanged.sourceFingerprint -eq $clean.sourceFingerprint) { throw 'Installer template changes were omitted from the source fingerprint' }
+    Set-Content -LiteralPath (Join-Path $fixtureRoot 'src-tauri/windows/installer.nsi') -Value 'installer one' -NoNewline
     $env:SAYALL_BUILD_CHANNEL = 'local'
     $localBuild = Get-FixtureIdentity $fixtureRoot
     if ($localBuild.buildChannel -ne 'local') { throw 'Local build channel was not preserved' }
@@ -62,6 +67,15 @@ try {
     Set-Content -LiteralPath $gadgetPath -Value 'fixture gadget' -NoNewline
     $gadgetHash = (Get-FileHash -LiteralPath $gadgetPath -Algorithm SHA256).Hash.ToLowerInvariant()
     @{ resources = @(@{ name = 'sayall-helper.exe'; sha256 = $payloadHash }, @{ name = 'frida-gadget.dll'; sha256 = $gadgetHash }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $fixtureRoot 'target/dev/bundle-staging/payloads.json') -Encoding utf8
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $identityScript -RepositoryRoot $fixtureRoot -IncludePayloads 2>$null | Out-Null; $missingMcpExit = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $previousErrorAction }
+    if ($missingMcpExit -eq 0) { throw 'Bundle identity accepted a receipt missing the MCP service' }
+    $mcpPath = Join-Path $fixtureRoot 'src-tauri/sayall-mcp.exe'
+    Set-Content -LiteralPath $mcpPath -Value 'fixture mcp' -NoNewline
+    $mcpHash = (Get-FileHash -LiteralPath $mcpPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    @{ resources = @(@{ name = 'sayall-helper.exe'; sha256 = $payloadHash }, @{ name = 'frida-gadget.dll'; sha256 = $gadgetHash }, @{ name = 'sayall-mcp.exe'; sha256 = $mcpHash }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $fixtureRoot 'target/dev/bundle-staging/payloads.json') -Encoding utf8
     $env:GITHUB_SHA = $head
     Remove-Item Env:SAYALL_BUILD_CHANNEL -ErrorAction SilentlyContinue
     $withPayload = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $identityScript -RepositoryRoot $fixtureRoot -IncludePayloads

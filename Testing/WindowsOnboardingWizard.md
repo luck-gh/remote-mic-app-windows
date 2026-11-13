@@ -1,5 +1,9 @@
 # Windows 首次设置向导（Onboarding）真机验收手册
 
+## 本轮整合边界
+
+上游新增独立“全按键支持”步骤后为八步；个人版保留按放配对、严格语音验证终态、Skip/退出清理与重跑行为。下文历史七步记录只证明当时构建，不作为本轮新流程已验收的证据。
+
 ## 适用范围
 
 - 仓库：`GetSayAll/remote-mic-app-windows`，分支 `feat/onboarding`
@@ -57,7 +61,7 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
 1. 记录提交 SHA、测试包路径与版本号、Windows 版本、VB-CABLE 版本。
 2. 安装本地测试包（保留既有用户数据）。本构建已打开向导开关；老机器走「设置 → 首次设置 → 重新运行向导」进入。
 3. 打开「权限」页确认日志路径，清空旧日志后开始。
-4. 每个工具测试前按向导第⑤步的核对卡逐项确认：工具麦克风 = CABLE Output；工具内语音键与 SayAll 一致；Vokie 保持运行；豆包需开启「支持更多输入工具」。核对卡是编号提示行（**没有勾选框**）——放行只看真实文字上屏。
+4. 每个工具测试前按向导第⑥步的核对卡逐项确认：工具麦克风 = CABLE Output；工具内语音键与 SayAll 一致；Vokie 保持运行；豆包需开启「支持更多输入工具」。核对卡是编号提示行（**没有勾选框**）——放行只看真实文字上屏。
 
 ## 界面结构（2026-10-05 改版，参考 Mac App）
 
@@ -72,7 +76,7 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
 - 第⑤步通过提示为绿色成功卡 + 对勾；最后一步右栏显示应用 logo + 对勾徽标。
 - 右栏 = 插图 + 检查卡（按步骤换标题：连接检查 / 音频检查 / 工具检查 / 实时检查 / 按键检查）；
   窗口过矮（高度 ≤ 660）或过窄（宽度 ≤ 1024）时检查卡折到内容下方。
-- 按键检测步骤（②遥控器 / ⑥普通按键）期间会**暂挂用户已配置的自定义按键**：只收集
+- 按键检测步骤（②遥控器 / ⑦普通按键）期间会**暂挂用户已配置的自定义按键**：只收集
   边沿，不触发任何映射动作；离开这两步立即恢复（日志 `mapping_suspend` / `mapping_resume`）。
 
 ## 诊断信息（2026-10-05 新增）
@@ -83,7 +87,7 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
    （`type=` 引导类型 `full` / `hiberboot` / `hibernate_resume` / `unknown`、
    `fast_startup=yes|no|unknown`；2026-10-20 快速启动断连取证——两项必须并列，
    开关开着但这次点的是「重启」时 `type` 仍是 `full`；读不到写 `unknown`，不写 `no`）、
-   `Wizard step: <token> (n/7)`、
+   `Wizard step: <token> (n/8)`、
    Gate、Blocked，以及运行行：`Remote`（含 `error=` 与 **`button_observed=`**——②步是否已收到
    普通按键）、**`Raw input`**（phase / matched / raw_events / semantic_edges / stale_events）、
    `Audio`（含 `error=`）、`Input tool`（含 **`capture=`**——「全按键支持」的**真实捕获状态**
@@ -99,11 +103,11 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
    已配置豆包的机器在任何步骤复制都应显示 `Input tool: doubao hotkey=…`，不是 `unset`；
    新装机器上快捷键按生效值显示（默认 左 Ctrl + 左 Win）。
    同口径（2026-10-14 起）：**「全按键支持」的开关状态与真实捕获状态（`capture=`）也做只读刷新**
-   ——①–③步复制不再把开着开关的机器报成 `full_key_support=off`；捕获状态读不到、或出现未知
+   ——①–④步复制不再把开着开关的机器报成 `full_key_support=off`；捕获状态读不到、或出现未知
    token 时写 `capture=unknown`（读取失败各留一条 `read_capture_switch` / `read_capture_state`
    失败日志）。**本条待真机复核**（复制真实块对照 `capture=active|inactive|starting`）。
    同日起多一段 **`IME:`**（当前输入法是不是所选工具 / 系统里可用输入法数量 / 工具 token）——
-   ③诊断"语音没出字是不是因为没切输入法"时先看这一行：
+   ④诊断"语音没出字是不是因为没切输入法"时先看这一行：
    `IME: detected=yes match=no installed_count=3 expected_tool=doubao`（`detected=no` = 读不到，
    界面不据此报警；复制块**保持全英文**，输入法显示名不进块，需要名字时看应用日志的
    `ime_status action=…` 行）。
@@ -127,7 +131,7 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
 
 失败判定：首次运行应进入向导却停在主界面，或已处理本版流程的用户重启时被自动弹入；退出/稍后设置不能返回主界面；任一步没有独立 Skip；Skip 置 `voiceVerified` 或伪报步骤/硬件 passed；重新运行不从 welcome 开始或清除任何显式保存有效设置；退出/跳过后语音、观察、映射暂挂或 pending 写入未按顺序收尾；未验证 staged 工具/快捷键未回滚/同步；无法确认清理/保存却不警告。
 
-## 用例二：步骤①–③（欢迎 / 遥控器 / 语音设备）
+## 用例二：步骤①–④（欢迎 / 遥控器 / 语音设备 / 全按键支持）
 
 1. 第②步点「打开蓝牙设置」：系统「蓝牙和其他设备」页应真实弹出。
 2. 第②步的「首次连接遥控器」卡应写清：长按「TV」约 3 秒进入配对；没有反应时同时长按「主页」+「菜单」
@@ -136,7 +140,7 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
    此期间按已配置映射的键（如 OK → Enter）**不应触发**用户的自定义动作（检测步骤暂挂映射）。
 4. 第③步：检测到带「推荐」标记的 CABLE 设备并自动选中；没有时给出安装与重启说明。设备不可用时用户仍可主动跳到下一步，但该步骤保持未通过，不得因此伪报端点就绪。
 
-## 用例三（核心）：第⑤步「按住说话验证」，三种工具各跑一遍
+## 用例三（核心）：第⑥步「按住说话验证」，三种工具各跑一遍
 
 对 豆包 / 微信 / Vokie 分别执行：
 
@@ -180,7 +184,9 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
   - ③ 语音设备：`refresh_endpoints`（`detail=auto|manual_total_N_rec_M`）、`select_endpoint`
     （`detail=auto|manual|fallback`）、`open_download_page`；另有 `phase=audio_route`
     （`reason=missing|not_selected|selected|ready`，状态去重）；
-  - ④ 输入工具：`read_tool_state`、`stage_binding`（`detail=<工具>`）、`save_other_keys`、
+  - ④ 全按键支持：`read_capture_state`（进入步骤时读取，`detail=enabled_0|1_available_0|1`）；
+    开关操作另落 `phase=authorization`（`step=full_key detail=full_key`，失败原文只进日志）；
+  - ⑤ 输入工具：`read_tool_state`、`stage_binding`（`detail=<工具>`）、`save_other_keys`、
     `vokie_detect`（`detail=installed_0|1_running_0|1`）、`open_vokie_site`、`vokie_launch`；
   - ⑤ 按住说话：`armed` / 终态 / `session_stopped` / `observation_begin_failed` 等
     （见上一条核对）；
@@ -195,12 +201,12 @@ NSIS 本地候选 12,878,070 B / SHA-256 `b8cc4ade31b207951caf900251dd1daae52f85
 
 失败判定：正常路径判定失败或看不到文字；键盘打字仍判通过；焦点类失败文案缺失；快速点按导致卡死、重复 attempt、或出现两个终态；日志缺 attempt 配对或含文字内容。
 
-## 用例四：步骤⑥⑦（普通按键体验 / 完成）
+## 用例四：步骤⑦⑧（普通按键体验 / 完成）
 
 1. 第⑥步：按除语音键外的 3 个不同普通按键（如 主页 / OK / 方向键）→ 已按下的键在芯片格里点亮、进度点走到 3/3 后可继续（同一键重复按不计）；期间遥控器普通按键不应执行用户已配置的映射动作（临时暂挂）；按语音键出现「这是语音键…」纠偏、且不计入。
 2. 正常完成：全部门禁通过后，第⑦步清单全绿，选择「开始使用」；提交已验证 staged 后回主界面「连接」页。另测显式“跳过验证并开始使用”：回主界面但不伪报全绿/硬件通过；若此前有任何 Skip，结束日志为 `skipped`，未验证 staged 工具/和弦回滚。
 3. 完成后再从设置页重跑入口进入：应回到第①步（不影响既有设置）。
-4. 断开遥控器后打开第⑦步（若可重现）：清单对应项转红，给「去修复」跳回对应步骤。
+4. 断开遥控器后打开第⑧步（若可重现）：清单对应项转红，给「去修复」跳回对应步骤。
 
 预期：第⑥步的暂挂只影响向导会话，离开后映射恢复；正常验证通过后才提交已验证的 staged 工具与和弦，未验证快捷键偏好只在验证通过后提交。
 
@@ -235,9 +241,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Testing\run-hardware-signal-
 ```
 
 - 状态隔离：`SAYALL_RUNTIME_SIMULATION_STATE_DIR` 下生成独立的 `settings.json` / `onboarding.json`，**不动**用户的真实向导状态；向导每次从第①步开始。
-- 覆盖：② 的按键门禁、③ 的端点推荐与自动选择、④ 的工具选择、⑤ 的会话与解码采样（`voice_attempt` 终端码）、⑥ 的 3 个不同按键、⑦ 的提交与收尾；日志含 `hardware_script action=apply ... terminal_result=` 逐条记录。
-- 转写文字：模拟轨道没有输入法注入，第⑤步的转写由驱动写入输入框并派发 `input` 事件（真机仍必须真人说话）。
-- 已跑通记录（2026-10-05，RC003 scenario）：①②③④⑥⑦ 全绿，⑤ `voice_attempt result=passed detail=d240_s240_q0_drain1`，收尾 `wizard_finished elapsed_ms=71920`；截图与日志摘录见 `artifacts/local-test/2026-10-05-onboarding-simulation/`。
+- 覆盖：② 的按键门禁、③ 的端点推荐与自动选择、④ 的全按键支持说明与「不开启也能继续」
+  （开关与授权属真机路径，仿真不覆盖）、⑤ 的工具选择、⑥ 的会话与解码采样（`voice_attempt` 终端码）、
+  ⑦ 的 3 个不同按键、⑧ 的提交与收尾；日志含 `hardware_script action=apply ... terminal_result=` 逐条记录。
+- 转写文字：模拟轨道没有输入法注入，第⑥步的转写由驱动写入输入框并派发 `input` 事件（真机仍必须真人说话）。
+- 已跑通记录（2026-10-05，RC003 scenario，**当时为七步流程**）：①②③④⑥⑦ 全绿，
+  ⑤ `voice_attempt result=passed detail=d240_s240_q0_drain1`，收尾 `wizard_finished elapsed_ms=71920`；
+  截图与日志摘录见 `artifacts/local-test/2026-10-05-onboarding-simulation/`。2026-11-05 在语音设备之后
+  插入新第④步后，原④–⑦ 依次后移为⑤–⑧；旧记录不重跑。
 - 边界：模拟 ≠ 真机——配对、射频、权限、驱动、真实音质与安装包行为仍按本手册真机执行；两种型号仍要分别做真机用例一~四。
 
 ## 验证边界

@@ -464,8 +464,53 @@ pub enum TaskSwitchView {
     Desktops,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// 更高结构版本写入、当前构建不认识的动作。
+///
+/// 只保留原始 JSON，不解释字段；界面显示为“来自更新版本、当前不可用”，
+/// 保存时原样写回，升级到支持该动作的版本后继续生效。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedAction {
+    pub action_type: String,
+    pub raw_json: String,
+}
+
+impl UnsupportedAction {
+    /// 日志用安全 token：动作类型来自配置文件，不能把控制字符原样写进日志。
+    pub fn log_token(&self) -> String {
+        self.action_type
+            .chars()
+            .filter(|value| value.is_ascii_alphanumeric() || *value == '_')
+            .take(32)
+            .collect()
+    }
+}
+
+/// 未识别的 JSON 字段/值的原始文本；保存时原样写回，供更高版本继续使用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawJson(pub String);
+
+impl Serialize for RawJson {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::Error as _;
+        let value: serde_json::Value = serde_json::from_str(&self.0).map_err(S::Error::custom)?;
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ButtonAction {
     #[default]
     Disabled,
@@ -486,7 +531,6 @@ pub enum ButtonAction {
     FocusInput,
     Scroll {
         direction: ScrollDirection,
-        #[serde(default = "default_scroll_steps")]
         steps: u16,
     },
     MouseClick {
@@ -501,10 +545,8 @@ pub enum ButtonAction {
     /// `macro_id` 指向 `combined-actions.json` 里的稳定 ID；运行时解析
     /// **最新已保存版本**（Mac 语义：编辑组合动作后所有引用自动生效）。
     /// `macro_version` 只作审计/展示（保存时所指版本）。
-    #[serde(rename_all = "camelCase")]
     RunMacro {
         macro_id: String,
-        #[serde(default)]
         macro_version: String,
     },
     /// 打开常用语面板（对标 macOS 的 `openCommonPhrases`）。
@@ -512,6 +554,223 @@ pub enum ButtonAction {
     /// 面板是**短时窗口**：方向键与 OK 在面板打开期间由面板即时认领（按下即插入，
     /// 不等手势判定），返回键关闭面板。未绑定该动作时不改变任何按键行为。
     OpenCommonPhrases,
+    /// Windows 应用切换器（Alt+Tab）临时会话（对标 macOS `appSwitcher`）。
+    ///
+    /// 触发后保持 Alt 并打开系统切换器；方向键 / OK / 返回由
+    /// [`crate::app_switcher::AppSwitcherSession`] 在按下沿即时认领。
+    AppSwitcher,
+    /// 向上翻一页：优先滚当前 APP 学习过的滚动区域，没有档案时用 UIA 兜底。
+    PageUp,
+    /// 向下翻一页。
+    PageDown,
+    /// 滚到当前 APP 滚动区域的顶部（一次性跳转）。
+    ScrollToTop,
+    /// 滚到当前 APP 滚动区域的底部（一次性跳转）。
+    ScrollToBottom,
+    /// 更高结构版本的动作：当前版本不执行，但保存时必须原样保留。
+    Unsupported(UnsupportedAction),
+}
+
+impl Serialize for ButtonAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::Error as _;
+        use serde_json::{Map, Value};
+
+        if let Self::Unsupported(raw) = self {
+            let value: Value = serde_json::from_str(&raw.raw_json).map_err(S::Error::custom)?;
+            return value.serialize(serializer);
+        }
+        let mut object = Map::new();
+        let action_type = match self {
+            Self::Disabled => "disabled",
+            Self::TaskSwitch { .. } => "task_switch",
+            Self::Shortcut { .. } => "shortcut",
+            Self::OpenApp { .. } => "open_app",
+            Self::FocusInput => "focus_input",
+            Self::Scroll { .. } => "scroll",
+            Self::MouseClick { .. } => "mouse_click",
+            Self::MouseMove { .. } => "mouse_move",
+            Self::RunMacro { .. } => "run_macro",
+            Self::OpenCommonPhrases => "open_common_phrases",
+            Self::AppSwitcher => "app_switcher",
+            Self::PageUp => "page_up",
+            Self::PageDown => "page_down",
+            Self::ScrollToTop => "scroll_to_top",
+            Self::ScrollToBottom => "scroll_to_bottom",
+            Self::Unsupported(_) => unreachable!("handled above"),
+        };
+        object.insert("type".to_owned(), Value::String(action_type.to_owned()));
+        match self {
+            Self::TaskSwitch { view } => {
+                object.insert(
+                    "view".to_owned(),
+                    serde_json::to_value(view).map_err(S::Error::custom)?,
+                );
+            }
+            Self::Shortcut { chord } => {
+                object.insert(
+                    "chord".to_owned(),
+                    serde_json::to_value(chord).map_err(S::Error::custom)?,
+                );
+            }
+            Self::OpenApp { target } => {
+                object.insert("target".to_owned(), Value::String(target.clone()));
+            }
+            Self::Scroll { direction, steps } => {
+                object.insert(
+                    "direction".to_owned(),
+                    serde_json::to_value(direction).map_err(S::Error::custom)?,
+                );
+                object.insert("steps".to_owned(), Value::from(*steps));
+            }
+            Self::MouseClick { kind } => {
+                object.insert(
+                    "kind".to_owned(),
+                    serde_json::to_value(kind).map_err(S::Error::custom)?,
+                );
+            }
+            Self::MouseMove {
+                direction,
+                distance,
+            } => {
+                object.insert(
+                    "direction".to_owned(),
+                    serde_json::to_value(direction).map_err(S::Error::custom)?,
+                );
+                object.insert("distance".to_owned(), Value::from(*distance));
+            }
+            Self::RunMacro {
+                macro_id,
+                macro_version,
+            } => {
+                object.insert("macroId".to_owned(), Value::String(macro_id.clone()));
+                object.insert(
+                    "macroVersion".to_owned(),
+                    Value::String(macro_version.clone()),
+                );
+            }
+            Self::Disabled
+            | Self::FocusInput
+            | Self::OpenCommonPhrases
+            | Self::AppSwitcher
+            | Self::PageUp
+            | Self::PageDown
+            | Self::ScrollToTop
+            | Self::ScrollToBottom
+            | Self::Unsupported(_) => {}
+        }
+        Value::Object(object).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ButtonAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        use serde_json::Value;
+
+        let value = Value::deserialize(deserializer)?;
+        let action_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::missing_field("type"))?
+            .to_owned();
+        let result = match action_type.as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "task_switch" => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    view: TaskSwitchView,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::TaskSwitch { view: fields.view })
+            }
+            "shortcut" => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    chord: KeyChord,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::Shortcut {
+                    chord: fields.chord,
+                })
+            }
+            "open_app" => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    target: String,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::OpenApp {
+                    target: fields.target,
+                })
+            }
+            "focus_input" => Ok(Self::FocusInput),
+            "scroll" => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    direction: ScrollDirection,
+                    #[serde(default = "default_scroll_steps")]
+                    steps: u16,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::Scroll {
+                    direction: fields.direction,
+                    steps: fields.steps,
+                })
+            }
+            "mouse_click" => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    kind: MouseClickKind,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::MouseClick { kind: fields.kind })
+            }
+            "mouse_move" => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    direction: MoveDirection,
+                    distance: u16,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::MouseMove {
+                    direction: fields.direction,
+                    distance: fields.distance,
+                })
+            }
+            "run_macro" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Fields {
+                    macro_id: String,
+                    #[serde(default)]
+                    macro_version: String,
+                }
+                let fields: Fields = serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(Self::RunMacro {
+                    macro_id: fields.macro_id,
+                    macro_version: fields.macro_version,
+                })
+            }
+            "open_common_phrases" => Ok(Self::OpenCommonPhrases),
+            "app_switcher" => Ok(Self::AppSwitcher),
+            "page_up" => Ok(Self::PageUp),
+            "page_down" => Ok(Self::PageDown),
+            "scroll_to_top" => Ok(Self::ScrollToTop),
+            "scroll_to_bottom" => Ok(Self::ScrollToBottom),
+            _ => Ok(Self::Unsupported(UnsupportedAction {
+                action_type,
+                raw_json: value.to_string(),
+            })),
+        };
+        result
+    }
 }
 
 impl ButtonAction {
@@ -533,7 +792,14 @@ impl ButtonAction {
             | Self::MouseClick { .. }
             // 组合动作与常用语面板都不可连发。
             | Self::RunMacro { .. }
-            | Self::OpenCommonPhrases => false,
+            | Self::OpenCommonPhrases
+            | Self::ScrollToTop
+            | Self::ScrollToBottom
+            | Self::Unsupported(_) => false,
+            // 应用切换器会话内每次触发只前进一项；按住连发即连续 Tab，
+            // 与系统 Alt+Tab 的按住循环语义一致（对齐 Mac `appSwitcher`）。
+            Self::AppSwitcher => true,
+            Self::PageUp | Self::PageDown => true,
             Self::Scroll { .. } | Self::MouseMove { .. } => true,
             Self::Shortcut { chord } => {
                 matches!(chord.keys.as_slice(), [key] if !key.is_modifier())
@@ -672,8 +938,7 @@ pub enum HoldRepeat {
     Long,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ButtonActions {
     pub single: ButtonAction,
     pub double: ButtonAction,
@@ -682,19 +947,18 @@ pub struct ButtonActions {
     /// `Off` 明确关闭，`Single` / `Long` 显式指定槽位。
     ///
     /// 每键至多一个槽位：互斥由界面与 [`ButtonMappings::normalized`] 强制。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_repeat: Option<HoldRepeat>,
     /// OK 键：用遥控器移动过光标后的 5 秒内，按 OK 直接点击光标位置
     /// （本次按压不触发单击/双击/长按）。只对 OK 键生效，默认关。
     ///
     /// 产品逻辑见 `docs/product/button-behavior.md` §2；方案见
     /// `docs/plan/2026-10-06-ok-context-click.md`。
-    #[serde(default, skip_serializing_if = "is_false")]
     pub ok_context_click: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
+    /// 更高结构版本写入、当前构建不认识的按键级字段；保存时原样保留。
+    pub extra: BTreeMap<String, RawJson>,
+    /// 更高结构版本写在**已知动作内部**的未知字段（例如 `shortcut` 上新增的
+    /// 可选字段）。键 = 触发方式；保存时合并回对应动作对象，绝不参与执行。
+    pub action_extras: BTreeMap<ButtonTrigger, BTreeMap<String, RawJson>>,
 }
 
 impl Default for ButtonActions {
@@ -705,7 +969,187 @@ impl Default for ButtonActions {
             long: ButtonAction::Disabled,
             hold_repeat: None,
             ok_context_click: false,
+            extra: BTreeMap::new(),
+            action_extras: BTreeMap::new(),
         }
+    }
+}
+
+fn trigger_wire_name(trigger: ButtonTrigger) -> &'static str {
+    match trigger {
+        ButtonTrigger::Single => "single",
+        ButtonTrigger::Double => "double",
+        ButtonTrigger::Long => "long",
+    }
+}
+
+/// 已知动作在 JSON 里由 [`ButtonAction`] 自己负责的字段；其余字段属于
+/// 更高版本的扩展，必须进 `action_extras` 等保存时合并回去。
+fn action_known_fields(action: &ButtonAction) -> &'static [&'static str] {
+    match action {
+        ButtonAction::TaskSwitch { .. } => &["type", "view"],
+        ButtonAction::Shortcut { .. } => &["type", "chord"],
+        ButtonAction::OpenApp { .. } => &["type", "target"],
+        ButtonAction::Scroll { .. } => &["type", "direction", "steps"],
+        ButtonAction::MouseClick { .. } => &["type", "kind"],
+        ButtonAction::MouseMove { .. } => &["type", "direction", "distance"],
+        ButtonAction::RunMacro { .. } => &["type", "macroId", "macroVersion"],
+        ButtonAction::Unsupported(_) => &["type"],
+        ButtonAction::Disabled
+        | ButtonAction::FocusInput
+        | ButtonAction::OpenCommonPhrases
+        | ButtonAction::AppSwitcher
+        | ButtonAction::PageUp
+        | ButtonAction::PageDown
+        | ButtonAction::ScrollToTop
+        | ButtonAction::ScrollToBottom => &["type"],
+    }
+}
+
+impl Serialize for ButtonActions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::Error as _;
+        use serde_json::{Map, Value};
+
+        let mut object = Map::new();
+        for (trigger, action) in [
+            (ButtonTrigger::Single, &self.single),
+            (ButtonTrigger::Double, &self.double),
+            (ButtonTrigger::Long, &self.long),
+        ] {
+            let mut value = serde_json::to_value(action).map_err(S::Error::custom)?;
+            if !matches!(action, ButtonAction::Unsupported(_)) {
+                if let Some(extras) = self.action_extras.get(&trigger) {
+                    if let Value::Object(fields) = &mut value {
+                        for (key, raw) in extras {
+                            let parsed =
+                                serde_json::from_str::<Value>(&raw.0).map_err(S::Error::custom)?;
+                            fields.insert(key.clone(), parsed);
+                        }
+                    }
+                }
+            }
+            object.insert(trigger_wire_name(trigger).to_owned(), value);
+        }
+        if let Some(hold_repeat) = self.hold_repeat {
+            object.insert(
+                "holdRepeat".to_owned(),
+                serde_json::to_value(hold_repeat).map_err(S::Error::custom)?,
+            );
+        }
+        if self.ok_context_click {
+            object.insert("okContextClick".to_owned(), Value::Bool(true));
+        }
+        for (key, raw) in &self.extra {
+            let parsed = serde_json::from_str::<Value>(&raw.0).map_err(S::Error::custom)?;
+            object.insert(key.clone(), parsed);
+        }
+        Value::Object(object).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ButtonActions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        use serde_json::Value;
+
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("按键动作必须是 JSON 对象"))?;
+        let is_cell = ["single", "double", "long"]
+            .iter()
+            .any(|key| object.contains_key(*key));
+        if !is_cell {
+            // 兼容旧版单动作文件：整个值就是一个 ButtonAction。更高版本
+            // 若仍沿用这个形状并新增字段，也要把未知字段留下来。
+            let raw = value.clone();
+            let single = serde_json::from_value::<ButtonAction>(value).map_err(D::Error::custom)?;
+            let mut action_extras = BTreeMap::new();
+            if !matches!(single, ButtonAction::Unsupported(_)) {
+                if let Some(fields) = raw.as_object() {
+                    let known = action_known_fields(&single);
+                    let extras: BTreeMap<String, RawJson> = fields
+                        .iter()
+                        .filter(|(key, _)| !known.contains(&key.as_str()))
+                        .map(|(key, value)| (key.clone(), RawJson(value.to_string())))
+                        .collect();
+                    if !extras.is_empty() {
+                        action_extras.insert(ButtonTrigger::Single, extras);
+                    }
+                }
+            }
+            return Ok(Self {
+                single,
+                action_extras,
+                ..Self::default()
+            });
+        }
+
+        let mut action_extras = BTreeMap::new();
+        let mut parse_action =
+            |trigger: ButtonTrigger, field: &str| -> Result<ButtonAction, D::Error> {
+                let raw = object
+                    .get(field)
+                    .cloned()
+                    .ok_or_else(|| D::Error::custom(format!("缺少 {field}")))?;
+                let action = serde_json::from_value::<ButtonAction>(raw.clone())
+                    .map_err(D::Error::custom)?;
+                if !matches!(action, ButtonAction::Unsupported(_)) {
+                    if let Some(fields) = raw.as_object() {
+                        let known = action_known_fields(&action);
+                        let extras: BTreeMap<String, RawJson> = fields
+                            .iter()
+                            .filter(|(key, _)| !known.contains(&key.as_str()))
+                            .map(|(key, value)| (key.clone(), RawJson(value.to_string())))
+                            .collect();
+                        if !extras.is_empty() {
+                            action_extras.insert(trigger, extras);
+                        }
+                    }
+                }
+                Ok(action)
+            };
+        let single = parse_action(ButtonTrigger::Single, "single")?;
+        let double = parse_action(ButtonTrigger::Double, "double")?;
+        let long = parse_action(ButtonTrigger::Long, "long")?;
+        let hold_repeat = match object.get("holdRepeat") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                serde_json::from_value::<HoldRepeat>(value.clone()).map_err(D::Error::custom)?,
+            ),
+        };
+        let ok_context_click = match object.get("okContextClick") {
+            None => false,
+            Some(value) => {
+                serde_json::from_value::<bool>(value.clone()).map_err(D::Error::custom)?
+            }
+        };
+        let extra = object
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "single" | "double" | "long" | "holdRepeat" | "okContextClick"
+                )
+            })
+            .map(|(key, value)| (key.clone(), RawJson(value.to_string())))
+            .collect();
+        Ok(Self {
+            single,
+            double,
+            long,
+            hold_repeat,
+            ok_context_click,
+            extra,
+            action_extras,
+        })
     }
 }
 
@@ -740,49 +1184,25 @@ impl ButtonActions {
     }
 }
 
-/// 兼容旧版单动作映射文件（actions 值为 ButtonAction 而非三列 ButtonActions）：
-/// 旧格式动作迁移为单击列。ButtonAction 是内部标签 `{"type": ...}`，与三列
-/// 结构（single/double/long 键齐全）在 JSON 形状上无歧义。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum ButtonActionsWire {
-    Cells(ButtonActionsCells),
-    Legacy(ButtonAction),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ButtonActionsCells {
-    single: ButtonAction,
-    double: ButtonAction,
-    long: ButtonAction,
-    #[serde(default)]
-    hold_repeat: Option<HoldRepeat>,
-    #[serde(default)]
-    ok_context_click: bool,
-}
-
-impl From<ButtonActionsWire> for ButtonActions {
-    fn from(wire: ButtonActionsWire) -> Self {
-        match wire {
-            ButtonActionsWire::Cells(cells) => Self {
-                single: cells.single,
-                double: cells.double,
-                long: cells.long,
-                hold_repeat: cells.hold_repeat,
-                ok_context_click: cells.ok_context_click,
-            },
-            ButtonActionsWire::Legacy(action) => Self {
-                single: action,
-                ..Self::default()
-            },
-        }
-    }
-}
-
-/// 按键映射配置结构版本：0 = 未记录版本，1 = 显式单击/长按连发，
-/// 2 = 显式关闭与组合动作绑定；缺省按当前自动规则执行，不物化为模板修改。
-pub const BUTTON_MAPPINGS_SCHEMA_VERSION: u32 = 2;
+/// 按键映射配置结构版本：
+/// 0 = 本功能之前的旧文件（加载时按旧行为迁移），
+/// 1 = 含显式「按住连续触发」（`holdRepeat`），
+/// 2 = 新增组合动作绑定（`runMacro`；尚未包含前向兼容读取的旧版本应用读到
+///     此动作类型会整体拒载，靠版本护栏备份原文件，不静默丢配置）。
+/// 3 = 预设应用的聚焦档案改为可覆盖默认值：旧版本留下的预设「自动选择 / 只打开」
+///     档案在加载时清除，让 Chrome / 网易云先落到产品默认聚焦方式；用户学习过的
+///     输入框、点击位置和显式快捷键保留。
+/// 4 = 新增「切换应用」（`app_switcher`，Alt+Tab 会话）。尚未包含前向兼容读取的
+///     旧版本读到该动作类型会整体拒载，靠版本护栏备份原文件（同 2 的约定）。
+/// 5 = 新增 APP 级滚动区域档案（`scrollRegions`）与翻页/到两端动作。尚未包含
+///     前向兼容读取的旧版本读到新动作类型会整体拒载，靠版本护栏备份原文件。
+///
+/// **任何新增持久化字段都必须递增本版本号**：更旧的构建读取同版本文件时会忽略
+/// 未知字段，并在下次保存时把它们丢掉（与 2026-10-25 统计字段丢失同类；
+/// 2026-11-11 评审）。自 2026-11-11 起，包含前向兼容读取的构建会把未知动作
+/// 保留为 `Unsupported`（不执行、不丢弃），并对未知顶层/每格字段做 round-trip；
+/// 但已发布的旧构建无法追溯获得该能力，所以仍不能只在需要迁移行为时才升版本。
+pub const BUTTON_MAPPINGS_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -801,6 +1221,14 @@ pub struct ButtonMappings {
     /// 去重/删库都不应该影响已记录的档案。
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub focus_profiles: BTreeMap<String, crate::focus::AppFocusProfile>,
+    /// 滚动区域档案：键与 `focus_profiles` 相同（预设 id 或应用路径）。
+    ///
+    /// 只保存 UIA 结构特征，不保存控件名称、窗口标题或内容文本。
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub scroll_regions: BTreeMap<String, crate::scroll_region::ScrollRegionTarget>,
+    /// 更高结构版本写入、当前构建不认识的顶层字段；保存时原样保留。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, RawJson>,
 }
 
 fn default_enabled() -> bool {
@@ -881,7 +1309,12 @@ pub fn collect_macro_references(
 pub fn clear_macro_references(mappings: &mut ButtonMappings, macro_id: &str) -> usize {
     let mut cleared = 0;
     for actions in mappings.actions.values_mut() {
-        for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
+        let mut cleared_triggers = Vec::new();
+        for (trigger, action) in [
+            (ButtonTrigger::Single, &mut actions.single),
+            (ButtonTrigger::Double, &mut actions.double),
+            (ButtonTrigger::Long, &mut actions.long),
+        ] {
             let matches = matches!(
                 action,
                 ButtonAction::RunMacro {
@@ -891,8 +1324,13 @@ pub fn clear_macro_references(mappings: &mut ButtonMappings, macro_id: &str) -> 
             );
             if matches {
                 *action = ButtonAction::Disabled;
+                cleared_triggers.push(trigger);
                 cleared += 1;
             }
+        }
+        // 动作已被替换，旧的更高版本动作字段不能再合并到新动作上。
+        for trigger in cleared_triggers {
+            actions.action_extras.remove(&trigger);
         }
         // 「按住连续触发」指向的槽位若被清空，连同一并关掉（否则留下指向空槽的开关）。
         if let Some(trigger) = actions.hold_repeat {
@@ -917,6 +1355,8 @@ impl Default for ButtonMappings {
             actions: BTreeMap::new(),
             applications: Vec::new(),
             focus_profiles: BTreeMap::new(),
+            scroll_regions: BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -933,40 +1373,87 @@ impl<'de> serde::Deserialize<'de> for ButtonMappings {
             schema_version: u32,
             #[serde(default = "default_enabled")]
             enabled: bool,
-            actions: Option<BTreeMap<RemoteButton, ButtonActionsWire>>,
+            actions: Option<BTreeMap<RemoteButton, ButtonActions>>,
             #[serde(default)]
             applications: Vec<crate::registered_apps::AppLibraryEntry>,
             #[serde(default)]
             focus_profiles: BTreeMap<String, crate::focus::AppFocusProfile>,
+            #[serde(default)]
+            scroll_regions: BTreeMap<String, crate::scroll_region::ScrollRegionTarget>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        let actions = wire
-            .actions
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(button, cell)| (button, ButtonActions::from(cell)))
-            .collect();
+        let actions = wire.actions.unwrap_or_default();
         Ok(Self {
             schema_version: wire.schema_version,
             enabled: wire.enabled,
             actions,
             applications: wire.applications,
             focus_profiles: wire.focus_profiles,
+            scroll_regions: wire.scroll_regions,
+            extra: wire
+                .extra
+                .into_iter()
+                .map(|(key, value)| (key, RawJson(value.to_string())))
+                .collect(),
         })
     }
 }
 
 impl ButtonMappings {
+    /// 键位方案的私有页可能仍把预设写成一次性 Alt+Tab；覆盖层加载时把它升级为
+    /// `app_switcher` 会话动作。基础映射不调用本方法，旧的一次性 Alt+Tab 绑定
+    /// 继续按字面快捷键执行。
+    pub fn promote_app_switcher_shortcuts(mut self) -> Self {
+        for actions in self.actions.values_mut() {
+            let mut promoted = Vec::new();
+            for (trigger, action) in [
+                (ButtonTrigger::Single, &mut actions.single),
+                (ButtonTrigger::Double, &mut actions.double),
+                (ButtonTrigger::Long, &mut actions.long),
+            ] {
+                if let ButtonAction::Shortcut { chord } = action {
+                    if chord.is_alt_tab() {
+                        *action = ButtonAction::AppSwitcher;
+                        promoted.push(trigger);
+                    }
+                }
+            }
+            for trigger in promoted {
+                actions.action_extras.remove(&trigger);
+            }
+        }
+        self
+    }
+
+    /// 结构版本 0–2 的旧预设「自动选择 / 只打开」档案是旧 UI 留下的默认值；新版
+    /// 预设应用要显示产品默认聚焦方式（Chrome/网易云快捷键、其余自动选择），因此
+    /// 一次性清掉这两类。学习过的输入框、点击位置和显式快捷键是用户资产，必须保留。
+    /// 版本 3 起用户重新选择的预设档案也会保留。
+    pub fn migrate_preset_focus_profiles(mut self) -> Self {
+        if self.schema_version < 3 {
+            self.focus_profiles.retain(|target, profile| {
+                if crate::app_launcher::preset_app(target).is_none() {
+                    return true;
+                }
+                !matches!(
+                    profile.strategy,
+                    crate::focus::FocusStrategy::AutoComposer
+                        | crate::focus::FocusStrategy::OpenOnly
+                )
+            });
+        }
+        self
+    }
+
     pub fn normalized(self) -> Result<Self, SendInputError> {
         // Device capability controls execution, never the user's saved mappings.
         let mut this = self;
-        if this.schema_version > BUTTON_MAPPINGS_SCHEMA_VERSION {
-            return Err(SendInputError::Backend(format!(
-                "按键映射配置版本 {} 高于当前支持的版本 {}",
-                this.schema_version, BUTTON_MAPPINGS_SCHEMA_VERSION
-            )));
-        }
-        this.schema_version = BUTTON_MAPPINGS_SCHEMA_VERSION;
+        // 前向兼容：更高结构版本不拒绝加载。未知动作与未知字段已在反序列化
+        // 时原样保留；这里保留更高的版本号，旧构建保存后文件仍标记为新版本，
+        // 升级回去时不会把数据当成旧格式处理。
+        this.schema_version = this.schema_version.max(BUTTON_MAPPINGS_SCHEMA_VERSION);
         this.applications = crate::registered_apps::normalize_library(this.applications)
             .map_err(SendInputError::Backend)?;
         // 非法聚焦档案整条丢弃（策略与字段不自洽、超出长度/条数上限）。
@@ -981,6 +1468,16 @@ impl ButtonMappings {
         }
         #[cfg(not(windows))]
         let _ = dropped;
+        let dropped_scroll =
+            crate::scroll_region::normalize_scroll_regions(&mut this.scroll_regions);
+        #[cfg(windows)]
+        if dropped_scroll > 0 {
+            crate::ble::gatt_note(format!(
+                "scroll_regions_dropped count={dropped_scroll} reason=invalid_or_over_limit"
+            ));
+        }
+        #[cfg(not(windows))]
+        let _ = dropped_scroll;
         for actions in this.actions.values_mut() {
             for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
                 match action {
@@ -1012,12 +1509,27 @@ impl ButtonMappings {
                 Some(HoldRepeat::Single) => ButtonTrigger::Single,
                 Some(HoldRepeat::Long) => ButtonTrigger::Long,
             };
+            // 更高版本动作当前不执行，但它的连发设置必须原样保留，不能因为
+            // 旧构建不认识动作类型就把整份配置判无效。
+            if matches!(actions.trigger(trigger), ButtonAction::Unsupported(_)) {
+                continue;
+            }
+            if trigger == ButtonTrigger::Double {
+                return Err(SendInputError::Backend(
+                    "按住连续触发不支持双击槽位".to_owned(),
+                ));
+            }
             if button.repeat_interval().is_none() {
                 return Err(SendInputError::Backend(format!(
                     "按键 {button:?} 不支持按住连续触发"
                 )));
             }
-            if trigger == ButtonTrigger::Single && actions.long != ButtonAction::Disabled {
+            if trigger == ButtonTrigger::Single
+                && actions.long != ButtonAction::Disabled
+                && !matches!(actions.long, ButtonAction::Unsupported(_))
+            {
+                // 未知长按动作当前版本不执行，无法判断是否真的占用长按，
+                // 因此只豁免“长按冲突”检查；target 自身的校验继续执行。
                 return Err(SendInputError::Backend(
                     "按住连续触发开在单击时不得同时配置长按动作".to_owned(),
                 ));
@@ -1088,6 +1600,16 @@ pub fn native_key(button: RemoteButton) -> Option<KeyCode> {
 }
 
 impl KeyChord {
+    /// 是否为单独的 Alt + Tab（左右 Alt 都算；不含 Ctrl/Shift 等附加修饰键）。
+    pub fn is_alt_tab(&self) -> bool {
+        self.keys.len() == 2
+            && self.keys[1] == KeyCode::Tab
+            && matches!(
+                self.keys[0],
+                KeyCode::Alt | KeyCode::LeftAlt | KeyCode::RightAlt
+            )
+    }
+
     /// Windows 的锁屏是系统动作，不依赖当前前台窗口或键盘注入链路。
     pub fn is_lock_workstation(&self) -> bool {
         self.keys.len() == 2
@@ -1302,6 +1824,10 @@ mod tests {
                 direction: ScrollDirection::Down,
                 steps: 5,
             },
+            ButtonAction::PageUp,
+            ButtonAction::PageDown,
+            ButtonAction::ScrollToTop,
+            ButtonAction::ScrollToBottom,
         ] {
             let json = serde_json::to_string(&action).unwrap();
             assert_eq!(serde_json::from_str::<ButtonAction>(&json).unwrap(), action);
@@ -2015,6 +2541,8 @@ mod tests {
             actions: mappings.actions.clone(),
             applications: Vec::new(),
             focus_profiles: BTreeMap::new(),
+            scroll_regions: BTreeMap::new(),
+            extra: BTreeMap::new(),
         };
         assert_eq!(disabled.mapped_mask(), 0, "总开关关闭时不吞任何键");
     }
@@ -2034,6 +2562,8 @@ mod tests {
                 },
                 hold_repeat: None,
                 ok_context_click: false,
+                extra: BTreeMap::new(),
+                ..ButtonActions::default()
             },
         );
         let encoded = serde_json::to_string(&mappings).unwrap();
@@ -2232,6 +2762,118 @@ mod tests {
         .allows_repeat());
         assert!(!ButtonAction::FocusInput.allows_repeat());
         assert!(!ButtonAction::Disabled.allows_repeat());
+        assert!(ButtonAction::PageUp.allows_repeat());
+        assert!(ButtonAction::PageDown.allows_repeat());
+        assert!(!ButtonAction::ScrollToTop.allows_repeat());
+        assert!(!ButtonAction::ScrollToBottom.allows_repeat());
+        assert!(!ButtonAction::Unsupported(UnsupportedAction {
+            action_type: "future_action".to_owned(),
+            raw_json: "{\"type\":\"future_action\"}".to_owned(),
+        })
+        .allows_repeat());
+        // 应用切换器会话内每次触发只前进一项；按住连发等价于连续 Tab。
+        assert!(ButtonAction::AppSwitcher.allows_repeat());
+    }
+
+    #[test]
+    fn app_switcher_action_round_trips_with_current_schema() {
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Tv,
+            actions_with(ButtonAction::AppSwitcher, None),
+        );
+        let json = serde_json::to_string(&mappings).unwrap();
+        assert!(json.contains("\"type\":\"app_switcher\""), "{json}");
+        assert!(
+            json.contains(&format!(
+                "\"schemaVersion\":{BUTTON_MAPPINGS_SCHEMA_VERSION}"
+            )),
+            "{json}"
+        );
+        let decoded: ButtonMappings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.action_for(RemoteButton::Tv, ButtonTrigger::Single),
+            ButtonAction::AppSwitcher
+        );
+        let normalized = decoded.normalized().unwrap();
+        assert_eq!(
+            normalized.action_for(RemoteButton::Tv, ButtonTrigger::Single),
+            ButtonAction::AppSwitcher
+        );
+        assert_eq!(BUTTON_MAPPINGS_SCHEMA_VERSION, 5);
+    }
+
+    #[test]
+    fn scroll_regions_round_trip_and_invalid_entries_are_dropped() {
+        let mut mappings = ButtonMappings::default();
+        mappings.scroll_regions.insert(
+            "notepad".to_owned(),
+            crate::scroll_region::ScrollRegionTarget {
+                control_type: "Pane".to_owned(),
+                automation_id: "ScrollViewer".to_owned(),
+                class_name: "ScrollViewer".to_owned(),
+                normalized_rect: None,
+            },
+        );
+        mappings.scroll_regions.insert(
+            "chrome".to_owned(),
+            crate::scroll_region::ScrollRegionTarget {
+                control_type: String::new(),
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_string(&mappings).unwrap();
+        assert!(json.contains("\"scrollRegions\""), "{json}");
+        let decoded: ButtonMappings = serde_json::from_str(&json).unwrap();
+        // 反序列化只保形；normalized() 才丢弃无效档案（与 focusProfiles 同口径）。
+        assert_eq!(decoded.scroll_regions.len(), 2);
+        assert_eq!(
+            decoded.scroll_regions.get("notepad").unwrap().automation_id,
+            "ScrollViewer"
+        );
+        let normalized = decoded.normalized().unwrap();
+        assert_eq!(normalized.schema_version, 5);
+        assert_eq!(normalized.scroll_regions.len(), 1);
+    }
+
+    #[test]
+    fn profile_overlay_promotes_only_alt_tab_shortcuts() {
+        assert!(chord(&[KeyCode::Alt, KeyCode::Tab]).is_alt_tab());
+        assert!(chord(&[KeyCode::LeftAlt, KeyCode::Tab]).is_alt_tab());
+        assert!(chord(&[KeyCode::RightAlt, KeyCode::Tab]).is_alt_tab());
+        assert!(!chord(&[KeyCode::Control, KeyCode::Tab]).is_alt_tab());
+        assert!(!chord(&[KeyCode::Alt, KeyCode::Shift, KeyCode::Tab]).is_alt_tab());
+
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Tv,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: chord(&[KeyCode::Alt, KeyCode::Tab]),
+                },
+                ..ButtonActions::default()
+            },
+        );
+        mappings.actions.insert(
+            RemoteButton::Back,
+            ButtonActions {
+                single: ButtonAction::Shortcut {
+                    chord: chord(&[KeyCode::Control, KeyCode::Tab]),
+                },
+                ..ButtonActions::default()
+            },
+        );
+        let promoted = mappings.promote_app_switcher_shortcuts();
+        assert_eq!(
+            promoted.action_for(RemoteButton::Tv, ButtonTrigger::Single),
+            ButtonAction::AppSwitcher
+        );
+        assert_eq!(
+            promoted.action_for(RemoteButton::Back, ButtonTrigger::Single),
+            ButtonAction::Shortcut {
+                chord: chord(&[KeyCode::Control, KeyCode::Tab]),
+            }
+        );
     }
 
     #[test]
@@ -2708,13 +3350,185 @@ mod tests {
         assert!(ok_long.normalized().is_ok());
     }
 
+    /// 旧构建读到更高结构版本：已知动作照常执行，未知动作与未知字段原样
+    /// 保留，版本号不降级；这样降级/同版本换装不会再把整份配置判为不可读。
     #[test]
-    fn future_schema_version_is_rejected_not_silently_downgraded() {
+    fn future_schema_version_is_read_and_preserved_with_unknown_actions() {
         let json = serde_json::json!({
             "schemaVersion": 99,
-            "actions": {}
+            "enabled": true,
+            "actions": {
+                "up": {
+                    "single": {
+                        "type": "future_action",
+                        "foo": 1,
+                        "nested": { "bar": true }
+                    },
+                    "double": { "type": "disabled" },
+                    "long": { "type": "disabled" },
+                    "holdRepeat": "single",
+                    "futureCellField": "keep"
+                },
+                "down": {
+                    "single": {
+                        "type": "shortcut",
+                        "chord": { "keys": ["delete"] },
+                        "futureActionField": { "nested": true }
+                    },
+                    "double": { "type": "disabled" },
+                    "long": { "type": "disabled" }
+                }
+            },
+            "futureTopLevel": { "nested": true }
         });
         let mappings = serde_json::from_value::<ButtonMappings>(json).unwrap();
-        assert!(mappings.normalized().is_err(), "未来版本必须拒绝");
+        let normalized = mappings.normalized().unwrap();
+        assert_eq!(normalized.schema_version, 99);
+        assert!(matches!(
+            normalized.actions(RemoteButton::Up).single,
+            ButtonAction::Unsupported(_)
+        ));
+        assert_eq!(
+            normalized.actions(RemoteButton::Down).single,
+            ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Delete]
+                }
+            }
+        );
+        assert_eq!(
+            normalized.actions(RemoteButton::Up).hold_repeat,
+            Some(HoldRepeat::Single)
+        );
+        assert_eq!(
+            normalized
+                .actions(RemoteButton::Up)
+                .extra
+                .get("futureCellField")
+                .map(|value| value.0.as_str()),
+            Some("\"keep\"")
+        );
+        assert_eq!(
+            normalized
+                .extra
+                .get("futureTopLevel")
+                .map(|value| value.0.as_str()),
+            Some("{\"nested\":true}")
+        );
+
+        let encoded = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(encoded["schemaVersion"].as_u64(), Some(99));
+        assert_eq!(encoded["futureTopLevel"]["nested"].as_bool(), Some(true));
+        assert_eq!(
+            encoded["actions"]["up"]["single"]["type"].as_str(),
+            Some("future_action")
+        );
+        assert_eq!(encoded["actions"]["up"]["single"]["foo"].as_u64(), Some(1));
+        assert_eq!(
+            encoded["actions"]["up"]["single"]["nested"]["bar"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            encoded["actions"]["up"]["futureCellField"].as_str(),
+            Some("keep")
+        );
+        // 已知动作内部的未知字段也必须 round-trip，而不是只在
+        // 未知动作/单元格字段上保留（2026-11-11 评审 P1）。
+        assert_eq!(
+            encoded["actions"]["down"]["single"]["futureActionField"]["nested"].as_bool(),
+            Some(true)
+        );
+        let decoded: ButtonMappings = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, normalized);
+    }
+
+    /// 旧式单动作形状（actions.up 直接是一个 ButtonAction）也要保留
+    /// 已知动作内部的新增字段。
+    #[test]
+    fn legacy_single_action_unknown_fields_round_trip() {
+        let mappings: ButtonMappings = serde_json::from_str(
+            r#"{"enabled":true,"actions":{"up":{"type":"shortcut","chord":{"keys":["delete"]},"futureActionField":1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mappings
+                .actions(RemoteButton::Up)
+                .action_extras
+                .get(&ButtonTrigger::Single)
+                .and_then(|extras| extras.get("futureActionField"))
+                .map(|value| value.0.as_str()),
+            Some("1")
+        );
+        let encoded = serde_json::to_value(&mappings).unwrap();
+        assert_eq!(
+            encoded["actions"]["up"]["single"]["futureActionField"].as_u64(),
+            Some(1)
+        );
+    }
+
+    /// 更高版本的新长按动作与旧版 holdRepeat=single 并存时，不能因为
+    /// “未知长按 != Disabled”就把整份配置判无效（2026-11-11 评审 P1）。
+    #[test]
+    fn unknown_long_action_does_not_reject_single_hold_repeat() {
+        let json = serde_json::json!({
+            "schemaVersion": 9,
+            "enabled": true,
+            "actions": {
+                "up": {
+                    "single": {
+                        "type": "shortcut",
+                        "chord": { "keys": ["delete"] }
+                    },
+                    "double": { "type": "disabled" },
+                    "long": { "type": "future_long_action" },
+                    "holdRepeat": "single"
+                }
+            }
+        });
+        let normalized = serde_json::from_value::<ButtonMappings>(json)
+            .unwrap()
+            .normalized()
+            .expect("未知长按动作不应让整份配置加载失败");
+        assert_eq!(
+            normalized.actions(RemoteButton::Up).hold_repeat,
+            Some(HoldRepeat::Single)
+        );
+        assert!(matches!(
+            normalized.actions(RemoteButton::Up).long,
+            ButtonAction::Unsupported(_)
+        ));
+    }
+
+    /// 放行未知长按只针对“长按冲突”本身；holdRepeat 指向空槽或不可重复
+    /// 动作时仍必须判无效（评审 P1）。
+    #[test]
+    fn unknown_long_action_does_not_hide_invalid_single_hold_repeat() {
+        for single in [
+            serde_json::json!({"type": "disabled"}),
+            serde_json::json!({
+                "type": "shortcut",
+                "chord": { "keys": ["control", "c"] }
+            }),
+        ] {
+            let json = serde_json::json!({
+                "schemaVersion": 9,
+                "enabled": true,
+                "actions": {
+                    "up": {
+                        "single": single,
+                        "double": { "type": "disabled" },
+                        "long": { "type": "future_long_action" },
+                        "holdRepeat": "single"
+                    }
+                }
+            });
+            assert!(
+                serde_json::from_value::<ButtonMappings>(json)
+                    .unwrap()
+                    .normalized()
+                    .is_err(),
+                "holdRepeat 指向空槽或不可重复动作时必须判无效"
+            );
+        }
     }
 }

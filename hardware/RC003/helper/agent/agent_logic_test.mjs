@@ -76,11 +76,18 @@ function fakePtr(initial) {
 
 const num = (n) => ({ toUInt32: () => n, isNull: () => false, toString: () => String(n) });
 
-/** NtDeviceIoControlFile 的 10 个参数（只有 5..9 被 agent 用到）。 */
-function fakeArgs(outPtr) {
+/** 假句柄：agent 只用 toString() 作为来源键；没有 NativeFunction 时不查询对象名。 */
+const fakeHandle = (name) => ({
+  toString: () => name,
+  isNull: () => false,
+  toUInt32: () => 0,
+});
+
+/** NtDeviceIoControlFile 的 10 个参数（0 与 5..9 被 agent 用到）。 */
+function fakeArgs(outPtr, source = 'h0') {
   const a = new Array(10).fill(null).map(() => num(0));
+  a[0] = fakeHandle(source);                                // FileHandle = 报告来源
   a[5] = num(0x80018483);                                   // IoControlCode
-  a[0] = num(10);
   a[4] = { isNull: () => false, readU32: () => 0,
     add: () => ({ readU64: () => ({ toString: () => '9' }) }) };
   a[6] = { isNull: () => false, readByteArray: () => toArrayBuffer(Uint8Array.from([0, 0, 0, 0, 0x02, 0x01, 0, 0])) };
@@ -95,8 +102,17 @@ const pending = [];                                          // 永不 settle �
 const sleeps = [];                                           // Thread.sleep 桩的调用记录（门内延迟判据）
 const messages = [];
 let detachCount = 0;
+let closeDetachCount = 0;
 let attachCount = 0;
 const moduleLookups = [];
+
+/* 第二个 attach（NtClose）按导出名分流；Node 里没有 NativeFunction，
+   NtQueryObject 返回 null，agent 走句柄字符串来源键。 */
+const exports = {
+  NtDeviceIoControlFile: { isNull: () => false, kind: 'ioctl' },
+  NtClose: { isNull: () => false, kind: 'close' },
+  NtQueryObject: null,
+};
 
 const sandbox = {
   console,
@@ -108,11 +124,12 @@ const sandbox = {
     getModuleByName(name) {
       moduleLookups.push(name);
       if (name !== 'ntdll.dll') throw new Error('unexpected system module lookup');
-      return { getExportByName: () => ({ isNull: () => false }) };
+      return { getExportByName: (name) => exports[name] || { isNull: () => false } };
     },
   },
   Interceptor: {
-    attach(_fn, cb) {
+    attach(fn, cb) {
+      if (fn && fn.kind === 'close') { handlers.onClose = cb.onEnter; return { detach() { closeDetachCount++; } }; }
       handlers.onEnter = cb.onEnter; handlers.onLeave = cb.onLeave;
       attachCount++;
       return { detach() { detachCount++; } };
@@ -156,11 +173,20 @@ ctx.handleCommand('{"type":"renew"}');
 assert.equal(ctx.installHook(), true, '捕获应仅凭 ntdll 导出安装，不依赖固定 WDF 模块');
 check('installHook 注册了 onEnter', typeof handlers.onEnter === 'function');
 
-function beginPress(...usages) {
+function beginPressOn(source, ...usages) {
   const ptr = fakePtr(report(...usages));
   const self = {};
-  handlers.onEnter.call(self, fakeArgs(ptr));
+  handlers.onEnter.call(self, fakeArgs(ptr, source));
   return { ptr, self };
+}
+
+function beginPress(...usages) { return beginPressOn('h0', ...usages); }
+
+function pressOn(source, ...usages) {
+  const result = beginPressOn(source, ...usages);
+  const restore = ctx.restoreOnLeave; ctx.restoreOnLeave = false;
+  handlers.onLeave.call(result.self, num(0)); ctx.restoreOnLeave = restore;
+  return result;
 }
 
 function press(...usages) {
@@ -171,6 +197,10 @@ function press(...usages) {
   handlers.onLeave.call(result.self, num(0));
   ctx.restoreOnLeave = restore;
   return result;
+}
+
+function closeHandle(source) {
+  if (handlers.onClose) handlers.onClose.call({}, [fakeHandle(source)]);
 }
 
 /* --------------------------------- 1. 默认（无哨兵键）：非目标键一字节不动 */
@@ -262,6 +292,61 @@ check('targets 热更新被接受（targets_applied=2）',
   ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 4, report: [], clear: [] }));
   const { ptr } = press(0x004a);
   check('动态目标清空后恢复原始报告', ptr.buf[3] === 0x4a);
+}
+
+/* ------- 7.5 按设备来源隔离（2026-11-12 共享宿主现场） -------
+   同一 WUDFHost 里另一台蓝牙键盘/散热器的空报告曾被当成遥控器的 UP，
+   把长按提前结束。这里钉住：只有当前按下来源能结束自己的按下状态。 */
+
+{
+  ctx.handleCommand(JSON.stringify({
+    type: 'targets', generation: 6, report: [0x00f1], clear: [0x00f1],
+  }));
+  ctx.activeSource = null;
+  ctx.pressed = {};
+
+  const beforeForeign = ctx.stat.foreign_reports;
+  const beforeEdges = ctx.stat.edges_sent;
+  const a = pressOn('device-a', 0x00f1);
+  check('来源隔离：设备 A 按下 0x00f1 被清零', a.ptr.buf[3] === 0 && a.ptr.buf[4] === 0);
+  check('来源隔离：设备 A 成为活动来源', ctx.activeSource === 'device-a');
+  check('来源隔离：设备 A 的 DOWN 已上报', ctx.stat.edges_sent === beforeEdges + 1);
+
+  const bEmpty = pressOn('device-b');
+  check('来源隔离：设备 B 的空报告不清空设备 A 的按下状态',
+    ctx.currentUsages().length === 1 && ctx.currentUsages()[0] === 0x00f1,
+    `usages=${JSON.stringify(ctx.currentUsages())}`);
+  check('来源隔离：设备 B 的空报告不产生释放边沿',
+    ctx.stat.edges_sent === beforeEdges + 1,
+    `edges=${ctx.stat.edges_sent} before=${beforeEdges}`);
+  check('来源隔离：异源报告计数 +1', ctx.stat.foreign_reports === beforeForeign + 1,
+    `foreign=${ctx.stat.foreign_reports} before=${beforeForeign}`);
+  check('来源隔离：设备 B 的空报告未被改写', bEmpty.ptr.buf[3] === 0 && bEmpty.self.hit !== true);
+
+  const bPress = pressOn('device-b', 0x00f1);
+  check('来源隔离：设备 B 按下同一 usage 不被清空/不冒充 A',
+    bPress.ptr.buf[3] === 0xf1 && bPress.ptr.buf[4] === 0 && ctx.activeSource === 'device-a');
+  check('来源隔离：设备 B 的按下不产生边沿',
+    ctx.stat.edges_sent === beforeEdges + 1 && bPress.self.hit !== true);
+
+  const aUp = pressOn('device-a');
+  check('来源隔离：设备 A 自己的空报告才产生 UP',
+    ctx.currentUsages().length === 0 && ctx.activeSource === null
+      && ctx.stat.edges_sent === beforeEdges + 2);
+  check('来源隔离：A 的释放帧不被当作目标键改写', aUp.ptr.buf[3] === 0);
+
+  const bTakeover = pressOn('device-b', 0x00f1);
+  check('来源隔离：A 释放后 B 可作为新的活动来源', ctx.activeSource === 'device-b'
+    && bTakeover.ptr.buf[3] === 0 && bTakeover.ptr.buf[4] === 0);
+
+  const beforeClose = ctx.stat.forced_releases;
+  closeHandle('device-b');
+  check('来源隔离：活动来源句柄关闭时补发 UP 并清空归属',
+    ctx.activeSource === null && ctx.currentUsages().length === 0
+      && ctx.stat.forced_releases === beforeClose + 1,
+    `active=${ctx.activeSource} forced=${ctx.stat.forced_releases} before=${beforeClose}`);
+
+  ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 7, report: [], clear: [] }));
 }
 
 /* --------------------------- 8. 护栏仍然生效 */
@@ -425,11 +510,13 @@ check('仅观察不改报告、不投递执行边沿',
   unmapped.ptr.buf[3] === 0x28 && unmapped.ptr.buf[5] === 0x04 &&
   !messages.slice(beforeObservation).some((m) => m.type === 'edge' && m.usages.length));
 const detachesBefore = detachCount;
+const closeDetachesBefore = closeDetachCount;
 ctx.handleCommand(JSON.stringify({ type: 'disarm', instance: 'foreign-agent', stop_id: 'wrong' }));
 check('另一 Agent 的停止请求不得撤钩', detachCount === detachesBefore);
 ctx.handleCommand(JSON.stringify({ type: 'disarm', instance: ctx.agentInstance, stop_id: 'stop-1' }));
 check('disarm 撤钩后确认 stopped', detachCount === detachesBefore + 1 &&
   messages.at(-1).type === 'stopped' && messages.at(-1).hook_detached === true);
+check('正常停止也撤除来源关闭钩子', closeDetachCount === closeDetachesBefore + 1 && ctx.closeHookListener === null);
 check('停止回执绑定同 Agent 与本轮请求', messages.at(-1).instance === ctx.agentInstance &&
   messages.at(-1).stop_id === 'stop-1' && typeof ctx.agentInstance === 'string');
 ctx.handleCommand(JSON.stringify({ type: 'disarm', instance: ctx.agentInstance, stop_id: 'stop-2' }));
@@ -619,6 +706,7 @@ async function authenticatedSession() {
     Date: class extends Date { static now() { return now; } },
     Interceptor: {
       attach(_address, handler) {
+        if (_address && _address.kind === 'close') return { detach() {} };
         callbacks.onEnter = handler.onEnter;
         callbacks.onLeave = handler.onLeave;
         return { detach() {} };
@@ -802,6 +890,174 @@ for (const oldRead of ['resolve', 'reject']) {
   await session.deliver(session.connections[0], { type: 'renew' });
   check('认证：合法 renew 不扩大 targets 或替代 arm', agent.handshakeDone && agent.disarmed && !agent.leaseOk() &&
     JSON.stringify(Array.from(agent.reportUsages)) === '[241]' && session.press(0xf1).buf[3] === 0xf1);
+}
+
+/* -------- 12. 来源键：NtQueryObject 对象名归并 / 查询失败回退（2026-11-12） -------- */
+/* 真实 Frida 里由 NativeFunction + Memory.alloc 完成；这里用最小桩验证
+   `sourceKeyOf` 的 UNICODE_STRING 读取与“同对象名=同来源”的归并逻辑。
+   旧 agent（阳性对照）没有 `sourceKeyOf`：记录一条失败并跳过本组，不能让
+   阳性对照在测试台里崩掉——那会让“红”失去分辨力。 */
+if (typeof ctx.sourceKeyOf === 'function') {
+  const fakeNameBuffer = (name) => ({
+    readU16: () => name.length * 2,
+    add: () => ({
+      readPointer: () => ({ isNull: () => false, readUtf16String: () => name }),
+    }),
+  });
+  const originalAlloc = ctx.Memory.alloc;
+  ctx.Memory.alloc = () => fakeNameBuffer('\\Device\\000000db');
+  ctx.ntQueryObject = () => 0;
+  const a = ctx.sourceKeyOf(fakeHandle('object-name-a'));
+  const b = ctx.sourceKeyOf(fakeHandle('object-name-b'));
+  check('来源键：设备对象名把不同句柄归并为同一来源',
+    a === '\\Device\\000000db' && b === a, `a=${a} b=${b}`);
+
+  /* 同一设备对象有两个句柄（不同 TLC）：关一个不能提前释放，关最后一个才释放。 */
+  ctx.handleCommand(JSON.stringify({
+    type: 'targets', generation: 8, report: [0x00f1], clear: [0x00f1],
+  }));
+  ctx.activeSource = null;
+  ctx.pressed = {};
+  delete ctx.sourceKeys['object-name-a'];
+  delete ctx.sourceKeys['object-name-b'];
+  ctx.sourceKeyOf(fakeHandle('tlc-a'));
+  ctx.sourceKeyOf(fakeHandle('tlc-b'));
+  pressOn('tlc-a', 0x00f1);
+  const beforeOneClose = ctx.stat.forced_releases;
+  closeHandle('tlc-a');
+  check('来源隔离：同一设备多句柄关一个不提前 UP',
+    ctx.activeSource === '\\Device\\000000db'
+      && ctx.currentUsages().length === 1
+      && ctx.stat.forced_releases === beforeOneClose,
+    `active=${ctx.activeSource} forced=${ctx.stat.forced_releases}`);
+  closeHandle('tlc-b');
+  check('来源隔离：同一设备最后一个句柄关闭才补发 UP',
+    ctx.activeSource === null && ctx.currentUsages().length === 0
+      && ctx.stat.forced_releases === beforeOneClose + 1,
+    `active=${ctx.activeSource} forced=${ctx.stat.forced_releases}`);
+  ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 9, report: [], clear: [] }));
+
+  ctx.ntQueryObject = null;
+  ctx.Memory.alloc = originalAlloc;
+  const c = ctx.sourceKeyOf(fakeHandle('fallback-handle'));
+  check('来源键：NtQueryObject 不可用时回退句柄字符串',
+    c === 'fallback-handle', `c=${c}`);
+} else {
+  check('来源键：agent 提供 sourceKeyOf', false, '旧 agent 无来源键');
+}
+
+/* -------- 13. 语音键释放后不能把 activeSource 永久钉住（2026-11-12 评审） -------- */
+{
+  await freshStubConnection();
+  ctx.handleCommand('{"type":"renew"}');
+  ctx.handleCommand('{"type":"mode","clear":true}');
+  ctx.handleCommand('{"type":"gate","on":false}');
+  ctx.handleCommand(JSON.stringify({ type: 'synth', from: 0x003e, to: 0x00e6 }));
+  ctx.handleCommand(JSON.stringify({
+    type: 'targets', generation: 10, report: [0x00f1], clear: [0x00f1],
+  }));
+  ctx.activeSource = null;
+  ctx.pressed = {};
+
+  const voice = pressOn('voice-source', 0x003e);
+  check('来源归属：语音键按下成为活动来源',
+    ctx.activeSource === 'voice-source' && voice.ptr.buf[3] === 0xe6);
+  pressOn('voice-source');
+  check('来源归属：语音键释放后清空来源，不永久占用', ctx.activeSource === null);
+
+  pressOn('voice-source', 0x003e);
+  check('来源归属：语音键按下时 synthHeld=true', ctx.synthHeld === true);
+  ctx.releaseEdges('test');
+  check('来源归属：映射强制释放不伪造合成键完成', ctx.synthHeld === true && ctx.activeSource === null);
+  pressOn('voice-source');
+
+  const foreignAfterVoice = pressOn('other-source', 0x00f1);
+  check('来源归属：语音释放后其它设备可重新成为来源',
+    ctx.activeSource === 'other-source' && foreignAfterVoice.ptr.buf[3] === 0);
+  ctx.handleCommand(JSON.stringify({ type: 'synth', off: true }));
+  ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 11, report: [], clear: [] }));
+}
+
+/* -------- 14. 语音键 clear-only：F5 必须在报告层被清掉，不能漏到桌面（2026-11-12 报障） -------- */
+{
+  await freshStubConnection();
+  ctx.handleCommand('{"type":"renew"}');
+  ctx.handleCommand('{"type":"mode","clear":true}');
+  ctx.handleCommand('{"type":"gate","on":false}');
+  ctx.handleCommand(JSON.stringify({ type: 'synth', off: true }));
+  ctx.handleCommand(JSON.stringify({
+    type: 'targets', generation: 12, report: [0x00f1], clear: [0x00f1, 0x003e],
+  }));
+  ctx.activeSource = null;
+  ctx.pressed = {};
+
+  const beforeCanary = ctx.stat.canary_hits;
+  const beforeTarget = ctx.stat.target_hits;
+  const beforeVoiceClear = ctx.stat.voice_clear_hits || 0;
+  const plainVoice = press(0x003e);
+  check('语音键 clear-only：槽被清零（F5 不交给 Windows）',
+    plainVoice.ptr.buf[3] === 0 && plainVoice.ptr.buf[4] === 0 && plainVoice.self.cleared === true,
+    `buf3=0x${plainVoice.ptr.buf[3].toString(16)} cleared=${plainVoice.self.cleared}`);
+  check('语音键 clear-only：不计入 canary_hits（不是哨兵键）',
+    ctx.stat.canary_hits === beforeCanary,
+    `canary=${ctx.stat.canary_hits} before=${beforeCanary}`);
+  check('语音键 clear-only：voice_clear_hits +1',
+    (ctx.stat.voice_clear_hits || 0) === beforeVoiceClear + 1,
+    `voice_clear=${ctx.stat.voice_clear_hits}`);
+  check('语音键 clear-only：不计入 target_hits（不产生映射边沿）',
+    ctx.stat.target_hits === beforeTarget);
+
+  /* 合成配置存在时，槽内替换优先于清空：语音键仍变成 RightAlt，且不污染 canary。 */
+  ctx.handleCommand(JSON.stringify({ type: 'synth', from: 0x003e, to: 0x00e6 }));
+  const beforeSynthCanary = ctx.stat.canary_hits;
+  const beforeSynthVoiceClear = ctx.stat.voice_clear_hits || 0;
+  const synthVoice = press(0x003e);
+  check('语音键 synth + clear-only：仍替换为 0x00E6',
+    synthVoice.ptr.buf[3] === 0xe6 && synthVoice.ptr.buf[4] === 0x00,
+    `buf3=0x${synthVoice.ptr.buf[3].toString(16)}`);
+  check('语音键 synth + clear-only：不计入 canary_hits',
+    ctx.stat.canary_hits === beforeSynthCanary);
+  check('语音键 synth + clear-only：不重复计 voice_clear_hits',
+    (ctx.stat.voice_clear_hits || 0) === beforeSynthVoiceClear);
+  ctx.handleCommand(JSON.stringify({ type: 'synth', off: true }));
+  ctx.handleCommand(JSON.stringify({ type: 'targets', generation: 13, report: [], clear: [] }));
+}
+
+/* -------- 15. 增强捕获关闭：语音键必须恢复原生（不能把 clear-only 变成常驻吞键） -------- */
+{
+  ctx.handleCommand(JSON.stringify({ type: 'synth', off: true }));
+  ctx.handleCommand(JSON.stringify({
+    type: 'targets', generation: 14, report: [], clear: [],
+  }));
+  ctx.activeSource = null;
+  ctx.pressed = {};
+
+  const beforeVoiceClear = ctx.stat.voice_clear_hits || 0;
+  const { ptr, self } = press(0x003e);
+  check('增强捕获关闭：语音键不被清空（F5 恢复原生）',
+    ptr.buf[3] === 0x3e && !self.cleared,
+    `buf3=0x${ptr.buf[3].toString(16)} cleared=${self.cleared}`);
+  check('增强捕获关闭：voice_clear_hits 不增长',
+    (ctx.stat.voice_clear_hits || 0) === beforeVoiceClear,
+    `voice_clear=${ctx.stat.voice_clear_hits}`);
+}
+
+// 产品目标只含报告映射键; 空闲物理 F5 首先到来不能扩大为新吞键范围。
+{
+  await freshStubConnection();
+  ctx.handleCommand('{"type":"renew"}');
+  ctx.handleCommand('{"type":"mode","clear":true}');
+  ctx.handleCommand('{"type":"synth","off":true}');
+  ctx.handleCommand(JSON.stringify({type:'targets', generation:15, report:[0xf1], clear:[0xf1]}));
+  ctx.activeSource = null;
+  ctx.pressed = {};
+  const keyboard = pressOn('physical-keyboard', 0x003e);
+  check('产品目标反例: 空闲物理F5先到仍原样放行且不认领来源',
+    keyboard.ptr.buf[3] === 0x3e && !keyboard.self.cleared && ctx.activeSource === null);
+  const remote = pressOn('remote', 0xf1);
+  check('产品目标反例: 物理F5不阻止后续目标键捕获',
+    remote.ptr.buf[3] === 0 && ctx.activeSource === 'remote');
+  pressOn('remote');
 }
 
 const failed = results.filter((r) => !r.ok);

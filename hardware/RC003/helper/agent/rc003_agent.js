@@ -57,7 +57,8 @@
  *   5. 租约有效（助手续约未过期）
  *   6. mode == 'clear'（观察模式一个字节都不写）
  *   7. 累计清键次数 < MAX_CLEARS
- *   8. usage ∈ clearUsages（产品目标来自主程序；验收时可能多一个哨兵键）
+ *   8. usage ∈ clearUsages（产品目标来自主程序；验收时可能多一个哨兵键；
+ *      语音键 0x003E 仅可作为显式诊断 clear-only 目标, 不上报边沿）
  * 只写偏移 3..8，绝不触碰 report_id / modifiers / reserved。
  *
  * ⚠️ 一个必须说明的可观测性缺口（2026-09-23）
@@ -91,20 +92,26 @@
    [AGENT-STALE]。没有它，"改了 agent 但宿主里跑的还是上一代"是完全静默的——
    握手正常、命令照发、日志漂亮，只有按键行为是旧的（2026-09-26 哨兵键那次
    就是这样白跑了一轮：以为在验新逻辑，其实接管的是旧实例）。 */
-var AGENT_BUILD = '2026-10-23.auth-lease';
+var AGENT_BUILD = '2026-11-13.personal-source-clear';
 
 var TARGET_IOCTL = 0x80018483;
+/* 仅 report 白名单（会产生映射边沿）；语音键 0x003E 只作为 clear-only
+   仅在显式诊断时由 targets.clear 下发, 绝不能在 report 里。 */
 var TARGET_USAGES = [
   0x00F1, 0x0028, 0x0035, 0x004A, 0x004F, 0x0050, 0x0051,
   0x0052, 0x0065, 0x0066, 0x007F, 0x0080, 0x0081
 ];
 
 /* 语音键热键合成（豆包支持，2026-09-28 白名单）。
- * from 只允许语音键 0x003E：ATVV 会话走 BLE 协议层不经过它，且它在
- * Windows 输入流本来就未映射——槽内替换零损失。
+ * from 只允许语音键 0x003E：ATVV 会话走 BLE 协议层不经过它；它在 Windows
+ * 键盘层是 F5，产品路径不自动清掉 F5; 只有
+ * 合成配置存在时才改为槽内替换。
  * to 只允许已实测映射的合成 usage（USAGE_TO_VK，见探针 wudf_ioctl_synth.py）：
  * 0x00E6 实测产出 VK_RMENU(0xA5)、0x00E2 实测产出 VK_LMENU(0xA4)。
  * 未实测的 usage 一律拒绝——替换 usage 必须逐键实测。 */
+/* 语音键 usage: 显式诊断可配置 clear-only, 产品路径不自动追加;
+   来源一致性不能证明报告属于选定遥控器。合成配置存在时仍优先槽内替换。 */
+var VOICE_KEY_HID_USAGE = 0x003E;
 var SYNTH_FROM_WHITELIST = [0x003E];
 var SYNTH_TO_WHITELIST = [0x00E6, 0x00E2];
 var TARGET_NAMES = {
@@ -165,6 +172,7 @@ var synthFrom = 0;
 var synthTo = 0;
 var gateDelayMs = 0;          /* 0 = 门未开启；>0 = 按下帧改写前先睡这么久 */
 var hookListener = null;
+var closeHookListener = null;
 var observedUsages = [];
 var physicalUsages = [];
 var blockedUsages = [];
@@ -211,14 +219,19 @@ var stopRequestId = '';
 var stat = {
   ioctl_calls: 0,
   target_hits: 0,
-  /* 只含额外清空键（clearUsages 里不属于 reportUsages）的报告数。 */
+  /* 只含额外清空键（clearUsages 里不属于 reportUsages）的报告数。
+     语音键 0x003E 的显式诊断 clear-only 单独计数, 不算普通哨兵键。 */
   canary_hits: 0,
+  /* 语音键 clear-only 命中数：证明 F5 在报告层被清掉（不是 synth 替换）。 */
+  voice_clear_hits: 0,
   clears_ok: 0,
   clears_fail: 0,
   restores_ok: 0,
   restore_skipped: 0,
   kernel_changed: 0,
   edges_sent: 0,
+  foreign_reports: 0,         /* 活动来源之外的、形状匹配的报告数（2026-11-12） */
+  forced_releases: 0,         /* disarm/bye/来源关闭触发的强制 UP（2026-11-12） */
   write_fail: 0,              /* 写失败/被拒的行数（不含"未连接"的丢弃） */
   /* 出站串行化的观测面（2026-10-02）。修复前 `targets_ack`/`synth:frame` 整类丢失
      在计数里完全不可见：`write_fail` 不涨、没有日志、连接也没断。这四个字段让
@@ -251,6 +264,20 @@ var stat = {
 };
 
 var pressed = {};             /* 当前按下的目标 usage（绝对状态） */
+
+/* 2026-11-12 现场（共享 WUDFHost 内的另一台蓝牙设备）：
+   `pressed` 原先是一份**全宿主共享**的状态，而 `NtDeviceIoControlFile` 的
+   hook 会收到同一宿主里所有 HID 设备的报告。于是另一台设备发出的空报告/
+   释放报告会把 `pressed` 清空，应用收到 UP，遥控器的长按就被提前结束。
+   这里给报告加**设备来源**：只有产生当前 DOWN 的那个来源才能发出 UP；
+   其它来源的报告一律不碰（也不清它的 usage，保持原生行为）。
+   来源键优先用 `NtQueryObject(ObjectNameInformation)` 返回的设备对象名
+   （同一设备的不同 TLC/句柄因此归并成一个来源），查询失败时退回句柄字符串。
+   `NtClose` 关闭当前来源时补发一次释放，避免设备拔掉/重连留下粘键。 */
+var activeSource = null;
+var sourceKeys = {};           /* 句柄字符串 → 设备对象名（或句柄字符串） */
+var ntQueryObject = null;      /* NativeFunction；测试桩/不可用时为 null */
+var inCloseHook = false;       /* NtClose 内部重入 guards（发送路径也可能关闭句柄） */
 
 /* 两个集合必须分开，否则"哨兵键"会污染按键证据：
    - reportUsages：**上报**集合。由主程序动态下发，且只能取语义按键白名单的子集。
@@ -498,7 +525,8 @@ function handleCommand(line) {
   }
   /* 下发动态捕获范围。两条护栏：report 只能来自语义按键白名单；clear 必须覆盖
      report，避免出现“已经上报但没有清掉原生边沿”的双触发。空集合是关闭增强捕获
-     时的 fail-open 配置。clear 仍可额外带哨兵键供人工验收。 */
+     时的 fail-open 配置。clear 仍可额外带哨兵键供人工验收，以及语音键 0x003E
+     作为显式诊断 clear-only 目标（它不进 report，因此不产生映射边沿）。 */
   if (cmd.type === 'targets') {
     var rep = usageArrayOf(cmd.report);
     var clr = usageArrayOf(cmd.clear);
@@ -596,7 +624,13 @@ function completeStop() {
       hookListener.detach();
       hookListener = null;
     }
+    if (closeHookListener !== null) {
+      closeHookListener.detach();
+      closeHookListener = null;
+    }
     Interceptor.flush();
+    sourceKeys = {};
+    activeSource = null;
     detached = true;
   } catch (e) { logLine('stop:detach_failed'); }
   sendLine({ type: 'stopped', instance: agentInstance, stop_id: stopRequestId,
@@ -606,8 +640,14 @@ function completeStop() {
 function releaseEdges(reason) {
   var usages = [];
   for (var u in pressed) if (pressed[u]) usages.push(parseInt(u, 10));
+  /* 即使当前没有按下，也要清掉活动来源：否则下一次异源报告会被挡住，
+     而应用侧已经通过看门狗/断线释放了。 */
+  activeSource = null;
   if (usages.length === 0) return;
   pressed = {};
+  /* `edges_sent` 继续只表示“状态变化边沿”，保住 `target_hits × 2 == edges_sent`
+     这条既有交叉校验；强制 UP 单独计数，日志/心跳仍能看出它发生过。 */
+  stat.forced_releases++;
   sendLine({ type: 'edge', t: Date.now(), usages: [], released_all: true, reason: reason });
 }
 
@@ -846,11 +886,54 @@ function currentUsages() {
   return out;
 }
 
-function emitEdgesIfChanged(found) {
+/* 报告来源键。`NtQueryObject` 是只读查询，不触发设备 IOCTL，因此可以安全地
+   在报告 hook 内对**首次见到的句柄**调用一次；之后按句柄缓存。查询失败不是
+   错误路径：退回句柄字符串仍然能隔离不同设备，只是同一设备换句柄时可能
+   被当成新来源（下一次 `NtClose` 会清掉旧缓存）。 */
+function sourceKeyOf(handle) {
+  var raw = handle.toString();
+  if (Object.prototype.hasOwnProperty.call(sourceKeys, raw)) return sourceKeys[raw];
+  var key = raw;
+  if (ntQueryObject !== null) {
+    try {
+      var buf = Memory.alloc(512);
+      var ret = Memory.alloc(4);
+      /* ObjectNameInformation = 1；返回 OBJECT_NAME_INFORMATION:
+         UNICODE_STRING { USHORT Length; USHORT MaximumLength; [pad]; PWSTR Buffer; } */
+      var status = ntQueryObject(handle, 1, buf, 512, ret);
+      if (status === 0) {
+        var len = buf.readU16();
+        var namePtr = buf.add(Process.pointerSize === 8 ? 8 : 4).readPointer();
+        if (!namePtr.isNull() && len > 0 && len <= 512) {
+          var name = namePtr.readUtf16String(len / 2);
+          if (name && name.length > 0) key = name;
+        }
+      }
+    } catch (e) {
+      /* fail-open：保持句柄键，不因为查询失败而丢掉来源隔离。 */
+    }
+  }
+  sourceKeys[raw] = key;
+  return key;
+}
+
+function emitEdgesIfChanged(found, source) {
   var sorted = found.slice().sort(function (x, y) { return x - y; });
+  /* 防御性第二道：onEnter 已对异源报告早退，这里再保证一次“异源不能改状态”。
+     只有“当前按下来源”的空报告才是真正的 UP；异源空报告只计数。 */
+  if (source !== undefined && activeSource !== null && source !== activeSource) {
+    stat.foreign_reports++;
+    return;
+  }
+  if (source !== undefined && activeSource === null && sorted.length > 0) {
+    activeSource = source;
+  }
   if (sameSet(sorted, currentUsages())) return;
   pressed = {};
   for (var i = 0; i < sorted.length; i++) pressed[sorted[i]] = true;
+  /* 无按下状态就没有“当前来源”可归属；目标集合变更把它清空时也一样。
+     否则异源报告会被一个已经不存在的按下状态长期挡住。 */
+  if (sorted.length === 0) activeSource = null;
   stat.edges_sent++;
   sendLine({
     type: 'edge',
@@ -884,6 +967,20 @@ function writeReport(ptr, bytes) {
 function installHook() {
   if (hookListener !== null) return true;
   var ntdll = Process.getModuleByName('ntdll.dll');
+  /* 设备来源查询只读、无设备 IOCTL；Node 逻辑台没有 NativeFunction，保持 null，
+     此时 sourceKeyOf 退回句柄字符串（回归台仍能验证来源隔离）。 */
+  try {
+    if (typeof NativeFunction === 'function') {
+      var query = ntdll.getExportByName('NtQueryObject');
+      if (query !== null && !query.isNull()) {
+        ntQueryObject = new NativeFunction(query, 'int',
+          ['pointer', 'int', 'pointer', 'uint', 'pointer']);
+      }
+    }
+  } catch (e) {
+    ntQueryObject = null;
+  }
+
   var fn = ntdll.getExportByName('NtDeviceIoControlFile');
   if (fn === null || fn.isNull()) {
     logLine('hook:export_missing');
@@ -910,6 +1007,21 @@ function installHook() {
         if (inBytes[4] !== 0x02 || inBytes[5] !== 0x01) return;
 
         if (outPtr.readU8() !== REPORT_ID) return;
+        if (args[0] === null || args[0].isNull()) return;
+
+        /* 2026-11-12：先按来源归属。活动来源（产生当前 DOWN 的那台设备）之外
+           的报告一律不碰——尤其不能让它的一帧空报告/释放报告结束遥控器的长按。
+           这里必须在 `this.hit = true` 之前早退：onLeave 只负责恢复我们改过的
+           缓冲区，异源报告我们一个字节都没动。 */
+        var source = sourceKeyOf(args[0]);
+        this.reportSource = source;
+        if (activeSource !== null && source !== activeSource) {
+          stat.foreign_reports++;
+          if (stat.foreign_reports <= 5 || stat.foreign_reports % 100 === 0) {
+            logLine('source:foreign n=' + stat.foreign_reports);
+          }
+          return;
+        }
 
         this.hit = true;
         this.outPtr = outPtr;
@@ -928,12 +1040,18 @@ function installHook() {
         if (leaseOk()) emitObservation(physicalUsages);
         var found = targetSetIn(bytes);      /* 主程序动态上报集合 */
         var toClear = clearSetIn(bytes);     /* 上报集合 + 哨兵键（如有） */
+        var synthSeen = synthSetIn(bytes);
+        /* 没有活动来源时，只有这份报告真的含目标键/哨兵键/语音键才认领来源；
+           异源设备的普通空报告不能抢占归属。 */
+        if (activeSource === null && (found.length > 0 || toClear.length > 0 || synthSeen)) {
+          activeSource = source;
+        }
         this.orig = bytes;
 
         /* 边沿上报必须早于/独立于清键：即使租约过期不上报也要如实反映状态 */
-        emitEdgesIfChanged(found);
+        emitEdgesIfChanged(found, source);
 
-        var synthSeen = synthSetIn(bytes);
+        if (!synthSeen && !synthHeld && activeSource === source && currentUsages().length === 0) activeSource = null;
         /* 门禁走 `shouldTouchReport`（= 上报 ∪ 清空），**不能**只走 found：
            只含哨兵键的报告会被漏掉，哨兵键就永远清不掉（2026-09-26 真机）。 */
         if (!shouldTouchReport(bytes)) return;
@@ -942,6 +1060,9 @@ function installHook() {
         /* 哨兵键命中单独计数：它不上报边沿，若混进 target_hits，
            "target_hits × 2 == edges_sent"这条交叉校验就再也读不懂了。 */
         for (var ci = 0; ci < toClear.length; ci++) {
+          /* 语音键是产品 clear-only 目标，不是哨兵键；计入 canary 会让
+             “哨兵键是否生效”这一诊断判据被每次语音按压污染。 */
+          if (toClear[ci] === VOICE_KEY_HID_USAGE) continue;
           if (reportUsages.indexOf(toClear[ci]) < 0) { stat.canary_hits++; break; }
         }
 
@@ -978,6 +1099,7 @@ function installHook() {
         var patched = bytes.slice();
         var changed = false;
         var synthChanged = false;
+        var voiceClearChanged = false;
         for (var i = 0; i < 3; i++) {
           var o = 3 + i * 2;
           var u = bytes[o] | (bytes[o + 1] << 8);
@@ -994,6 +1116,7 @@ function installHook() {
           patched[o] = 0;
           patched[o + 1] = 0;
           changed = true;
+          if (u === VOICE_KEY_HID_USAGE) voiceClearChanged = true;
         }
         if (!changed) { if (synthSeen) synthTrace('skip reason=nochange'); return; }
 
@@ -1016,6 +1139,13 @@ function installHook() {
             this.synthWritten = true;
           }
           if (synthChanged) synthTrace('replace ok to=0x' + synthTo.toString(16));
+          if (voiceClearChanged) {
+            stat.voice_clear_hits++;
+            /* 只记首条与每 20 条：证明 clear-only 路径真的生效，又不刷爆日志。 */
+            if (stat.voice_clear_hits === 1 || stat.voice_clear_hits % 20 === 0) {
+              logLine('voice:clear n=' + stat.voice_clear_hits + ' mode=clear');
+            }
+          }
           this.cleared = true;
         } else {
           stat.clears_fail++;
@@ -1047,6 +1177,7 @@ function installHook() {
             && !synthCompletionUncertain) {
           synthHeld = false;
           synthHeldFrom = 0; synthHeldTo = 0; synthHeldHandle = '';
+          if (activeSource === this.reportSource && currentUsages().length === 0) activeSource = null;
           if (stopPending) completeStop();
         } else if (stopPending && this.releaseGeneration >= 0 && !completed) {
           logLine('stop:release_unconfirmed reason=ioctl_not_completed');
@@ -1069,6 +1200,41 @@ function installHook() {
       }
     }
   });
+
+  /* 设备拔掉/重连时宿主会关闭该设备的句柄；若它正是当前按下来源，
+     必须补发一次 UP，否则应用会一直等高亮/连发（fail-open 的成对性）。
+     `NtClose` 是高频路径，只做一次缓存查表；发送路径自身若关闭句柄，
+     用 `inCloseHook` 防止重入。 */
+  try {
+    var closeFn = ntdll.getExportByName('NtClose');
+    if (closeFn !== null && !closeFn.isNull()) {
+      closeHookListener = Interceptor.attach(closeFn, {
+        onEnter: function (args) {
+          if (inCloseHook) return;
+          var raw = args[0].toString();
+          if (!Object.prototype.hasOwnProperty.call(sourceKeys, raw)) return;
+          var key = sourceKeys[raw];
+          delete sourceKeys[raw];
+          if (activeSource !== null && key === activeSource) {
+            /* 同一设备对象可能有多个句柄（不同 TLC/重复句柄）。只有最后一个
+               句柄关闭才算设备离开；关掉其中一个不能提前发 UP。 */
+            var stillOpen = false;
+            for (var h in sourceKeys) {
+              if (sourceKeys[h] === key) { stillOpen = true; break; }
+            }
+            if (!stillOpen) {
+              inCloseHook = true;
+              try { releaseEdges('source_closed'); } catch (e) { /* fail-open */ }
+              inCloseHook = false;
+            }
+          }
+        }
+      });
+    }
+  } catch (e) {
+    /* 没有 NtClose 导出/attach 失败：来源关闭时退化为“等下一帧同源报告”，
+       不影响其它路径。 */
+  }
 
   return true;
 }
@@ -1143,11 +1309,14 @@ function heartbeat() {
       ioctl_calls: stat.ioctl_calls,
       target_hits: stat.target_hits,
       canary_hits: stat.canary_hits,
+      voice_clear_hits: stat.voice_clear_hits,
       clears_ok: stat.clears_ok,
       clears_fail: stat.clears_fail,
       restores_ok: stat.restores_ok,
       kernel_changed: stat.kernel_changed,
       edges_sent: stat.edges_sent,
+      foreign_reports: stat.foreign_reports,
+      forced_releases: stat.forced_releases,
       write_fail: stat.write_fail,
       /* 出站串行化的观测面：tx_lines 不涨 = 上行根本没出去；
          tx_busy_drop>0 = 又撞上了 write 单飞互斥（修复回归）。 */

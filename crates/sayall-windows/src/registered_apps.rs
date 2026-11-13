@@ -75,8 +75,7 @@ pub fn normalize_library(apps: Vec<AppLibraryEntry>) -> Result<Vec<AppLibraryEnt
     for mut app in apps {
         app.name = app.name.trim().to_owned();
         let lower = app.path.to_ascii_lowercase();
-        let file_target = (lower.ends_with(".exe") || lower.ends_with(".lnk"))
-            && (app.path.contains('\\') || app.path.contains('/'));
+        let file_target = is_file_target(&app.path);
         if app.name.is_empty()
             || app.name.len() > 1024
             || app.path.len() > 8192
@@ -90,6 +89,141 @@ pub fn normalize_library(apps: Vec<AppLibraryEntry>) -> Result<Vec<AppLibraryEnt
     let mut apps: Vec<_> = unique.into_values().collect();
     apps.sort_by_key(|app| (app.name.to_lowercase(), app.path.to_lowercase()));
     Ok(apps)
+}
+
+/// 文件型启动目标的既有语法：`.exe/.lnk` 且含路径分隔符。
+/// 保持旧配置的兼容口径，不在这里追加绝对路径要求。
+fn is_file_target(path: &str) -> bool {
+    let path = path.trim();
+    let lower = path.to_ascii_lowercase();
+    (lower.ends_with(".exe") || lower.ends_with(".lnk"))
+        && (path.contains('\\') || path.contains('/'))
+        && path.len() <= 8192
+        && !path.chars().any(|c| c.is_control() || c == '"')
+}
+
+/// 扫描到的新文件 target 必须是绝对路径，避免把 `{GUID}\cmd.exe`
+/// 这类 shell 相对解析名当成可直接启动的文件。
+fn is_absolute_file_target(path: &str) -> bool {
+    is_file_target(path) && std::path::Path::new(path).is_absolute()
+}
+
+/// 打包应用内部目录受 ACL 保护，按 exe 路径启动不可靠；这类条目应保留
+/// AUMID，而不是改成文件 target。
+fn is_packaged_internal_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("\\windowsapps\\") || lower.contains("\\windows\\systemapps\\")
+}
+
+/// 解析 `{已知文件夹 GUID}\相对路径` 形式的 AppsFolder 解析名。
+///
+/// `cmd.exe`、`Windows PowerShell`、`系统信息` 等传统系统工具在 AppsFolder
+/// 里不是 `shell:AppsFolder\<AUMID>`，而是已知文件夹下的相对路径。
+/// `IShellItem::GetDisplayName(SIGDN_FILESYSPATH)` 对这些条目常返回失败；
+/// 用公开的 `SHGetKnownFolderPath` 解析前缀 GUID 后再拼接。
+#[cfg(windows)]
+fn known_folder_relative(relative: &str) -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+    let (guid_text, remainder) = relative.split_once('\\')?;
+    if remainder.is_empty() {
+        return None;
+    }
+    // 只接受已知文件夹下的普通相对组件，拒绝 ..、绝对路径和盘符前缀，
+    // 避免 AppsFolder 解析名把目标带出已知文件夹。
+    let relative_path = std::path::Path::new(remainder);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let guid = parse_guid(guid_text)?;
+    let base = unsafe { SHGetKnownFolderPath(&guid, KF_FLAG_DEFAULT, None) }.ok()?;
+    let base_text = unsafe { base.to_string() }.unwrap_or_default();
+    unsafe {
+        CoTaskMemFree(Some(base.0.cast()));
+    }
+    if base_text.is_empty() {
+        return None;
+    }
+    std::path::Path::new(&base_text)
+        .join(relative_path)
+        .to_str()
+        .map(str::to_owned)
+}
+
+#[cfg(windows)]
+fn parse_guid(text: &str) -> Option<windows::core::GUID> {
+    let text = text.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let parts: Vec<&str> = text.split('-').collect();
+    if parts.len() != 5
+        || parts[0].len() != 8
+        || parts[1].len() != 4
+        || parts[2].len() != 4
+        || parts[3].len() != 4
+        || parts[4].len() != 12
+    {
+        return None;
+    }
+    let data1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let data2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let data3 = u16::from_str_radix(parts[2], 16).ok()?;
+    let tail = format!("{}{}", parts[3], parts[4]);
+    let mut data4 = [0u8; 8];
+    for (index, chunk) in tail.as_bytes().chunks(2).enumerate() {
+        data4[index] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(windows::core::GUID {
+        data1,
+        data2,
+        data3,
+        data4,
+    })
+}
+
+/// 明显的卸载程序不作为「打开应用」候选。只按展示名与文件名判断，
+/// 不读取程序内容；误判代价只是不在扫描列表里出现，用户仍可手动选择。
+fn looks_like_uninstaller(name: &str, target: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    let file_stem = std::path::Path::new(target)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    [name.as_str(), file_stem.as_str()]
+        .iter()
+        .any(|text| text.contains("unins") || text.contains("卸载"))
+}
+
+/// 把一条 AppsFolder 条目转换成可持久化的启动目标。
+///
+/// 优先保留 `shell:AppsFolder\<AUMID>`：打包应用只能按 AUMID 激活。
+/// 解析名含路径分隔符时，改用 Shell 解析出的真实文件路径；这样
+/// `{GUID}\cmd.exe` 与传统桌面应用的绝对路径都能进入应用库。
+fn appsfolder_launch_target(
+    name: &str,
+    relative: &str,
+    filesystem_path: Option<&str>,
+) -> Option<String> {
+    if relative.is_empty() || name.trim().is_empty() || name.len() > 1024 {
+        return None;
+    }
+    let registered = format!("{REGISTERED_PREFIX}{relative}");
+    let target = if is_registered_target(&registered) {
+        registered
+    } else {
+        filesystem_path
+            .filter(|path| is_absolute_file_target(path) && !is_packaged_internal_path(path))
+            .map(str::to_owned)
+            .or_else(|| {
+                (is_absolute_file_target(relative) && !is_packaged_internal_path(relative))
+                    .then(|| relative.to_owned())
+            })?
+    };
+    (!looks_like_uninstaller(name, &target)).then_some(target)
 }
 
 #[cfg(windows)]
@@ -143,7 +277,8 @@ fn scan_sta(started: std::time::Instant) -> Result<Vec<AppLibraryEntry>, String>
     };
     use windows::Win32::UI::Shell::{
         BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem,
-        SHCreateItemInKnownFolder, KF_FLAG_DEFAULT, SIGDN_NORMALDISPLAY,
+        SHCreateItemFromParsingName, SHCreateItemInKnownFolder, KF_FLAG_DEFAULT,
+        SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
         SIGDN_PARENTRELATIVEPARSING,
     };
     unsafe {
@@ -173,6 +308,9 @@ fn scan_sta(started: std::time::Instant) -> Result<Vec<AppLibraryEntry>, String>
                 SHCreateItemInKnownFolder(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, PCWSTR::null())?;
             let enumeration: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
             let mut apps = Vec::new();
+            let mut registered_count = 0usize;
+            let mut file_count = 0usize;
+            let mut skipped_count = 0usize;
             loop {
                 if started.elapsed().as_secs() >= 14 || apps.len() >= 2000 {
                     return Err(windows::core::Error::new(
@@ -197,11 +335,57 @@ fn scan_sta(started: std::time::Instant) -> Result<Vec<AppLibraryEntry>, String>
                     Ok(value) => text(value),
                     Err(_) => continue,
                 };
-                let path = format!("{REGISTERED_PREFIX}{id}");
-                if !name.is_empty() && is_registered_target(&path) {
-                    apps.push(AppLibraryEntry { name, path });
+                // AUMID 条目保持原样；解析名是路径的条目（{GUID}\cmd.exe、传统
+                // 桌面应用的绝对路径）改用 Shell 的真实文件路径，否则
+                // is_registered_target 会因反斜杠把它们整条丢掉。
+                let registered_target = format!("{REGISTERED_PREFIX}{id}");
+                let filesystem_path = if is_registered_target(&registered_target) {
+                    None
+                } else {
+                    // FILESYSPATH 对 AppsFolder 里的 {GUID}\... 条目常拿不到；
+                    // 再试桌面绝对解析名，最后按完整 AppsFolder 目标重新解析一次。
+                    let direct = item
+                        .GetDisplayName(SIGDN_FILESYSPATH)
+                        .ok()
+                        .map(|value| text(value));
+                    let desktop = item
+                        .GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING)
+                        .ok()
+                        .map(|value| text(value));
+                    let reparsed = {
+                        let wide: Vec<u16> =
+                            registered_target.encode_utf16().chain(Some(0)).collect();
+                        let resolved: windows::core::Result<IShellItem> =
+                            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None);
+                        resolved
+                            .ok()
+                            .and_then(|resolved| resolved.GetDisplayName(SIGDN_FILESYSPATH).ok())
+                            .map(|value| text(value))
+                    };
+                    let known = known_folder_relative(&id);
+                    [direct, desktop, reparsed, known]
+                        .into_iter()
+                        .flatten()
+                        .find(|path| {
+                            is_absolute_file_target(path) && !is_packaged_internal_path(path)
+                        })
+                };
+                let Some(path) = appsfolder_launch_target(&name, &id, filesystem_path.as_deref())
+                else {
+                    skipped_count += 1;
+                    continue;
+                };
+                if path.starts_with(REGISTERED_PREFIX) {
+                    registered_count += 1;
+                } else {
+                    file_count += 1;
                 }
+                apps.push(AppLibraryEntry { name, path });
             }
+            crate::gatt_note(format!(
+                "registered_apps phase=filtered registered={registered_count} files={file_count} skipped={skipped_count} kept={}",
+                registered_count + file_count
+            ));
             Ok(apps)
         }
     })();
@@ -378,7 +562,22 @@ pub fn launch_registered_app(target: &str) -> Result<(), String> {
                         )
                     },
                 );
-                let visibility = by_identity.merge(by_path);
+                // 启动器式注册项：解析路径可能是根目录 `Feishu.exe`，真正持有窗口的
+                // 是同目录 `app\Feishu.exe`。只查 AUMID + 精确路径会得到 (0,0)，
+                // 随后 `activate_install_directory_family` 会把隐藏主窗口直接显示出来
+                // （2026-11-12 飞书菜单键现场：source=install_directory + took_show_path=true）。
+                let by_family = executable_path.as_deref().map_or(
+                    crate::app_launcher::WindowVisibility::EMPTY,
+                    |path| {
+                        crate::app_launcher::window_visibility(
+                            crate::app_launcher::WindowSelector::InstallDirectoryFamily {
+                                resolved_path: path,
+                                app_user_model_id: &app_user_model_id,
+                            },
+                        )
+                    },
+                );
+                let visibility = by_identity.merge(by_path).merge(by_family);
                 let (visible, hidden) = (visibility.visible, visibility.hidden);
                 let main_hidden = hidden > 0 && visibility.hidden_max_area > visibility.visible_max_area;
                 if (visible == 0 || main_hidden) && hidden > 0 {
@@ -526,7 +725,9 @@ pub fn launch_registered_app(target: &str) -> Result<(), String> {
             // 应用会由单实例处理把主窗口显示出来）。先有界复核应用是否自己把窗口显示出来，
             // 是则不再走会被判"点不动"的直接显示路径。
             if let Some(hwnd) = deferred_hidden_window {
-                let self_shown = crate::app_launcher::readback_hidden_window_shown(Some(hwnd));
+                // 600ms 足够覆盖单实例转发；后续 `ensure_open_only_foreground`
+                // 会继续观察并激活可见窗口，这里不干等满 1.2s。
+                let self_shown = crate::app_launcher::readback_hidden_window_shown_brief(Some(hwnd));
                 crate::gatt_note(format!(
                     "registered_app_launch phase=app_self_shown terminal_result={}",
                     if self_shown { "passed" } else { "failed" },
@@ -536,19 +737,31 @@ pub fn launch_registered_app(target: &str) -> Result<(), String> {
                 }
             }
 
-            let foreground_observed = pid.is_some_and(|pid| {
-                observe_registered_foreground(
-                    pid,
-                    &app_user_model_id,
-                    executable_path.as_deref(),
-                    method == "shell_fallback",
-                )
-            });
-            crate::gatt_note(format!(
-                "registered_app_launch phase=foreground_readback method={method} pid_available={} target_result={}",
-                pid.is_some(),
-                if foreground_observed { "foreground_observed" } else { "foreground_denied" }
-            ));
+            let foreground_observed = if deferred_hidden_window.is_some() {
+                // 窗口已确认是「应用自己收在托盘」的隐藏主窗口，且契约/ShellExecute
+                // 已经请求应用自己显示；这里绝不能再走 activate_* 的隐藏候选兜底，
+                // 否则会把应用自己隐藏的主窗口强行 ShowWindow 出来（2026-11-12 飞书）。
+                crate::gatt_note(
+                    "registered_app_launch phase=foreground_readback target_result=deferred reason=window_hidden_by_app"
+                        .to_owned(),
+                );
+                false
+            } else {
+                let foreground_observed = pid.is_some_and(|pid| {
+                    observe_registered_foreground(
+                        pid,
+                        &app_user_model_id,
+                        executable_path.as_deref(),
+                        method == "shell_fallback",
+                    )
+                });
+                crate::gatt_note(format!(
+                    "registered_app_launch phase=foreground_readback method={method} pid_available={} target_result={}",
+                    pid.is_some(),
+                    if foreground_observed { "foreground_observed" } else { "foreground_denied" }
+                ));
+                foreground_observed
+            };
             (
                 classify_registered_launch(submitted, foreground_observed),
                 foreground_observed,
@@ -685,5 +898,113 @@ mod tests {
             }])
             .is_err());
         }
+    }
+
+    #[test]
+    fn appsfolder_entries_keep_aumids_and_reject_documents_and_uninstallers() {
+        assert_eq!(
+            appsfolder_launch_target(
+                "设置",
+                "Microsoft.AutoGenerated.{B775B473-2C80-E64C-6B77-9634BE4A48A2}",
+                None,
+            ),
+            Some(format!(
+                "{REGISTERED_PREFIX}Microsoft.AutoGenerated.{{B775B473-2C80-E64C-6B77-9634BE4A48A2}}"
+            ))
+        );
+        assert_eq!(
+            appsfolder_launch_target("此电脑", "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", None),
+            Some(format!(
+                "{REGISTERED_PREFIX}::{{20D04FE0-3AEA-1069-A2D8-08002B30309D}}"
+            ))
+        );
+        assert_eq!(
+            appsfolder_launch_target("Python Manuals", "C:\\Python\\Doc\\index.html", None),
+            None
+        );
+        assert_eq!(
+            appsfolder_launch_target("笔记本使用手册", "https://pc.mi.com/sysc.html", None),
+            None
+        );
+        assert_eq!(
+            appsfolder_launch_target("卸载百度网盘", "卸载百度网盘", None),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn appsfolder_path_entries_become_absolute_file_targets() {
+        assert_eq!(
+            appsfolder_launch_target(
+                "命令提示符",
+                "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe",
+                Some("C:\\Windows\\System32\\cmd.exe"),
+            ),
+            Some("C:\\Windows\\System32\\cmd.exe".into())
+        );
+        assert_eq!(
+            appsfolder_launch_target("微信", "D:\\Apps\\Weixin\\Weixin.exe", None),
+            Some("D:\\Apps\\Weixin\\Weixin.exe".into())
+        );
+        assert_eq!(
+            appsfolder_launch_target(
+                "Store App",
+                "Vendor.App_123!App",
+                Some("C:\\Program Files\\WindowsApps\\Vendor.App\\app.exe"),
+            ),
+            Some(format!("{REGISTERED_PREFIX}Vendor.App_123!App"))
+        );
+        assert_eq!(
+            appsfolder_launch_target(
+                "Store Internal",
+                "{GUID}\\app.exe",
+                Some("C:\\Program Files\\WindowsApps\\Vendor.App\\app.exe"),
+            ),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn known_folder_relative_resolves_system_tools_and_rejects_escapes() {
+        let resolved = known_folder_relative("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe")
+            .expect("System32 known folder should resolve cmd.exe");
+        let expected =
+            std::path::Path::new(&std::env::var("SystemRoot").expect("SystemRoot should be set"))
+                .join("System32")
+                .join("cmd.exe");
+        assert!(
+            resolved.eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "unexpected cmd.exe path: {resolved}"
+        );
+        assert_eq!(
+            known_folder_relative("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\..\\evil.exe"),
+            None
+        );
+        assert_eq!(known_folder_relative("{not-a-guid}\\cmd.exe"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn library_accepts_file_targets_and_dedupes_case_insensitively() {
+        let apps = normalize_library(vec![
+            AppLibraryEntry {
+                name: "Command Prompt".into(),
+                path: "C:\\Windows\\System32\\cmd.exe".into(),
+            },
+            AppLibraryEntry {
+                name: "Command Prompt".into(),
+                path: "c:\\windows\\system32\\CMD.EXE".into(),
+            },
+            AppLibraryEntry {
+                name: "WeChat".into(),
+                path: "D:\\Apps\\Weixin\\Weixin.exe".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(apps.len(), 2);
+        assert!(apps.iter().any(|app| app.path.ends_with("cmd.exe")));
+        assert!(apps.iter().any(|app| app.path.ends_with("Weixin.exe")));
     }
 }

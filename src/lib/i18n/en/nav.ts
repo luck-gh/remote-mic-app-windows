@@ -14,4 +14,5 @@ export default {
   "nav.设置": "Settings",
   "nav.会员": "Membership",
   "nav.个人中心": "Profile",
+  "nav.我的": "Me",
 };

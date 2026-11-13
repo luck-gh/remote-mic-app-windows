@@ -1843,3 +1843,22 @@ pub fn phrase_panel_mask() -> u64 {
     .iter()
     .fold(0, |mask, button| mask | (1u64 << button.ordinal()))
 }
+
+// 仅更新报告层目标, 不授予全局键盘钩子吞键权。
+static APP_SWITCHER_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+type CaptureMaskSink = Arc<dyn Fn() + Send + Sync>;
+static CAPTURE_MASK_SINK: std::sync::Mutex<Option<CaptureMaskSink>> = std::sync::Mutex::new(None);
+pub(crate) fn set_capture_mask_sink(sink: CaptureMaskSink) {
+    *CAPTURE_MASK_SINK.lock().unwrap() = Some(sink);
+}
+pub fn set_app_switcher_mask(mask: u64) {
+    if APP_SWITCHER_MASK.swap(mask, std::sync::atomic::Ordering::AcqRel) != mask {
+        let sink = CAPTURE_MASK_SINK.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink();
+        }
+    }
+}
+pub fn app_switcher_mask() -> u64 {
+    APP_SWITCHER_MASK.load(std::sync::atomic::Ordering::Acquire)
+}

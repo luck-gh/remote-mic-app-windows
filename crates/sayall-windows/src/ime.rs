@@ -86,6 +86,9 @@ pub(crate) fn recovery_epoch() -> u64 {
 pub(crate) fn recovery_current(epoch: u64) -> bool {
     RECOVERY.current(epoch)
 }
+pub(crate) fn voice_session_active() -> bool {
+    RECOVERY.voice_active.load(Ordering::SeqCst)
+}
 pub(crate) fn voice_started() {
     RECOVERY.voice_started();
 }

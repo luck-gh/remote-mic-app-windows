@@ -13,6 +13,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub mod app_launcher;
+/// Windows 应用切换器（Alt+Tab）临时会话：状态机、I/O 接缝与结束报告。
+/// 产品行为对齐 macOS Command+Tab 会话，平台差异见模块文档。
+pub mod app_switcher;
 pub mod application_control;
 #[cfg(windows)]
 mod audio;
@@ -133,6 +136,9 @@ pub mod remote_target;
 #[cfg(windows)]
 mod resource_probe;
 pub mod scene_control;
+pub mod scroll_region;
+#[cfg(windows)]
+pub mod scroll_region_windows;
 pub mod send_input;
 /// 真实注入运行时（2026-09-06 起 pub：预设注入链路真机验证探针
 /// examples/preset_inject_probe.rs 需复用与映射引擎完全相同的管线）。
@@ -698,11 +704,10 @@ impl Default for WindowsPlatform {
                 macro_runtime::WindowsMacroStepperSource::new(Arc::clone(&injector), {
                     let profiles = Arc::clone(&macro_focus_profiles);
                     Arc::new(move |target: &str| {
-                        profiles
+                        let profiles = profiles
                             .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .get(target)
-                            .cloned()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        crate::button_mapping::focus_profile_for_target(&profiles, target)
                     })
                 }),
             );
@@ -1026,6 +1031,20 @@ impl WindowsPlatform {
     }
     pub fn usage_counters(&self) -> Arc<UsageCounters> {
         Arc::clone(&self.usage)
+    }
+
+    /// 退出前同步释放应用切换器（Alt+Tab）会话，等引擎确认 Alt 已释放。
+    ///
+    /// 必须排在 BLE 收尾之前：`std::process::exit` 不执行析构，只有显式调用
+    /// 才能保证不把按住的 Alt 留在系统键态。无活动会话时立即返回 true。
+    #[cfg(windows)]
+    pub fn release_app_switcher_for_exit(&self, timeout: std::time::Duration) -> bool {
+        self.button_mapping.release_app_switcher_for_exit(timeout)
+    }
+
+    #[cfg(not(windows))]
+    pub fn release_app_switcher_for_exit(&self, _timeout: std::time::Duration) -> bool {
+        true
     }
 
     pub fn test_scroll(
@@ -1484,10 +1503,17 @@ impl WindowsPlatform {
         self.button_mapping
             .set_input_context(RemoteModel::Unknown, false);
         let macros_stopped = self.macro_runtime.shutdown(timeout);
+        let switcher_stopped = self
+            .button_mapping
+            .release_app_switcher_for_exit(timeout.saturating_sub(started.elapsed()));
         let mappings_stopped = self
             .button_mapping
             .wait_for_idle(timeout.saturating_sub(started.elapsed()));
-        if !macros_stopped {
+        if !switcher_stopped {
+            Err(PlatformError::WindowsApi(
+                "application switcher release barrier failed".to_owned(),
+            ))
+        } else if !macros_stopped {
             Err(PlatformError::WindowsApi(
                 "macro shutdown barrier timed out".to_owned(),
             ))
@@ -1540,6 +1566,43 @@ impl WindowsPlatform {
         self.button_mapping
             .learn_focus_point(target)
             .map_err(PlatformError::SendInput)
+    }
+
+    /// UI「学习滚动区域」：等待用户点击目标应用的可滚动内容区。
+    pub fn learn_scroll_region(&self) -> Result<scroll_region::ScrollRegionTarget, PlatformError> {
+        #[cfg(windows)]
+        {
+            scroll_region_windows::learn_scroll_region_for_foreground()
+                .map_err(|error| PlatformError::SendInput(error.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    /// UI「测试滚动」：先激活目标应用，再用已保存的区域执行一次翻页。
+    pub fn test_scroll_region(
+        &self,
+        target: &str,
+        command: scroll_region::ScrollCommand,
+    ) -> Result<scroll_region::ScrollOutcome, PlatformError> {
+        #[cfg(windows)]
+        {
+            app_launcher::activate_or_launch(target).map_err(PlatformError::SendInput)?;
+            let _ = app_launcher::wait_for_target_foreground(
+                target,
+                std::time::Duration::from_millis(1200),
+            );
+            let region = self.button_mappings().scroll_regions.get(target).cloned();
+            scroll_region_windows::scroll_foreground(region, command)
+                .map_err(|error| PlatformError::SendInput(error.to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (target, command);
+            Err(PlatformError::UnsupportedPlatform)
+        }
     }
 
     /// 订阅语义按键边沿（画布高亮数据源）。

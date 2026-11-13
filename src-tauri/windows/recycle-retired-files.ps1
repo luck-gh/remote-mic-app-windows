@@ -1,4 +1,4 @@
-﻿param([string]$InstallDirectory, [switch]$FunctionsOnly, [switch]$ProductFiles, [switch]$Shortcuts, [string]$ProgramsDirectory, [string]$DesktopDirectory, [string]$SelectedStartMenuFolder, [int]$RestoreCustom = 0, [int]$NoShortcuts = 0)
+﻿param([string]$InstallDirectory, [switch]$FunctionsOnly, [switch]$ProductFiles, [switch]$CheckProductAccess, [switch]$Shortcuts, [string]$ProgramsDirectory, [string]$DesktopDirectory, [string]$SelectedStartMenuFolder, [int]$RestoreCustom = 0, [int]$NoShortcuts = 0)
 $ErrorActionPreference = 'Stop'
 
 function Get-SayAllRetiredFiles([string]$Directory, [switch]$ProductFiles) {
@@ -15,7 +15,7 @@ function Get-SayAllRetiredFiles([string]$Directory, [switch]$ProductFiles) {
         'SayAllInput/SayAllInput.inf', 'SayAllInput/SayAllInput.sys', 'SayAllInput/SayAllInput.cat')
     if ($ProductFiles) {
         # Current payload only; never enumerate settings, authorization or unknown files.
-        $known += @('sayall-windows-app.exe', 'sayall-helper.exe', 'frida-gadget.dll',
+        $known += @('sayall-windows-app.exe', 'sayall-helper.exe', 'frida-gadget.dll', 'sayall-mcp.exe',
             'sayall-helper-arm64.exe', 'frida-gadget-arm64.dll',
             'licenses/ATTRIBUTION.md', 'licenses/Frida-COPYING.txt', 'uninstall.exe')
     }
@@ -34,6 +34,43 @@ function Get-SayAllRetiredFiles([string]$Directory, [switch]$ProductFiles) {
             $candidate
         }
     }
+}
+
+function Assert-SayAllPayloadAccess([string]$Directory, [string[]]$Files) {
+    if (-not [IO.Directory]::Exists($Directory)) { return }
+    if ($null -eq $Files) { $Files = @(Get-SayAllRetiredFiles $Directory -ProductFiles) }
+    if (-not ('SayAllPayloadAccess' -as [type])) {
+        # OPEN_EXISTING never changes bytes. Write/delete access detects mapped
+        # executables and incompatible sharing before the first product mutation.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class SayAllPayloadAccess {
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+ static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+ public static void Assert(string[] paths) {
+  var handles = new List<SafeFileHandle>();
+  try {
+   foreach (string path in paths) {
+    var handle = CreateFileW(path, 0x40000000 | 0x00010000, 7, IntPtr.Zero, 3, 0, IntPtr.Zero);
+    int error = Marshal.GetLastWin32Error();
+    handles.Add(handle);
+    if (handle.IsInvalid) throw new Win32Exception(error);
+   }
+  } finally { foreach (var handle in handles) handle.Dispose(); }
+ }
+}
+'@
+    }
+    try { [SayAllPayloadAccess]::Assert($Files) }
+    catch [System.Management.Automation.MethodInvocationException] {
+        Write-Output 'payload_access phase=preflight result=blocked reason=payload_unavailable'
+        throw
+    }
+    Write-Output ('payload_access phase=preflight result=passed checked_count=' + $Files.Count)
 }
 
 function Initialize-SayAllRecycleApi {
@@ -99,6 +136,8 @@ public static class SayAllRecycle {
 
 function Invoke-SayAllRetiredFileRecycle([string]$Directory, [switch]$ProductFiles) {
     $files = @(Get-SayAllRetiredFiles $Directory -ProductFiles:$ProductFiles)
+    # Inspect the entire set before recycling its first item.
+    Assert-SayAllPayloadAccess $Directory -Files $files
     if ($files.Count -gt 0) { Initialize-SayAllRecycleApi }
     foreach ($file in $files) {
         # Revalidate immediately before each operation; never recurse or accept a wildcard.
@@ -224,10 +263,12 @@ function Invoke-SayAllRetiredShortcutRecycle([string]$Directory, [string]$Progra
 
 if ($FunctionsOnly) { return }
 try {
+    if ($CheckProductAccess) { Assert-SayAllPayloadAccess $InstallDirectory; exit 0 }
     if ($Shortcuts) { Invoke-SayAllRetiredShortcutRecycle $InstallDirectory $ProgramsDirectory $DesktopDirectory $SelectedStartMenuFolder $RestoreCustom $NoShortcuts; exit $script:ReplacedShortcutKinds }
     else { Invoke-SayAllRetiredFileRecycle $InstallDirectory -ProductFiles:$ProductFiles }
     exit 0
 } catch {
+    if ($CheckProductAccess) { Write-Output 'payload_access phase=preflight result=blocked reason=payload_unavailable'; exit 32 }
     if ($Shortcuts) { Write-Output ('shortcut-cleanup: result=failed phase=' + $script:ShortcutFailurePhase + ' recycled_count=' + $script:RecycledShortcutCount) }
     Write-Output 'retired-files: unconfirmed; no permanent-delete fallback'
     exit 15

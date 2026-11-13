@@ -24,6 +24,8 @@
 | 指定按键增强 | RC003 增强；操作写“重新启动增强” | 驱动页与 `ComponentSupportPanel.vue` |
 | 输入工具选择 | 输入工具名称及实际按住说话快捷键 | `ConnectionPage.vue`；与增强启停分开 |
 | 按键配置 | 自定义按键功能 / 按键映射 | `ButtonsPage.vue` |
+| 更高版本写入的未知按键动作（2026-11-11） | 动作摘要显示「不支持的动作（来自更新版本）」；当前版本只保留、不执行；编辑时第一次选择只解除保护，再次选择才替换。配置结构版本不降级，未知字段随文件 round-trip | `src/lib/bridge.ts`（`actionSummary` / `isKnownButtonAction`）、`ButtonsPage.vue` |
+| Windows 应用切换器（按键页「系统与媒体」） | 「切换应用」；卡片显示 `Alt + Tab`；悬停提示「切换应用：用左、右键选择，按“确定”确认，返回取消」。会话内方向键 / 确定 / 返回只操作系统切换器，15 秒无操作自动取消（对齐 Mac `Command+Tab` 临时会话，平台动作换成 Alt+Tab）；旧的一次性 `Alt+Tab` 绑定保留可执行。按键页、组合动作页与键位方案的预设芯片统一只显示按键组合，功能描述只作悬停提示；`Win + D`/`Win + L`/`Win + S`/`Win + Shift + S` 保存后摘要也显示 `Win`，不显示「左 Win」或「右 Win」。组合动作里的 `Alt + Tab` 也启动应用切换器会话（运行时按 Alt+Tab 识别）；键位方案复用共享清单的 `app_switcher` 动作。组合动作步骤在会话启动后立即完成，建议把 `Alt + Tab` 放在最后一步，避免后续步骤在切换器打开时继续发送按键 | `src/lib/shortcut-presets.ts`、`ButtonsPage.vue`、`MacrosPage.vue`、`src/lib/bridge.ts`（`actionSummary`）、`sayall-windows::app_switcher` |
 | 虚拟声卡端点 | CABLE Input / CABLE Output（经典 2 通道驱动）；CABLE In 16 Ch（3.3.1.7 起的新版 16 通道驱动，渲染端） | VB-Audio 官方名称；界面文案只说“选择带『推荐』标记的 CABLE 设备”，不硬编码单独一个名字（2026-10-02 现场教训） |
 | 第三方语音工具 Vokie | Vokie；官网 vokie.com；说明文案“流式显示，智能整理，不占用输入法”（Vokie 官方口径，原样引用） | `VOKIE_HOMEPAGE_URL`（`src/lib/bridge.ts`）、`ConnectionPage.vue` |
 | 推荐页（侧栏，2026-10-18） | 侧栏与页面标题统一为「推荐」；英文为 Picks（对齐 Mac 补充页标题）。页面正文、筛选项、商品名与详情全部来自官网 `https://sayall.app/recommendations/`，不在本地维护推荐文案。英文设置下使用 `/en/recommendations/` 与 Mac 同款英文固定文案（Picks / Loading page… / This page is temporarily unavailable. Open the website or try again later. / Open website / Retry / Back） | `src/navigation.ts`、`RecommendationsPage.vue`、`RECOMMENDATIONS_URL` |
@@ -32,9 +34,10 @@
 | 语音音量（连接页「语音设备」卡） | 增益；读数写“12 dB”；说明“0 dB 保持原始音量；数值越大声音越响，也会放大环境噪声。建议先从 6–12 dB 开始。”（对齐 Mac `audio.gain.*`） | `ConnectionPage.vue`、`AppSettings.gain_db` |
 | 常用语（会员能力：按键动作 + 浮层面板） | 常用语；动作名「打开常用语」；缺私有组件时已保存的绑定显示「打开常用语（当前不可用）」；失败提示按原因分叉（见 §7 2026-10-15 条） | `src/lib/bridge.ts`（`actionSummary`）、`ButtonsPage.vue`、`SettingsPage.vue`；面板内文案在私有组件 |
 | 启动行为第二项（设置页「通用」） | 启动时自动打开主面板（对齐 Mac `about.preferences.open_main_window_at_launch`）；悬停提示“关闭后普通启动仅保留托盘入口；更新完成后仍会显示主面板。”；新装与老配置默认开启（2026-10-19 用户定稿「照 Mac 原样」）；通用模块不显示行副标题 | `SettingsPage.vue`、`AppSettings.open_window_at_launch` |
-| 应用语言（设置页「通用」，2026-10-24） | 应用语言；三档「跟随系统」「简体中文」「English」；通用模块不显示行副标题；持久化 `application_language`（`system` / `zh-Hans` / `en`，对齐 Mac `AppLanguage`）；**全界面**跟随语言即时切换：侧栏、六个页面、向导 ①–⑦、弹窗、错误文案、托盘菜单与窗口标题；英文术语对齐 Mac（Routines / Full-key support / Doubao / WeType / App Language / System Default） | `SettingsPage.vue`、`AppSettings.application_language`、`src/lib/language.ts`、`src/lib/i18n.ts`、`src-tauri/src/lib.rs`（`apply_native_language`） |
+| 应用语言（设置页「通用」，2026-10-24） | 应用语言；三档「跟随系统」「简体中文」「English」；通用模块不显示行副标题；持久化 `application_language`（`system` / `zh-Hans` / `en`，对齐 Mac `AppLanguage`）；**全界面**跟随语言即时切换：侧栏、六个页面、向导 ①–⑧、弹窗、错误文案、托盘菜单与窗口标题；英文术语对齐 Mac（Routines / Full-key support / Doubao / WeType / App Language / System Default） | `SettingsPage.vue`、`AppSettings.application_language`、`src/lib/language.ts`、`src/lib/i18n.ts`、`src-tauri/src/lib.rs`（`apply_native_language`） |
 | 更新完成提示（启动时一次性） | 标题「无线麦已更新」、正文「已成功更新到版本 {版本号}。」、按钮「好」（对齐 Mac `update.completed.*`，原样移植）；只在“本次启动前刚完成更新”时出现一次 | `UpdateCompletedDialog.vue`、`launch_state.rs` |
 | 组合动作（侧边栏页 + 按键页动作分组） | 组合动作；步骤类型写「打开应用」「等待应用」「单键或快捷键」「聚焦输入框」「聚焦学习过的输入框」「打开网址」「执行已有组合动作」（对齐 Mac `macro.step.*`；「系统与媒体动作」不再作为新步骤提供，旧数据仍可显示与执行）；终态写「组合动作执行成功」「组合动作已执行，但无法确认第三方 App 的结果」「组合动作已取消」「组合动作执行超时」等（对齐 Mac `macro.status.execution.*`） | `MacrosPage.vue`、`ButtonsPage.vue`、`src/lib/bridge.ts`（`macroActionLabel` / `macroTerminalLabel` / `macroStepSummary`） |
+| 注册应用选择器（按键页 / 组合动作页 / APP 适配页的「添加应用」弹窗） | 标题写「选择应用」；两个入口写「本机扫描」「程序选择」；确认按钮写「添加应用」；清空写「取消选择」；已加入应用库的条目显示「已添加」；单选锁定提示「已选择应用。要重新选择，请先取消下方已选择的应用。」。已选择区域只显示名称和来源，不显示路径；空态不显示路径说明；左下角不显示确认提示。一次只能选择一个应用 | `RegisteredAppsDialog.vue`、`src/lib/i18n/en/common.ts` |
 
 `Remote Mic` 仅用于历史兼容标识、代码标识符与既有发布资产，不出现在新文案里。
 型号名只允许在 `remoteModelLabel` 定义一次，其他地方引用它（2026-10-01 教训：连接页
@@ -52,22 +55,29 @@
 | 组合动作 | Routine / Routines | 内容与动作单数；侧栏、页面标题、库标题用 Routines |
 | 连接 | Connection / Connect | 侧栏用 Connection；页面标题按 Mac `connection.page.title` 用 Connection & Voice；按钮动作「连接」用 Connect |
 | 推荐 | Recommended | 仅保留设备徽标；个人版不恢复推广页 |
-| 权限 | Permissions | 侧栏用 Permissions；页面标题按 Mac `permissions.page.title` 用 Permissions & Privacy |
+| 权限 | Permissions | 设置页分组；诊断与日志同样归设置页 |
 | 按键映射页标题 | Button Mapping | 对齐 Mac `button_mapping.page.title` |
 | 设置 | Settings / Set Up | 页面/侧栏用 Settings；向导阶段用 Set Up |
 | 全按键支持 | Full-key support | 句首大写，其余小写 |
 | 遥控器语音键 | Voice Button | 遥控器上的语音键；相关句子用 voice button |
 | 按住说话快捷键（输入工具触发键） | Voice Trigger Key / voice shortcut | 对齐 Mac `connection.voice_key_mode.title` / `onboarding.voice_tool.*` |
+| 切换应用（按键动作） | Switch Apps | 对齐 Mac `shortcut.preset.app_switcher`；卡片显示 `Alt + Tab` |
 | 单击 / 双击 | Single Press / Double Press | 遥控器按键触发方式；鼠标单击仍用 click |
 | 上一曲 / 下一曲 | Previous track / Next track | 对齐 Mac |
 | 小米蓝牙语音遥控器 2 / 2 Pro | Xiaomi Bluetooth Voice Remote 2 / 2 Pro | 包含「语音」与版本后缀 |
 | 豆包输入法 / 微信输入法 | Doubao / WeType | 对齐 Mac |
 | 应用语言 / 跟随系统 | App Language / System Default | 「简体中文」保持中文原生写法 |
 | 登录时自动启动 / 启动时自动打开主面板 | Launch at login / Open main window at launch | 对齐 Mac `about.preferences.*` |
+| 选择应用 / 本机扫描 / 程序选择 / 添加应用 / 取消选择 | Choose App / Local Scan / Program / Add App / Clear Selection | 单选应用弹窗；「已添加」为 Added |
 
 ## 3. 面向用户解释结果与必要条件
 
 普通状态句优先说明用户可观察的结果，避免堆砌报告层、HID、Raw Input、会话代次等实现术语。权限、可选增强、正常清理和失败原因涉及用户决策时必须如实说明；不能为去术语化隐藏管理员授权、以运行中代替就绪，或修改现行驱动页和模板契约。
+
+例外（2026-11-05，用户指定与 Mac 文案一致）：「回眸 → 本地 Agent 访问」卡片必须出现
+「访问令牌」「MCP」。理由：用户要在生成的配置里保管一个只显示一次的字符串，并把它粘到
+对应 AI 工具里；换词会让 Mac 与 Windows 两份说明对不上。该卡片之外仍不得出现「令牌」，
+端口、进程、助手 / Helper、注入、提权等机制词在任何位置都不出现。
 
 **用户必须知情的内容照写，但说结果、不说机制**：
 
