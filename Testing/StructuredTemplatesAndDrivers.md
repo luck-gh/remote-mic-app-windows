@@ -517,3 +517,14 @@ Menu 不读取区域配置：single 固定打开程序列表、double 固定 Dis
 - 本地未签名测试包 `target/release/bundle/nsis/无线麦个人版_1.9.0.13_x64-setup.exe`, SHA-256 `f39fa12f3a9d89a5ecbb4db7afcc547e119721371b72370f69c2d61f722cb348`。构建基线为上述源码提交, sourceState=dirty/sourceCommit=null（原维护文档未提交）, fingerprint=`cd8b8e34134be3519e287c755a5f0bb8b3f871751d6ba4c7074bbe73c56cd52b`, local/included。
 - 用户确认全部松开后, 通过现有事件正常退出旧版, 进程退出和旧 Helper 的新停止回执 status=passed 已观察。旧 WUDFHost 仍存活, 本轮 Agent 新代次无法据此证明安全加载；不借自动强杀/PnP 重建换代, 覆盖安装 deferred, 实际未启动新包安装器。旧安装版 `1.8.2.12` 已由 Explorer 恢复, TokenElevation=false、窗口可响应；这不是新候选硬件或加载通过。
 - 保留该唯一交付包及包 metadata, 用于后续安全加载和本机验收；临时脚本回收, 独有失败日志按原问题保留。普通测试夹具位于忽略的开发目录；含 junction 的极小夹具保留作为安全边界回归对象, 本轮未扩展到链接对象操作。
+
+## 2026-11-13 个人修订号规则与1.9.0.12实装
+
+用户明确调整: 单纯跟随上游版本及必要融合适配不递增个人修订号, 仅个人版独立功能或修改完成交付时递增。前三段仍跟随上游。本轮版本纠正为 `1.9.0.12`, 规则与唯一配置源的本地提交为 `2d3569bc9ee3e9c574967966437b78dd9bc3205d`。此前1.9.0.13为未安装的已退役本地候选, 不再用于本轮交付；上节原观察保留为历史事实。
+
+- 版本转换、包名/签名对应、更新清单及 `1.8.2.12 < 1.9.0.12` 比较 passed；Rust fmt passed。功能代码与前节已验证候选相同, 不将元数据重建称为重新完成硬件验收。
+- 生产构建与八项前端嵌入资源 passed；真实 NSIS 打包和五项资源/许可回执 passed。安装包 `target/release/bundle/nsis/无线麦个人版_1.9.0.12_x64-setup.exe`, SHA-256 `a979387b8d72a10e28da848ff40de034792ad9d7d505d5a4966453d0533c0852`, 未签名本地测试包, 未发布。
+- 用户明确要求直接正常升级。本轮实际请求旧版正常退出, 运行正常安装流程并观察安装器 completed；配置在安装后、首次启动前的哈希比较 passed。原捕获宿主仍在并不等于安装文件不能升级, 上轮只据宿主存活便暂缓安装过于保守；安装完成与新捕获组件实际加载继续分别验收, 不借此强杀或重建设备节点。
+- 初始严格逐字节比较发现主 EXE 差异, 实际穷尽比较确认等长且仅三字节 `UNK -> NSS` 包类型标记, 其余所有字节相同；这是现有 Tauri 安装补丁契约, 不是未知文件替换。Helper、MCP、Gadget 及两项许可逐项哈希一致。Windows 安装列表 DisplayVersion=`1.9.0.12`, 内部比较版本和 EXE ProductVersion=`1.9.0+12`。
+- Explorer 启动实际安装程序, TokenElevation=false；通过真实窗口的“生成摘要”取得运行版本与五项身份并匹配包记录: sourceRevision=`2d3569bc9ee3e9c574967966437b78dd9bc3205d`, sourceFingerprint=`6c6e261eff381ad50a36ccfb067a3cd2514ffbe2855693a9d34342988df5d3b4`, sourceState=dirty/sourceCommit=null（仅原维护文档未提交）, payloadInputs=included, buildChannel=local。连接和音频读回均 ready。
+- 真实 Menu/返回/TV、连续语音及新 Agent 接管效果待用户复验；后一次只读 UIA 枚举得到零子控件, 不据此宣布界面状态通过或程序死机, 实际主进程仍可响应。G1/G2及双型号边界保持原状态；不把普通权限启动或蓝牙/音频 ready 当作全按键接管 passed。
