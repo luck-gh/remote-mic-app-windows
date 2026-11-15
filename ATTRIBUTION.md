@@ -1,5 +1,7 @@
 # 来源与归属
 
+2026-11-15 驻留组件升级的独立进程可行性验证参考 Frida官方[Gadget Script生命周期与on_change契约](https://frida.re/docs/gadget/#script)。项目现有锁定Gadget17.18.0的ignore配置不读取后续配置变化; 独立进程中的reload原子脚本替换用例只证明匿名init/dispose顺序, 不证明真实捕获组件可安全热换。直接覆盖重载候选实际失败, 未引入生产配置或新增依赖; 原故障和验证边界见[故障记录](Bugs/2026-10-03-foreground-input-regression.md#2026-11-15-修改范围与独立进程可行性验证)。
+
 本仓库是面向 Windows 的 Rust/Tauri 工程。
 
 本个人版基于 [GetSayAll/remote-mic-app-windows](https://github.com/GetSayAll/remote-mic-app-windows)，软件代码按 GPL-3.0-only 保留原作者版权与来源；个人修改者为 luck-gh。上游项目链接用于来源追溯，个人版下载与反馈入口由 README 维护。
