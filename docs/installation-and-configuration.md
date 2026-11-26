@@ -16,15 +16,14 @@
 ## 2. 下载并安装无线麦
 
 1. 打开[个人版 Releases](https://github.com/luck-gh/remote-mic-app-windows/releases)，选择需要的稳定版或标记为“Pre-release”的预览版。若尚无可用发行包，使用维护者提供的本地测试包，不用上游安装包替代。
-2. 下载 `SayAll-Windows-<版本号>-x64-setup.exe`。不要下载 `latest.json` 或 `.sig` 文件来手动安装。
-3. 建议同时下载 `SHA256SUMS.txt`，在安装包所在目录打开 PowerShell，执行：
+2. 手动安装只需下载 `SayAll-Windows-<版本号>-x64-setup.exe`。`latest.json` 供应用内更新使用。
+3. 如需核对下载完整性，在安装包所在目录打开 PowerShell，运行：
 
    ```powershell
    Get-FileHash -Algorithm SHA256 .\SayAll-Windows-*-x64-setup.exe
-   Get-Content .\SHA256SUMS.txt
    ```
 
-   两处安装包哈希值应完全相同。若不同，删除安装包并停止安装。
+   将结果与 Release 正文或附件详情里的安装包 SHA-256 对照。摘要不一致时停止安装。
 4. 双击安装包，选择语言并按提示完成安装。安装位置由安装器管理，不需要手动选择。
 5. 按安装时选择的快捷方式，从开始菜单或桌面启动“无线麦”。
 

@@ -9,7 +9,7 @@
 - 发布源必须是已合入远端 `main` 的精确 SHA；开始前 `git fetch origin main`，发布 worktree 必须干净且与该 SHA 一致。
 - `main` 不直接开发或 push，版本、Release Notes、脚本和文档均通过普通 PR 合入。
 - Preview 的 CI 未签名 NSIS artifact 只能用于受限验收，不能宣称为公开可信安装包；公开分发需同时满足 Authenticode（若流程已启用）、updater minisign 签名、SHA-256 和来源元数据要求。
-- Tag、Release Notes、资产和 `latest.json` 建立后视为不可变。内容变化回到普通 PR，使用新版本/Build；不得覆盖旧 Tag 或资产。
+- Tag、安装器、更新清单和已公开的附件不可覆盖。发布说明在草稿阶段补齐，公开后冻结。公开内容需要修订时，回到普通 PR，使用新版本/Build。
 
 ## 双载荷：x64 + arm64（2026-10-07 issue206）
 
@@ -93,16 +93,20 @@
 4. 运行 `scripts/verify-windows-bundle.ps1`，确认 NSIS、应用和元数据状态；未签名候选明确标记为 `unsigned-ci-preview-not-for-public-release`。
 5. 在 Windows 主机按 [Testing/WindowsReleaseBranchLifecycle.md](Testing/WindowsReleaseBranchLifecycle.md) 完成安装、升级、卸载、启动和设置保留验证；按 [Testing/WindowsRC003Preview.md](Testing/WindowsRC003Preview.md) 执行硬件与第三方语音边界。
 6. PR 描述分别列出自动化、安装器、真实 RC001/RC003、VB-CABLE 和第三方输入法结果；不可把 Mac 构建或模拟器结果写成 Windows 真机通过。
+7. 标签工作流生成预览草稿，正文首屏提供 Windows 安装包的直达链接。公开前根据发布 PR，补齐相对上一个公开版本的主要变化、适用范围、升级限制和本版验证结果。
+8. 取得本次公开预览授权并通过上述核对后，以 Pre-release 发布。默认稳定更新入口继续指向现有稳定版。预览草稿仅向具备权限的维护者开放。
 
 ## Stable 与 updater 资产
 
 - 个人版仅从 `luck-gh/remote-mic-app-windows` 发布并更新；生成器拒绝其它 Repository，workflow 必须显式传入 `GITHUB_REPOSITORY`。稳定/预览检查与待安装资产均不回退上游；生产构建不接受开发端点覆盖。
+- 稳定发布须获得对应授权，从已合入远端 `main` 的提交构建，满足正式签名要求并验证受支持的升级路径。公开为稳定版后，回读默认稳定清单与可匿名下载的安装器，核对版本、签名和摘要。
 - 个人 updater 公钥与上游隔离；本机私钥位于仓库外 `%LOCALAPPDATA%\SayAll\personal-updater.key`。用户须自行安全备份，丢失将阻断已装个人客户端后续更新；不得将它提交或输出。2026-10-15 用户仅授权本机生成和公钥替换，尚未配置远端Secret或发布。本地打包使用个人密钥的实际口令（未加密密钥为空），不再使用旧测试固定口令。
 - 发布前 `scripts/verify-updater-signing.ps1 -Installer <精确包>` 必须用配置公钥对实际包与 `.sig` 验签；不匹配直接停止，不能因为 Secret 非空或 Tauri 产出了 `.sig` 就上传。
 
 - Tag Release workflow 必须从精确 Tag/Commit 构建，缺少 `TAURI_SIGNING_PRIVATE_KEY` 时 fail closed；当前产物为无 Authenticode 代码签名的 Draft / Pre-release，仅供受限测试，不自动公开，公开正式分发的代码签名门禁尚需完成。CI 始终使用临时 updater key，只允许测试构建，当前 CI 工作流不读取正式签名 Secret。Tag 工作流的构建与验签共用 `SAYALL_BUNDLE_BUILD=1`，确保构建身份包含本轮载荷回执及实际字节。
-- `scripts/generate-updater-manifest.ps1` 生成 `latest.json`、ASCII 安装器名、`.sig` 和 `SHA256SUMS.txt`。清单中的签名是 `.sig` 内容，不是路径；下载地址必须为 HTTPS。
-- 发布前打印并核对待上传资产清单、大小和 SHA-256；删除或覆盖远端资产不属于正常重试流程。
+- GitHub Release 只挂载 ASCII 文件名的 NSIS 安装器与 `latest.json`。手动安装用户只下载 `.exe`。`scripts/generate-updater-manifest.ps1` 将构建验签使用的 `.sig` 内容写入清单，客户端从清单取得 HTTPS 下载地址和签名。
+- 创建草稿前打印两件附件的名称、大小和 SHA-256。发布正文记录安装器 SHA-256，核对 GitHub 附件的大小和摘要与构建结果一致。普通 CI 的预览构建回执仍包含独立的 `SHA256SUMS.txt`。
+- 标签按其指向的提交运行工作流。后续从 `main` 发布时，Tag 指向已包含本节发布规则及对应工作流的提交。
 - 应用内更新退出前必须显式断开 BLE、释放键态和停止音频；不能依赖 `Drop`，也不能强杀正在连接的旧进程。
 
 ## 失败与重试
