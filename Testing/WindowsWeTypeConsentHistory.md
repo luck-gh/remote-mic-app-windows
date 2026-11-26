@@ -1,5 +1,39 @@
 # WeType ConsentStore 历史记录修复测试手册
 
+> 2026-11-26 当前个人版已取消持键会话内的输入法切换与快捷键重放。下文 PR #55 包、
+> `wetype_check` / `chord_retry` 日志和 2026-09 真机结果保留为历史证据，不可当作当前候选已验。
+> 当前候选的核心判据是：一次会话只有一次 `chord_press result=ok`，终止路径只有一次
+> `chord_release result=ok`；持键期间可以有 `voice_verify` 观测，但不得出现 profile cycle、
+> release/repress 或旧会话迟到边沿。当前 x64 本地候选（个人版 `1.9.0+12`，NSIS SHA-256
+> `92f52e4a…d62289`）已完成自动化、编译、嵌入、签名、bundle 静态校验、正常退出、覆盖安装及
+> Explorer 普通权限启动；配置哈希保持。该包随后在 RC003 上实测持续按住 15.045 秒和
+> 21.571 秒，期间均无和弦重发。该结果适用于此旧包。
+>
+> 接入 [上游 WASAPI 录音会话观测](https://github.com/GetSayAll/remote-mic-app-windows/pull/426)
+> 后，按原持续按住及闲置场景复测。对照同一 session 的 `voice_verify`，期望微信输入法在
+> 旧判据缺失时仍可显示 `capture=active verdict=reacted`。录音会话枚举不完整时，
+> `capture=unavailable` 在无其他正面证据时应显示 `verdict=unknown`。如候选执行会话后
+> 恢复，查看 `voice_heal phase=recheck`，确认迟到 Active 或观测不可用会阻止恢复。验收以
+> 一次配对边沿及实际听写持续到松手为准，不记录音频、进程路径或端点身份。
+
+### 2026-11-26 WASAPI 移植候选
+
+- 本地 x64 个人版 `1.9.0.12`，基础提交 `fb5d0ae9`，构建源码指纹
+  `47b4faaad935face750c3a0399f0f1e9222c1c738ba8ac79add114ce53947ef6`（dirty）。
+  NSIS SHA-256 `200c9ea510184c8f16418bcbabca18c92e591ee48969cc83719a1df14ecb52f4`。
+- `cargo test --locked -p sayall-windows --lib` 分别按 `wetype_revive`、`ble::tests`、
+  `ime::` 筛选通过 17、39、46 项（两项 ignored）。工作区 fmt/check、runtime-simulation
+  编译检查、个人安装与覆盖安装规则 13 项测试通过。
+- 前端嵌入、更新签名、x64 bundle 静态检查通过。旧主程序和 key host 正常退出，管理员
+  覆盖原安装目录后核对五件载荷和当前源码指纹。新主程序和 key host 由 Explorer 在同一
+  用户会话以普通权限启动，Tauri setup 和单实例日志确认，`settings.json` 与
+  `onboarding.json` 安装前、安装后及启动后的哈希一致。`button-mappings.json` 启动后
+  SHA-256 摘要 `59abdf1a…c376` 与前一候选现场摘要一致，最后写入时间早于本轮安装。
+  本轮安装前未采集该文件的完整哈希。
+- 本包实际听写、冷态首用、快速与连续会话及 RC001/RC003 新包端到端验收为 `deferred`。
+  [上游 RC001 复测](https://github.com/GetSayAll/remote-mic-app-windows/pull/427)与上述
+  旧个人版 RC003 结果各自对应原包。
+
 ## 测试对象
 
 - 修复 PR：[#55](https://github.com/GetSayAll/remote-mic-app-windows/pull/55)

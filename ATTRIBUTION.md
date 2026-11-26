@@ -387,6 +387,14 @@
 
 ## WeType 热键休眠自动恢复调研来源（2026-09-05，热键休眠专项 v2）
 
+2026-11-26 选择性吸收 GetSayAll 官方上游 qeeing 的
+[`aef3f7180f620ff79917aafb3cd668426f8042a2`](https://github.com/GetSayAll/remote-mic-app-windows/commit/aef3f7180f620ff79917aafb3cd668426f8042a2)（[#426](https://github.com/GetSayAll/remote-mic-app-windows/pull/426)）
+中 `crates/sayall-windows/src/wetype_revive.rs` 的 WASAPI 录音会话观测、稳定采样点及合并裁决。
+使用现有 wasapi 依赖，通过 [Windows 音频会话枚举](https://learn.microsoft.com/windows/win32/api/audiopolicy/nn-audiopolicy-iaudiosessionenumerator)
+采样活动录音端点。任一 Active 正面观测有效，枚举不完整则无负面结论。个人版保留单次 DOWN/UP
+及会话结束后才能恢复的约束。上游真机复测归 [#427](https://github.com/GetSayAll/remote-mic-app-windows/pull/427)，
+个人版用例见 [WeType 测试手册](Testing/WindowsWeTypeConsentHistory.md)。
+
 场景：WeType 2.1.3.18 后台约 40 分钟后"TSF 存活但全局键盘钩子休眠"——和弦注入 LWin 穿透、无 0xFC、ConsentStore 时间戳不动；打开 WeType 任意自身界面立即复活（kb-live 会话 23-26 真机取证）。跨进程 `SetProcessInformation(ProcessPowerThrottling)` 解除节流**真机证伪**（对其他进程 E_INVALIDARG 0x80070057，wetype_service 打开即 0x80070005，15:04 live12 取证），该路线已从 `wetype_revive.rs` 移除。v2 已实现（`ble.rs` + `ime.rs`）：检测（注入后 700ms ConsentStore 时间戳未动）→ TSF 配置切换唤醒（`cycle_wetype_profile`：激活微软拼音 80ms 后切回，公开 API）→ 300ms 后经 `WorkerMessage::RetryVoiceChord` 在工作线程释放旧和弦并重注入 → 二次检测未响应才提示人工。关键参考与实测：
 
 - **TSF profile 管理 API**（`ITfInputProcessorProfileMgr::ActivateProfile`/`EnumProfiles`，`TF_IPPMF_FORSESSION` 会话级激活）：微软官方文档 `learn.microsoft.com/windows/win32/api/msctf/nf-msctf-itfinputprocessorprofilemgr-activateprofile`。选择理由：切换配置会向所有 TSF 感知进程广播激活事件，是唯一能从外部触达 WeType 的公开 API 路径。

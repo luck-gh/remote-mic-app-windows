@@ -1,7 +1,3 @@
-use crate::wetype_revive::{
-    reaction_verdict, response_since, wetype_mic_observation, MicObservation, MicResponse,
-    WetypeReaction,
-};
 use crate::{
     audio::{AudioBeginGuard, AudioRuntime},
     disconnect_loop::{DisconnectCause, DisconnectLoopDetector, LoopReport},
@@ -653,21 +649,6 @@ pub(crate) enum WorkerMessage {
         connection_generation: u64,
         reading: crate::battery::BatteryReading,
     },
-    /// 微信输入法热键休眠自动重试（wetype_check 线程检测到未响应并完成
-    /// 配置切换唤醒后请求）：释放旧和弦边沿并重注入——在工作线程内
-    /// 串行执行，与会话结束路径无竞态。`attempt` 为本次重注入对应的
-    /// 检测轮次（1 起）；`epoch` 为 armed 时的语音会话纪元（防跨会话
-    /// 误伤，见 worker_loop 中 voice_session_epoch 注释）。
-    ///
-    /// `marker_baseline` 是**本会话**按下前的存活标记计数（不是本轮新取），
-    /// 使"微信输入法曾响应过本次按住"的正面证据在整个按住期间持续生效；
-    /// 本轮新的开麦基线在重注入前重新取样。
-    RetryVoiceChord {
-        attempt: u32,
-        epoch: u64,
-        baseline: Option<MicObservation>,
-        marker_baseline: u64,
-    },
     Control {
         connection_generation: u64,
         begin_guard: Option<AudioBeginGuard>,
@@ -714,6 +695,35 @@ fn attempt_probe(
     }
 }
 
+#[derive(Default)]
+struct VoiceHotkeyHold {
+    chord: Option<KeyChord>,
+}
+
+impl VoiceHotkeyHold {
+    fn press_with<R, E>(
+        &mut self,
+        chord: KeyChord,
+        press: impl FnOnce(&KeyChord) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let result = press(&chord)?;
+        self.chord = Some(chord);
+        Ok(result)
+    }
+
+    fn release_with<R, E>(
+        &mut self,
+        release: impl FnOnce(&KeyChord) -> Result<R, E>,
+    ) -> Option<Result<R, E>> {
+        self.chord.take().map(|chord| release(&chord))
+    }
+
+    #[cfg(test)]
+    fn is_held(&self) -> bool {
+        self.chord.is_some()
+    }
+}
+
 fn worker_loop(
     receiver: Receiver<WorkerMessage>,
     sender: Sender<WorkerMessage>,
@@ -757,7 +767,7 @@ fn worker_loop(
     let mut preferred_device_id: Option<String> = None;
     let mut system_suspended = false;
     let mut backoff = ReconnectBackoff::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
-    let mut held_hotkey: Option<KeyChord> = None;
+    let mut held_hotkey = VoiceHotkeyHold::default();
     let mut pending_microphone_close: Option<(u64, u16, u8)> = None;
     let mut extend_deadline: Option<Instant> = None;
     // 回眸：MIC_OPEN 先到就提前取基线；RC003 直接 0x04 时在 StreamStarted 兜底。
@@ -770,13 +780,6 @@ fn worker_loop(
     // 保证"首条"日志按 episode 计，不被上一轮的大数字吞掉）。
     let mut last_attempt_finished: Option<Instant> = None;
     let mut suppressed_promotions: u64 = 0;
-    // 语音会话纪元：每次会话开始（StreamStarted）+1。wetype_check 重试
-    // 阶梯（最长 ~7.4s）用它区分"本会话仍在流式"与"旧会话已结束、
-    // 新会话已开始"——仅看全局 voice_state 会把新会话误判为旧会话，
-    // 导致旧阶梯释放并重按新会话（可能已成功开麦）的和弦（2026-09-05
-    // 17:35 实测：用户失败后 0.7s 即再按）。阶梯线程在关键点核对
-    // armed 时的纪元，不符即退出，让新会话自带的新一轮检测接管。
-    let voice_session_epoch: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     // 资源探针（2026-09-16）：判定 0x80070008 成因的必要证据，见
     // resource_probe 模块头部的判读方法。
     let mut resource_probe = crate::resource_probe::ResourceProbe::default();
@@ -1153,82 +1156,6 @@ fn worker_loop(
                     false,
                 );
             }
-            WorkerMessage::RetryVoiceChord {
-                attempt,
-                epoch,
-                baseline,
-                marker_baseline,
-            } => {
-                // 微信输入法热键休眠的自动重试（同一次按住内完成）：
-                // 释放旧和弦边沿 → 重注入。在工作线程内串行执行，与
-                // StreamStopped/中止路径无竞态；仅在会话仍在流式且纪元
-                // 未变（未被新会话替换）时执行。
-                // Validate before taking ownership: a stale retry must never
-                // discard the chord needed to release the current session.
-                if pipeline.state() != VoiceSessionState::Streaming
-                    || voice_session_epoch.load(Ordering::SeqCst) != epoch
-                {
-                    gatt_note(format!("chord_retry skipped reason=stale epoch={epoch}"));
-                    continue;
-                }
-                let (verdict, evidence, mic) = wetype_reaction(baseline, marker_baseline);
-                if verdict != WetypeReaction::NotReacted {
-                    gatt_note(format!(
-                        "chord_retry skipped reason={} evidence={evidence} mic={} attempt={attempt} epoch={epoch}",
-                        if verdict == WetypeReaction::Reacted {
-                            "wetype_alive"
-                        } else {
-                            "observation_unavailable"
-                        },
-                        mic.as_log_str()
-                    ));
-                    continue;
-                }
-                let retry_mic_baseline = wetype_mic_observation();
-                let chord_configured = lock(&voice_hold_hotkey).clone();
-                if let (Some(chord), Some(old)) = (chord_configured, held_hotkey.as_ref()) {
-                    if voice_session_ime_tool(*lock(&voice_input_tool), &chord)
-                        != Some(VoiceInputTool::Wechat)
-                        || !is_wetype_voice_hotkey(&chord)
-                    {
-                        gatt_note(format!(
-                            "chord_retry skipped reason=hotkey_not_wetype epoch={epoch}"
-                        ));
-                        continue;
-                    }
-                    if send_input.release(old).is_err() {
-                        gatt_note(format!(
-                            "chord_retry result=err reason=release_failed epoch={epoch}"
-                        ));
-                        continue;
-                    }
-                    held_hotkey = None;
-                    match send_input.press(&chord) {
-                        Ok(_) => {
-                            gatt_note(format!(
-                                "chord_retry result=ok attempt={attempt} epoch={epoch}"
-                            ));
-                            held_hotkey = Some(chord);
-                            spawn_wetype_check(
-                                &state,
-                                sender.clone(),
-                                attempt,
-                                epoch,
-                                &voice_session_epoch,
-                                retry_mic_baseline,
-                                marker_baseline,
-                            );
-                        }
-                        Err(_) => {
-                            gatt_note(format!(
-                                "chord_retry result=err attempt={attempt} epoch={epoch} error_domain=send_input error_code=retry_failed reason=injection_failed retryable=true"
-                            ));
-                        }
-                    }
-                } else {
-                    gatt_note("chord_retry skipped reason=no_chord".to_owned());
-                }
-            }
             WorkerMessage::Control {
                 connection_generation: message_generation,
                 begin_guard,
@@ -1255,8 +1182,6 @@ fn worker_loop(
                         &mut extend_deadline,
                         &mut last_voice_audio_at,
                         &mut voice_stream_started_at,
-                        &sender,
-                        &voice_session_epoch,
                         begin_guard,
                         stamp,
                         &transcript_capture,
@@ -1561,7 +1486,6 @@ fn worker_loop(
             }
             WorkerMessage::CancelVoiceTest { reply } => {
                 extend_deadline = None;
-                voice_session_epoch.fetch_add(1, Ordering::SeqCst);
                 crate::ime::cancel_recovery();
                 crate::scene_control::clear_voice_button("onboarding_cancelled");
                 release_voice_hold_hotkey(&send_input, &mut held_hotkey);
@@ -1706,7 +1630,7 @@ fn attempt_connection(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    held_hotkey: &mut VoiceHotkeyHold,
     session: &mut Option<BleSession>,
     pipeline: &mut AtvvVoicePipeline,
     connection_generation: &mut u64,
@@ -1880,7 +1804,7 @@ fn invalidate_connection(
     pipeline: &mut AtvvVoicePipeline,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    held_hotkey: &mut VoiceHotkeyHold,
     connection_generation: &mut u64,
     usage: &UsageCounters,
 ) -> Result<(), PlatformError> {
@@ -2249,14 +2173,12 @@ fn handle_control(
     send_input: &Arc<SendInputRuntime>,
     voice_hold_hotkey: &Mutex<Option<KeyChord>>,
     voice_input_tool: &Mutex<Option<VoiceInputTool>>,
-    held_hotkey: &mut Option<KeyChord>,
+    held_hotkey: &mut VoiceHotkeyHold,
     usage: &UsageCounters,
     active_voice_samples: &mut u64,
     extend_deadline: &mut Option<Instant>,
     last_voice_audio_at: &mut Option<Instant>,
     voice_stream_started_at: &mut Option<Instant>,
-    sender: &Sender<WorkerMessage>,
-    voice_session_epoch: &Arc<AtomicU64>,
     begin_guard: Option<AudioBeginGuard>,
     stamp: CallbackStamp,
     transcript_capture: &crate::transcript_capture::TranscriptCaptureRuntime,
@@ -2441,7 +2363,6 @@ fn handle_control(
             *last_voice_audio_at = Some(Instant::now());
             // 语音会话纪元 +1：本轮 wetype_check 阶梯以此为 armed 纪元，
             // 后续新会话会使旧阶梯的核对失效（防跨会话误伤）。
-            let epoch = voice_session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
             *active_voice_samples = 0;
             *voice_stream_started_at = Some(Instant::now());
             if let Some(session) = session {
@@ -2510,27 +2431,25 @@ fn handle_control(
             // 按住说话快捷键（参考 ZSTDJan/Voice_VibeCoding）：先注入快捷键
             // DOWN；WASAPI 准备已完成，注入失败直接中止并统一释放。
             let attempt_tool = *lock(voice_input_tool);
-            let verify_marker = crate::ime::mic_marker_for(attempt_tool);
+            let hold_chord = lock(voice_hold_hotkey).clone();
+            let session_ime_tool = hold_chord
+                .as_ref()
+                .and_then(|chord| voice_session_ime_tool(attempt_tool, chord));
+            let verify_tool = attempt_tool.or(session_ime_tool);
+            let verify_marker = crate::ime::mic_marker_for(verify_tool);
             let verify_baseline = verify_marker.and_then(crate::wetype_revive::mic_observation_for);
             let f5_baseline = crate::key_suppressor::f5_snapshot();
             let marker_baseline = crate::key_suppressor::wetype_marker_count();
             let recovery_ticket = crate::ime::RecoveryTicket::capture();
             gatt_note(format!("voice_attempt session={session_id} tool={} path={} synth=off synth_confirmed=false fg_self={} since_tool_select_ms={} since_hotkey_change_ms={} since_ime_switch_ms={}", crate::ime::tool_label(attempt_tool), if lock(voice_hold_hotkey).is_some() { "send_input" } else { "none" }, crate::ime::foreground_is_self(), crate::ime::age_label(crate::ime::tool_select_age_ms()), crate::ime::age_label(crate::ime::hotkey_change_age_ms()), crate::ime::age_label(crate::ime::last_switch_age_ms())));
-            if let Some(chord) = lock(voice_hold_hotkey).clone() {
-                let configured_tool = *lock(voice_input_tool);
-                let session_ime_tool = voice_session_ime_tool(configured_tool, &chord);
-                let wetype_hotkey = session_ime_tool == Some(VoiceInputTool::Wechat)
-                    && is_wetype_voice_hotkey(&chord);
+            if let Some(chord) = hold_chord {
                 gatt_note(format!(
-                    "voice_input_tool phase=session_target configured={} target={} wetype_recovery={wetype_hotkey}",
-                    configured_tool.is_some(),
+                    "voice_input_tool phase=session_target configured={} target={} wetype_recovery=false",
+                    attempt_tool.is_some(),
                     session_ime_tool
                         .and_then(crate::ime::ime_target_for)
                         .map_or("none", |target| target.label)
                 ));
-                let mic_baseline = wetype_hotkey.then(wetype_mic_observation).flatten();
-                // 存活标记基线已在两条注入路径之前统一取样（见上方 marker_baseline，
-                // 只会更早、更不会把本次自己的标记算成"基线内"）。
                 // 会话级激活目标输入法：语音热键只在自身为当前会话活动输入法
                 // 时生效（2026-09-05 持锁实验，evidence/p）；激活后零延迟注入
                 // 3/3 触发，不增加按键延迟。目标按**用户选的工具**决定
@@ -2564,7 +2483,7 @@ fn handle_control(
                     );
                     return;
                 }
-                if let Err(error) = send_input.press(&chord) {
+                if let Err(error) = held_hotkey.press_with(chord, |chord| send_input.press(chord)) {
                     gatt_note(format!(
                         "chord_press result=err session={session_id} error_domain=send_input error_code=press_failed reason=injection_failed retryable=true"
                     ));
@@ -2590,7 +2509,6 @@ fn handle_control(
                 if begin_guard.as_ref().is_some_and(AudioBeginGuard::cancelled)
                     || route_permit.as_ref().is_some_and(|p| p.cancelled())
                 {
-                    *held_hotkey = Some(chord);
                     release_voice_hold_hotkey(send_input, held_hotkey);
                     abort_voice_session(
                         session,
@@ -2612,21 +2530,6 @@ fn handle_control(
                     "chord_press result=ok session={session_id} gap_ms={}",
                     crate::send_input::HOLD_CHORD_EVENT_GAP.as_millis(),
                 ));
-                *held_hotkey = Some(chord);
-                if wetype_hotkey {
-                    // WeType 热键休眠检测与自动恢复（见 spawn_wetype_check）。
-                    // 纪元在 StreamStarted 顶部已递增并捕获（见上），连同引用
-                    // 传入，防旧阶梯跨会话误伤新会话的和弦。
-                    spawn_wetype_check(
-                        state,
-                        sender.clone(),
-                        0,
-                        epoch,
-                        voice_session_epoch,
-                        mic_baseline,
-                        marker_baseline,
-                    );
-                }
             } else {
                 // 功能点日志：会话开始但未配置按住说话快捷键（无注入环节）。
                 gatt_note(format!(
@@ -2663,7 +2566,7 @@ fn handle_control(
                     });
                 crate::wetype_revive::spawn_mic_verify(
                     u64::from(session_id),
-                    crate::ime::tool_label(attempt_tool),
+                    crate::ime::tool_label(verify_tool),
                     marker,
                     verify_baseline,
                     f5_baseline,
@@ -2765,7 +2668,7 @@ fn handle_audio(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    held_hotkey: &mut VoiceHotkeyHold,
     active_voice_samples: &mut u64,
     stamp: CallbackStamp,
     gain_db: &Mutex<f32>,
@@ -2894,7 +2797,7 @@ fn abort_voice_session(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    held_hotkey: &mut VoiceHotkeyHold,
     active_voice_samples: &mut u64,
     session_id: Option<u8>,
     error: String,
@@ -2935,15 +2838,14 @@ pub(crate) fn cancel_aborted_voice_capture(
     transcript_capture.cancel("voice_aborted");
 }
 
-fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut VoiceHotkeyHold) {
     // This helper is the existing common cleanup boundary for normal stop,
     // abort, disconnect, sleep and shutdown. The notification is idempotent.
     crate::ime::voice_ended();
     crate::scene_control::notify_voice_activity(false);
     crate::key_suppressor::set_session_active(false);
-    if let Some(chord) = held_hotkey.take() {
+    if let Some(result) = held_hotkey.release_with(|chord| send_input.release(chord)) {
         // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。
-        let result = send_input.release(&chord);
         gatt_note(format!(
             "chord_release result={} error_domain={} error_code={} reason={} retryable={}",
             if result.is_ok() { "ok" } else { "err" },
@@ -4271,185 +4173,6 @@ fn format_utc_timestamp(duration: std::time::Duration) -> String {
     )
 }
 
-/// WeType 热键休眠检测与同一次按住内的自动恢复（2026-09-05 实证闭环）：
-/// - 实证：WeType 可能"TSF 激活但热键钩子休眠"（LWin 穿透、无 0xFC、
-///   不开麦），打开其设置页立即复活；跨进程解除节流不可行
-///   （SetProcessInformation 对其他进程 E_INVALIDARG，15:04 真机）。
-/// - 检测：和弦注入后 ~700ms 读 ConsentStore 开麦时间戳验证 WeType 真的
-///   响应了本次语音（公开可观测判据）。
-/// - 恢复（重试阶梯，全部基于 2026-09-05 16:44-17:35 七次真实休眠发作
-///   的 kb-live.log/ConsentStore 持锁解码实测，非推测常量）：
-///   - 配置切换（ime::cycle_wetype_profile，公开 API）确实能复活钩子；
-///   - 复活延迟实测 ∈ (300ms, ~6s]，典型 1.3-2.3s（七次发作中用户在
-///     cycle 后 1.28/1.68/1.85/1.9/2.28s 的再按全部成功）；
-///   - cycle 后 +300ms 的重注入 7/7 失败（过早）——据此第一轮重试
-///     延迟取 2000ms，第二轮（再次 cycle 后）取 3000ms；
-///   - 每轮：检测未响应 → cycle → 等待 → 请求工作线程释放旧和弦并
-///     重注入（WorkerMessage::RetryVoiceChord{attempt}，串行无竞态）→
-///     下一轮检测；两轮重试都未响应才提示人工（打开微信输入法界面）。
-/// 全程落 gatt_note 日志（含 attempt 轮次）；检测线程尽力而为，绝不
-/// 阻塞语音会话。
-const WETYPE_CHECK_DELAY_MS: u64 = 700;
-/// 每轮重注入距上一轮 cycle 完成的等待。实测依据（2026-09-05 20:15-20:27
-/// 七次发作 + 16:44-17:35 七次，sayall-diag.log/kb-live 解码）：复活延迟
-/// 分布 1.4/1.45/2.24/3.2/3.4/5.3/>10.4s——[2,3] 两轮只覆盖前三种且实测
-/// 4 次重试 0 命中（用户总在重试前松开再按）；扩为 [2,3,5] 三轮覆盖除
-/// >10.4s 离群点外的全部观测值（按住约 13s 内完成整个阶梯）。
-const WETYPE_RETRY_SETTLE_MS: [u64; 3] = [2000, 3000, 5000];
-/// 最大重注入轮次（检测共 attempt 0..=3 四轮）。
-const WETYPE_RETRY_MAX_ATTEMPT: u32 = 3;
-
-/// 合并微信输入法"本次按住是否已被触发"的两个独立判据，返回
-/// （裁决，证据来源，开麦判据结果）。
-///
-/// 证据来源只用于日志归因：`marker` = 钩子层看到微信输入法自注入的存活标记
-/// （0xFC break key，与版本解耦）；`mic` = ConsentStore 开麦观测；`unavailable`
-/// = 观测不可用；`none` = 两个判据都确认未触发（可执行恢复阶梯）。
-///
-/// 第三个返回值**始终**记录开麦判据自身的结果：`evidence=marker mic=not_observed`
-/// 就是 issue #118 的盲判形态（微信输入法在录音但 ConsentStore 没写），
-/// 而 `evidence=marker mic=observed` 说明两条通道同时命中——修复是否承重，
-/// 靠这一个字段即可在复现窗口判定。
-///
-/// 背景（2026-09-23 issue #118）：微信输入法 2.1.4.6 起录音不再写 ConsentStore，
-/// 单靠开麦观测会把"其实已在录音"判成未响应，随后重放和弦拆掉进行中的会话。
-/// 存活标记是正面证据，出现即否决恢复；判据缺失时退化为原行为，不比现状更差。
-fn wetype_reaction(
-    baseline: Option<MicObservation>,
-    marker_baseline: u64,
-) -> (WetypeReaction, &'static str, MicResponse) {
-    let mic = response_since(baseline, wetype_mic_observation());
-    let marker_now = crate::key_suppressor::wetype_marker_count();
-    let verdict = reaction_verdict(mic, marker_baseline, marker_now);
-    let evidence = match verdict {
-        WetypeReaction::Reacted if marker_now > marker_baseline => "marker",
-        WetypeReaction::Reacted => "mic",
-        WetypeReaction::Unknown => "unavailable",
-        WetypeReaction::NotReacted => "none",
-    };
-    (verdict, evidence, mic)
-}
-
-fn spawn_wetype_check(
-    state: &Arc<Mutex<ConnectionSnapshot>>,
-    sender: Sender<WorkerMessage>,
-    attempt: u32,
-    epoch: u64,
-    epoch_ref: &Arc<AtomicU64>,
-    baseline: Option<MicObservation>,
-    marker_baseline: u64,
-) {
-    let state = Arc::clone(state);
-    let epoch_ref = Arc::clone(epoch_ref);
-    gatt_note(format!(
-        "wetype_check armed attempt={attempt} epoch={epoch} baseline_available={} marker_baseline={marker_baseline}",
-        baseline.is_some()
-    ));
-    std::thread::Builder::new()
-        .name("sayall-wetype-check".to_owned())
-        .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(WETYPE_CHECK_DELAY_MS));
-            let (still_streaming, same_session) = {
-                let snapshot = lock(&state);
-                (
-                    snapshot.voice_state == VoiceSessionState::Streaming,
-                    epoch_ref.load(Ordering::SeqCst) == epoch,
-                )
-            };
-            if !still_streaming || !same_session {
-                // 会话已结束或已被新会话替换：无需验证/唤醒（避免误判与
-                // 误伤——旧阶梯释放/重按新会话的和弦会打断其听写）。
-                gatt_note(if same_session {
-                    "wetype_check skipped reason=session_ended".to_owned()
-                } else {
-                    format!("wetype_check skipped reason=session_replaced epoch={epoch}")
-                });
-                return;
-            }
-            match wetype_reaction(baseline, marker_baseline) {
-                (WetypeReaction::Reacted, evidence, mic) => {
-                    // marker_extra 是目标程序自定义的魔数（WeType = "WTYP"），
-                    // 只用于真机归因，不含用户数据。mic= 记录开麦判据自身结果，
-                    // 用于区分"盲判"与"两条通道同时命中"。
-                    gatt_note(format!(
-                        "wetype_check reacted=true attempt={attempt} epoch={epoch} evidence={evidence} mic={} marker_extra={:#X}",
-                        mic.as_log_str(),
-                        crate::key_suppressor::wetype_marker_last_extra()
-                    ));
-                    return;
-                }
-                (WetypeReaction::Unknown, _, mic) => {
-                    gatt_note(format!(
-                        "wetype_check skipped reason=observation_unavailable attempt={attempt} epoch={epoch} mic={}",
-                        mic.as_log_str()
-                    ));
-                    return;
-                }
-                (WetypeReaction::NotReacted, _, _) => {}
-            }
-            if attempt >= WETYPE_RETRY_MAX_ATTEMPT {
-                // 最后一轮仍未响应：放弃自动恢复，提示人工（唯一兜底）。
-                gatt_note(format!(
-                    "wetype_check final=not_reacted attempts={WETYPE_RETRY_MAX_ATTEMPT}"
-                ));
-                lock(&state).last_error = Some(
-                    "微信输入法热键休眠，自动唤醒重试后仍未响应。可打开一次微信输入法的任意界面（如设置页）恢复其监听后重试"
-                        .to_owned(),
-                );
-                return;
-            }
-            gatt_note(format!(
-                "wetype_check reacted=false attempt={attempt} epoch={epoch} reviving"
-            ));
-            let revive = crate::ime::cycle_wetype_profile();
-            gatt_note(format!(
-                "wetype_revive result={} attempt={attempt} epoch={epoch}",
-                if revive.is_ok() { "ok" } else { "err" }
-            ));
-            std::thread::sleep(std::time::Duration::from_millis(
-                WETYPE_RETRY_SETTLE_MS[attempt as usize],
-            ));
-            let (still, same_session) = {
-                let snapshot = lock(&state);
-                (
-                    snapshot.voice_state == VoiceSessionState::Streaming,
-                    epoch_ref.load(Ordering::SeqCst) == epoch,
-                )
-            };
-            if !still || !same_session {
-                gatt_note(if same_session {
-                    "wetype_check skipped_retry reason=session_ended".to_owned()
-                } else {
-                    format!(
-                        "wetype_check skipped_retry reason=session_replaced epoch={epoch}"
-                    )
-                });
-                return;
-            }
-            let (verdict, evidence, mic) = wetype_reaction(baseline, marker_baseline);
-            if verdict != WetypeReaction::NotReacted {
-                gatt_note(format!(
-                    "wetype_check skipped_retry reason={} evidence={evidence} mic={} attempt={attempt} epoch={epoch}",
-                    if verdict == WetypeReaction::Reacted {
-                        "wetype_alive"
-                    } else {
-                        "observation_unavailable"
-                    },
-                    mic.as_log_str()
-                ));
-                return;
-            }
-            let next_attempt = attempt + 1;
-            let _ = sender.send(WorkerMessage::RetryVoiceChord {
-                attempt: next_attempt,
-                epoch,
-                baseline,
-                marker_baseline,
-            });
-        })
-        .ok();
-}
-
 fn invalidate_control_callback(channel: WorkerChannel, release_epoch: &AtomicU64) {
     if matches!(channel, WorkerChannel::Control) {
         release_epoch.fetch_add(1, Ordering::SeqCst);
@@ -4977,6 +4700,42 @@ impl Drop for WinRtApartment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_hotkey_hold_emits_no_mid_session_edges_and_releases_once() {
+        let chord = KeyChord {
+            keys: vec![KeyCode::LeftControl, KeyCode::LeftWindows],
+        };
+        let mut hold = VoiceHotkeyHold::default();
+        let mut edges = Vec::new();
+
+        hold.press_with(chord, |held| {
+            edges.extend(crate::send_input::plan_key_down(held).unwrap());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+        // 微信输入法的反应探测可能连续返回阴性；持键生命周期不再提供任何
+        // 会话中途的 release/repress 入口，只有终态收尾可以产生 UP。
+        assert!(hold.is_held());
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| !edge.is_key_up));
+
+        let released = hold
+            .release_with(|held| {
+                edges.extend(crate::send_input::plan_key_up(held).unwrap());
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(released, Ok(()));
+        assert!(!hold.is_held());
+        assert_eq!(edges.len(), 4);
+        assert!(edges[..2].iter().all(|edge| !edge.is_key_up));
+        assert!(edges[2..].iter().all(|edge| edge.is_key_up));
+
+        // 迟到的旧会话探测/终态清理不得再产生边沿。
+        assert!(hold.release_with(|_| Ok::<(), ()>(())).is_none());
+    }
 
     #[test]
     fn voice_input_tool_unset_preserves_default_wetype_session_activation() {

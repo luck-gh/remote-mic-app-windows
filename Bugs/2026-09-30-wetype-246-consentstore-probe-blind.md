@@ -2,6 +2,34 @@
 
 > 上游历史记录（2026-10-02 同步）：本文的“本机”、版本、用户反馈与 passed/failed 指官方上游原现场，来源为[固定上游文件](https://github.com/GetSayAll/remote-mic-app-windows/blob/c81308e011a757dc22d22f2861b687ef787d295e/Bugs/2026-09-30-wetype-246-consentstore-probe-blind.md)。本地融合候选的实际结果归 [TODO](../TODO.md) 与 [FEATURES](../docs/FEATURES.md)，不得把下文历史结果当成本轮验收。
 
+## 2026-11-26 当前个人版纠偏：持键会话内不再自动重放和弦
+
+当前个人版现场再次证明“输入法未响应”探测会在听写已经启动后产生假阴性，且会话中的
+`cycle_wetype_profile` 与 `RetryVoiceChord` 会主动释放、重按用户正在持有的语音和弦：
+
+- 本地 10:23 的五段会话均在开始后约 0.7 秒报 `not_reacted`，随后切换输入法配置并在约
+  3 秒处重放和弦；用户可见听写约 5 秒停止，而 ATVV 音频继续到遥控器停止通知。
+- 后续同机实测 session 62/63 的音频分别持续 12.015 秒和 24.765 秒、解码错误为 0；
+  session 63 仍在 +3.058 / +6.983 / +12.915 秒执行和弦重试，用户约 5 秒已看到微信听写停止。
+  这把“微信听写被应用重试打断”与“遥控器/音频只录 5 秒”分开了。
+
+因此当前契约不再尝试在**同一次持键会话中**根据间接探测修复输入法：
+
+- 会话开始时只执行一次目标输入法准备和一次快捷键 DOWN；正常停止、中止、断连、睡眠与
+  退出共用幂等收尾，只执行一次配对 UP。
+- 删除会话内 TSF profile cycle、`RetryVoiceChord` 及其迟到回调入口。`voice_verify` 继续提供
+  脱敏观测；自动恢复只允许在会话已结束、目标与 generation 仍有效时运行，不得拆当前持键。
+- 0xFC marker 计数仍用于诊断和会话后裁决；不再保留只供旧重试日志使用的 last-extra 状态。
+
+自动化结果：新增的真实边沿规划回归验证一次 DOWN、终态一次 UP、重复/迟到释放不再产生边沿；
+`ble::tests` 39/39、`wetype_revive::tests` 15/15（另 1 项 live ConsentStore ignored）、
+`cargo fmt --all -- --check`、runtime-simulation host check 与 `cargo check --workspace` 均为 `passed`。
+一次完整 `sayall-windows --lib` 尝试受到既有 named-pipe/key-host/voice-recording 环境用例失败及
+长时等待影响而中止，不能记为全套通过。随后在这版 RC003 实测两次持续按住
+15.045 秒和 21.571 秒，均无中途重发。当前 WASAPI 移植候选及其他场景的状态见 [TODO](../TODO.md)。
+
+下文“引入 marker 后仍保留会话内恢复阶梯”的描述是上游历史设计，不再代表当前个人版契约。
+
 - 对应报告：issue [#118](https://github.com/GetSayAll/remote-mic-app-windows/issues/118)（2026-09-23 社区报告，0.2.12）；
   社区修复尝试：PR [#119](https://github.com/GetSayAll/remote-mic-app-windows/pull/119)（未合入）。
 - 发现：2026-09-23；本仓处理：2026-09-30。

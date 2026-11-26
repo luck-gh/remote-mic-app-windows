@@ -98,7 +98,6 @@ mod windows_impl {
     /// 判据（2026-09-23 issue #118 起 ConsentStore 对 2.1.4.6 失明）。
     pub(crate) const VK_WETYPE_MARKER: u32 = 0xFC;
     static WETYPE_MARKER_COUNT: AtomicU64 = AtomicU64::new(0);
-    static WETYPE_MARKER_LAST_EXTRA: AtomicU64 = AtomicU64::new(0);
 
     /// 纯判定：该键盘事件是否为微信输入法的存活标记（单元测试覆盖）。
     /// 物理键盘不会产生 0xFC，因此只认注入形态。
@@ -110,11 +109,6 @@ mod windows_impl {
     /// 已响应本次和弦（判据由 `wetype_revive::reaction_verdict` 合并）。
     pub fn wetype_marker_count() -> u64 {
         WETYPE_MARKER_COUNT.load(Ordering::Relaxed)
-    }
-
-    /// 最后一次标记的 extra（诊断用；0 表示尚未观察到任何标记）。
-    pub fn wetype_marker_last_extra() -> u64 {
-        WETYPE_MARKER_LAST_EXTRA.load(Ordering::Relaxed)
     }
 
     /// F5 边沿判据的一次快照（2026-10-28 现场：`mic=not_observed` 的按下里
@@ -220,9 +214,8 @@ mod windows_impl {
     /// `None` = 无需裁决（异步事件）。
     pub(crate) fn handle_host_message(message: HostSuppressorMessage) -> Option<bool> {
         match message {
-            HostSuppressorMessage::WetypeMarker { extra } => {
+            HostSuppressorMessage::WetypeMarker { extra: _ } => {
                 WETYPE_MARKER_COUNT.fetch_add(1, Ordering::Relaxed);
-                WETYPE_MARKER_LAST_EXTRA.store(extra, Ordering::Relaxed);
                 None
             }
             HostSuppressorMessage::F5Up => {
@@ -364,7 +357,7 @@ pub use windows_impl::{
 };
 
 #[cfg(windows)]
-pub use windows_impl::{wetype_marker_count, wetype_marker_last_extra};
+pub use windows_impl::wetype_marker_count;
 
 #[cfg(windows)]
 pub use windows_impl::f5_key_down_in_os;

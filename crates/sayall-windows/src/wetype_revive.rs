@@ -1,10 +1,9 @@
-//! Observe WeType microphone use through the public Windows ConsentStore.
-//! Updates leave historical executable entries behind; enumeration order is
-//! unrelated to the version that is currently recording.
+//! Observe input tool microphone use through Windows ConsentStore and WASAPI.
 
 use crate::ConnectionSnapshot;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use wasapi::{Device, DeviceEnumerator, Direction, SessionState};
 use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, HWND};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
@@ -93,24 +92,100 @@ pub fn capture_mic_verdict(baseline: Option<u64>) -> &'static str {
     }
 }
 
-/// 微信输入法"本次按住是否真的被触发"的合并裁决。
-///
-/// 两个**相互独立**的证据源：
-/// - ConsentStore 开麦观测（历史判据，见本模块顶部说明）；
-/// - 钩子层观测到的微信输入法自注入标记（`0xFC` break key，extra="WTYP"）：
-///   其钩子存活时吞掉和弦的 LWin 边沿并注入自己的标记边沿对，休眠时无标记
-///   （2026-09-05 kb-live 实测，与开麦时间戳 100% 交叉一致，见 ATTRIBUTION.md）。
-///
-/// 2026-09-23 社区报告（issue #118 / PR #119）：微信输入法 2.1.4.6 起录音不再
-/// 写 ConsentStore，单靠开麦观测会把"其实已在录音"判成未响应，随后重放和弦
-/// 拆掉进行中的会话（长按约 2.9s 即断）。标记是**正面存活证据**，一旦在本次
-/// 按住期间出现即否决一切破坏性恢复动作；判据缺失时退化为原行为（只减不增，
-/// 绝不比现状更差）。
+/// 微信输入法 3.0.3.x 录音时可能没有 ConsentStore 或钩子标记。用录音端点
+/// 上的 WASAPI 会话补充观测，仅在观察线程查询会话状态和进程归属。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureEvidence {
+    Active,
+    Inactive,
+    Unavailable,
+    NotApplicable,
+}
+
+impl CaptureEvidence {
+    fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+            Self::Unavailable => "unavailable",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+fn is_wetype_process_image(path: &str) -> bool {
+    let normalized = path.to_ascii_lowercase().replace('/', "\\");
+    normalized.contains("\\wetype\\")
+        || normalized
+            .rsplit('\\')
+            .next()
+            .is_some_and(|name| name.starts_with("wetype"))
+}
+
+// 任一正面观测有效；只有全部查询成功才允许使用负面观测。
+fn summarize_capture(matches: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut complete = true;
+    for matched in matches {
+        match matched {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => complete = false,
+        }
+    }
+    complete.then_some(false)
+}
+
+fn device_has_wetype_capture(device: &Device) -> Option<bool> {
+    let manager = device.get_iaudiosessionmanager().ok()?;
+    let sessions = manager.get_audiosessionenumerator().ok()?;
+    let count = sessions.get_count().ok()?;
+    summarize_capture((0..count).map(|index| {
+        let session = sessions.get_session(index).ok()?;
+        if session.get_state().ok()? != SessionState::Active {
+            return Some(false);
+        }
+        let pid = session.get_process_id().ok()?;
+        if pid == 0 {
+            return Some(false);
+        }
+        crate::app_launcher::process_image_path(pid).map(|path| is_wetype_process_image(&path))
+    }))
+}
+
+fn query_capture_devices() -> Option<bool> {
+    let enumerator = DeviceEnumerator::new().ok()?;
+    let devices = enumerator.get_device_collection(&Direction::Capture).ok()?;
+    let count = devices.get_nbr_devices().ok()?;
+    if count == 0 {
+        return None;
+    }
+    summarize_capture((0..count).map(|index| {
+        let device = devices.get_device_at_index(index).ok()?;
+        device_has_wetype_capture(&device)
+    }))
+}
+
+fn capture_for_marker(marker: &str) -> CaptureEvidence {
+    if marker != "wetype" {
+        return CaptureEvidence::NotApplicable;
+    }
+    if wasapi::initialize_mta().is_err() {
+        return CaptureEvidence::Unavailable;
+    }
+    let observation = query_capture_devices();
+    wasapi::deinitialize();
+    match observation {
+        Some(true) => CaptureEvidence::Active,
+        Some(false) => CaptureEvidence::Inactive,
+        None => CaptureEvidence::Unavailable,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WetypeReaction {
     /// 已有正面证据证明本次按住触发了微信输入法。
     Reacted,
-    /// 两个证据源都确认未触发：此时恢复阶梯（配置切换 + 重放和弦）仍可执行。
+    /// 观测支持在会话结束后考虑恢复。
     NotReacted,
     /// 观测不可用，调用方不得据此做任何推断。
     Unknown,
@@ -125,22 +200,26 @@ fn reaction_log_str(reaction: WetypeReaction) -> &'static str {
     }
 }
 
-/// 合并裁决：标记证据优先于开麦观测（正面证据否决误判）。
-pub(crate) fn reaction_verdict(
+/// 任一正面证据否决恢复。微信输入法只在稳定采样点接受录音会话负面证据。
+fn reaction_verdict(
     mic: MicResponse,
     marker_baseline: u64,
     marker_now: u64,
+    capture: CaptureEvidence,
+    capture_settled: bool,
 ) -> WetypeReaction {
-    if marker_now > marker_baseline {
-        // 微信输入法自注入标记只可能来自它自己（0xFC break key + extra="WTYP"）：
-        // 出现即证明其钩子活着并已消费本次和弦，任何重放都是破坏性的。
+    if marker_now > marker_baseline
+        || mic == MicResponse::Observed
+        || capture == CaptureEvidence::Active
+    {
         return WetypeReaction::Reacted;
     }
-    match mic {
-        MicResponse::Observed => WetypeReaction::Reacted,
-        MicResponse::NotObserved => WetypeReaction::NotReacted,
-        MicResponse::Unknown => WetypeReaction::Unknown,
+    if (capture == CaptureEvidence::Inactive && capture_settled)
+        || (capture == CaptureEvidence::NotApplicable && mic == MicResponse::NotObserved)
+    {
+        return WetypeReaction::NotReacted;
     }
+    WetypeReaction::Unknown
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -416,14 +495,16 @@ pub(crate) fn spawn_mic_verify(
     marker_baseline: u64,
     heal: Option<ImeHealContext>,
 ) {
-    const SAMPLES_MS: [u64; 2] = [800, 2500];
+    // 沿用上游的稳定采样点（其真机约 1.02 秒首次观测到 Active）。
+    const CAPTURE_SETTLE_MS: u64 = 2500;
+    const SAMPLES_MS: [u64; 2] = [800, CAPTURE_SETTLE_MS];
     let observation_epoch = crate::ime::recovery_epoch();
     let _ = std::thread::Builder::new()
         .name("sayall-mic-verify".to_owned())
         .spawn(move || {
             let started = std::time::Instant::now();
             let mut reaction = WetypeReaction::Unknown;
-            let mut both_not_reacted = true;
+            let mut eligible = heal.is_some();
             for delay in SAMPLES_MS {
                 let elapsed = started.elapsed().as_millis() as u64;
                 if elapsed < delay {
@@ -434,17 +515,27 @@ pub(crate) fn spawn_mic_verify(
                     return;
                 }
                 let mic = response_since(baseline, mic_observation_for(marker));
+                let capture = capture_for_marker(marker);
+                let capture_settled = delay == CAPTURE_SETTLE_MS && crate::ime::voice_session_active();
                 reaction = reaction_verdict(
                     mic,
                     marker_baseline,
                     crate::key_suppressor::wetype_marker_count(),
+                    capture,
+                    capture_settled,
                 );
                 let f5 = crate::key_suppressor::f5_snapshot().delta_since(f5_baseline);
-                both_not_reacted &= reaction == WetypeReaction::NotReacted;
+                eligible &= match capture {
+                    CaptureEvidence::NotApplicable => reaction == WetypeReaction::NotReacted,
+                    CaptureEvidence::Inactive => reaction != WetypeReaction::Reacted,
+                    CaptureEvidence::Unavailable | CaptureEvidence::Active => false,
+                };
                 crate::ble::gatt_note(format!(
-                    "voice_verify session={session} tool={tool} marker={marker} at_ms={} mic={} verdict={} f5_edges={} f5_leaked={} f5_key_down={}",
+                    "voice_verify session={session} tool={tool} marker={marker} at_ms={} mic={} capture={} capture_settled={} verdict={} f5_edges={} f5_leaked={} f5_key_down={}",
                     started.elapsed().as_millis(),
                     mic.as_log_str(),
+                    capture.as_log_str(),
+                    capture_settled,
                     reaction_log_str(reaction),
                     f5.edges,
                     f5.leaked,
@@ -455,11 +546,16 @@ pub(crate) fn spawn_mic_verify(
                     },
                 ));
             }
+            if !crate::ime::recovery_current(observation_epoch)
+                || heal.as_ref().is_some_and(|h| !h.ticket.current())
+            {
+                crate::ble::gatt_note(format!("voice_verify session={session} tool={tool} terminal_result=cancelled reason=stale_target_or_session"));
+                return;
+            }
             if reaction != WetypeReaction::NotReacted {
                 // 被唤起过（或观测不足以下结论）：救回计数归零，且绝不动作。
                 IME_HEAL_STEPS.store(0, Ordering::Relaxed);
             }
-            let eligible = heal.is_some() && both_not_reacted;
             if !should_heal(reaction, eligible) {
                 return;
             }
@@ -471,14 +567,34 @@ pub(crate) fn spawn_mic_verify(
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(350));
-            // 动作前再裁决一次：等会话结束的这段时间里恢复阶梯可能已经重放和弦
-            // 把语音拉起来了（用户一直按着）。迟到的正面证据必须否决动作，
-            // 否则会把刚起来的会话拆掉（10-20 教训）。
+            if !heal.ticket.can_recover() {
+                crate::ble::gatt_note(format!(
+                    "voice_heal session={session} tool={tool} action=focus_bounce skipped=recovery_target_unavailable"
+                ));
+                return;
+            }
+            // 动作前再裁决一次：等待会话结束期间可能出现迟到的正面证据。
+            // 当前会话内不再重放和弦；该复检只保护会话结束后的恢复动作，
+            // 防止旧观察污染已经变化的目标或后续会话。
+            let mic = response_since(baseline, mic_observation_for(marker));
+            let capture = capture_for_marker(marker);
             let recheck = reaction_verdict(
-                response_since(baseline, mic_observation_for(marker)),
+                mic,
                 marker_baseline,
                 crate::key_suppressor::wetype_marker_count(),
+                capture,
+                true,
             );
+            crate::ble::gatt_note(format!(
+                "voice_heal session={session} tool={tool} phase=recheck mic={} capture={} verdict={}",
+                mic.as_log_str(), capture.as_log_str(), reaction_log_str(recheck)
+            ));
+            if !heal.ticket.can_recover() {
+                crate::ble::gatt_note(format!(
+                    "voice_heal session={session} tool={tool} action=focus_bounce skipped=recovery_target_unavailable"
+                ));
+                return;
+            }
             if recheck != WetypeReaction::NotReacted {
                 IME_HEAL_STEPS.store(0, Ordering::Relaxed);
                 let reason = if recheck == WetypeReaction::Reacted { "reacted_late" } else { "reaction_unknown" };
@@ -578,16 +694,107 @@ mod tests {
     /// 焦点往返/切换会把它拆掉（10-20 教训）。迟到的正面证据必须否决动作。
     #[test]
     fn late_positive_evidence_cancels_a_pending_heal() {
-        // 采样时未响应（marker 未前进）→ 可以救。
+        // 稳定采样时无录音会话且 marker 未前进，才可考虑恢复。
         assert!(should_heal(
-            reaction_verdict(MicResponse::NotObserved, 7, 7),
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Inactive,
+                true
+            ),
             true
         ));
         // 动作前再裁决：marker 前进 → 放弃动作。
         assert!(!should_heal(
-            reaction_verdict(MicResponse::NotObserved, 7, 9),
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                9,
+                CaptureEvidence::Inactive,
+                true
+            ),
             true
         ));
+        // 动作前发现迟到的 Active 会话，或会话枚举失效，也应放弃。
+        assert!(!should_heal(
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Active,
+                true
+            ),
+            true
+        ));
+        assert!(!should_heal(
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Unavailable,
+                true
+            ),
+            true
+        ));
+    }
+
+    #[test]
+    fn partial_enumeration_is_not_inactive_and_preserves_positive_matches() {
+        assert_eq!(summarize_capture([Some(false), None].into_iter()), None);
+        assert_eq!(summarize_capture([None, Some(false)].into_iter()), None);
+        assert_eq!(
+            summarize_capture([None, Some(true)].into_iter()),
+            Some(true)
+        );
+        assert_eq!(
+            summarize_capture([Some(false), Some(false)].into_iter()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn capture_evidence_is_fail_safe_for_wechat_recovery() {
+        assert_eq!(
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Active,
+                false,
+            ),
+            WetypeReaction::Reacted
+        );
+        assert_eq!(
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Inactive,
+                false,
+            ),
+            WetypeReaction::Unknown
+        );
+        assert_eq!(
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Unavailable,
+                true,
+            ),
+            WetypeReaction::Unknown
+        );
+        assert_eq!(
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::Inactive,
+                true,
+            ),
+            WetypeReaction::NotReacted
+        );
     }
 
     #[test]
@@ -609,16 +816,27 @@ mod tests {
         // NotObserved，但钩子层仍看到它的自注入标记（说明它正在工作）。
         // 必须判 Reacted：绝不重放和弦拆掉进行中的会话。
         assert_eq!(
-            reaction_verdict(MicResponse::NotObserved, 7, 9),
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                9,
+                CaptureEvidence::Unavailable,
+                true
+            ),
             WetypeReaction::Reacted
         );
     }
 
     #[test]
-    fn dormant_hook_without_marker_and_without_mic_opening_stays_recoverable() {
-        // 2026-09-05 真休眠：无标记、无开麦 → NotReacted，恢复阶梯照旧可用。
+    fn other_tools_keep_the_existing_negative_consent_verdict() {
         assert_eq!(
-            reaction_verdict(MicResponse::NotObserved, 7, 7),
+            reaction_verdict(
+                MicResponse::NotObserved,
+                7,
+                7,
+                CaptureEvidence::NotApplicable,
+                false
+            ),
             WetypeReaction::NotReacted
         );
     }
@@ -627,7 +845,13 @@ mod tests {
     fn marker_evidence_beats_unavailable_mic_observation() {
         // 观测不可用但标记前进：已有正面存活证据，不得报"不可用"。
         assert_eq!(
-            reaction_verdict(MicResponse::Unknown, 7, 8),
+            reaction_verdict(
+                MicResponse::Unknown,
+                7,
+                8,
+                CaptureEvidence::Unavailable,
+                true
+            ),
             WetypeReaction::Reacted
         );
     }
@@ -636,7 +860,13 @@ mod tests {
     fn unavailable_mic_observation_without_marker_is_never_dormancy() {
         // 失败安全保持：观测不可用且无标记 → Unknown（调用方不得据此恢复）。
         assert_eq!(
-            reaction_verdict(MicResponse::Unknown, 7, 7),
+            reaction_verdict(
+                MicResponse::Unknown,
+                7,
+                7,
+                CaptureEvidence::NotApplicable,
+                false
+            ),
             WetypeReaction::Unknown
         );
     }
@@ -644,7 +874,13 @@ mod tests {
     #[test]
     fn mic_opening_without_marker_is_still_reacted() {
         assert_eq!(
-            reaction_verdict(MicResponse::Observed, 7, 7),
+            reaction_verdict(
+                MicResponse::Observed,
+                7,
+                7,
+                CaptureEvidence::Unavailable,
+                true
+            ),
             WetypeReaction::Reacted
         );
     }
