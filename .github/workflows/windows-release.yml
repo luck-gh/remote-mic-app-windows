@@ -4,8 +4,8 @@ name: Windows Release
 # 1. push 形如 v0.2.0 的 tag 触发；
 # 2. 用仓库 Secret TAURI_SIGNING_PRIVATE_KEY 构建 minisign 签名的 NSIS 安装器
 #    （缺 Secret 直接失败——禁止用一次性密钥发布正式更新包）；
-# 3. 生成 latest.json（updater 静态清单）并把资产重命名为纯 ASCII 文件名；
-# 4. 创建 DRAFT Release 并挂载资产——人工核对后点 Publish 才对全量用户生效
+# 3. 验签后将签名写入 latest.json，暂存 ASCII 文件名的安装器；
+# 4. 创建 DRAFT Release 并上传安装器与清单，正文记录安装器 SHA-256
 #    （releases/latest/download/latest.json 只统计已发布的稳定 Release）。
 on:
   push:
@@ -86,41 +86,40 @@ jobs:
           ./scripts/verify-updater-signing.ps1 -Installer $installers[0].FullName
           ./scripts/generate-updater-manifest.ps1 -Tag $env:GITHUB_REF_NAME -Repository $env:GITHUB_REPOSITORY
 
-      - name: Show staged assets before release (delete-free verification)
-        shell: pwsh
-        run: |
-          Write-Host "将上传到 Draft Release $env:GITHUB_REF_NAME 的资产清单："
-          Get-ChildItem -LiteralPath "artifacts/windows-release" -File |
-            ForEach-Object { Write-Host ("- {0} ({1} bytes)" -f $_.Name, $_.Length) }
-
       - name: Create draft GitHub release with assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $assets = Get-ChildItem -LiteralPath "artifacts/windows-release" -File | ForEach-Object { $_.FullName }
-          # Keep automated notes limited to this workflow's source identity.
-          # Reviewed feature and validation notes belong to the release PR before tagging.
+          $repositoryUrl = "https://github.com/$env:GITHUB_REPOSITORY"
+          $assetDirectory = "artifacts/windows-release"
+          $installerName = "SayAll-Windows-$($tag.TrimStart('v'))-x64-setup.exe"
+          $installerUrl = "$repositoryUrl/releases/download/$tag/$installerName"
+          $installer = Get-Item -LiteralPath (Join-Path $assetDirectory $installerName)
+          $manifest = Get-Item -LiteralPath (Join-Path $assetDirectory "latest.json")
+          $assets = @($installer.FullName, $manifest.FullName)
+          $installerSha = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestSha = (Get-FileHash -LiteralPath $manifest.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "将上传到 Draft Release $tag 的资产清单"
+          Write-Host "- $installerName ($($installer.Length) bytes, SHA-256 $installerSha)"
+          Write-Host "- latest.json ($($manifest.Length) bytes, SHA-256 $manifestSha)"
+          # 发布前根据发布 PR 补齐版本变化、升级限制和实际验证结果。
           $notes = @"
           # 无线麦 Windows 个人版 $tag 预览版
 
-          本次安装器由当前工作流的精确 Tag/Commit 构建；对应源码提交为 $env:GITHUB_SHA。
-          功能、安装生命周期与真机结果以该提交的 PR 和 Testing 记录为准。
-          上游历史硬件验证不自动成为本地合并候选的验收结论。
+          ## 下载与安装
 
-          ## 已知边界
+          [**下载 Windows 安装包（.exe）**]($installerUrl)
 
-          - 当前测试安装器仅具备 updater 签名，尚无 Windows Authenticode 代码签名。
-          - 全按键支持需要用户显式授权；基础语音保持普通用户权限。
-          - 自动恢复只使用协作停止与真实释放确认，不强制结束设备宿主。
-          - 当前候选的 RC001、RC003 和 ARM64 真机覆盖需分别确认。
+          手动安装只需上面的安装包。适用于 64 位 Windows 10 1809 或更新版本。
+          安装器 SHA-256 ``$installerSha``。
+          此安装器已验证应用更新签名，Windows Authenticode 代码签名尚未启用。
 
-          更新资产：
-          - SayAll-Windows-$($tag.TrimStart('v'))-x64-setup.exe
-          - SayAll-Windows-$($tag.TrimStart('v'))-x64-setup.exe.sig
-          - latest.json
-          - SHA256SUMS.txt
+          ## 版本记录
+
+          构建对应提交 ``$env:GITHUB_SHA``。
+          [对应源码与提交记录]($repositoryUrl/commit/$env:GITHUB_SHA)
           "@
           gh release create $tag --draft --prerelease --title "无线麦 · 个人版 $tag 预览版" --notes $notes @assets
           if ($LASTEXITCODE -ne 0) {
