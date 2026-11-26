@@ -2,7 +2,7 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'application-version.ps1')
 $repositoryRoot=Split-Path -Parent $PSScriptRoot
-$evidence=Join-Path $repositoryRoot 'target/dev/personal-version'
+$evidence=Join-Path $repositoryRoot ('target/dev/personal-version/manifest-'+[guid]::NewGuid().ToString('N'))
 function Assert-Equal($Actual,$Expected){if($Actual -ne $Expected){throw "Expected $Expected, observed $Actual"}}
 function Assert-Rejected([scriptblock]$Action,[string]$Expected){
     try{& $Action}catch{if($_.Exception.Message -notmatch $Expected){throw};return}
@@ -34,10 +34,16 @@ foreach($case in @(@('1.0.0+1','1.0.0.1'),@('1.0.0+10','1.0.0.10'),@('0.2.0','0.
     Assert-Equal (Get-FileHash -LiteralPath $normalized -Algorithm SHA256).Hash $before
     Assert-Equal (& (Join-Path $PSScriptRoot 'normalize-personal-package.ps1') -RepositoryRoot $fixture -BundleDirectory $bundle) $normalized
     & (Join-Path $PSScriptRoot 'generate-updater-manifest.ps1') -Tag ('v'+$public) -RepositoryRoot $fixture|Out-Null
-    $manifest=Get-Content -Raw (Join-Path $fixture 'artifacts/windows-release/latest.json')|ConvertFrom-Json
+    $staging=Join-Path $fixture 'artifacts/windows-release'
+    $assetName="SayAll-Windows-$public-x64-setup.exe"
+    $stagedNames=@(Get-ChildItem -LiteralPath $staging -File | Sort-Object Name | ForEach-Object Name)
+    Assert-Equal ($stagedNames -join ',') "latest.json,$assetName"
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $staging $assetName) -Algorithm SHA256).Hash $before
+    Assert-Equal (Get-Content -LiteralPath ($normalized+'.sig') -Raw).Trim() 'fixture-signature'
+    $manifest=Get-Content -Raw (Join-Path $staging 'latest.json')|ConvertFrom-Json
     Assert-Equal $manifest.version $canonical
     Assert-Equal $manifest.platforms.'windows-x86_64'.url "https://github.com/luck-gh/remote-mic-app-windows/releases/download/v$public/SayAll-Windows-$public-x64-setup.exe"
     Assert-Equal $manifest.platforms.'windows-x86_64'.signature 'fixture-signature'
     if($canonical -ne $public){Assert-Rejected {& (Join-Path $PSScriptRoot 'generate-updater-manifest.ps1') -Tag ('v'+$canonical) -RepositoryRoot $fixture} 'Tag .*tauri.conf.json'}
 }
-'passed: public version conversion/range, package/signature rename and idempotence, canonical manifest with public tag/assets, legacy three-part releases'
+'passed: public version conversion/range, package/signature rename and idempotence, canonical manifest with embedded signature, exact two-asset release staging, legacy three-part releases'

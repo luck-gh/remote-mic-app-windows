@@ -1,11 +1,9 @@
-# 生成应用内更新清单 latest.json 并把 Release 资产复制为纯 ASCII 文件名。
+# 生成应用内更新清单并暂存使用 ASCII 文件名的安装器。
 # 用法（Windows Release workflow，tag push 触发）：
 #   ./scripts/generate-updater-manifest.ps1 -Tag v0.2.0 [-Repository owner/repo]
 # 输出目录 artifacts/windows-release/：
 #   latest.json                                # updater 静态清单（tauri.conf.json 版本 + .sig 内容 + 资产直链）
 #   SayAll-Windows-<version>-x64-setup.exe     # NSIS 安装器（ASCII 重命名，消除 URL 编码风险）
-#   SayAll-Windows-<version>-x64-setup.exe.sig # minisign 签名
-#   SHA256SUMS.txt                             # 上述两个二进制资产的校验和
 param(
     [Parameter(Mandatory = $true)]
     [string]$Tag,
@@ -59,7 +57,6 @@ if ([string]::IsNullOrWhiteSpace($signature)) {
 }
 
 $assetName = "SayAll-Windows-$publicVersion-x64-setup.exe"
-$signatureAssetName = "$assetName.sig"
 $downloadUrl = "https://github.com/$Repository/releases/download/$Tag/$assetName"
 $pubDate = ([DateTimeOffset]::UtcNow).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
 
@@ -81,15 +78,7 @@ $manifestPath = Join-Path $stagingDirectory "latest.json"
 [System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 6), $utf8WithoutBom)
 
 $stagedInstaller = Join-Path $stagingDirectory $assetName
-$stagedSignature = Join-Path $stagingDirectory $signatureAssetName
 Copy-Item -LiteralPath $installer.FullName -Destination $stagedInstaller -Force
-Copy-Item -LiteralPath $signaturePath -Destination $stagedSignature -Force
-
-$checksumLines = @(
-    "$((Get-FileHash -Algorithm SHA256 -LiteralPath $stagedInstaller).Hash.ToLowerInvariant())  $assetName",
-    "$((Get-FileHash -Algorithm SHA256 -LiteralPath $stagedSignature).Hash.ToLowerInvariant())  $signatureAssetName"
-)
-[System.IO.File]::WriteAllText((Join-Path $stagingDirectory "SHA256SUMS.txt"), ($checksumLines -join "`n") + "`n", $utf8WithoutBom)
 
 # 自检：清单内容必须能被 updater 按静态 JSON 契约解析回来（version/url/signature）。
 $parsed = Get-Content -Raw -Encoding UTF8 $manifestPath | ConvertFrom-Json
@@ -102,6 +91,6 @@ Write-Host "Version: $version (tag $Tag)"
 Write-Host "Download URL: $downloadUrl"
 Write-Host "Signature length: $($signature.Length) chars"
 Write-Host "Staged release assets:"
-foreach ($name in @("latest.json", $assetName, $signatureAssetName, "SHA256SUMS.txt")) {
+foreach ($name in @("latest.json", $assetName)) {
     Write-Host "- $name"
 }

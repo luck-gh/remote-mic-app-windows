@@ -104,8 +104,8 @@ const PROGRESS_EVENT: &str = "app-update-progress";
 /// 呈现规则（2026-09-06 用户终裁）：与"服务器确认无新版本"一致，均提示
 /// "已经是最新版本"，不让用户看到失败感文案；真实原因只写诊断日志。
 /// 已知代价：正式 Release 若漏挂 latest.json 资产，用户也会看到"已经是
-/// 最新版本"——由发布流程（windows-release.yml：缺 latest.json/.sig 即
-/// fail-fast 拒绝建 Release）与诊断日志（稳定 error_domain/error_code）兜底。
+/// 最新版本"——发布流程要求清单与经过验签的安装器一同上传，
+/// 诊断日志保留稳定的 error_domain/error_code。
 fn release_not_found_counts_as_up_to_date(error: &UpdaterError) -> bool {
     matches!(error, UpdaterError::ReleaseNotFound)
 }
